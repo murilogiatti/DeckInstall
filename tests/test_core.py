@@ -37,10 +37,12 @@ from deckinstall.scanner import (  # noqa: E402
     scan_all_games,
     scan_game_folder,
 )
-from deckinstall.steam_paths import SteamPaths, find_default_proton_name  # noqa: E402
+from deckinstall.steam_paths import SteamPaths, find_default_proton_name, list_steam_users  # noqa: E402
 from deckinstall.steam_vdf import (  # noqa: E402
     ShortcutEntry,
+    _backup_file,
     compute_shortcut_appid,
+    infer_game_root_from_exe,
     migrate_shortcut_to_games,
     plan_bulk_migration,
 )
@@ -202,6 +204,66 @@ class CoreTests(unittest.TestCase):
             sanitize_folder_name("/abs/path")
         cmd = _select_extract_cmd(Path("game.tar.gz"), Path("/tmp/out"))
         self.assertEqual(cmd[0], "tar")
+
+    def test_extract_archive_merges_existing_directory_without_wiping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dest_root = root / "Games"
+            existing = dest_root / "PatchGame" / "data"
+            existing.mkdir(parents=True)
+            (existing / "keep.txt").write_text("original", encoding="utf-8")
+            (existing / "config.ini").write_text("old", encoding="utf-8")
+
+            zpath = root / "patch.zip"
+            with zipfile.ZipFile(zpath, "w") as zf:
+                zf.writestr("PatchGame/data/config.ini", "new")
+
+            out = extract_archive(zpath, dest_root, "PatchGame")
+            self.assertEqual((out / "data" / "keep.txt").read_text(encoding="utf-8"), "original")
+            self.assertEqual((out / "data" / "config.ini").read_text(encoding="utf-8"), "new")
+
+    def test_infer_game_root_skips_binaries_win64_and_guards_downloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            exe = root / "Custom" / "MyGame" / "Binaries" / "Win64" / "Game-Win64-Shipping.exe"
+            exe.parent.mkdir(parents=True)
+            exe.write_bytes(b"MZ")
+            self.assertEqual(infer_game_root_from_exe(exe), (root / "Custom" / "MyGame").resolve())
+
+            dl_dir = root / "Downloads"
+            dl_dir.mkdir(parents=True)
+            loose = dl_dir / "LooseGame.exe"
+            loose.write_bytes(b"MZ")
+            with mock.patch("pathlib.Path.home", return_value=root):
+                with self.assertRaises(ValueError):
+                    infer_game_root_from_exe(loose)
+
+    def test_backup_file_rotation_and_loginusers_priority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "shortcuts.vdf"
+            target.write_bytes(b"v1")
+            for _ in range(7):
+                _backup_file(target, keep=5)
+            backups = list(root.glob("shortcuts.vdf.*.deckinstall.bak"))
+            self.assertLessEqual(len(backups), 5)
+            self.assertGreaterEqual(len(backups), 1)
+
+            steam_root = root / "Steam"
+            (steam_root / "userdata" / "100").mkdir(parents=True)
+            (steam_root / "userdata" / "200").mkdir(parents=True)
+            (steam_root / "config").mkdir(parents=True)
+            (steam_root / "config" / "loginusers.vdf").write_text("users", encoding="utf-8")
+
+            fake_login = {
+                "users": {
+                    str(76561197960265728 + 100): {"MostRecent": "0", "Timestamp": "100"},
+                    str(76561197960265728 + 200): {"MostRecent": "1", "Timestamp": "200"},
+                }
+            }
+            with mock.patch("vdf.loads", return_value=fake_login):
+                ordered = list_steam_users(steam_root)
+            self.assertEqual(ordered[0], "200")
 
 
 if __name__ == "__main__":

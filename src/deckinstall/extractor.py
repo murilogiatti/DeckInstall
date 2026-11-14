@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import select
 import shutil
 import subprocess
 import tempfile
@@ -56,7 +57,7 @@ def _select_extract_cmd(archive: Path, out_dir: Path) -> list[str]:
 
 
 def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
-    """Move extracted contents to final_dir, avoiding double nested folders."""
+    """Move extracted contents to final_dir, merging safely if directories already exist."""
     entries = list(temp_dir.iterdir())
     source_root = (
         entries[0]
@@ -67,6 +68,10 @@ def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
     for item in source_root.iterdir():
         dest = final_dir / item.name
         if dest.exists():
+            if item.is_dir() and dest.is_dir():
+                shutil.copytree(item, dest, dirs_exist_ok=True, symlinks=True)
+                shutil.rmtree(item)
+                continue
             if dest.is_dir():
                 shutil.rmtree(dest)
             else:
@@ -101,20 +106,37 @@ def extract_archive(
         )
         pct = 10
         assert proc.stdout is not None
-        for line in proc.stdout:
+        while True:
             if cancel_flag and cancel_flag():
                 proc.terminate()
-                proc.wait(timeout=5)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
                 raise RuntimeError("Extração cancelada pelo usuário.")
-            m = re.search(r"(\d{1,3})%", line)
-            if m:
-                pct = min(95, max(pct, int(m.group(1))))
-            elif pct < 90:
-                pct = min(90, pct + 1)
-            if on_progress:
-                on_progress(pct, line.strip()[:120] or f"Extraindo {archive.name}...")
+            ready, _, _ = select.select([proc.stdout], [], [], 0.2)
+            if ready:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                m = re.search(r"(\d{1,3})%", line)
+                if m:
+                    pct = min(95, max(pct, int(m.group(1))))
+                elif pct < 90:
+                    pct = min(90, pct + 1)
+                if on_progress:
+                    on_progress(pct, line.strip()[:120] or f"Extraindo {archive.name}...")
+            elif proc.poll() is not None:
+                # Drain any remaining lines after process exit.
+                for line in proc.stdout:
+                    if on_progress and line.strip():
+                        on_progress(pct, line.strip()[:120])
+                break
 
         rc = proc.wait()
+        if cancel_flag and cancel_flag():
+            raise RuntimeError("Extração cancelada pelo usuário.")
         if rc != 0:
             raise RuntimeError(f"Falha ao extrair {archive.name} (código {rc}).")
 
@@ -131,6 +153,7 @@ def run_windows_installer(
     installer_exe: Path,
     target_dir: Path,
     on_log: Callable[[str], None] | None = None,
+    cancel_flag: Callable[[], bool] | None = None,
 ) -> Path:
     """Run a Windows setup.exe using Steam's Proton in a disposable prefix."""
     steam_root = find_steam_root()
@@ -160,10 +183,27 @@ def run_windows_installer(
             errors="replace",
         )
         if proc.stdout:
-            for line in proc.stdout:
-                if on_log and line.strip():
-                    on_log(line.strip()[:140])
+            while True:
+                if cancel_flag and cancel_flag():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    raise RuntimeError("Instalador cancelado pelo usuário.")
+                ready, _, _ = select.select([proc.stdout], [], [], 0.25)
+                if ready:
+                    line = proc.stdout.readline()
+                    if not line:
+                        break
+                    if on_log and line.strip():
+                        on_log(line.strip()[:140])
+                elif proc.poll() is not None:
+                    break
         rc = proc.wait()
+        if cancel_flag and cancel_flag():
+            raise RuntimeError("Instalador cancelado pelo usuário.")
         if rc != 0:
             raise RuntimeError(f"Instalador encerrou com código {rc}.")
     return target_dir

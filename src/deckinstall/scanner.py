@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -86,23 +87,27 @@ def rank_executables(game_dir: Path) -> list[Path]:
     candidates: list[Path] = []
     root_depth_limit = 4
     base_parts = len(game_dir.parts)
-    try:
-        entries = list(game_dir.rglob("*"))
-    except OSError:
-        entries = []
-    for path in entries:
-        try:
-            if not path.is_file():
+    for dirpath, dirnames, filenames in os.walk(game_dir, followlinks=False):
+        cur = Path(dirpath)
+        depth = len(cur.parts) - base_parts
+        if depth >= root_depth_limit:
+            dirnames[:] = []
+        else:
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        if depth + 1 > root_depth_limit:
+            continue
+        for fname in filenames:
+            if not fname.lower().endswith(".exe"):
                 continue
-        except OSError:
-            continue
-        if len(path.parts) - base_parts > root_depth_limit:
-            continue
-        if path.suffix.lower() != ".exe":
-            continue
-        if _is_ignored_exe(path):
-            continue
-        candidates.append(path)
+            path = cur / fname
+            try:
+                if not path.is_file():
+                    continue
+            except OSError:
+                continue
+            if _is_ignored_exe(path):
+                continue
+            candidates.append(path)
 
     def score(exe: Path) -> tuple[int, int, int, int]:
         name_low = exe.name.lower()
@@ -183,7 +188,11 @@ def scan_all_games(roots: list[Path] | None = None) -> list[DetectedGame]:
         except OSError:
             continue
         for child in children:
-            if not _safe_is_dir(child) or child.name.startswith("."):
+            if (
+                not _safe_is_dir(child)
+                or child.name.startswith(".")
+                or child.name in {"steamapps", "lost+found", "System Volume Information"}
+            ):
                 continue
             try:
                 resolved = child.resolve()

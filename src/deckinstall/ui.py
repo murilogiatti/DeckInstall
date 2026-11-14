@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import requests
-from PySide6.QtCore import QSettings, Qt, QThread, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QIcon, QPixmap
+from PySide6.QtCore import QSettings, Qt, QThread, Signal, qInstallMessageHandler
+from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -151,6 +152,7 @@ class ExtractWorker(QThread):
                     self.source,
                     self.dest_root / self.folder_name,
                     on_log=lambda msg: self.progress.emit(50, msg),
+                    cancel_flag=lambda: self._cancelled,
                 )
                 self.progress.emit(100, f"Instalador finalizado em {out}")
             else:
@@ -163,27 +165,29 @@ class ExtractWorker(QThread):
 class SteamSearchWorker(QThread):
     """Background worker for Steam Store search."""
 
-    results = Signal(list)
-    failed = Signal(str)
+    results = Signal(int, list)
+    failed = Signal(int, str)
 
-    def __init__(self, query: str) -> None:
+    def __init__(self, req_id: int, query: str) -> None:
         super().__init__()
+        self.req_id = req_id
         self.query = query
 
     def run(self) -> None:
         try:
-            self.results.emit(search_steam_games(self.query))
+            self.results.emit(self.req_id, search_steam_games(self.query))
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(self.req_id, str(exc))
 
 
 class PreviewWorker(QThread):
     """Background worker to fetch a Steam header preview image."""
 
-    loaded = Signal(bytes)
+    loaded = Signal(int, bytes)
 
-    def __init__(self, steam_appid: int) -> None:
+    def __init__(self, req_id: int, steam_appid: int) -> None:
         super().__init__()
+        self.req_id = req_id
         self.steam_appid = steam_appid
 
     def run(self) -> None:
@@ -191,9 +195,22 @@ class PreviewWorker(QThread):
         try:
             resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
             if resp.status_code == 200 and len(resp.content) > 512:
-                self.loaded.emit(resp.content)
+                self.loaded.emit(self.req_id, resp.content)
         except requests.RequestException:
             pass
+
+
+class ScanWorker(QThread):
+    """Background worker to scan game folders without blocking the UI thread."""
+
+    finished_scan = Signal(list)
+
+    def run(self) -> None:
+        try:
+            self.finished_scan.emit(scan_all_games())
+        except Exception:
+            logging.exception("ScanWorker failed")
+            self.finished_scan.emit([])
 
 
 class AddToSteamWorker(QThread):
@@ -332,11 +349,15 @@ class MainWindow(QMainWindow):
         self.settings = QSettings(__app_name__, __app_name__)
         self.paths = resolve_steam_paths()
         self._detected_games: list[DetectedGame] = []
+        self._active_workers: set[QThread] = set()
+        self._search_req_id = 0
+        self._preview_req_id = 0
         self._extract_worker: ExtractWorker | None = None
         self._search_worker: SteamSearchWorker | None = None
         self._preview_worker: PreviewWorker | None = None
         self._add_worker: AddToSteamWorker | None = None
         self._bulk_worker: BulkMigrateWorker | None = None
+        self._scan_worker: ScanWorker | None = None
 
         self.setWindowTitle(f"{__app_name__} v{__version__}")
         self.resize(980, 660)
@@ -344,6 +365,25 @@ class MainWindow(QMainWindow):
         self._apply_saved_theme()
         self._refresh_games()
         self._refresh_shortcuts()
+
+    def _track_worker(self, worker: QThread) -> None:
+        """Keep a strong reference to running QThreads until finished to prevent Qt SIGABRT."""
+        worker.setParent(self)
+        self._active_workers.add(worker)
+
+        def _cleanup() -> None:
+            self._active_workers.discard(worker)
+            worker.deleteLater()
+
+        worker.finished.connect(_cleanup)
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self._extract_worker and self._extract_worker.isRunning():
+            self._extract_worker.cancel()
+        for worker in list(self._active_workers):
+            if worker.isRunning():
+                worker.wait(5000)
+        super().closeEvent(event)
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -691,6 +731,7 @@ class MainWindow(QMainWindow):
         self.btn_use_extracted.setEnabled(False)
 
         self._extract_worker = ExtractWorker(src, dst, name)
+        self._track_worker(self._extract_worker)
         self._extract_worker.progress.connect(self._on_extract_progress)
         self._extract_worker.finished_ok.connect(self._on_extract_done)
         self._extract_worker.failed.connect(self._on_extract_failed)
@@ -729,7 +770,18 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(1)
 
     def _refresh_games(self) -> None:
-        self._detected_games = scan_all_games()
+        worker = ScanWorker()
+        self._scan_worker = worker
+        self._track_worker(worker)
+        worker.finished_scan.connect(
+            lambda games, w=worker: self._on_games_scanned(w, games)
+        )
+        worker.start()
+
+    def _on_games_scanned(self, worker: ScanWorker, games: list[DetectedGame]) -> None:
+        if worker is not self._scan_worker:
+            return
+        self._detected_games = games
         self.games_list.clear()
         for g in self._detected_games:
             tag = f" [AppID {g.steam_appid}]" if g.steam_appid else ""
@@ -771,6 +823,13 @@ class MainWindow(QMainWindow):
             self.steam_search_input.setText(
                 str(game.steam_appid) if (game and game.steam_appid) else name
             )
+            self.steam_match_combo.clear()
+            if game and game.steam_appid:
+                self.steam_match_combo.addItem(
+                    f"AppID detectado: {game.steam_appid}", game.steam_appid
+                )
+            else:
+                self.preview_label.setText("Prévia da Arte\n(Steam Store)")
 
     def _search_steam_art(self) -> None:
         query = self.steam_search_input.text().strip()
@@ -784,14 +843,23 @@ class MainWindow(QMainWindow):
             return
 
         self.status_label.setText(f"Buscando '{query}' na Steam...")
-        self._search_worker = SteamSearchWorker(query)
-        self._search_worker.results.connect(self._on_steam_results)
-        self._search_worker.failed.connect(
-            lambda e: QMessageBox.warning(self, __app_name__, f"Erro na busca: {e}")
-        )
-        self._search_worker.start()
+        self._search_req_id += 1
+        req_id = self._search_req_id
+        worker = SteamSearchWorker(req_id, query)
+        self._search_worker = worker
+        self._track_worker(worker)
+        worker.results.connect(self._on_steam_results)
+        worker.failed.connect(self._on_steam_search_failed)
+        worker.start()
 
-    def _on_steam_results(self, matches: list[SteamMatch]) -> None:
+    def _on_steam_search_failed(self, req_id: int, err: str) -> None:
+        if req_id != self._search_req_id:
+            return
+        QMessageBox.warning(self, __app_name__, f"Erro na busca: {err}")
+
+    def _on_steam_results(self, req_id: int, matches: list[SteamMatch]) -> None:
+        if req_id != self._search_req_id:
+            return
         self.steam_match_combo.clear()
         for m in matches:
             self.steam_match_combo.addItem(f"{m.name} ({m.appid})", m.appid)
@@ -803,15 +871,21 @@ class MainWindow(QMainWindow):
 
     def _on_steam_match_changed(self) -> None:
         appid = self.steam_match_combo.currentData()
+        self._preview_req_id += 1
         if not isinstance(appid, int):
             self.preview_label.setText("Prévia da Arte\n(Steam Store)")
             return
+        req_id = self._preview_req_id
         self.preview_label.setText("Carregando prévia...")
-        self._preview_worker = PreviewWorker(appid)
-        self._preview_worker.loaded.connect(self._set_preview_bytes)
-        self._preview_worker.start()
+        worker = PreviewWorker(req_id, appid)
+        self._preview_worker = worker
+        self._track_worker(worker)
+        worker.loaded.connect(self._set_preview_bytes)
+        worker.start()
 
-    def _set_preview_bytes(self, raw: bytes) -> None:
+    def _set_preview_bytes(self, req_id: int, raw: bytes) -> None:
+        if req_id != self._preview_req_id:
+            return
         pix = QPixmap()
         if pix.loadFromData(raw):
             scaled = pix.scaled(
@@ -853,6 +927,7 @@ class MainWindow(QMainWindow):
             enable_proton=self.chk_proton.isChecked(),
             restart_steam=self.chk_restart.isChecked(),
         )
+        self._track_worker(self._add_worker)
         self._add_worker.status.connect(self.status_label.setText)
         self._add_worker.finished_ok.connect(self._on_add_done)
         self._add_worker.failed.connect(self._on_add_failed)
@@ -930,7 +1005,12 @@ class MainWindow(QMainWindow):
         if not entry or not self.paths:
             return
         old_exe = Path(entry.exe.strip().strip('"'))
-        suggested = clean_game_name(infer_game_root_from_exe(old_exe).name)
+        try:
+            old_root = infer_game_root_from_exe(old_exe)
+        except Exception as exc:
+            QMessageBox.critical(self, __app_name__, str(exc))
+            return
+        suggested = clean_game_name(old_root.name)
         new_name, ok = QInputDialog.getText(
             self,
             __app_name__,
@@ -947,34 +1027,19 @@ class MainWindow(QMainWindow):
             )
             if ans != QMessageBox.StandardButton.Yes:
                 return
-        was_running = is_steam_running()
-        try:
-            if was_running and not shutdown_steam():
-                raise RuntimeError("Não foi possível fechar o Steam a tempo.")
-            new_appid, new_exe, steam_appid = migrate_shortcut_to_games(
-                paths=self.paths,
-                entry=entry,
-                games_root=Path.home() / "Games",
-                new_name=new_name.strip(),
-            )
-            if steam_appid is None:
-                matches = search_steam_games(new_name.strip(), limit=1)
-                if matches:
-                    steam_appid = matches[0].appid
-            art_msg = "Sem artes baixadas."
-            if steam_appid:
-                art = download_steam_artwork(steam_appid, new_appid, self.paths.grid_dir)
-                art_msg = f"Artes: {', '.join(art.saved_files.keys()) or 'nenhuma'}"
-            msg = f"Migrado para {new_exe} (ID {new_appid}). {art_msg}"
-            self.status_label.setText(msg)
-            QMessageBox.information(self, __app_name__, msg)
-        except Exception as exc:
-            QMessageBox.critical(self, __app_name__, str(exc))
-        finally:
-            if was_running and not is_steam_running():
-                start_steam()
-            self._refresh_games()
-            self._refresh_shortcuts()
+        item = MigrationPlanItem(
+            entry=entry,
+            old_root=old_root,
+            new_name=new_name.strip(),
+            has_compatdata=(self.paths.compatdata_dir / str(entry.appid_u32)).is_dir(),
+        )
+        self.btn_bulk_migrate.setEnabled(False)
+        self._bulk_worker = BulkMigrateWorker(self.paths, [item])
+        self._track_worker(self._bulk_worker)
+        self._bulk_worker.status.connect(self.status_label.setText)
+        self._bulk_worker.finished_ok.connect(self._on_bulk_done)
+        self._bulk_worker.failed.connect(self._on_bulk_failed)
+        self._bulk_worker.start()
 
     def _bulk_migrate_shortcuts(self) -> None:
         if not self.paths:
@@ -1003,6 +1068,7 @@ class MainWindow(QMainWindow):
 
         self.btn_bulk_migrate.setEnabled(False)
         self._bulk_worker = BulkMigrateWorker(self.paths, plan)
+        self._track_worker(self._bulk_worker)
         self._bulk_worker.status.connect(self.status_label.setText)
         self._bulk_worker.finished_ok.connect(self._on_bulk_done)
         self._bulk_worker.failed.connect(self._on_bulk_failed)
@@ -1020,8 +1086,13 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, __app_name__, f"Erro na migração em massa: {err}")
 
 
+def _qt_message_handler(mode, context, message: str) -> None:
+    logging.warning("Qt[%s]: %s", mode, message)
+
+
 def main() -> int:
     """Application entry point."""
+    qInstallMessageHandler(_qt_message_handler)
     app = QApplication(sys.argv)
     app.setApplicationName(__app_name__)
     app.setApplicationVersion(__version__)

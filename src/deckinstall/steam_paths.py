@@ -34,8 +34,36 @@ def find_steam_root() -> Path | None:
     return None
 
 
+def _parse_loginusers_priority(steam_root: Path) -> dict[str, tuple[int, int]]:
+    """Return {steam3_id: (most_recent_flag, timestamp)} from config/loginusers.vdf."""
+    loginusers = steam_root / "config" / "loginusers.vdf"
+    if not loginusers.is_file():
+        return {}
+    try:
+        import vdf
+
+        data = vdf.loads(loginusers.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return {}
+    users_map = data.get("users")
+    if not isinstance(users_map, dict):
+        return {}
+    priority: dict[str, tuple[int, int]] = {}
+    for steam64_str, info in users_map.items():
+        if not isinstance(info, dict) or not str(steam64_str).isdigit():
+            continue
+        account_id = int(steam64_str) - 76561197960265728
+        if account_id <= 0:
+            continue
+        most_recent = 1 if str(info.get("MostRecent", "0")) == "1" else 0
+        ts_str = str(info.get("Timestamp", "0"))
+        ts = int(ts_str) if ts_str.isdigit() else 0
+        priority[str(account_id)] = (most_recent, ts)
+    return priority
+
+
 def list_steam_users(steam_root: Path) -> list[str]:
-    """Return numeric Steam3 userdata IDs, ordered by most recently modified."""
+    """Return numeric Steam3 userdata IDs, prioritizing loginusers.vdf MostRecent/Timestamp."""
     userdata = steam_root / "userdata"
     if not userdata.is_dir():
         return []
@@ -44,7 +72,17 @@ def list_steam_users(steam_root: Path) -> list[str]:
         for p in userdata.iterdir()
         if p.is_dir() and p.name.isdigit() and p.name != "0"
     ]
-    users.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    login_prio = _parse_loginusers_priority(steam_root)
+
+    def _sort_key(p: Path) -> tuple[int, int, float]:
+        mr, ts = login_prio.get(p.name, (0, 0))
+        try:
+            mtime = p.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        return (mr, ts, mtime)
+
+    users.sort(key=_sort_key, reverse=True)
     return [u.name for u in users]
 
 

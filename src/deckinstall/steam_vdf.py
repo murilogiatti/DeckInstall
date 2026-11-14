@@ -61,11 +61,26 @@ def _atomic_write_text(path: Path, text: str) -> None:
     _atomic_write_bytes(path, text.encode("utf-8"))
 
 
-def _backup_file(path: Path) -> Path | None:
+def _backup_file(path: Path, keep: int = 5) -> Path | None:
     if not path.is_file():
         return None
-    backup = path.with_suffix(path.suffix + ".deckinstall.bak")
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.name}.{stamp}.deckinstall.bak")
+    counter = 1
+    while backup.exists():
+        backup = path.with_name(f"{path.name}.{stamp}.{counter}.deckinstall.bak")
+        counter += 1
     shutil.copy2(path, backup)
+    old_backups = sorted(
+        path.parent.glob(f"{path.name}.*.deckinstall.bak"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for stale in old_backups[keep:]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
     return backup
 
 
@@ -274,6 +289,21 @@ def remove_compat_tool(config_vdf: Path, appid_u32: int) -> None:
         _atomic_write_text(config_vdf, vdf.dumps(data, pretty=True))
 
 
+_SUBDIR_NAMES = {
+    "win64",
+    "win32",
+    "x64",
+    "x86",
+    "bin",
+    "binaries",
+    "shipping",
+    "retail",
+    "build",
+    "release",
+    "engine",
+}
+
+
 def infer_game_root_from_exe(exe_path: Path) -> Path:
     """Infer the top-level game folder from an executable path."""
     home = Path.home()
@@ -298,7 +328,18 @@ def infer_game_root_from_exe(exe_path: Path) -> Path:
             and parent.parent.name == "Games"
         ):
             return parent
-    return resolved.parent
+    candidate = resolved.parent
+    while (
+        candidate.name.lower() in _SUBDIR_NAMES
+        and candidate.parent != candidate
+        and candidate.parent not in known_containers
+        and not (
+            len(candidate.parent.parts) <= 4
+            and candidate.parent.parts[:3] == ("/", "run", "media")
+        )
+    ):
+        candidate = candidate.parent
+    return candidate
 
 
 def migrate_shortcut_to_games(
@@ -344,9 +385,12 @@ def migrate_shortcut_to_games(
         new_compat = paths.compatdata_dir / str(new_appid)
         if old_compat.is_dir():
             if new_compat.exists():
-                backup_compat = paths.compatdata_dir / f"{new_appid}.deckinstall.bak"
-                if backup_compat.exists():
-                    shutil.rmtree(backup_compat)
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                backup_compat = paths.compatdata_dir / f"{new_appid}.{stamp}.deckinstall.bak"
+                counter = 1
+                while backup_compat.exists():
+                    backup_compat = paths.compatdata_dir / f"{new_appid}.{stamp}.{counter}.deckinstall.bak"
+                    counter += 1
                 shutil.move(str(new_compat), str(backup_compat))
             shutil.move(str(old_compat), str(new_compat))
 
