@@ -43,6 +43,7 @@ from deckinstall.steam_paths import SteamPaths, find_default_proton_name, list_s
 from deckinstall.steam_vdf import (  # noqa: E402
     ShortcutEntry,
     _backup_file,
+    _rewrite_launch_options,
     compute_shortcut_appid,
     delete_cleanup_candidates,
     find_cleanup_candidates,
@@ -470,6 +471,30 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn(other_compat, {c.path for c in cands})
             bak_cand = next(c for c in cands if c.path == bak_with_save)
             self.assertTrue(bak_cand.has_saves)
+
+    def test_rewrite_launch_options_and_missing_proton_triggers_bulk_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_root = root / "Downloads" / "MyGame"
+            new_root = root / "Games" / "MyGame"
+            rewritten = _rewrite_launch_options(
+                f'WINEPREFIX="{old_root}/pfx" %command% --data "{old_root}/data"',
+                old_root,
+                new_root,
+            )
+            self.assertIn(str(new_root), rewritten)
+            self.assertNotIn(str(old_root), rewritten)
+
+            new_root.mkdir(parents=True)
+            exe = new_root / "Game.exe"
+            exe.write_bytes(b"MZ")
+            appid_u32, _ = compute_shortcut_appid(f'"{exe}"', "MyGame")
+            entry = ShortcutEntry("0", appid_u32, "MyGame", f'"{exe}"', f'"{new_root}"', "", "")
+            cfg = root / "config.vdf"
+            cfg.write_text('{"InstallConfigStore":{}}', encoding="utf-8")
+            with mock.patch("vdf.loads", return_value={"InstallConfigStore": {"Software": {"Valve": {"Steam": {"CompatToolMapping": {}}}}}}):
+                plan = plan_bulk_migration([entry], root / "Games", root / "compat", search_roots=[], config_vdf=cfg)
+            self.assertEqual(len(plan), 1)
 
 
 if __name__ == "__main__":

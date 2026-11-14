@@ -337,6 +337,36 @@ _FORBIDDEN_ROOT_NAMES = {
 }
 
 
+def _rewrite_launch_options(launch_options: str, old_root: Path, new_root: Path) -> str:
+    """Update references to old_root inside LaunchOptions when moving a game folder."""
+    if not launch_options or old_root.resolve() == new_root.resolve():
+        return launch_options
+    old_str = str(old_root)
+    old_res = str(old_root.resolve())
+    new_str = str(new_root)
+    updated = launch_options.replace(old_res, new_str)
+    if old_str != old_res:
+        updated = updated.replace(old_str, new_str)
+    return updated
+
+
+def _has_proton_mapping(config_vdf: Path, appid_u32: int) -> bool:
+    if not config_vdf.is_file():
+        return False
+    try:
+        data = vdf.loads(config_vdf.read_text(encoding="utf-8", errors="replace"))
+        mapping = (
+            data.get("InstallConfigStore", {})
+            .get("Software", {})
+            .get("Valve", {})
+            .get("Steam", {})
+            .get("CompatToolMapping", {})
+        )
+        return str(appid_u32) in mapping
+    except Exception:
+        return False
+
+
 def infer_game_root_from_exe(exe_path: Path) -> Path:
     """Infer the top-level game folder from an executable path."""
     home = Path.home()
@@ -415,6 +445,7 @@ def migrate_shortcut_to_games(
         moved_root = True
 
     new_exe = new_root / rel_exe
+    new_launch = _rewrite_launch_options(entry.launch_options, old_root, new_root)
     try:
         with _STEAM_LOCK:
             new_appid = add_or_update_shortcut(
@@ -423,7 +454,7 @@ def migrate_shortcut_to_games(
                 exe_path=new_exe,
                 start_dir=new_exe.parent,
                 icon_path=Path(entry.icon) if entry.icon else None,
-                launch_options=entry.launch_options,
+                launch_options=new_launch,
                 enable_proton=True,
             )
 
@@ -684,8 +715,9 @@ def plan_bulk_migration(
     games_root: Path,
     compatdata_dir: Path,
     search_roots: list[Path] | None = None,
+    config_vdf: Path | None = None,
 ) -> list[MigrationPlanItem]:
-    """Identify Windows .exe shortcuts needing standardization in games_root or external save import."""
+    """Identify Windows .exe shortcuts needing standardization, Proton Stable, or external save import."""
     plan: list[MigrationPlanItem] = []
     games_resolved = games_root.resolve()
     for entry in entries:
@@ -702,9 +734,11 @@ def plan_bulk_migration(
         already_named = entry.app_name == clean_name and old_root.resolve() == new_root.resolve()
         if already_in_games and already_named:
             steam_appid = detect_steam_appid(old_root)
-            if not _has_pending_external_saves(
+            needs_proton = bool(config_vdf and not _has_proton_mapping(config_vdf, entry.appid_u32))
+            has_pending = _has_pending_external_saves(
                 compatdata_dir, entry.appid_u32, clean_name, steam_appid, search_roots
-            ):
+            )
+            if not needs_proton and not has_pending:
                 continue
         plan.append(
             MigrationPlanItem(

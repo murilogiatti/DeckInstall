@@ -698,21 +698,21 @@ class MainWindow(QMainWindow):
         self.btn_bulk_migrate = QPushButton("Migrar Todos para ~/Games")
         self.btn_bulk_migrate.setObjectName("primaryBtn")
         self.btn_bulk_migrate.clicked.connect(self._bulk_migrate_shortcuts)
-        btn_migrate = QPushButton("Migrar Selecionado")
-        btn_migrate.clicked.connect(self._migrate_selected_shortcut)
-        btn_art = QPushButton("Atualizar Artes")
-        btn_art.clicked.connect(self._update_selected_shortcut_art)
+        self.btn_migrate = QPushButton("Migrar Selecionado")
+        self.btn_migrate.clicked.connect(self._migrate_selected_shortcut)
+        self.btn_art = QPushButton("Atualizar Artes")
+        self.btn_art.clicked.connect(self._update_selected_shortcut_art)
         self.btn_cleanup = QPushButton("Limpar Prefixos Migrados...")
         self.btn_cleanup.clicked.connect(self._cleanup_old_prefixes)
-        btn_remove = QPushButton("Remover do Steam")
-        btn_remove.setObjectName("dangerBtn")
-        btn_remove.clicked.connect(self._remove_selected_shortcut)
+        self.btn_remove = QPushButton("Remover do Steam")
+        self.btn_remove.setObjectName("dangerBtn")
+        self.btn_remove.clicked.connect(self._remove_selected_shortcut)
         actions.addWidget(self.btn_bulk_migrate)
-        actions.addWidget(btn_migrate)
-        actions.addWidget(btn_art)
+        actions.addWidget(self.btn_migrate)
+        actions.addWidget(self.btn_art)
         actions.addWidget(self.btn_cleanup)
         actions.addStretch()
-        actions.addWidget(btn_remove)
+        actions.addWidget(self.btn_remove)
         lib_layout.addLayout(actions)
         layout.addWidget(lib_card, 1)
         return page
@@ -959,7 +959,7 @@ class MainWindow(QMainWindow):
         if steam_appid is None and self.steam_search_input.text().strip().isdigit():
             steam_appid = int(self.steam_search_input.text().strip())
 
-        self.btn_add_steam.setEnabled(False)
+        self._set_steam_busy(True)
         self._add_worker = AddToSteamWorker(
             paths=self.paths,
             app_name=app_name,
@@ -975,13 +975,13 @@ class MainWindow(QMainWindow):
         self._add_worker.start()
 
     def _on_add_done(self, msg: str) -> None:
-        self.btn_add_steam.setEnabled(True)
+        self._set_steam_busy(False)
         self.status_label.setText(msg)
         self._refresh_shortcuts()
         QMessageBox.information(self, __app_name__, msg)
 
     def _on_add_failed(self, err: str) -> None:
-        self.btn_add_steam.setEnabled(True)
+        self._set_steam_busy(False)
         QMessageBox.critical(self, __app_name__, err)
 
     def _refresh_shortcuts(self) -> None:
@@ -999,25 +999,65 @@ class MainWindow(QMainWindow):
             return None
         return item.data(Qt.ItemDataRole.UserRole)
 
+    def _set_steam_busy(self, busy: bool) -> None:
+        enabled = not busy
+        for btn in (
+            self.btn_add_steam,
+            self.btn_bulk_migrate,
+            self.btn_migrate,
+            self.btn_art,
+            self.btn_cleanup,
+            self.btn_remove,
+        ):
+            btn.setEnabled(enabled)
+
     def _update_selected_shortcut_art(self) -> None:
         entry = self._selected_shortcut()
         if not entry or not self.paths:
             return
-        try:
-            matches = search_steam_games(entry.app_name, limit=1)
-            if not matches:
-                QMessageBox.information(
-                    self, __app_name__, f"Não encontrei '{entry.app_name}' na loja Steam."
-                )
-                return
-            res = download_steam_artwork(matches[0].appid, entry.appid_u32, self.paths.grid_dir)
-            QMessageBox.information(
-                self,
-                __app_name__,
-                f"Artes de '{matches[0].name}' atualizadas: {', '.join(res.saved_files.keys()) or 'nenhuma'}",
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, __app_name__, f"Erro ao atualizar artes: {exc}")
+        self._set_steam_busy(True)
+        self.status_label.setText(f"Buscando artes para '{entry.app_name}'...")
+
+        class _ArtUpdateWorker(QThread):
+            done = Signal(str)
+            failed = Signal(str)
+
+            def __init__(self, paths: SteamPaths, shortcut: ShortcutEntry) -> None:
+                super().__init__()
+                self._paths = paths
+                self._shortcut = shortcut
+
+            def run(self) -> None:
+                try:
+                    matches = search_steam_games(self._shortcut.app_name, limit=1)
+                    if not matches:
+                        self.done.emit(f"Não encontrei '{self._shortcut.app_name}' na loja Steam.")
+                        return
+                    res = download_steam_artwork(
+                        matches[0].appid, self._shortcut.appid_u32, self._paths.grid_dir
+                    )
+                    self.done.emit(
+                        f"Artes de '{matches[0].name}' atualizadas: "
+                        f"{', '.join(res.saved_files.keys()) or 'nenhuma'}"
+                    )
+                except Exception as exc:
+                    self.failed.emit(str(exc))
+
+        worker = _ArtUpdateWorker(self.paths, entry)
+        self._track_worker(worker)
+
+        def _ok(msg: str) -> None:
+            self._set_steam_busy(False)
+            self.status_label.setText(msg)
+            QMessageBox.information(self, __app_name__, msg)
+
+        def _err(err: str) -> None:
+            self._set_steam_busy(False)
+            QMessageBox.critical(self, __app_name__, f"Erro ao atualizar artes: {err}")
+
+        worker.done.connect(_ok)
+        worker.failed.connect(_err)
+        worker.start()
 
     def _remove_selected_shortcut(self) -> None:
         entry = self._selected_shortcut()
@@ -1075,7 +1115,7 @@ class MainWindow(QMainWindow):
             new_root=Path.home() / "Games" / new_name.strip(),
             has_compatdata=(self.paths.compatdata_dir / str(entry.appid_u32)).is_dir(),
         )
-        self.btn_bulk_migrate.setEnabled(False)
+        self._set_steam_busy(True)
         self._bulk_worker = BulkMigrateWorker(self.paths, [item])
         self._track_worker(self._bulk_worker)
         self._bulk_worker.status.connect(self.status_label.setText)
@@ -1086,29 +1126,59 @@ class MainWindow(QMainWindow):
     def _bulk_migrate_shortcuts(self) -> None:
         if not self.paths:
             return
-        entries = load_shortcuts(self.paths.shortcuts_vdf)
-        plan = plan_bulk_migration(
-            entries=entries,
-            games_root=Path.home() / "Games",
-            compatdata_dir=self.paths.compatdata_dir,
-        )
+        self._set_steam_busy(True)
+        self.status_label.setText("Analisando jogos, saves externos e Proton Stable...")
+
+        class _BulkPlanWorker(QThread):
+            ready = Signal(list)
+            failed = Signal(str)
+
+            def __init__(self, paths: SteamPaths) -> None:
+                super().__init__()
+                self._paths = paths
+
+            def run(self) -> None:
+                try:
+                    entries = load_shortcuts(self._paths.shortcuts_vdf)
+                    plan = plan_bulk_migration(
+                        entries=entries,
+                        games_root=Path.home() / "Games",
+                        compatdata_dir=self._paths.compatdata_dir,
+                        config_vdf=self._paths.config_vdf,
+                    )
+                    self.ready.emit(plan)
+                except Exception as exc:
+                    self.failed.emit(str(exc))
+
+        worker = _BulkPlanWorker(self.paths)
+        self._track_worker(worker)
+        worker.ready.connect(self._confirm_and_run_bulk_plan)
+        worker.failed.connect(self._on_bulk_failed)
+        worker.start()
+
+    def _confirm_and_run_bulk_plan(self, plan: list[MigrationPlanItem]) -> None:
+        if not self.paths:
+            self._set_steam_busy(False)
+            return
         if not plan:
+            self._set_steam_busy(False)
+            self.status_label.setText("Todos os jogos .exe já estão padronizados em ~/Games.")
             QMessageBox.information(
                 self, __app_name__, "Todos os jogos .exe já estão padronizados em ~/Games!"
             )
             return
 
         lines = [
-            f"• {p.entry.app_name} → {p.new_name} (saves: {'sim' if p.has_compatdata else 'novo'})"
+            f"• {p.entry.app_name} → {p.new_name} (saves: {'sim' if p.has_compatdata else 'novo/externo'})"
             for p in plan
         ]
-        msg = "Os seguintes jogos serão movidos para ~/Games, padronizados com Proton Stable e artes oficiais:\n\n" + "\n".join(lines)
+        msg = "Os seguintes jogos serão padronizados em ~/Games com Proton Stable, artes oficiais e importação de saves:\n\n" + "\n".join(lines)
         if is_gamescope_session() and is_steam_running():
             msg += "\n\nAviso: você está no Modo Jogo (gamescope); o Steam será reiniciado."
         if QMessageBox.question(self, __app_name__, msg) != QMessageBox.StandardButton.Yes:
+            self._set_steam_busy(False)
             return
 
-        self.btn_bulk_migrate.setEnabled(False)
         self._bulk_worker = BulkMigrateWorker(self.paths, plan)
         self._track_worker(self._bulk_worker)
         self._bulk_worker.status.connect(self.status_label.setText)
@@ -1117,14 +1187,14 @@ class MainWindow(QMainWindow):
         self._bulk_worker.start()
 
     def _on_bulk_done(self, summary: str) -> None:
-        self.btn_bulk_migrate.setEnabled(True)
+        self._set_steam_busy(False)
         self.status_label.setText("Migração em massa concluída.")
         self._refresh_games()
         self._refresh_shortcuts()
         QMessageBox.information(self, __app_name__, summary)
 
     def _on_bulk_failed(self, err: str) -> None:
-        self.btn_bulk_migrate.setEnabled(True)
+        self._set_steam_busy(False)
         QMessageBox.critical(self, __app_name__, f"Erro na migração em massa: {err}")
 
     def _cleanup_old_prefixes(self) -> None:
@@ -1212,10 +1282,31 @@ class MainWindow(QMainWindow):
         ]
         if not selected:
             return
-        deleted, freed = delete_cleanup_candidates(selected)
-        msg = f"Removidos {deleted} item(ns), liberando {freed / (1024 * 1024):.1f} MB."
-        self.status_label.setText(msg)
-        QMessageBox.information(self, __app_name__, msg)
+        self._set_steam_busy(True)
+        self.status_label.setText(f"Apagando {len(selected)} prefixo(s)/backup(s)...")
+
+        class _CleanupDeleteWorker(QThread):
+            done = Signal(int, int)
+
+            def __init__(self, items: list[CleanupCandidate]) -> None:
+                super().__init__()
+                self._items = items
+
+            def run(self) -> None:
+                deleted, freed = delete_cleanup_candidates(self._items)
+                self.done.emit(deleted, freed)
+
+        worker = _CleanupDeleteWorker(selected)
+        self._track_worker(worker)
+
+        def _on_deleted(deleted: int, freed: int) -> None:
+            self._set_steam_busy(False)
+            msg = f"Removidos {deleted} item(ns), liberando {freed / (1024 * 1024):.1f} MB."
+            self.status_label.setText(msg)
+            QMessageBox.information(self, __app_name__, msg)
+
+        worker.done.connect(_on_deleted)
+        worker.start()
 
 
 def _qt_message_handler(mode, context, message: str) -> None:
