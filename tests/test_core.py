@@ -475,24 +475,38 @@ class CoreTests(unittest.TestCase):
     def test_rewrite_launch_options_and_missing_proton_triggers_bulk_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            old_root = root / "Downloads" / "MyGame"
-            new_root = root / "Games" / "MyGame"
+            old_root = root / "Downloads" / "My.Game-RUNE"
+            new_root = root / "Games" / "My Game"
+            old_compat = root / "compat" / "111"
+            new_compat = root / "compat" / "222"
             rewritten = _rewrite_launch_options(
-                f'WINEPREFIX="{old_root}/pfx" %command% --data "{old_root}/data"',
+                f'STEAM_COMPAT_DATA_PATH={old_compat} %command% --data "{old_root}/data" --other "{old_root}2/x"',
                 old_root,
                 new_root,
+                old_compat=old_compat,
+                new_compat=new_compat,
             )
-            self.assertIn(str(new_root), rewritten)
-            self.assertNotIn(str(old_root), rewritten)
+            import shlex
+            tokens = shlex.split(rewritten)
+            self.assertIn(f"STEAM_COMPAT_DATA_PATH={new_compat}", tokens)
+            self.assertIn(f"{new_root}/data", tokens)
+            self.assertIn(f"{old_root}2/x", tokens)
 
             new_root.mkdir(parents=True)
             exe = new_root / "Game.exe"
             exe.write_bytes(b"MZ")
-            appid_u32, _ = compute_shortcut_appid(f'"{exe}"', "MyGame")
-            entry = ShortcutEntry("0", appid_u32, "MyGame", f'"{exe}"', f'"{new_root}"', "", "")
+            appid_u32, _ = compute_shortcut_appid(f'"{exe}"', "My Game")
+            entry = ShortcutEntry("0", appid_u32, "My Game", f'"{exe}"', f'"{new_root}"', "", "")
             cfg = root / "config.vdf"
             cfg.write_text('{"InstallConfigStore":{}}', encoding="utf-8")
-            with mock.patch("vdf.loads", return_value={"InstallConfigStore": {"Software": {"Valve": {"Steam": {"CompatToolMapping": {}}}}}}):
+            with mock.patch(
+                "vdf.loads",
+                return_value={
+                    "InstallConfigStore": {
+                        "Software": {"Valve": {"Steam": {"CompatToolMapping": {str(appid_u32): {"name": ""}}}}}
+                    }
+                },
+            ):
                 plan = plan_bulk_migration([entry], root / "Games", root / "compat", search_roots=[], config_vdf=cfg)
             self.assertEqual(len(plan), 1)
 

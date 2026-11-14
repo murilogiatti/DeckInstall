@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -337,17 +338,61 @@ _FORBIDDEN_ROOT_NAMES = {
 }
 
 
-def _rewrite_launch_options(launch_options: str, old_root: Path, new_root: Path) -> str:
-    """Update references to old_root inside LaunchOptions when moving a game folder."""
-    if not launch_options or old_root.resolve() == new_root.resolve():
+def _rewrite_path_prefix(val: str, old_prefixes: tuple[str, ...], new_prefix: str) -> str:
+    for old_p in old_prefixes:
+        if not old_p:
+            continue
+        if val == old_p:
+            return new_prefix
+        if val.startswith(old_p + "/"):
+            return new_prefix + val[len(old_p) :]
+    return val
+
+
+def _rewrite_launch_options(
+    launch_options: str,
+    old_root: Path,
+    new_root: Path,
+    old_compat: Path | None = None,
+    new_compat: Path | None = None,
+) -> str:
+    """Safely rewrite path tokens in LaunchOptions without splitting spaces or matching sibling prefixes."""
+    if not launch_options:
         return launch_options
-    old_str = str(old_root)
-    old_res = str(old_root.resolve())
-    new_str = str(new_root)
-    updated = launch_options.replace(old_res, new_str)
-    if old_str != old_res:
-        updated = updated.replace(old_str, new_str)
-    return updated
+    old_roots = tuple(dict.fromkeys([str(old_root.resolve()), str(old_root)]))
+    new_root_str = str(new_root)
+    old_compats = (
+        tuple(dict.fromkeys([str(old_compat.resolve()), str(old_compat)]))
+        if old_compat
+        else ()
+    )
+    new_compat_str = str(new_compat) if new_compat else ""
+    try:
+        tokens = shlex.split(launch_options)
+    except ValueError:
+        return launch_options
+
+    changed = False
+    out_tokens: list[str] = []
+    for tok in tokens:
+        new_tok = tok
+        if "=" in tok and not tok.startswith("-"):
+            key, val = tok.split("=", 1)
+            upd = _rewrite_path_prefix(val, old_roots, new_root_str)
+            if old_compats and new_compat_str:
+                upd = _rewrite_path_prefix(upd, old_compats, new_compat_str)
+            if upd != val:
+                new_tok = f"{key}={upd}"
+                changed = True
+        else:
+            upd = _rewrite_path_prefix(tok, old_roots, new_root_str)
+            if old_compats and new_compat_str:
+                upd = _rewrite_path_prefix(upd, old_compats, new_compat_str)
+            if upd != tok:
+                new_tok = upd
+                changed = True
+        out_tokens.append(new_tok)
+    return shlex.join(out_tokens) if changed else launch_options
 
 
 def _has_proton_mapping(config_vdf: Path, appid_u32: int) -> bool:
@@ -362,7 +407,8 @@ def _has_proton_mapping(config_vdf: Path, appid_u32: int) -> bool:
             .get("Steam", {})
             .get("CompatToolMapping", {})
         )
-        return str(appid_u32) in mapping
+        entry = mapping.get(str(appid_u32))
+        return isinstance(entry, dict) and bool(str(entry.get("name") or "").strip())
     except Exception:
         return False
 
@@ -445,7 +491,24 @@ def migrate_shortcut_to_games(
         moved_root = True
 
     new_exe = new_root / rel_exe
-    new_launch = _rewrite_launch_options(entry.launch_options, old_root, new_root)
+    predicted_appid, _ = compute_shortcut_appid(_quote_path(str(new_exe)), target_name)
+    old_compat = paths.compatdata_dir / str(entry.appid_u32)
+    new_compat = paths.compatdata_dir / str(predicted_appid)
+    new_launch = _rewrite_launch_options(
+        entry.launch_options,
+        old_root,
+        new_root,
+        old_compat=old_compat if predicted_appid != entry.appid_u32 else None,
+        new_compat=new_compat if predicted_appid != entry.appid_u32 else None,
+    )
+
+    shortcuts_snap = paths.shortcuts_vdf.read_bytes() if paths.shortcuts_vdf.is_file() else None
+    config_snap = paths.config_vdf.read_bytes() if paths.config_vdf.is_file() else None
+    moved_compat_pair: tuple[Path, Path] | None = None
+    copied_compat_dst: Path | None = None
+    backed_compat_pair: tuple[Path, Path] | None = None
+    moved_art_pairs: list[tuple[Path, Path]] = []
+
     try:
         with _STEAM_LOCK:
             new_appid = add_or_update_shortcut(
@@ -459,9 +522,16 @@ def migrate_shortcut_to_games(
             )
 
             if new_appid != entry.appid_u32:
-                old_compat = paths.compatdata_dir / str(entry.appid_u32)
                 new_compat = paths.compatdata_dir / str(new_appid)
                 if old_compat.is_dir():
+                    used_by_other = False
+                    for uid in list_steam_users(paths.steam_root):
+                        if uid == paths.user_id:
+                            continue
+                        other_sv = paths.steam_root / "userdata" / uid / "config" / "shortcuts.vdf"
+                        if any(e.appid_u32 == entry.appid_u32 for e in load_shortcuts(other_sv)):
+                            used_by_other = True
+                            break
                     if new_compat.exists():
                         stamp = time.strftime("%Y%m%d-%H%M%S")
                         backup_compat = paths.compatdata_dir / f"{new_appid}.{stamp}.deckinstall.bak"
@@ -470,7 +540,13 @@ def migrate_shortcut_to_games(
                             backup_compat = paths.compatdata_dir / f"{new_appid}.{stamp}.{counter}.deckinstall.bak"
                             counter += 1
                         shutil.move(str(new_compat), str(backup_compat))
-                    shutil.move(str(old_compat), str(new_compat))
+                        backed_compat_pair = (backup_compat, new_compat)
+                    if used_by_other:
+                        shutil.copytree(old_compat, new_compat, symlinks=True)
+                        copied_compat_dst = new_compat
+                    else:
+                        shutil.move(str(old_compat), str(new_compat))
+                        moved_compat_pair = (new_compat, old_compat)
 
                 if paths.grid_dir.is_dir():
                     old_prefix = str(entry.appid_u32)
@@ -480,9 +556,38 @@ def migrate_shortcut_to_games(
                             dest_art = paths.grid_dir / f"{new_appid}{suffix}"
                             if not dest_art.exists():
                                 shutil.move(str(art_file), str(dest_art))
+                                moved_art_pairs.append((dest_art, art_file))
 
                 remove_shortcut(paths, entry.appid_u32)
     except Exception:
+        for dst_a, src_a in reversed(moved_art_pairs):
+            try:
+                if dst_a.exists() and not src_a.exists():
+                    shutil.move(str(dst_a), str(src_a))
+            except OSError:
+                pass
+        if copied_compat_dst and copied_compat_dst.exists():
+            try:
+                shutil.rmtree(copied_compat_dst)
+            except OSError:
+                pass
+        if moved_compat_pair and moved_compat_pair[0].exists() and not moved_compat_pair[1].exists():
+            try:
+                shutil.move(str(moved_compat_pair[0]), str(moved_compat_pair[1]))
+            except OSError:
+                pass
+        if backed_compat_pair and backed_compat_pair[0].exists() and not backed_compat_pair[1].exists():
+            try:
+                shutil.move(str(backed_compat_pair[0]), str(backed_compat_pair[1]))
+            except OSError:
+                pass
+        try:
+            if shortcuts_snap is not None:
+                _atomic_write_bytes(paths.shortcuts_vdf, shortcuts_snap)
+            if config_snap is not None:
+                _atomic_write_bytes(paths.config_vdf, config_snap)
+        except OSError:
+            logging.exception("Rollback failed restoring VDF files")
         if moved_root and new_root.exists() and not old_root.exists():
             try:
                 shutil.move(str(new_root), str(old_root))

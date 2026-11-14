@@ -1070,16 +1070,47 @@ class MainWindow(QMainWindow):
         )
         if ans != QMessageBox.StandardButton.Yes:
             return
-        was_running = is_steam_running()
-        if was_running and not shutdown_steam():
-            QMessageBox.critical(self, __app_name__, "Não foi possível fechar o Steam a tempo.")
-            return
-        removed = remove_shortcut(self.paths, entry.appid_u32)
-        if was_running:
-            start_steam()
-        if removed:
-            self._refresh_shortcuts()
-            self.status_label.setText(f"Removido: {entry.app_name}")
+        self._set_steam_busy(True)
+        self.status_label.setText(f"Removendo '{entry.app_name}' do Steam...")
+
+        class _RemoveWorker(QThread):
+            done = Signal(bool)
+            failed = Signal(str)
+
+            def __init__(self, paths: SteamPaths, shortcut: ShortcutEntry) -> None:
+                super().__init__()
+                self._paths = paths
+                self._shortcut = shortcut
+
+            def run(self) -> None:
+                was_running = is_steam_running()
+                try:
+                    if was_running and not shutdown_steam():
+                        raise RuntimeError("Não foi possível fechar o Steam a tempo.")
+                    removed = remove_shortcut(self._paths, self._shortcut.appid_u32)
+                    self.done.emit(removed)
+                except Exception as exc:
+                    self.failed.emit(str(exc))
+                finally:
+                    if was_running and not is_steam_running():
+                        start_steam()
+
+        worker = _RemoveWorker(self.paths, entry)
+        self._track_worker(worker)
+
+        def _on_removed(removed: bool) -> None:
+            self._set_steam_busy(False)
+            if removed:
+                self._refresh_shortcuts()
+                self.status_label.setText(f"Removido: {entry.app_name}")
+
+        def _on_remove_err(err: str) -> None:
+            self._set_steam_busy(False)
+            QMessageBox.critical(self, __app_name__, err)
+
+        worker.done.connect(_on_removed)
+        worker.failed.connect(_on_remove_err)
+        worker.start()
 
     def _migrate_selected_shortcut(self) -> None:
         entry = self._selected_shortcut()
