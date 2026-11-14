@@ -125,6 +125,13 @@ def scan_game_folder(game_dir: Path) -> DetectedGame | None:
     )
 
 
+def _safe_is_dir(path: Path) -> bool:
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
 def default_scan_roots() -> list[Path]:
     """Return standard game/download directories on SteamOS."""
     roots = [
@@ -133,12 +140,17 @@ def default_scan_roots() -> list[Path]:
         Path.home() / "Syncthing",
     ]
     media_root = Path("/run/media")
-    if media_root.is_dir():
-        for child in media_root.iterdir():
-            if child.is_dir():
-                games_sub = child / "Games"
-                roots.append(games_sub if games_sub.is_dir() else child)
-    return [r for r in roots if r.is_dir()]
+    if _safe_is_dir(media_root):
+        try:
+            media_children = list(media_root.iterdir())
+        except OSError:
+            media_children = []
+        for child in media_children:
+            if not _safe_is_dir(child):
+                continue
+            games_sub = child / "Games"
+            roots.append(games_sub if _safe_is_dir(games_sub) else child)
+    return [r for r in roots if _safe_is_dir(r)]
 
 
 def scan_all_games(roots: list[Path] | None = None) -> list[DetectedGame]:
@@ -146,10 +158,17 @@ def scan_all_games(roots: list[Path] | None = None) -> list[DetectedGame]:
     seen: set[Path] = set()
     results: list[DetectedGame] = []
     for root in roots or default_scan_roots():
-        for child in sorted(root.iterdir()):
-            if not child.is_dir() or child.name.startswith("."):
+        try:
+            children = sorted(root.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if not _safe_is_dir(child) or child.name.startswith("."):
                 continue
-            resolved = child.resolve()
+            try:
+                resolved = child.resolve()
+            except OSError:
+                continue
             if resolved in seen:
                 continue
             detected = scan_game_folder(child)
