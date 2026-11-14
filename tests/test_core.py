@@ -42,6 +42,8 @@ from deckinstall.steam_vdf import (  # noqa: E402
     ShortcutEntry,
     _backup_file,
     compute_shortcut_appid,
+    delete_cleanup_candidates,
+    find_cleanup_candidates,
     import_external_prefix_saves,
     import_hydra_umu_saves,
     infer_game_root_from_exe,
@@ -363,6 +365,61 @@ class CoreTests(unittest.TestCase):
                 plan_bulk_migration([entry], games_root, compat_dir, search_roots=[lutris_root]),
                 [],
             )
+
+    def test_find_and_delete_cleanup_candidates_protects_active_games(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            steam_root = root / "Steam"
+            steamapps = steam_root / "steamapps"
+            compat_dir = steamapps / "compatdata"
+            (steamapps / "appmanifest_12345.acf").parent.mkdir(parents=True, exist_ok=True)
+            (steamapps / "appmanifest_12345.acf").write_text("", encoding="utf-8")
+
+            # Protected compatdata: 0 (Steam default), 12345 (Steam game), 3000000001 (active shortcut)
+            for pid in ("0", "12345", "3000000001"):
+                (compat_dir / pid / "pfx" / "drive_c" / "users").mkdir(parents=True)
+                (compat_dir / pid / "data.bin").write_bytes(b"x" * 100)
+
+            # Orphan compatdata + old backup + external Hydra prefix
+            orphan = compat_dir / "3999999999"
+            (orphan / "pfx" / "drive_c" / "users").mkdir(parents=True)
+            (orphan / "big.bin").write_bytes(b"y" * 2048)
+
+            bak = compat_dir / "3000000001.20261114.deckinstall.bak"
+            bak.mkdir(parents=True)
+            (bak / "old.bin").write_bytes(b"z" * 512)
+
+            ext_root = root / "hydra" / "wine-prefixes"
+            ext_pfx = ext_root / "4078430"
+            (ext_pfx / "drive_c" / "users" / "steamuser" / "Documents").mkdir(parents=True)
+            (ext_pfx / "drive_c" / "users" / "steamuser" / "Documents" / "save.dat").write_bytes(b"s" * 256)
+
+            shortcuts_vdf = steam_root / "userdata" / "1" / "config" / "shortcuts.vdf"
+            shortcuts_vdf.parent.mkdir(parents=True)
+            shortcuts_vdf.write_bytes(b"VDF")
+            paths = SteamPaths(
+                steam_root=steam_root,
+                user_id="1",
+                userdata_dir=steam_root / "userdata" / "1",
+                shortcuts_vdf=shortcuts_vdf,
+                grid_dir=steam_root / "userdata" / "1" / "config" / "grid",
+                config_vdf=steam_root / "config" / "config.vdf",
+                compatdata_dir=compat_dir,
+            )
+            active_entry = ShortcutEntry("0", 3000000001, "Active", '"/g/a.exe"', '"/g"', "", "")
+            with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[active_entry]):
+                cands = find_cleanup_candidates(paths, extra_external_roots=[ext_root])
+
+            cand_paths = {c.path for c in cands}
+            self.assertEqual(cand_paths, {orphan, bak, ext_pfx})
+            ext_cand = next(c for c in cands if c.path == ext_pfx)
+            self.assertTrue(ext_cand.has_saves)
+
+            deleted, freed = delete_cleanup_candidates([c for c in cands if c.path in (orphan, bak)])
+            self.assertEqual(deleted, 2)
+            self.assertGreaterEqual(freed, 2560)
+            self.assertFalse(orphan.exists())
+            self.assertTrue((compat_dir / "3000000001").exists())
 
 
 if __name__ == "__main__":

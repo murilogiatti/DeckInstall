@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -50,9 +52,12 @@ from .steam_paths import (
     resolve_steam_paths,
 )
 from .steam_vdf import (
+    CleanupCandidate,
     MigrationPlanItem,
     ShortcutEntry,
     add_or_update_shortcut,
+    delete_cleanup_candidates,
+    find_cleanup_candidates,
     import_external_prefix_saves,
     infer_game_root_from_exe,
     load_shortcuts,
@@ -682,12 +687,15 @@ class MainWindow(QMainWindow):
         btn_migrate.clicked.connect(self._migrate_selected_shortcut)
         btn_art = QPushButton("Atualizar Artes")
         btn_art.clicked.connect(self._update_selected_shortcut_art)
+        self.btn_cleanup = QPushButton("Limpar Prefixos...")
+        self.btn_cleanup.clicked.connect(self._cleanup_old_prefixes)
         btn_remove = QPushButton("Remover do Steam")
         btn_remove.setObjectName("dangerBtn")
         btn_remove.clicked.connect(self._remove_selected_shortcut)
         actions.addWidget(self.btn_bulk_migrate)
         actions.addWidget(btn_migrate)
         actions.addWidget(btn_art)
+        actions.addWidget(self.btn_cleanup)
         actions.addStretch()
         actions.addWidget(btn_remove)
         lib_layout.addLayout(actions)
@@ -1100,6 +1108,95 @@ class MainWindow(QMainWindow):
     def _on_bulk_failed(self, err: str) -> None:
         self.btn_bulk_migrate.setEnabled(True)
         QMessageBox.critical(self, __app_name__, f"Erro na migração em massa: {err}")
+
+    def _cleanup_old_prefixes(self) -> None:
+        if not self.paths:
+            return
+        self.btn_cleanup.setEnabled(False)
+        self.status_label.setText("Buscando prefixos antigos e compatdata órfãos...")
+
+        class _CleanupScanWorker(QThread):
+            found = Signal(list)
+
+            def __init__(self, paths: SteamPaths) -> None:
+                super().__init__()
+                self._paths = paths
+
+            def run(self) -> None:
+                self.found.emit(find_cleanup_candidates(self._paths))
+
+        worker = _CleanupScanWorker(self.paths)
+        self._track_worker(worker)
+        worker.found.connect(self._show_cleanup_dialog)
+        worker.start()
+
+    def _show_cleanup_dialog(self, candidates: list[CleanupCandidate]) -> None:
+        self.btn_cleanup.setEnabled(True)
+        if not candidates:
+            self.status_label.setText("Nenhum prefixo antigo ou órfão encontrado.")
+            QMessageBox.information(self, __app_name__, "Tudo limpo! Nenhum prefixo antigo ou órfão encontrado.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Limpar Prefixos Antigos")
+        dlg.resize(680, 440)
+        lay = QVBoxLayout(dlg)
+        info = QLabel(
+            "Revise os prefixos antigos/órfãos antes de apagar. "
+            "Dica: rode 'Migrar Todos para ~/Games' antes para importar saves pendentes."
+        )
+        info.setWordWrap(True)
+        lay.addWidget(info)
+
+        lst = QListWidget()
+        for cand in candidates:
+            mb = cand.size_bytes / (1024 * 1024)
+            save_tag = " [TEM SAVES]" if cand.has_saves else ""
+            item = QListWidgetItem(f"[{cand.category}] {cand.label} — {mb:.1f} MB{save_tag}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Unchecked if cand.has_saves else Qt.CheckState.Checked
+            )
+            item.setData(Qt.ItemDataRole.UserRole, cand)
+            lst.addItem(item)
+        lay.addWidget(lst, 1)
+
+        total_lbl = QLabel()
+
+        def _update_total() -> None:
+            sel_bytes = 0
+            for i in range(lst.count()):
+                it = lst.item(i)
+                if it.checkState() == Qt.CheckState.Checked:
+                    c: CleanupCandidate = it.data(Qt.ItemDataRole.UserRole)
+                    sel_bytes += c.size_bytes
+            total_lbl.setText(f"Espaço selecionado para liberar: {sel_bytes / (1024 * 1024):.1f} MB")
+
+        lst.itemChanged.connect(lambda _: _update_total())
+        _update_total()
+        lay.addWidget(total_lbl)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Apagar Selecionados")
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = [
+            lst.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(lst.count())
+            if lst.item(i).checkState() == Qt.CheckState.Checked
+        ]
+        if not selected:
+            return
+        deleted, freed = delete_cleanup_candidates(selected)
+        msg = f"Removidos {deleted} item(ns), liberando {freed / (1024 * 1024):.1f} MB."
+        self.status_label.setText(msg)
+        QMessageBox.information(self, __app_name__, msg)
 
 
 def _qt_message_handler(mode, context, message: str) -> None:

@@ -640,3 +640,160 @@ def plan_bulk_migration(
             )
         )
     return plan
+
+
+@dataclass(frozen=True)
+class CleanupCandidate:
+    """An old external prefix, orphan Steam compatdata folder, or backup safe to review for removal."""
+
+    category: str
+    label: str
+    path: Path
+    size_bytes: int
+    has_saves: bool
+
+
+def _dir_size_bytes(path: Path) -> int:
+    total = 0
+    if path.is_file():
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+    for dirpath, _, filenames in os.walk(path, followlinks=False):
+        cur = Path(dirpath)
+        for fname in filenames:
+            fp = cur / fname
+            try:
+                if not fp.is_symlink():
+                    total += fp.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def _prefix_has_saves(prefix_dir: Path) -> bool:
+    src_users = _prefix_users_dir(prefix_dir)
+    if src_users is None:
+        return False
+    dummy_dst = prefix_dir / "__unused__"
+    for src_file, _ in _iter_prefix_save_pairs(src_users, dummy_dst):
+        try:
+            if src_file.stat().st_size > 0:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _installed_steam_appids(steam_root: Path) -> set[int]:
+    """Return installed Steam AppIDs from appmanifest_*.acf files."""
+    appids: set[int] = {0, 228980}
+    steamapps_dirs = [steam_root / "steamapps"]
+    lib_vdf = steam_root / "steamapps" / "libraryfolders.vdf"
+    if lib_vdf.is_file():
+        try:
+            data = vdf.loads(lib_vdf.read_text(encoding="utf-8", errors="replace"))
+            folders = data.get("libraryfolders") or data.get("LibraryFolders") or {}
+            for val in folders.values():
+                if isinstance(val, dict) and val.get("path"):
+                    steamapps_dirs.append(Path(str(val["path"])) / "steamapps")
+        except Exception:
+            pass
+    for sa in steamapps_dirs:
+        if not sa.is_dir():
+            continue
+        for acf in sa.glob("appmanifest_*.acf"):
+            stem_id = acf.stem.removeprefix("appmanifest_")
+            if stem_id.isdigit():
+                appids.add(int(stem_id))
+    return appids
+
+
+def find_cleanup_candidates(
+    paths: SteamPaths,
+    extra_external_roots: list[Path] | None = None,
+) -> list[CleanupCandidate]:
+    """Find old external prefixes, orphan Steam compatdata folders, and DeckInstall backups."""
+    candidates: list[CleanupCandidate] = []
+    seen: set[Path] = set()
+
+    for root in extra_external_roots or external_prefix_roots():
+        if not root.is_dir():
+            continue
+        try:
+            children = list(root.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            if _prefix_users_dir(child) is None:
+                continue
+            resolved = child.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            candidates.append(
+                CleanupCandidate(
+                    category="Prefixo Externo",
+                    label=f"{root.parent.name}/{root.name}/{child.name}",
+                    path=child,
+                    size_bytes=_dir_size_bytes(child),
+                    has_saves=_prefix_has_saves(child),
+                )
+            )
+
+    active_shortcuts = {e.appid_u32 for e in load_shortcuts(paths.shortcuts_vdf)}
+    installed_steam = _installed_steam_appids(paths.steam_root)
+    if paths.compatdata_dir.is_dir():
+        for child in paths.compatdata_dir.iterdir():
+            if not child.is_dir():
+                continue
+            if child.name.endswith(".deckinstall.bak"):
+                candidates.append(
+                    CleanupCandidate(
+                        category="Backup",
+                        label=child.name,
+                        path=child,
+                        size_bytes=_dir_size_bytes(child),
+                        has_saves=False,
+                    )
+                )
+                continue
+            if not child.name.isdigit():
+                continue
+            appid = int(child.name)
+            if appid in active_shortcuts or appid in installed_steam:
+                continue
+            candidates.append(
+                CleanupCandidate(
+                    category="Compatdata Órfão",
+                    label=f"compatdata/{child.name}",
+                    path=child,
+                    size_bytes=_dir_size_bytes(child),
+                    has_saves=_prefix_has_saves(child),
+                )
+            )
+
+    candidates.sort(key=lambda c: c.size_bytes, reverse=True)
+    return candidates
+
+
+def delete_cleanup_candidates(candidates: list[CleanupCandidate]) -> tuple[int, int]:
+    """Delete selected cleanup directories/files and return (deleted_count, freed_bytes)."""
+    deleted = 0
+    freed = 0
+    for item in candidates:
+        if not item.path.exists():
+            continue
+        try:
+            if item.path.is_dir() and not item.path.is_symlink():
+                shutil.rmtree(item.path)
+            else:
+                item.path.unlink()
+            deleted += 1
+            freed += item.size_bytes
+        except OSError:
+            continue
+    return deleted, freed
