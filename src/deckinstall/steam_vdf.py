@@ -1091,11 +1091,17 @@ def _prefix_saves_verified_in_target(src_prefix: Path, dst_compatdata: Path) -> 
             if os.path.samefile(src_file, dst_file) or src_file.resolve() == dst_file.resolve():
                 return False
             dst_stat = dst_file.stat()
-            if (
-                dst_stat.st_size != src_stat.st_size
-                or dst_stat.st_mtime < src_stat.st_mtime
-                or _file_sha256(src_file) != _file_sha256(dst_file)
-            ):
+            if dst_stat.st_size == 0 or dst_stat.st_mtime < src_stat.st_mtime:
+                return False
+            same_content = (
+                dst_stat.st_size == src_stat.st_size
+                and _file_sha256(src_file) == _file_sha256(dst_file)
+            )
+            strictly_newer_steam_save = (
+                dst_stat.st_mtime > src_stat.st_mtime + 1.0
+                and dst_stat.st_size >= min(src_stat.st_size, 16)
+            )
+            if not (same_content or strictly_newer_steam_save):
                 return False
         except OSError:
             return False

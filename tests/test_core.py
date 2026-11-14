@@ -575,6 +575,12 @@ class CoreTests(unittest.TestCase):
             dfile.write_bytes(b"X")
             self.assertFalse(_prefix_saves_verified_in_target(src_pfx, dst_pfx))
 
+            # 1b) Strictly newer Steam save (played after migration) must verify
+            dfile.write_bytes(b"NEWER_STEAM_SAVE_DATA_12345")
+            newer_ts = sfile.stat().st_mtime + 120
+            os.utime(dfile, (newer_ts, newer_ts))
+            self.assertTrue(_prefix_saves_verified_in_target(src_pfx, dst_pfx))
+
             # 2) Shell assignment with spaces remains valid shell after rewrite
             old_r = root / "Old Game"
             new_r = root / "New Game"
