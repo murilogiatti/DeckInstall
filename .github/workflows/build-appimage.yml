@@ -40,9 +40,11 @@ jobs:
           VERSION=$(cat VERSION | tr -d '[:space:]')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Generate 256x256 PNG icon
+      - name: Verify 256x256 PNG icon
         run: |
-          rsvg-convert -w 256 -h 256 assets/icon.svg -o assets/icon.png
+          if [ ! -f assets/icon.png ]; then
+            rsvg-convert -w 256 -h 256 assets/icon.svg -o assets/icon.png
+          fi
 
       - name: Compile standalone binary with Nuitka
         run: |

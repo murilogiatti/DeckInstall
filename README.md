@@ -1,3 +1,5 @@
+![DeckInstall Banner](assets/hero_banner.jpg)
+
 # DeckInstall
 
 Instalador e gerenciador simples de jogos Não-Steam para **Steam Deck / SteamOS** (KDE Plasma + Qt6).

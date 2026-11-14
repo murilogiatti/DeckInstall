@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt, QThread, Signal
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -636,6 +637,9 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(__app_name__)
     app.setApplicationVersion(__version__)
+    icon_file = Path(__file__).resolve().parent.parent.parent / "assets" / "icon.png"
+    if icon_file.is_file():
+        app.setWindowIcon(QIcon(str(icon_file)))
     win = MainWindow(app)
     win.show()
     return app.exec()
