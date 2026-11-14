@@ -50,7 +50,11 @@ def _select_extract_cmd(archive: Path, out_dir: Path) -> list[str]:
 def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
     """Move extracted contents to final_dir, avoiding double nested folders."""
     entries = list(temp_dir.iterdir())
-    source_root = entries[0] if len(entries) == 1 and entries[0].is_dir() else temp_dir
+    source_root = (
+        entries[0]
+        if len(entries) == 1 and entries[0].is_dir() and not entries[0].is_symlink()
+        else temp_dir
+    )
     final_dir.mkdir(parents=True, exist_ok=True)
     for item in source_root.iterdir():
         dest = final_dir / item.name

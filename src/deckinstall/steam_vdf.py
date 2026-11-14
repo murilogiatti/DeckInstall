@@ -273,6 +273,12 @@ def infer_game_root_from_exe(exe_path: Path) -> Path:
     for parent in resolved.parents:
         if parent.parent in known_containers:
             return parent
+        if (
+            len(parent.parts) >= 5
+            and parent.parts[:3] == ("/", "run", "media")
+            and parent.parent.name == "Games"
+        ):
+            return parent
     return resolved.parent
 
 
@@ -315,7 +321,12 @@ def migrate_shortcut_to_games(
     if new_appid != entry.appid_u32:
         old_compat = paths.compatdata_dir / str(entry.appid_u32)
         new_compat = paths.compatdata_dir / str(new_appid)
-        if old_compat.is_dir() and not new_compat.exists():
+        if old_compat.is_dir():
+            if new_compat.exists():
+                backup_compat = paths.compatdata_dir / f"{new_appid}.deckinstall.bak"
+                if backup_compat.exists():
+                    shutil.rmtree(backup_compat)
+                shutil.move(str(new_compat), str(backup_compat))
             shutil.move(str(old_compat), str(new_compat))
 
         if paths.grid_dir.is_dir():
@@ -331,3 +342,45 @@ def migrate_shortcut_to_games(
 
     steam_appid = detect_steam_appid(new_root)
     return new_appid, new_exe, steam_appid
+
+
+@dataclass(frozen=True)
+class MigrationPlanItem:
+    """Preview item for bulk shortcut migration."""
+
+    entry: ShortcutEntry
+    old_root: Path
+    new_name: str
+    new_root: Path
+    has_compatdata: bool
+
+
+def plan_bulk_migration(
+    entries: list[ShortcutEntry],
+    games_root: Path,
+    compatdata_dir: Path,
+) -> list[MigrationPlanItem]:
+    """Identify Windows .exe shortcuts that are not yet standardized in games_root."""
+    plan: list[MigrationPlanItem] = []
+    games_resolved = games_root.resolve()
+    for entry in entries:
+        exe_path = Path(entry.exe.strip().strip('"'))
+        if exe_path.suffix.lower() != ".exe" or not exe_path.is_file():
+            continue
+        old_root = infer_game_root_from_exe(exe_path)
+        clean_name = clean_game_name(old_root.name)
+        new_root = games_root / clean_name
+        already_in_games = old_root.resolve().parent == games_resolved
+        already_named = entry.app_name == clean_name and old_root.resolve() == new_root.resolve()
+        if already_in_games and already_named:
+            continue
+        plan.append(
+            MigrationPlanItem(
+                entry=entry,
+                old_root=old_root,
+                new_name=clean_name,
+                new_root=new_root,
+                has_compatdata=(compatdata_dir / str(entry.appid_u32)).is_dir(),
+            )
+        )
+    return plan

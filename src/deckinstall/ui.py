@@ -49,11 +49,13 @@ from .steam_paths import (
     resolve_steam_paths,
 )
 from .steam_vdf import (
+    MigrationPlanItem,
     ShortcutEntry,
     add_or_update_shortcut,
     infer_game_root_from_exe,
     load_shortcuts,
     migrate_shortcut_to_games,
+    plan_bulk_migration,
     remove_shortcut,
     shutdown_steam,
     start_steam,
@@ -256,6 +258,62 @@ class AddToSteamWorker(QThread):
             self.failed.emit(str(exc))
 
 
+class BulkMigrateWorker(QThread):
+    """Background worker to migrate multiple Non-Steam games to ~/Games safely."""
+
+    status = Signal(str)
+    finished_ok = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, paths: SteamPaths, items: list[MigrationPlanItem]) -> None:
+        super().__init__()
+        self.paths = paths
+        self.items = items
+
+    def run(self) -> None:
+        was_running = is_steam_running()
+        migrated: list[str] = []
+        errors: list[str] = []
+        try:
+            if was_running:
+                self.status.emit("Fechando Steam com segurança...")
+                if not shutdown_steam():
+                    raise RuntimeError("Não foi possível fechar o Steam a tempo.")
+
+            games_root = Path.home() / "Games"
+            for idx, item in enumerate(self.items, start=1):
+                self.status.emit(
+                    f"[{idx}/{len(self.items)}] Migrando {item.entry.app_name} → {item.new_name}..."
+                )
+                try:
+                    new_appid, _, steam_appid = migrate_shortcut_to_games(
+                        paths=self.paths,
+                        entry=item.entry,
+                        games_root=games_root,
+                        new_name=item.new_name,
+                    )
+                    if steam_appid is None:
+                        matches = search_steam_games(item.new_name, limit=1)
+                        if matches:
+                            steam_appid = matches[0].appid
+                    if steam_appid:
+                        download_steam_artwork(steam_appid, new_appid, self.paths.grid_dir)
+                    migrated.append(item.new_name)
+                except Exception as exc:
+                    errors.append(f"{item.entry.app_name}: {exc}")
+
+            summary = f"Migrados ({len(migrated)}): {', '.join(migrated) or 'nenhum'}."
+            if errors:
+                summary += "\nErros:\n" + "\n".join(errors)
+            self.finished_ok.emit(summary)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if was_running and not is_steam_running():
+                self.status.emit("Reiniciando Steam...")
+                start_steam()
+
+
 def _make_card() -> tuple[QFrame, QVBoxLayout]:
     card = QFrame()
     card.setObjectName("Card")
@@ -278,6 +336,7 @@ class MainWindow(QMainWindow):
         self._search_worker: SteamSearchWorker | None = None
         self._preview_worker: PreviewWorker | None = None
         self._add_worker: AddToSteamWorker | None = None
+        self._bulk_worker: BulkMigrateWorker | None = None
 
         self.setWindowTitle(f"{__app_name__} v{__version__}")
         self.resize(980, 660)
@@ -561,14 +620,17 @@ class MainWindow(QMainWindow):
         lib_layout.addWidget(self.shortcuts_list, 1)
 
         actions = QHBoxLayout()
-        btn_migrate = QPushButton("Migrar para ~/Games & Padronizar")
-        btn_migrate.setObjectName("primaryBtn")
+        self.btn_bulk_migrate = QPushButton("Migrar Todos para ~/Games")
+        self.btn_bulk_migrate.setObjectName("primaryBtn")
+        self.btn_bulk_migrate.clicked.connect(self._bulk_migrate_shortcuts)
+        btn_migrate = QPushButton("Migrar Selecionado")
         btn_migrate.clicked.connect(self._migrate_selected_shortcut)
-        btn_art = QPushButton("Baixar/Atualizar Artes do Selecionado")
+        btn_art = QPushButton("Atualizar Artes")
         btn_art.clicked.connect(self._update_selected_shortcut_art)
         btn_remove = QPushButton("Remover do Steam")
         btn_remove.setObjectName("dangerBtn")
         btn_remove.clicked.connect(self._remove_selected_shortcut)
+        actions.addWidget(self.btn_bulk_migrate)
         actions.addWidget(btn_migrate)
         actions.addWidget(btn_art)
         actions.addStretch()
@@ -825,18 +887,21 @@ class MainWindow(QMainWindow):
         entry = self._selected_shortcut()
         if not entry or not self.paths:
             return
-        matches = search_steam_games(entry.app_name, limit=1)
-        if not matches:
+        try:
+            matches = search_steam_games(entry.app_name, limit=1)
+            if not matches:
+                QMessageBox.information(
+                    self, __app_name__, f"Não encontrei '{entry.app_name}' na loja Steam."
+                )
+                return
+            res = download_steam_artwork(matches[0].appid, entry.appid_u32, self.paths.grid_dir)
             QMessageBox.information(
-                self, __app_name__, f"Não encontrei '{entry.app_name}' na loja Steam."
+                self,
+                __app_name__,
+                f"Artes de '{matches[0].name}' atualizadas: {', '.join(res.saved_files.keys()) or 'nenhuma'}",
             )
-            return
-        res = download_steam_artwork(matches[0].appid, entry.appid_u32, self.paths.grid_dir)
-        QMessageBox.information(
-            self,
-            __app_name__,
-            f"Artes de '{matches[0].name}' atualizadas: {', '.join(res.saved_files.keys()) or 'nenhuma'}",
-        )
+        except Exception as exc:
+            QMessageBox.critical(self, __app_name__, f"Erro ao atualizar artes: {exc}")
 
     def _remove_selected_shortcut(self) -> None:
         entry = self._selected_shortcut()
@@ -881,8 +946,8 @@ class MainWindow(QMainWindow):
             )
             if ans != QMessageBox.StandardButton.Yes:
                 return
+        was_running = is_steam_running()
         try:
-            was_running = is_steam_running()
             if was_running:
                 shutdown_steam()
             new_appid, new_exe, steam_appid = migrate_shortcut_to_games(
@@ -899,15 +964,59 @@ class MainWindow(QMainWindow):
             if steam_appid:
                 art = download_steam_artwork(steam_appid, new_appid, self.paths.grid_dir)
                 art_msg = f"Artes: {', '.join(art.saved_files.keys()) or 'nenhuma'}"
-            if was_running:
-                start_steam()
-            self._refresh_games()
-            self._refresh_shortcuts()
             msg = f"Migrado para {new_exe} (ID {new_appid}). {art_msg}"
             self.status_label.setText(msg)
             QMessageBox.information(self, __app_name__, msg)
         except Exception as exc:
             QMessageBox.critical(self, __app_name__, str(exc))
+        finally:
+            if was_running and not is_steam_running():
+                start_steam()
+            self._refresh_games()
+            self._refresh_shortcuts()
+
+    def _bulk_migrate_shortcuts(self) -> None:
+        if not self.paths:
+            return
+        entries = load_shortcuts(self.paths.shortcuts_vdf)
+        plan = plan_bulk_migration(
+            entries=entries,
+            games_root=Path.home() / "Games",
+            compatdata_dir=self.paths.compatdata_dir,
+        )
+        if not plan:
+            QMessageBox.information(
+                self, __app_name__, "Todos os jogos .exe já estão padronizados em ~/Games!"
+            )
+            return
+
+        lines = [
+            f"• {p.entry.app_name} → {p.new_name} (saves: {'sim' if p.has_compatdata else 'novo'})"
+            for p in plan
+        ]
+        msg = "Os seguintes jogos serão movidos para ~/Games, padronizados com Proton Stable e artes oficiais:\n\n" + "\n".join(lines)
+        if is_gamescope_session() and is_steam_running():
+            msg += "\n\nAviso: você está no Modo Jogo (gamescope); o Steam será reiniciado."
+        if QMessageBox.question(self, __app_name__, msg) != QMessageBox.StandardButton.Yes:
+            return
+
+        self.btn_bulk_migrate.setEnabled(False)
+        self._bulk_worker = BulkMigrateWorker(self.paths, plan)
+        self._bulk_worker.status.connect(self.status_label.setText)
+        self._bulk_worker.finished_ok.connect(self._on_bulk_done)
+        self._bulk_worker.failed.connect(self._on_bulk_failed)
+        self._bulk_worker.start()
+
+    def _on_bulk_done(self, summary: str) -> None:
+        self.btn_bulk_migrate.setEnabled(True)
+        self.status_label.setText("Migração em massa concluída.")
+        self._refresh_games()
+        self._refresh_shortcuts()
+        QMessageBox.information(self, __app_name__, summary)
+
+    def _on_bulk_failed(self, err: str) -> None:
+        self.btn_bulk_migrate.setEnabled(True)
+        QMessageBox.critical(self, __app_name__, f"Erro na migração em massa: {err}")
 
 
 def main() -> int:

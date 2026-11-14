@@ -84,25 +84,35 @@ def _is_ignored_exe(exe: Path) -> bool:
 def rank_executables(game_dir: Path) -> list[Path]:
     """Find and rank candidate Windows executables inside a game folder."""
     candidates: list[Path] = []
-    for root_depth_limit in (4,):
-        base_parts = len(game_dir.parts)
-        for path in game_dir.rglob("*"):
+    root_depth_limit = 4
+    base_parts = len(game_dir.parts)
+    try:
+        entries = list(game_dir.rglob("*"))
+    except OSError:
+        entries = []
+    for path in entries:
+        try:
             if not path.is_file():
                 continue
-            if len(path.parts) - base_parts > root_depth_limit:
-                continue
-            if path.suffix.lower() != ".exe":
-                continue
-            if _is_ignored_exe(path):
-                continue
-            candidates.append(path)
+        except OSError:
+            continue
+        if len(path.parts) - base_parts > root_depth_limit:
+            continue
+        if path.suffix.lower() != ".exe":
+            continue
+        if _is_ignored_exe(path):
+            continue
+        candidates.append(path)
 
-    def score(exe: Path) -> tuple[int, int, int]:
+    def score(exe: Path) -> tuple[int, int, int, int]:
         name_low = exe.name.lower()
         rel_depth = len(exe.relative_to(game_dir).parts)
         is_shipping = 0 if "win64-shipping.exe" in name_low else 1
         is_root = 0 if rel_depth == 1 else 1
-        size_neg = -exe.stat().st_size if exe.exists() else 0
+        try:
+            size_neg = -exe.stat().st_size
+        except OSError:
+            size_neg = 0
         return (is_shipping, is_root, rel_depth, size_neg)
 
     candidates.sort(key=score)
@@ -149,7 +159,17 @@ def default_scan_roots() -> list[Path]:
             if not _safe_is_dir(child):
                 continue
             games_sub = child / "Games"
-            roots.append(games_sub if _safe_is_dir(games_sub) else child)
+            if _safe_is_dir(games_sub):
+                roots.append(games_sub)
+            try:
+                sub_children = list(child.iterdir())
+            except OSError:
+                sub_children = []
+            for sub in sub_children:
+                if not _safe_is_dir(sub):
+                    continue
+                sub_games = sub / "Games"
+                roots.append(sub_games if _safe_is_dir(sub_games) else sub)
     return [r for r in roots if _safe_is_dir(r)]
 
 
