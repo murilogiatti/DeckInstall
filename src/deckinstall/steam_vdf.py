@@ -881,6 +881,7 @@ class CleanupCandidate:
     has_saves: bool
     saves_verified_migrated: bool = False
     matched_game: str = ""
+    game_hint: str = ""
 
 
 def _dir_size_bytes(path: Path) -> int:
@@ -914,6 +915,65 @@ def _prefix_has_saves(prefix_dir: Path) -> bool:
         except OSError:
             continue
     return False
+
+
+_GENERIC_GAME_HINT_DIRS = _PREFIX_SKIP_DIRS | {
+    "unrealengine",
+    "unity",
+    "gse saves",
+    "steam",
+    "valve",
+    "vulkan",
+    "goldberg steamemu saves",
+    "empress",
+    "rune",
+    "codex",
+    "saved",
+    "config",
+    "default",
+}
+
+
+def _infer_prefix_game_name(prefix_dir: Path) -> str:
+    """Best-effort inference of the game name from save/AppData folders inside a Wine prefix."""
+    src_users = _prefix_users_dir(prefix_dir)
+    if src_users is None:
+        return ""
+    try:
+        user_dirs = [d for d in src_users.iterdir() if d.is_dir() and d.name.lower() != "public"]
+    except OSError:
+        return ""
+    for user_dir in user_dirs:
+        candidates_roots = [
+            (user_dir / "Documents" / "My Games", False),
+            (user_dir / "Saved Games", False),
+            (user_dir / "AppData" / "LocalLow", True),
+            (user_dir / "AppData" / "Local", False),
+            (user_dir / "AppData" / "Roaming", False),
+        ]
+        for root_dir, check_sub in candidates_roots:
+            if not root_dir.is_dir():
+                continue
+            try:
+                subdirs = sorted(
+                    d for d in root_dir.iterdir()
+                    if d.is_dir() and not d.name.startswith(".") and d.name.lower() not in _GENERIC_GAME_HINT_DIRS
+                )
+            except OSError:
+                continue
+            for sd in subdirs:
+                if check_sub:
+                    try:
+                        inner = sorted(
+                            c for c in sd.iterdir()
+                            if c.is_dir() and not c.name.startswith(".") and c.name.lower() not in _GENERIC_GAME_HINT_DIRS
+                        )
+                    except OSError:
+                        inner = []
+                    if inner:
+                        return inner[0].name
+                return sd.name
+    return ""
 
 
 def _prefix_saves_verified_in_target(src_prefix: Path, dst_compatdata: Path) -> bool:
@@ -1044,6 +1104,7 @@ def find_cleanup_candidates(
             if has_saves and matched_entry is not None:
                 dst_compat = paths.compatdata_dir / str(matched_entry.appid_u32)
                 saves_verified = _prefix_saves_verified_in_target(child, dst_compat)
+            matched_name = matched_entry.app_name if matched_entry else ""
             candidates.append(
                 CleanupCandidate(
                     category="Prefixo Externo",
@@ -1052,7 +1113,8 @@ def find_cleanup_candidates(
                     size_bytes=_dir_size_bytes(child),
                     has_saves=has_saves,
                     saves_verified_migrated=saves_verified,
-                    matched_game=matched_entry.app_name if matched_entry else "",
+                    matched_game=matched_name,
+                    game_hint=matched_name or _infer_prefix_game_name(child),
                 )
             )
 
@@ -1080,6 +1142,7 @@ def find_cleanup_candidates(
                     saves_verified = _prefix_saves_verified_in_target(
                         child, paths.compatdata_dir / prefix_id
                     )
+                matched_name = matched_entry.app_name if matched_entry else ""
                 candidates.append(
                     CleanupCandidate(
                         category="Backup",
@@ -1088,7 +1151,8 @@ def find_cleanup_candidates(
                         size_bytes=_dir_size_bytes(child),
                         has_saves=has_saves,
                         saves_verified_migrated=saves_verified,
-                        matched_game=matched_entry.app_name if matched_entry else "",
+                        matched_game=matched_name,
+                        game_hint=matched_name or _infer_prefix_game_name(child),
                     )
                 )
                 continue
@@ -1116,6 +1180,7 @@ def find_cleanup_candidates(
                     has_saves=has_saves,
                     saves_verified_migrated=saves_verified,
                     matched_game=matched_game,
+                    game_hint=matched_game or _infer_prefix_game_name(child),
                 )
             )
 

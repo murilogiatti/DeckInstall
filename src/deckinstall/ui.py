@@ -1330,7 +1330,8 @@ class MainWindow(QMainWindow):
                     save_tag = " [SEM JOGO NO STEAM]"
                 else:
                     save_tag = " [SEM SAVES]"
-                item = QListWidgetItem(f"[{cand.category}] {cand.label} — {mb:.1f} MB{save_tag}")
+                hint = f" ({cand.game_hint})" if cand.game_hint else ""
+                item = QListWidgetItem(f"[{cand.category}] {cand.label}{hint} — {mb:.1f} MB{save_tag}")
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 if cand.category == "Prefixo Externo":
                     auto_check = bool(cand.matched_game) and (
