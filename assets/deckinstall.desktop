@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=DeckInstall
+GenericName=Steam Deck Game Installer
+Comment=Extract games, fetch official Steam artwork, and add Non-Steam shortcuts
+Exec=deckinstall
+Icon=deckinstall
+Categories=Utility;Game;
+Terminal=false

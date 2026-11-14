@@ -1,0 +1,86 @@
+name: Build DeckInstall AppImage
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-appimage:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install system graphics and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1-mesa-dev patchelf librsvg2-bin
+
+      - name: Install Python dependencies and Nuitka
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install nuitka
+
+      - name: Read version
+        id: meta
+        run: |
+          VERSION=$(cat VERSION | tr -d '[:space:]')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate 256x256 PNG icon
+        run: |
+          rsvg-convert -w 256 -h 256 assets/icon.svg -o assets/icon.png
+
+      - name: Compile standalone binary with Nuitka
+        run: |
+          PYTHONPATH=src python -m nuitka \
+            --standalone \
+            --enable-plugin=pyside6 \
+            --include-package=deckinstall \
+            --include-data-dir=assets=assets \
+            --output-dir=build \
+            --output-filename=deckinstall \
+            main.py
+
+      - name: Prepare AppDir
+        run: |
+          APPDIR="build/DeckInstall.AppDir"
+          mv build/main.dist "$APPDIR"
+          cp assets/deckinstall.desktop "$APPDIR/deckinstall.desktop"
+          cp assets/icon.png "$APPDIR/deckinstall.png"
+          mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+          cp assets/icon.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/deckinstall.png"
+          ln -s deckinstall "$APPDIR/AppRun"
+
+      - name: Build AppImage
+        run: |
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run \
+            build/DeckInstall.AppDir \
+            "DeckInstall-${{ steps.meta.outputs.version }}-x86_64.AppImage"
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeckInstall-AppImage
+          path: "DeckInstall-*-x86_64.AppImage"
+
+      - name: Attach to GitHub Release on tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: "DeckInstall-*-x86_64.AppImage"
