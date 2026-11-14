@@ -66,6 +66,7 @@ from .steam_vdf import (
     remove_shortcut,
     shutdown_steam,
     start_steam,
+    sync_all_external_saves,
 )
 from .theme import ThemeMode, apply_theme
 
@@ -339,7 +340,13 @@ class BulkMigrateWorker(QThread):
                 except Exception as exc:
                     errors.append(f"{item.entry.app_name}: {exc}")
 
-            summary = f"Migrados ({len(migrated)}): {', '.join(migrated) or 'nenhum'}."
+            self.status.emit("Sincronizando e validando saves de todos os atalhos...")
+            checked, copied = sync_all_external_saves(self._paths)
+
+            summary = (
+                f"Migrados ({len(migrated)}): {', '.join(migrated) or 'nenhum'}.\n"
+                f"Saves validados em {checked} atalho(s) ({copied} arquivo(s) importado(s)/atualizado(s))."
+            )
             if errors:
                 summary += "\nErros:\n" + "\n".join(errors)
             self.finished_ok.emit(summary)
@@ -1192,11 +1199,40 @@ class MainWindow(QMainWindow):
             self._set_steam_busy(False)
             return
         if not plan:
-            self._set_steam_busy(False)
-            self.status_label.setText("Todos os jogos .exe já estão padronizados em ~/Games.")
-            QMessageBox.information(
-                self, __app_name__, "Todos os jogos .exe já estão padronizados em ~/Games!"
-            )
+            self.status_label.setText("Atalhos já padronizados. Validando e sincronizando saves externos...")
+
+            class _SaveSyncWorker(QThread):
+                done = Signal(int, int)
+                failed = Signal(str)
+
+                def __init__(self, paths: SteamPaths) -> None:
+                    super().__init__()
+                    self._paths = paths
+
+                def run(self) -> None:
+                    try:
+                        checked, copied = sync_all_external_saves(self._paths)
+                        self.done.emit(checked, copied)
+                    except Exception as exc:
+                        self.failed.emit(str(exc))
+
+            def _on_sync_done(checked: int, copied: int) -> None:
+                self._set_steam_busy(False)
+                self.status_label.setText("Saves validados e sincronizados.")
+                QMessageBox.information(
+                    self,
+                    __app_name__,
+                    f"Todos os jogos .exe já estão padronizados em ~/Games!\n\n"
+                    f"Validação concluída em {checked} atalho(s): "
+                    f"{copied} arquivo(s) de save importado(s)/atualizado(s).\n"
+                    f"Agora você pode usar 'Limpar Prefixos Migrados...' com segurança.",
+                )
+
+            sync_worker = _SaveSyncWorker(self.paths)
+            self._track_worker(sync_worker)
+            sync_worker.done.connect(_on_sync_done)
+            sync_worker.failed.connect(self._on_bulk_failed)
+            sync_worker.start()
             return
 
         lines = [
@@ -1258,27 +1294,16 @@ class MainWindow(QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Limpar Prefixos Já Migrados e Órfãos")
-        dlg.resize(680, 440)
+        dlg.resize(720, 460)
         lay = QVBoxLayout(dlg)
         info = QLabel(
             "Revise os prefixos antigos/órfãos antes de apagar. "
-            "Dica: rode 'Migrar Todos para ~/Games' antes para importar saves pendentes."
+            "Só vêm marcados automaticamente os prefixos sem saves ou cujos saves já foram validados no Steam."
         )
         info.setWordWrap(True)
         lay.addWidget(info)
 
         lst = QListWidget()
-        for cand in candidates:
-            mb = cand.size_bytes / (1024 * 1024)
-            save_tag = " [TEM SAVES]" if cand.has_saves else ""
-            item = QListWidgetItem(f"[{cand.category}] {cand.label} — {mb:.1f} MB{save_tag}")
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            auto_check = (not cand.has_saves) and cand.category != "Prefixo Externo"
-            item.setCheckState(
-                Qt.CheckState.Checked if auto_check else Qt.CheckState.Unchecked
-            )
-            item.setData(Qt.ItemDataRole.UserRole, cand)
-            lst.addItem(item)
         lay.addWidget(lst, 1)
 
         total_lbl = QLabel()
@@ -1292,17 +1317,122 @@ class MainWindow(QMainWindow):
                     sel_bytes += c.size_bytes
             total_lbl.setText(f"Espaço selecionado para liberar: {sel_bytes / (1024 * 1024):.1f} MB")
 
+        def _populate_list(items: list[CleanupCandidate]) -> None:
+            lst.blockSignals(True)
+            lst.clear()
+            for cand in items:
+                mb = cand.size_bytes / (1024 * 1024)
+                if cand.saves_verified_migrated:
+                    save_tag = f" [SAVES VALIDADOS ✓: {cand.matched_game}]"
+                elif cand.has_saves:
+                    save_tag = " [TEM SAVES - NÃO VALIDADO]"
+                elif cand.category == "Prefixo Externo" and not cand.matched_game:
+                    save_tag = " [SEM JOGO NO STEAM]"
+                else:
+                    save_tag = " [SEM SAVES]"
+                item = QListWidgetItem(f"[{cand.category}] {cand.label} — {mb:.1f} MB{save_tag}")
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                if cand.category == "Prefixo Externo":
+                    auto_check = bool(cand.matched_game) and (
+                        (not cand.has_saves) or cand.saves_verified_migrated
+                    )
+                else:
+                    auto_check = (not cand.has_saves) or cand.saves_verified_migrated
+                item.setCheckState(
+                    Qt.CheckState.Checked if auto_check else Qt.CheckState.Unchecked
+                )
+                item.setData(Qt.ItemDataRole.UserRole, cand)
+                lst.addItem(item)
+            lst.blockSignals(False)
+            _update_total()
+
+        _populate_list(candidates)
         lst.itemChanged.connect(lambda _: _update_total())
-        _update_total()
         lay.addWidget(total_lbl)
 
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Apagar Selecionados")
+        ok_btn = btns.button(QDialogButtonBox.StandardButton.Ok)
+        ok_btn.setText("Apagar Selecionados")
+        btn_revalidate = btns.addButton(
+            "Validar e Importar Saves", QDialogButtonBox.ButtonRole.ActionRole
+        )
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
         lay.addWidget(btns)
+
+        dialog_open = True
+        dlg.finished.connect(lambda _: nonlocal_close())
+
+        def nonlocal_close() -> None:
+            nonlocal dialog_open
+            dialog_open = False
+
+        def _revalidate_now() -> None:
+            if not self.paths:
+                return
+            btn_revalidate.setEnabled(False)
+            ok_btn.setEnabled(False)
+            lst.setEnabled(False)
+            info.setText("Sincronizando saves pendentes e revalidando prefixos...")
+
+            class _RevalidateWorker(QThread):
+                done = Signal(list, int, int, int)
+                failed = Signal(str)
+
+                def __init__(self, paths: SteamPaths) -> None:
+                    super().__init__()
+                    self._paths = paths
+
+                def run(self) -> None:
+                    try:
+                        entries = load_shortcuts(self._paths.shortcuts_vdf)
+                        pending_plan = plan_bulk_migration(
+                            entries=entries,
+                            games_root=Path.home() / "Games",
+                            compatdata_dir=self._paths.compatdata_dir,
+                            config_vdf=self._paths.config_vdf,
+                        )
+                        checked, copied = sync_all_external_saves(self._paths)
+                        new_cands = find_cleanup_candidates(self._paths)
+                        self.done.emit(new_cands, checked, copied, len(pending_plan))
+                    except Exception as exc:
+                        self.failed.emit(str(exc))
+
+            def _on_reval_done(
+                new_cands: list[CleanupCandidate], checked: int, copied: int, pending: int
+            ) -> None:
+                if not dialog_open:
+                    return
+                btn_revalidate.setEnabled(True)
+                ok_btn.setEnabled(True)
+                lst.setEnabled(True)
+                _populate_list(new_cands)
+                extra = (
+                    f" Atenção: há {pending} jogo(s) ainda não padronizado(s) — rode 'Migrar Todos para ~/Games' antes."
+                    if pending
+                    else ""
+                )
+                info.setText(
+                    f"Validação concluída ({checked} atalho(s), {copied} save(s) importado(s)/atualizado(s)).{extra}"
+                )
+
+            def _on_reval_err(err: str) -> None:
+                if not dialog_open:
+                    return
+                btn_revalidate.setEnabled(True)
+                ok_btn.setEnabled(True)
+                lst.setEnabled(True)
+                info.setText(f"Erro ao validar saves: {err}")
+
+            w = _RevalidateWorker(self.paths)
+            self._track_worker(w)
+            w.done.connect(_on_reval_done)
+            w.failed.connect(_on_reval_err)
+            w.start()
+
+        btn_revalidate.clicked.connect(_revalidate_now)
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return

@@ -866,6 +866,8 @@ class CleanupCandidate:
     path: Path
     size_bytes: int
     has_saves: bool
+    saves_verified_migrated: bool = False
+    matched_game: str = ""
 
 
 def _dir_size_bytes(path: Path) -> int:
@@ -901,6 +903,60 @@ def _prefix_has_saves(prefix_dir: Path) -> bool:
     return False
 
 
+def _prefix_saves_verified_in_target(src_prefix: Path, dst_compatdata: Path) -> bool:
+    """Return True if src_prefix has >=1 non-empty save and all are present & up-to-date in dst_compatdata."""
+    src_users = _prefix_users_dir(src_prefix)
+    dst_users = _prefix_users_dir(dst_compatdata)
+    if src_users is None or dst_users is None:
+        return False
+    any_nonempty = False
+    for src_file, dst_file in _iter_prefix_save_pairs(src_users, dst_users):
+        try:
+            src_stat = src_file.stat()
+        except OSError:
+            return False
+        if src_stat.st_size == 0:
+            continue
+        any_nonempty = True
+        if dst_file.is_symlink() or not dst_file.is_file():
+            return False
+        try:
+            dst_stat = dst_file.stat()
+        except OSError:
+            return False
+        if dst_stat.st_size == 0 or dst_stat.st_mtime < src_stat.st_mtime:
+            return False
+    return any_nonempty
+
+
+def sync_all_external_saves(
+    paths: SteamPaths,
+    extra_external_roots: list[Path] | None = None,
+) -> tuple[int, int]:
+    """Import any pending/newer saves from external prefixes into all matching active shortcuts.
+
+    Returns (shortcuts_checked, save_files_copied).
+    """
+    entries = load_shortcuts(paths.shortcuts_vdf)
+    checked = 0
+    copied = 0
+    for entry in entries:
+        if not entry.exe.lower().endswith(".exe") and not (
+            paths.compatdata_dir / str(entry.appid_u32)
+        ).is_dir():
+            continue
+        checked += 1
+        steam_appid = detect_steam_appid(Path(entry.start_dir)) if entry.start_dir else None
+        copied += import_external_prefix_saves(
+            paths=paths,
+            shortcut_appid_u32=entry.appid_u32,
+            game_name=entry.app_name,
+            steam_appid=steam_appid,
+            search_roots=extra_external_roots,
+        )
+    return checked, copied
+
+
 def _installed_steam_appids(steam_root: Path) -> set[int]:
     """Return installed Steam AppIDs from appmanifest_*.acf files."""
     appids: set[int] = {0, 228980}
@@ -933,6 +989,21 @@ def find_cleanup_candidates(
     candidates: list[CleanupCandidate] = []
     seen: set[Path] = set()
 
+    current_entries = load_shortcuts(paths.shortcuts_vdf)
+    by_norm_key: dict[str, ShortcutEntry] = {}
+    by_steam_appid: dict[str, ShortcutEntry] = {}
+    by_appid_u32: dict[int, ShortcutEntry] = {}
+    for entry in current_entries:
+        by_appid_u32[entry.appid_u32] = entry
+        nk = _norm_key(entry.app_name)
+        if nk and nk not in by_norm_key:
+            by_norm_key[nk] = entry
+        if entry.start_dir:
+            sa = detect_steam_appid(Path(entry.start_dir))
+            if sa:
+                by_steam_appid.setdefault(str(sa), entry)
+                by_steam_appid.setdefault(f"umu-{sa}", entry)
+
     for root in extra_external_roots or external_prefix_roots():
         if not root.is_dir():
             continue
@@ -949,20 +1020,28 @@ def find_cleanup_candidates(
             if resolved in seen:
                 continue
             seen.add(resolved)
+            matched_entry = by_steam_appid.get(child.name) or by_norm_key.get(_norm_key(child.name))
+            has_saves = _prefix_has_saves(child)
+            saves_verified = False
+            if has_saves and matched_entry is not None:
+                dst_compat = paths.compatdata_dir / str(matched_entry.appid_u32)
+                saves_verified = _prefix_saves_verified_in_target(child, dst_compat)
             candidates.append(
                 CleanupCandidate(
                     category="Prefixo Externo",
                     label=f"{root.parent.name}/{root.name}/{child.name}",
                     path=child,
                     size_bytes=_dir_size_bytes(child),
-                    has_saves=_prefix_has_saves(child),
+                    has_saves=has_saves,
+                    saves_verified_migrated=saves_verified,
+                    matched_game=matched_entry.app_name if matched_entry else "",
                 )
             )
 
     active_shortcuts: set[int] = set()
     all_users = list_steam_users(paths.steam_root)
     if not all_users:
-        active_shortcuts = {e.appid_u32 for e in load_shortcuts(paths.shortcuts_vdf)}
+        active_shortcuts = {e.appid_u32 for e in current_entries}
     else:
         for uid in all_users:
             sv = paths.steam_root / "userdata" / uid / "config" / "shortcuts.vdf"
@@ -973,13 +1052,25 @@ def find_cleanup_candidates(
             if not child.is_dir():
                 continue
             if child.name.endswith(".deckinstall.bak"):
+                prefix_id = child.name.removesuffix(".deckinstall.bak")
+                matched_entry = (
+                    by_appid_u32.get(int(prefix_id)) if prefix_id.isdigit() else None
+                )
+                has_saves = _prefix_has_saves(child)
+                saves_verified = False
+                if has_saves and matched_entry is not None:
+                    saves_verified = _prefix_saves_verified_in_target(
+                        child, paths.compatdata_dir / prefix_id
+                    )
                 candidates.append(
                     CleanupCandidate(
                         category="Backup",
                         label=child.name,
                         path=child,
                         size_bytes=_dir_size_bytes(child),
-                        has_saves=_prefix_has_saves(child),
+                        has_saves=has_saves,
+                        saves_verified_migrated=saves_verified,
+                        matched_game=matched_entry.app_name if matched_entry else "",
                     )
                 )
                 continue

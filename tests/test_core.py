@@ -52,6 +52,7 @@ from deckinstall.steam_vdf import (  # noqa: E402
     infer_game_root_from_exe,
     migrate_shortcut_to_games,
     plan_bulk_migration,
+    sync_all_external_saves,
 )
 
 
@@ -466,7 +467,7 @@ class CoreTests(unittest.TestCase):
             (bak_with_save / "pfx" / "drive_c" / "users" / "steamuser" / "Documents" / "s.dat").write_bytes(b"save")
 
             other_entry = ShortcutEntry("0", 3555555555, "OtherUserGame", '"/g/o.exe"', '"/g"', "", "")
-            with mock.patch("deckinstall.steam_vdf.load_shortcuts", side_effect=[[], [other_entry]]):
+            with mock.patch("deckinstall.steam_vdf.load_shortcuts", side_effect=[[], [], [other_entry]]):
                 cands = find_cleanup_candidates(paths, extra_external_roots=[])
             self.assertNotIn(other_compat, {c.path for c in cands})
             bak_cand = next(c for c in cands if c.path == bak_with_save)
@@ -509,6 +510,53 @@ class CoreTests(unittest.TestCase):
             ):
                 plan = plan_bulk_migration([entry], root / "Games", root / "compat", search_roots=[], config_vdf=cfg)
             self.assertEqual(len(plan), 1)
+
+    def test_sync_all_external_saves_and_verified_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            steam_root = root / "Steam"
+            compat_dir = steam_root / "steamapps" / "compatdata"
+            game_dir = root / "Games" / "Hollow Knight"
+            game_dir.mkdir(parents=True)
+            exe = game_dir / "hollow_knight.exe"
+            exe.write_bytes(b"MZ")
+            appid_u32 = 3123456789
+            (compat_dir / str(appid_u32) / "pfx" / "drive_c" / "users").mkdir(parents=True)
+
+            ext_root = root / "Heroic" / "Prefixes"
+            ext_pfx = ext_root / "Hollow Knight"
+            save_src = ext_pfx / "drive_c" / "users" / "deck" / "AppData" / "LocalLow" / "save.dat"
+            save_src.parent.mkdir(parents=True)
+            save_src.write_bytes(b"SAVE123")
+
+            shortcuts_vdf = steam_root / "userdata" / "1" / "config" / "shortcuts.vdf"
+            shortcuts_vdf.parent.mkdir(parents=True)
+            shortcuts_vdf.write_bytes(b"VDF")
+            paths = SteamPaths(
+                steam_root=steam_root,
+                user_id="1",
+                userdata_dir=steam_root / "userdata" / "1",
+                shortcuts_vdf=shortcuts_vdf,
+                grid_dir=steam_root / "userdata" / "1" / "config" / "grid",
+                config_vdf=steam_root / "config" / "config.vdf",
+                compatdata_dir=compat_dir,
+            )
+            entry = ShortcutEntry("0", appid_u32, "Hollow Knight", f'"{exe}"', f'"{game_dir}"', "", "")
+            with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[entry]):
+                before = find_cleanup_candidates(paths, extra_external_roots=[ext_root])
+                self.assertEqual(len(before), 1)
+                self.assertTrue(before[0].has_saves)
+                self.assertFalse(before[0].saves_verified_migrated)
+
+                checked, copied = sync_all_external_saves(paths, extra_external_roots=[ext_root])
+                self.assertEqual(checked, 1)
+                self.assertEqual(copied, 1)
+
+                after = find_cleanup_candidates(paths, extra_external_roots=[ext_root])
+                self.assertEqual(len(after), 1)
+                self.assertTrue(after[0].has_saves)
+                self.assertTrue(after[0].saves_verified_migrated)
+                self.assertEqual(after[0].matched_game, "Hollow Knight")
 
 
 if __name__ == "__main__":
