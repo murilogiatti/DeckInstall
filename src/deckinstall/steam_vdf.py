@@ -48,6 +48,19 @@ def _quote_path(path: str) -> str:
     return f'"{stripped}"'
 
 
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write bytes to a temp file in the same directory and atomically replace target."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write UTF-8 text to a temp file in the same directory and atomically replace target."""
+    _atomic_write_bytes(path, text.encode("utf-8"))
+
+
 def _backup_file(path: Path) -> Path | None:
     if not path.is_file():
         return None
@@ -185,7 +198,7 @@ def add_or_update_shortcut(
     }
     filtered.append(new_entry)
     data["shortcuts"] = {str(i): entry for i, entry in enumerate(filtered)}
-    paths.shortcuts_vdf.write_bytes(vdf.binary_dumps(data))
+    _atomic_write_bytes(paths.shortcuts_vdf, vdf.binary_dumps(data))
 
     if enable_proton:
         set_compat_tool(
@@ -217,7 +230,7 @@ def remove_shortcut(paths: SteamPaths, appid_u32: int) -> bool:
     if not removed:
         return False
     data["shortcuts"] = {str(i): entry for i, entry in enumerate(kept)}
-    paths.shortcuts_vdf.write_bytes(vdf.binary_dumps(data))
+    _atomic_write_bytes(paths.shortcuts_vdf, vdf.binary_dumps(data))
     remove_compat_tool(paths.config_vdf, appid_u32)
     return True
 
@@ -240,7 +253,7 @@ def set_compat_tool(config_vdf: Path, appid_u32: int, tool_name: str) -> None:
         "config": "",
         "priority": "250",
     }
-    config_vdf.write_text(vdf.dumps(data, pretty=True), encoding="utf-8")
+    _atomic_write_text(config_vdf, vdf.dumps(data, pretty=True))
 
 
 def remove_compat_tool(config_vdf: Path, appid_u32: int) -> None:
@@ -258,18 +271,24 @@ def remove_compat_tool(config_vdf: Path, appid_u32: int) -> None:
     if str(appid_u32) in mapping:
         _backup_file(config_vdf)
         del mapping[str(appid_u32)]
-        config_vdf.write_text(vdf.dumps(data, pretty=True), encoding="utf-8")
+        _atomic_write_text(config_vdf, vdf.dumps(data, pretty=True))
 
 
 def infer_game_root_from_exe(exe_path: Path) -> Path:
     """Infer the top-level game folder from an executable path."""
     home = Path.home()
     known_containers = {
+        home.resolve(),
         (home / "Games").resolve(),
         (home / "Downloads").resolve(),
         (home / "Syncthing").resolve(),
     }
     resolved = exe_path.resolve()
+    if resolved.parent in known_containers:
+        raise ValueError(
+            f"O executável está solto diretamente em {resolved.parent}; "
+            "coloque-o dentro de uma subpasta própria antes de migrar."
+        )
     for parent in resolved.parents:
         if parent.parent in known_containers:
             return parent
@@ -298,6 +317,8 @@ def migrate_shortcut_to_games(
 
     old_root = infer_game_root_from_exe(old_exe)
     target_name = (new_name or "").strip() or clean_game_name(old_root.name)
+    if not target_name or target_name in (".", "..") or "/" in target_name or "\\" in target_name:
+        raise ValueError(f"Nome de jogo inválido: {target_name!r}")
     new_root = games_root / target_name
     games_root.mkdir(parents=True, exist_ok=True)
 
@@ -367,7 +388,10 @@ def plan_bulk_migration(
         exe_path = Path(entry.exe.strip().strip('"'))
         if exe_path.suffix.lower() != ".exe" or not exe_path.is_file():
             continue
-        old_root = infer_game_root_from_exe(exe_path)
+        try:
+            old_root = infer_game_root_from_exe(exe_path)
+        except ValueError:
+            continue
         clean_name = clean_game_name(old_root.name)
         new_root = games_root / clean_name
         already_in_games = old_root.resolve().parent == games_resolved

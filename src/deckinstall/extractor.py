@@ -34,16 +34,24 @@ def suggest_target_name(source: Path) -> str:
     return clean_game_name(name)
 
 
+def sanitize_folder_name(name: str) -> str:
+    """Ensure folder_name is a single safe directory name without path traversal."""
+    cleaned = name.strip().strip("/\\")
+    if not cleaned or cleaned in (".", "..") or "/" in cleaned or "\\" in cleaned:
+        raise ValueError(f"Nome de pasta inválido: {name!r}")
+    return cleaned
+
+
 def _select_extract_cmd(archive: Path, out_dir: Path) -> list[str]:
     low = archive.name.lower()
+    if any(low.endswith(ext) for ext in (".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.zst", ".tar.bz2", ".tar")) and shutil.which("tar"):
+        return ["tar", "-xf", str(archive), "-C", str(out_dir)]
     if low.endswith(".rar") and shutil.which("unrar"):
         return ["unrar", "x", "-o+", "-y", str(archive), str(out_dir) + "/"]
     if low.endswith(".zip") and shutil.which("unzip"):
         return ["unzip", "-o", str(archive), "-d", str(out_dir)]
     if shutil.which("7z"):
         return ["7z", "x", "-y", f"-o{out_dir}", str(archive)]
-    if any(low.endswith(ext) for ext in (".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.zst", ".tar.bz2", ".tar")) and shutil.which("tar"):
-        return ["tar", "-xf", str(archive), "-C", str(out_dir)]
     raise RuntimeError(f"Nenhuma ferramenta de extração encontrada para: {archive.name}")
 
 
@@ -74,7 +82,7 @@ def extract_archive(
     cancel_flag: Callable[[], bool] | None = None,
 ) -> Path:
     """Extract an archive into dest_root/<game_folder_name> and return the target path."""
-    folder_name = game_folder_name or suggest_target_name(archive)
+    folder_name = sanitize_folder_name(game_folder_name or suggest_target_name(archive))
     final_dir = dest_root / folder_name
     dest_root.mkdir(parents=True, exist_ok=True)
 

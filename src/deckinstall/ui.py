@@ -915,8 +915,9 @@ class MainWindow(QMainWindow):
         if ans != QMessageBox.StandardButton.Yes:
             return
         was_running = is_steam_running()
-        if was_running:
-            shutdown_steam()
+        if was_running and not shutdown_steam():
+            QMessageBox.critical(self, __app_name__, "Não foi possível fechar o Steam a tempo.")
+            return
         removed = remove_shortcut(self.paths, entry.appid_u32)
         if was_running:
             start_steam()
@@ -948,8 +949,8 @@ class MainWindow(QMainWindow):
                 return
         was_running = is_steam_running()
         try:
-            if was_running:
-                shutdown_steam()
+            if was_running and not shutdown_steam():
+                raise RuntimeError("Não foi possível fechar o Steam a tempo.")
             new_appid, new_exe, steam_appid = migrate_shortcut_to_games(
                 paths=self.paths,
                 entry=entry,

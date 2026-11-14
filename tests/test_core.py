@@ -23,7 +23,13 @@ if "vdf" not in sys.modules:
     fake_vdf.dumps = lambda d, pretty=True: "{}"
     sys.modules["vdf"] = fake_vdf
 
-from deckinstall.extractor import extract_archive, is_archive, suggest_target_name  # noqa: E402
+from deckinstall.extractor import (  # noqa: E402
+    _select_extract_cmd,
+    extract_archive,
+    is_archive,
+    sanitize_folder_name,
+    suggest_target_name,
+)
 from deckinstall.scanner import (  # noqa: E402
     clean_game_name,
     detect_steam_appid,
@@ -187,6 +193,15 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(new_exe, games_root / "Stellar Blade" / "SB.exe")
             self.assertTrue(new_exe.is_file())
             self.assertTrue((compat_dir / str(new_appid) / "pfx" / "save.dat").is_file())
+
+    def test_sanitize_folder_name_and_tar_priority(self) -> None:
+        self.assertEqual(sanitize_folder_name("My Game"), "My Game")
+        with self.assertRaises(ValueError):
+            sanitize_folder_name("../escape")
+        with self.assertRaises(ValueError):
+            sanitize_folder_name("/abs/path")
+        cmd = _select_extract_cmd(Path("game.tar.gz"), Path("/tmp/out"))
+        self.assertEqual(cmd[0], "tar")
 
 
 if __name__ == "__main__":
