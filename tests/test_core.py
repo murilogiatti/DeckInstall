@@ -42,6 +42,7 @@ from deckinstall.steam_vdf import (  # noqa: E402
     ShortcutEntry,
     _backup_file,
     compute_shortcut_appid,
+    import_hydra_umu_saves,
     infer_game_root_from_exe,
     migrate_shortcut_to_games,
     plan_bulk_migration,
@@ -264,6 +265,52 @@ class CoreTests(unittest.TestCase):
             with mock.patch("vdf.loads", return_value=fake_login):
                 ordered = list_steam_users(steam_root)
             self.assertEqual(ordered[0], "200")
+
+    def test_import_hydra_umu_saves_merges_only_newer_and_skips_junk(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hydra_root = root / "hydra" / "wine-prefixes"
+            src_users = hydra_root / "4423270" / "drive_c" / "users"
+            (src_users / "steamuser" / "AppData" / "LocalLow" / "Game").mkdir(parents=True)
+            (src_users / "steamuser" / "AppData" / "Local" / "Temp").mkdir(parents=True)
+            (src_users / "Public" / "Documents" / "Steam" / "RUNE").mkdir(parents=True)
+
+            save_src = src_users / "steamuser" / "AppData" / "LocalLow" / "Game" / "save.dat"
+            save_src.write_bytes(b"hydra-save")
+            rune_src = src_users / "Public" / "Documents" / "Steam" / "RUNE" / "stats.bin"
+            rune_src.write_bytes(b"rune")
+            junk_src = src_users / "steamuser" / "AppData" / "Local" / "Temp" / "junk.tmp"
+            junk_src.write_bytes(b"junk")
+
+            compat_dir = root / "Steam" / "steamapps" / "compatdata"
+            dst_existing = (
+                compat_dir / "3387715067" / "pfx" / "drive_c" / "users" / "Public" / "Documents" / "Steam" / "RUNE" / "stats.bin"
+            )
+            dst_existing.parent.mkdir(parents=True)
+            dst_existing.write_bytes(b"newer-steam-save")
+            os.utime(save_src, (1000, 1000))
+            os.utime(rune_src, (1000, 1000))
+            os.utime(dst_existing, (2000, 2000))
+
+            paths = SteamPaths(
+                steam_root=root / "Steam",
+                user_id="1",
+                userdata_dir=root / "Steam" / "userdata" / "1",
+                shortcuts_vdf=root / "shortcuts.vdf",
+                grid_dir=root / "grid",
+                config_vdf=root / "config.vdf",
+                compatdata_dir=compat_dir,
+            )
+            copied = import_hydra_umu_saves(paths, 3387715067, 4423270, hydra_prefixes_root=hydra_root)
+            self.assertEqual(copied, 1)
+            self.assertEqual(
+                (compat_dir / "3387715067" / "pfx" / "drive_c" / "users" / "steamuser" / "AppData" / "LocalLow" / "Game" / "save.dat").read_bytes(),
+                b"hydra-save",
+            )
+            self.assertEqual(dst_existing.read_bytes(), b"newer-steam-save")
+            self.assertFalse(
+                (compat_dir / "3387715067" / "pfx" / "drive_c" / "users" / "steamuser" / "AppData" / "Local" / "Temp" / "junk.tmp").exists()
+            )
 
 
 if __name__ == "__main__":

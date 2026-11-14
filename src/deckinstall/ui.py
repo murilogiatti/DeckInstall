@@ -53,6 +53,7 @@ from .steam_vdf import (
     MigrationPlanItem,
     ShortcutEntry,
     add_or_update_shortcut,
+    import_hydra_umu_saves,
     infer_game_root_from_exe,
     load_shortcuts,
     migrate_shortcut_to_games,
@@ -256,6 +257,9 @@ class AddToSteamWorker(QThread):
 
             art_msg = "Sem artes baixadas."
             if self.steam_appid:
+                imported = import_hydra_umu_saves(self.paths, shortcut_id, self.steam_appid)
+                if imported:
+                    self.status.emit(f"{imported} arquivo(s) de save importados do Hydra UMU.")
                 self.status.emit(f"Baixando artes oficiais (AppID {self.steam_appid})...")
                 art = download_steam_artwork(
                     steam_appid=self.steam_appid,
@@ -313,6 +317,7 @@ class BulkMigrateWorker(QThread):
                         matches = search_steam_games(item.new_name, limit=1)
                         if matches:
                             steam_appid = matches[0].appid
+                            import_hydra_umu_saves(self.paths, new_appid, steam_appid)
                     if steam_appid:
                         download_steam_artwork(steam_appid, new_appid, self.paths.grid_dir)
                     migrated.append(item.new_name)
@@ -1031,6 +1036,7 @@ class MainWindow(QMainWindow):
             entry=entry,
             old_root=old_root,
             new_name=new_name.strip(),
+            new_root=Path.home() / "Games" / new_name.strip(),
             has_compatdata=(self.paths.compatdata_dir / str(entry.appid_u32)).is_dir(),
         )
         self.btn_bulk_migrate.setEnabled(False)

@@ -406,7 +406,61 @@ def migrate_shortcut_to_games(
         remove_shortcut(paths, entry.appid_u32)
 
     steam_appid = detect_steam_appid(new_root)
+    if steam_appid:
+        import_hydra_umu_saves(paths, new_appid, steam_appid)
     return new_appid, new_exe, steam_appid
+
+
+_HYDRA_SKIP_DIRS = {"microsoft", "temp", "dxvk", "nvidia", "amd", "d3dscache"}
+_HYDRA_USER_SUBPATHS = (
+    Path("steamuser") / "Documents",
+    Path("steamuser") / "Saved Games",
+    Path("steamuser") / "AppData" / "Local",
+    Path("steamuser") / "AppData" / "LocalLow",
+    Path("steamuser") / "AppData" / "Roaming",
+    Path("Public") / "Documents",
+)
+
+
+def import_hydra_umu_saves(
+    paths: SteamPaths,
+    shortcut_appid_u32: int,
+    steam_appid: int | None,
+    hydra_prefixes_root: Path | None = None,
+) -> int:
+    """Import newer/missing save files from Hydra UMU wine-prefixes into Steam compatdata."""
+    if not steam_appid:
+        return 0
+    base = hydra_prefixes_root or (Path.home() / ".config" / "hydralauncher" / "wine-prefixes")
+    src_users = base / str(steam_appid) / "drive_c" / "users"
+    if not src_users.is_dir():
+        return 0
+
+    dst_users = paths.compatdata_dir / str(shortcut_appid_u32) / "pfx" / "drive_c" / "users"
+    copied = 0
+    for rel_sub in _HYDRA_USER_SUBPATHS:
+        src_root = src_users / rel_sub
+        if not src_root.is_dir():
+            continue
+        dst_root = dst_users / rel_sub
+        for dirpath, dirnames, filenames in os.walk(src_root, followlinks=False):
+            dirnames[:] = [d for d in dirnames if d.lower() not in _HYDRA_SKIP_DIRS]
+            cur = Path(dirpath)
+            rel_dir = cur.relative_to(src_root)
+            for fname in filenames:
+                src_file = cur / fname
+                if src_file.is_symlink() or not src_file.is_file():
+                    continue
+                dst_file = dst_root / rel_dir / fname
+                try:
+                    if dst_file.exists() and dst_file.stat().st_mtime >= src_file.stat().st_mtime:
+                        continue
+                    dst_file.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_file, dst_file)
+                    copied += 1
+                except OSError:
+                    continue
+    return copied
 
 
 @dataclass(frozen=True)
