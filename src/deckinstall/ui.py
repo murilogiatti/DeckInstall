@@ -1,19 +1,22 @@
-"""PySide6 main window for DeckInstall."""
+"""Modern KDE-style PySide6 interface for DeckInstall."""
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
+import requests
 from PySide6.QtCore import QSettings, Qt, QThread, Signal
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -23,14 +26,14 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QTabWidget,
+    QStackedWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from . import __app_name__, __version__
-from .artwork import SteamMatch, download_steam_artwork, search_steam_games
+from .artwork import STEAM_CDN_BASE, USER_AGENT, SteamMatch, download_steam_artwork, search_steam_games
 from .extractor import (
     extract_archive,
     is_archive,
@@ -53,6 +56,61 @@ from .steam_vdf import (
     start_steam,
 )
 from .theme import ThemeMode, apply_theme
+
+
+def _pick_file(parent: QWidget, title: str, start_dir: Path, kdialog_filter: str, qt_filter: str) -> str:
+    """Open native KDE kdialog file picker when available, falling back to QFileDialog."""
+    if shutil.which("kdialog"):
+        res = subprocess.run(
+            ["kdialog", "--title", title, "--getopenfilename", str(start_dir), kdialog_filter],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode == 0:
+            return res.stdout.strip()
+        if res.returncode == 1:
+            return ""
+    path, _ = QFileDialog.getOpenFileName(parent, title, str(start_dir), qt_filter)
+    return path
+
+
+def _pick_dir(parent: QWidget, title: str, start_dir: Path) -> str:
+    """Open native KDE kdialog folder picker when available, falling back to QFileDialog."""
+    if shutil.which("kdialog"):
+        res = subprocess.run(
+            ["kdialog", "--title", title, "--getexistingdirectory", str(start_dir)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode == 0:
+            return res.stdout.strip()
+        if res.returncode == 1:
+            return ""
+    return QFileDialog.getExistingDirectory(parent, title, str(start_dir))
+
+
+class DropZoneFrame(QFrame):
+    """Drag-and-drop card for archive or setup.exe selection."""
+
+    file_dropped = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setObjectName("DropZone")
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        urls = event.mimeData().urls()
+        if urls:
+            local = urls[0].toLocalFile()
+            if local:
+                self.file_dropped.emit(local)
 
 
 class ExtractWorker(QThread):
@@ -112,6 +170,25 @@ class SteamSearchWorker(QThread):
             self.results.emit(search_steam_games(self.query))
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class PreviewWorker(QThread):
+    """Background worker to fetch a Steam header preview image."""
+
+    loaded = Signal(bytes)
+
+    def __init__(self, steam_appid: int) -> None:
+        super().__init__()
+        self.steam_appid = steam_appid
+
+    def run(self) -> None:
+        url = f"{STEAM_CDN_BASE}/{self.steam_appid}/header.jpg"
+        try:
+            resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
+            if resp.status_code == 200 and len(resp.content) > 512:
+                self.loaded.emit(resp.content)
+        except requests.RequestException:
+            pass
 
 
 class AddToSteamWorker(QThread):
@@ -176,6 +253,15 @@ class AddToSteamWorker(QThread):
             self.failed.emit(str(exc))
 
 
+def _make_card() -> tuple[QFrame, QVBoxLayout]:
+    card = QFrame()
+    card.setObjectName("Card")
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(16, 14, 16, 14)
+    layout.setSpacing(10)
+    return card, layout
+
+
 class MainWindow(QMainWindow):
     """Main DeckInstall application window."""
 
@@ -185,13 +271,13 @@ class MainWindow(QMainWindow):
         self.settings = QSettings(__app_name__, __app_name__)
         self.paths = resolve_steam_paths()
         self._detected_games: list[DetectedGame] = []
-        self._steam_matches: list[SteamMatch] = []
         self._extract_worker: ExtractWorker | None = None
         self._search_worker: SteamSearchWorker | None = None
+        self._preview_worker: PreviewWorker | None = None
         self._add_worker: AddToSteamWorker | None = None
 
         self.setWindowTitle(f"{__app_name__} v{__version__}")
-        self.resize(860, 620)
+        self.resize(980, 660)
         self._build_ui()
         self._apply_saved_theme()
         self._refresh_games()
@@ -199,73 +285,142 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         central = QWidget()
-        root = QVBoxLayout(central)
-        root.setContentsMargins(14, 14, 14, 14)
-        root.setSpacing(10)
+        central.setObjectName("ContentArea")
+        shell = QHBoxLayout(central)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
 
-        # Header
-        header = QHBoxLayout()
-        title_box = QVBoxLayout()
-        title = QLabel(f"<b>{__app_name__}</b> <span style='opacity:0.7;'>v{__version__}</span>")
-        title.setStyleSheet("font-size: 18px;")
-        subtitle = QLabel(
-            f"Usuário Steam: {self.paths.user_id}"
-            if self.paths
-            else "Steam não detectado neste usuário"
+        shell.addWidget(self._build_sidebar())
+
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(22, 20, 22, 14)
+        right_layout.setSpacing(12)
+
+        self.stack = QStackedWidget()
+        self.stack.addWidget(self._build_extract_page())
+        self.stack.addWidget(self._build_add_page())
+        self.stack.addWidget(self._build_library_page())
+        right_layout.addWidget(self.stack)
+
+        self.status_label = QLabel("Pronto.")
+        self.status_label.setObjectName("MutedText")
+        right_layout.addWidget(self.status_label)
+
+        shell.addWidget(right, 1)
+        self.setCentralWidget(central)
+
+    def _build_sidebar(self) -> QWidget:
+        sidebar = QWidget()
+        sidebar.setObjectName("Sidebar")
+        sidebar.setFixedWidth(225)
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(14, 20, 14, 16)
+        layout.setSpacing(6)
+
+        brand_row = QHBoxLayout()
+        icon_lbl = QLabel()
+        icon_path = Path(__file__).resolve().parent.parent.parent / "assets" / "icon.png"
+        if icon_path.is_file():
+            pix = QPixmap(str(icon_path)).scaled(
+                36, 36, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            )
+            icon_lbl.setPixmap(pix)
+        brand_text = QVBoxLayout()
+        brand_text.setSpacing(0)
+        title = QLabel(f"<b>{__app_name__}</b>")
+        title.setStyleSheet("font-size: 16px;")
+        ver = QLabel(f"v{__version__}")
+        ver.setObjectName("MutedText")
+        brand_text.addWidget(title)
+        brand_text.addWidget(ver)
+        brand_row.addWidget(icon_lbl)
+        brand_row.addSpacing(8)
+        brand_row.addLayout(brand_text)
+        brand_row.addStretch()
+        layout.addLayout(brand_row)
+        layout.addSpacing(18)
+
+        self._nav_buttons: list[QPushButton] = []
+        nav_items = [
+            "Extrair / Instalar",
+            "Adicionar ao Steam",
+            "Biblioteca Não-Steam",
+        ]
+        for idx, label in enumerate(nav_items):
+            btn = QPushButton(label)
+            btn.setCheckable(True)
+            btn.setAutoExclusive(True)
+            btn.clicked.connect(lambda _=False, i=idx: self.stack.setCurrentIndex(i))
+            layout.addWidget(btn)
+            self._nav_buttons.append(btn)
+        self._nav_buttons[0].setChecked(True)
+
+        layout.addStretch()
+
+        steam_lbl = QLabel(
+            f"Steam ID: {self.paths.user_id}" if self.paths else "Steam não detectado"
         )
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        header.addLayout(title_box)
-        header.addStretch()
+        steam_lbl.setObjectName("MutedText")
+        layout.addWidget(steam_lbl)
 
-        header.addWidget(QLabel("Tema:"))
+        theme_lbl = QLabel("Tema")
+        theme_lbl.setObjectName("MutedText")
+        layout.addWidget(theme_lbl)
         self.theme_combo = QComboBox()
         self.theme_combo.addItem("Automático", "auto")
         self.theme_combo.addItem("Escuro", "dark")
         self.theme_combo.addItem("Claro", "light")
         self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
-        header.addWidget(self.theme_combo)
-        root.addLayout(header)
+        layout.addWidget(self.theme_combo)
+        return sidebar
 
-        # Tabs
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_extract_tab(), "1. Extrair / Instalar")
-        self.tabs.addTab(self._build_add_tab(), "2. Adicionar ao Steam")
-        self.tabs.addTab(self._build_library_tab(), "3. Biblioteca Não-Steam")
-        root.addWidget(self.tabs)
+    def _build_extract_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
 
-        self.status_label = QLabel("Pronto.")
-        root.addWidget(self.status_label)
-        self.setCentralWidget(central)
+        title = QLabel("Extrair ou Instalar Jogo")
+        title.setObjectName("PageTitle")
+        sub = QLabel("Arraste um arquivo (.zip, .rar, .7z, .tar.* ou setup.exe) ou escolha pelo seletor nativo do KDE.")
+        sub.setObjectName("MutedText")
+        sub.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(sub)
 
-    def _build_extract_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        form = QFormLayout()
+        drop_card = DropZoneFrame()
+        drop_card.file_dropped.connect(self._set_extract_source)
+        drop_layout = QVBoxLayout(drop_card)
+        drop_layout.setContentsMargins(18, 16, 18, 16)
+        drop_layout.setSpacing(10)
 
         src_row = QHBoxLayout()
         self.extract_src = QLineEdit()
-        self.extract_src.setPlaceholderText("Arquivo .zip, .rar, .7z, .tar.* ou setup.exe")
-        btn_src = QPushButton("Selecionar Arquivo")
+        self.extract_src.setPlaceholderText("Selecione ou arraste o arquivo baixado aqui...")
+        btn_src = QPushButton("Procurar Arquivo")
         btn_src.clicked.connect(self._pick_archive_or_installer)
-        src_row.addWidget(self.extract_src)
+        src_row.addWidget(self.extract_src, 1)
         src_row.addWidget(btn_src)
-        form.addRow("Arquivo:", src_row)
+        drop_layout.addLayout(src_row)
 
+        form = QFormLayout()
+        form.setSpacing(10)
         self.extract_name = QLineEdit()
-        self.extract_name.setPlaceholderText("Nome da pasta em ~/Games")
+        self.extract_name.setPlaceholderText("Nome da pasta do jogo em ~/Games")
         form.addRow("Nome do Jogo:", self.extract_name)
 
         dst_row = QHBoxLayout()
         self.extract_dst_root = QLineEdit(str(Path.home() / "Games"))
-        btn_dst = QPushButton("Pasta")
+        btn_dst = QPushButton("Escolher Pasta")
         btn_dst.clicked.connect(self._pick_dest_root)
-        dst_row.addWidget(self.extract_dst_root)
+        dst_row.addWidget(self.extract_dst_root, 1)
         dst_row.addWidget(btn_dst)
         form.addRow("Destino:", dst_row)
+        drop_layout.addLayout(form)
+        layout.addWidget(drop_card)
 
-        layout.addLayout(form)
-
+        prog_card, prog_layout = _make_card()
         btn_row = QHBoxLayout()
         self.btn_extract = QPushButton("Extrair / Instalar")
         self.btn_extract.setObjectName("primaryBtn")
@@ -280,90 +435,131 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_cancel_extract)
         btn_row.addStretch()
         btn_row.addWidget(self.btn_use_extracted)
-        layout.addLayout(btn_row)
+        prog_layout.addLayout(btn_row)
 
         self.extract_progress = QProgressBar()
-        layout.addWidget(self.extract_progress)
+        prog_layout.addWidget(self.extract_progress)
 
         self.extract_log = QTextEdit()
         self.extract_log.setReadOnly(True)
-        layout.addWidget(self.extract_log)
-        return tab
+        prog_layout.addWidget(self.extract_log)
+        layout.addWidget(prog_card, 1)
+        return page
 
-    def _build_add_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
+    def _build_add_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
 
+        title = QLabel("Adicionar Jogo ao Steam")
+        title.setObjectName("PageTitle")
+        sub = QLabel("Selecione o jogo detectado, confirme as artes oficiais da Steam e adicione com 1 clique.")
+        sub.setObjectName("MutedText")
+        layout.addWidget(title)
+        layout.addWidget(sub)
+
+        list_card, list_layout = _make_card()
         scan_row = QHBoxLayout()
-        btn_scan = QPushButton("Reescanear Pastas")
+        lbl_det = QLabel("Jogos encontrados")
+        lbl_det.setObjectName("SectionTitle")
+        btn_scan = QPushButton("Reescanear")
         btn_scan.clicked.connect(self._refresh_games)
-        btn_browse_exe = QPushButton("Escolher .exe Manualmente")
+        btn_browse_exe = QPushButton("Escolher .exe")
         btn_browse_exe.clicked.connect(self._pick_manual_exe)
+        scan_row.addWidget(lbl_det)
+        scan_row.addStretch()
         scan_row.addWidget(btn_scan)
         scan_row.addWidget(btn_browse_exe)
-        scan_row.addStretch()
-        layout.addLayout(scan_row)
+        list_layout.addLayout(scan_row)
 
         self.games_list = QListWidget()
-        self.games_list.setMaximumHeight(150)
+        self.games_list.setMaximumHeight(145)
         self.games_list.currentRowChanged.connect(self._on_game_selected)
-        layout.addWidget(self.games_list)
+        list_layout.addWidget(self.games_list)
+        layout.addWidget(list_card)
 
-        cfg_box = QGroupBox("Configuração do Atalho Steam")
-        form = QFormLayout(cfg_box)
+        cfg_card, cfg_layout = _make_card()
+        cfg_split = QHBoxLayout()
+        cfg_split.setSpacing(16)
 
+        form = QFormLayout()
+        form.setSpacing(10)
         self.add_name = QLineEdit()
         form.addRow("Nome no Steam:", self.add_name)
 
         self.add_exe_combo = QComboBox()
         self.add_exe_combo.setEditable(True)
-        form.addRow("Executável (.exe):", self.add_exe_combo)
+        form.addRow("Executável:", self.add_exe_combo)
 
         art_row = QHBoxLayout()
         self.steam_search_input = QLineEdit()
-        self.steam_search_input.setPlaceholderText("Nome ou Steam AppID para artes oficiais")
-        btn_search = QPushButton("Buscar na Steam")
+        self.steam_search_input.setPlaceholderText("Nome ou Steam AppID")
+        btn_search = QPushButton("Buscar Artes")
         btn_search.clicked.connect(self._search_steam_art)
-        art_row.addWidget(self.steam_search_input)
+        art_row.addWidget(self.steam_search_input, 1)
         art_row.addWidget(btn_search)
-        form.addRow("Buscar Artes:", art_row)
+        form.addRow("Steam Store:", art_row)
 
         self.steam_match_combo = QComboBox()
-        form.addRow("Jogo na Steam:", self.steam_match_combo)
+        self.steam_match_combo.currentIndexChanged.connect(self._on_steam_match_changed)
+        form.addRow("Correspondência:", self.steam_match_combo)
 
-        self.chk_proton = QCheckBox("Ativar Proton padrão automaticamente (recomendado)")
+        self.chk_proton = QCheckBox("Ativar Proton padrão automaticamente")
         self.chk_proton.setChecked(True)
         form.addRow("", self.chk_proton)
 
-        self.chk_restart = QCheckBox("Reabrir o Steam automaticamente após gravar")
+        self.chk_restart = QCheckBox("Reabrir o Steam após adicionar")
         self.chk_restart.setChecked(True)
         form.addRow("", self.chk_restart)
 
-        layout.addWidget(cfg_box)
+        cfg_split.addLayout(form, 1)
+
+        self.preview_label = QLabel("Prévia da Arte\n(Steam Store)")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setFixedSize(230, 108)
+        self.preview_label.setStyleSheet("border: 1px solid #344157; border-radius: 8px;")
+        cfg_split.addWidget(self.preview_label, 0, Qt.AlignmentFlag.AlignTop)
+
+        cfg_layout.addLayout(cfg_split)
 
         self.btn_add_steam = QPushButton("Adicionar ao Steam (com Artes)")
         self.btn_add_steam.setObjectName("primaryBtn")
         self.btn_add_steam.clicked.connect(self._add_selected_to_steam)
-        layout.addWidget(self.btn_add_steam)
-        layout.addStretch()
-        return tab
+        cfg_layout.addWidget(self.btn_add_steam)
+        layout.addWidget(cfg_card, 1)
+        return page
 
-    def _build_library_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
+    def _build_library_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
 
+        title = QLabel("Biblioteca Não-Steam")
+        title.setObjectName("PageTitle")
+        sub = QLabel("Gerencie os atalhos já adicionados ao Steam, atualize artes oficiais ou remova entradas.")
+        sub.setObjectName("MutedText")
+        layout.addWidget(title)
+        layout.addWidget(sub)
+
+        lib_card, lib_layout = _make_card()
         top = QHBoxLayout()
+        lbl = QLabel("Atalhos cadastrados")
+        lbl.setObjectName("SectionTitle")
         btn_reload = QPushButton("Atualizar Lista")
         btn_reload.clicked.connect(self._refresh_shortcuts)
-        top.addWidget(btn_reload)
+        top.addWidget(lbl)
         top.addStretch()
-        layout.addLayout(top)
+        top.addWidget(btn_reload)
+        lib_layout.addLayout(top)
 
         self.shortcuts_list = QListWidget()
-        layout.addWidget(self.shortcuts_list)
+        lib_layout.addWidget(self.shortcuts_list, 1)
 
         actions = QHBoxLayout()
         btn_art = QPushButton("Baixar/Atualizar Artes do Selecionado")
+        btn_art.setObjectName("primaryBtn")
         btn_art.clicked.connect(self._update_selected_shortcut_art)
         btn_remove = QPushButton("Remover do Steam")
         btn_remove.setObjectName("dangerBtn")
@@ -371,8 +567,9 @@ class MainWindow(QMainWindow):
         actions.addWidget(btn_art)
         actions.addStretch()
         actions.addWidget(btn_remove)
-        layout.addLayout(actions)
-        return tab
+        lib_layout.addLayout(actions)
+        layout.addWidget(lib_card, 1)
+        return page
 
     def _apply_saved_theme(self) -> None:
         saved = str(self.settings.value("theme", "auto"))
@@ -387,23 +584,27 @@ class MainWindow(QMainWindow):
         self.settings.setValue("theme", mode)
         apply_theme(self.app, mode)
 
-    def _pick_archive_or_installer(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Selecionar arquivo do jogo",
-            str(Path.home() / "Downloads"),
-            "Arquivos (*.zip *.rar *.7z *.tar *.tar.gz *.tgz *.tar.xz *.tar.zst *.exe);;Todos (*)",
-        )
-        if path:
-            p = Path(path)
+    def _set_extract_source(self, path_str: str) -> None:
+        p = Path(path_str)
+        if p.is_file():
             self.extract_src.setText(str(p))
             if not self.extract_name.text().strip():
                 self.extract_name.setText(suggest_target_name(p))
 
-    def _pick_dest_root(self) -> None:
-        path = QFileDialog.getExistingDirectory(
-            self, "Selecionar pasta de destino", self.extract_dst_root.text()
+    def _pick_archive_or_installer(self) -> None:
+        path = _pick_file(
+            self,
+            "Selecionar arquivo do jogo",
+            Path.home() / "Downloads",
+            "*.zip *.rar *.7z *.tar *.tar.gz *.tgz *.tar.xz *.tar.zst *.exe |Arquivos de Jogo",
+            "Arquivos (*.zip *.rar *.7z *.tar *.tar.gz *.tgz *.tar.xz *.tar.zst *.exe);;Todos (*)",
         )
+        if path:
+            self._set_extract_source(path)
+
+    def _pick_dest_root(self) -> None:
+        start = Path(self.extract_dst_root.text().strip() or str(Path.home() / "Games"))
+        path = _pick_dir(self, "Selecionar pasta de destino", start)
         if path:
             self.extract_dst_root.setText(path)
 
@@ -456,7 +657,8 @@ class MainWindow(QMainWindow):
             game = scan_game_folder(target)
             if game:
                 self._populate_game_form(game)
-        self.tabs.setCurrentIndex(1)
+        self._nav_buttons[1].setChecked(True)
+        self.stack.setCurrentIndex(1)
 
     def _refresh_games(self) -> None:
         self._detected_games = scan_all_games()
@@ -484,10 +686,11 @@ class MainWindow(QMainWindow):
             )
 
     def _pick_manual_exe(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
+        path = _pick_file(
             self,
             "Selecionar executável do jogo",
-            str(Path.home() / "Games"),
+            Path.home() / "Games",
+            "*.exe |Executáveis Windows",
             "Executáveis (*.exe);;Todos (*)",
         )
         if path:
@@ -521,7 +724,6 @@ class MainWindow(QMainWindow):
         self._search_worker.start()
 
     def _on_steam_results(self, matches: list[SteamMatch]) -> None:
-        self._steam_matches = matches
         self.steam_match_combo.clear()
         for m in matches:
             self.steam_match_combo.addItem(f"{m.name} ({m.appid})", m.appid)
@@ -530,6 +732,26 @@ class MainWindow(QMainWindow):
             if matches
             else "Nenhum jogo encontrado na Steam com esse nome."
         )
+
+    def _on_steam_match_changed(self) -> None:
+        appid = self.steam_match_combo.currentData()
+        if not isinstance(appid, int):
+            self.preview_label.setText("Prévia da Arte\n(Steam Store)")
+            return
+        self.preview_label.setText("Carregando prévia...")
+        self._preview_worker = PreviewWorker(appid)
+        self._preview_worker.loaded.connect(self._set_preview_bytes)
+        self._preview_worker.start()
+
+    def _set_preview_bytes(self, raw: bytes) -> None:
+        pix = QPixmap()
+        if pix.loadFromData(raw):
+            scaled = pix.scaled(
+                self.preview_label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self.preview_label.setPixmap(scaled)
 
     def _add_selected_to_steam(self) -> None:
         if not self.paths:

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+# Bridge isolated AppImage Qt6 to the host KDE/XDG file chooser portal.
+os.environ.setdefault("QT_QPA_PLATFORMTHEME", "xdgdesktopportal")
 
 SRC_DIR = Path(__file__).resolve().parent / "src"
 if str(SRC_DIR) not in sys.path:
