@@ -54,9 +54,13 @@ def clean_game_name(raw_name: str) -> str:
 
 def detect_steam_appid(game_dir: Path) -> int | None:
     """Check common Steam emulator/appid files for an official numeric Steam AppID."""
-    appid_file = game_dir / "steam_appid.txt"
-    if appid_file.is_file():
-        text = appid_file.read_text(encoding="utf-8", errors="ignore").strip()
+    for appid_file in [game_dir / "steam_appid.txt", *game_dir.rglob("steam_appid.txt")]:
+        if not appid_file.is_file():
+            continue
+        try:
+            text = appid_file.read_text(encoding="utf-8", errors="ignore").strip()
+        except OSError:
+            continue
         if text.isdigit():
             return int(text)
 

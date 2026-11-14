@@ -70,25 +70,31 @@ def resolve_steam_paths(user_id: str | None = None) -> SteamPaths | None:
 
 
 def find_default_proton_name(steam_root: Path) -> str:
-    """Return the Steam CompatToolMapping name for the default Proton."""
+    """Return the Steam CompatToolMapping name for the newest stable Proton."""
     common = steam_root / "steamapps" / "common"
-    if (common / "Proton - Experimental" / "proton").is_file():
-        return "proton_experimental"
     for candidate_dir, tool_name in [
         ("Proton 11.0", "proton_11"),
         ("Proton 10.0", "proton_10"),
-        ("Proton 9.0 (Beta)", "proton_9"),
         ("Proton 9.0", "proton_9"),
+        ("Proton 9.0 (Beta)", "proton_9"),
     ]:
         if (common / candidate_dir / "proton").is_file():
             return tool_name
-    return "proton_experimental"
+    if common.is_dir():
+        for entry in sorted(common.glob("Proton [0-9]*"), reverse=True):
+            if (entry / "proton").is_file():
+                major = entry.name.split()[1].split(".")[0]
+                if major.isdigit():
+                    return f"proton_{major}"
+    if (common / "Proton - Experimental" / "proton").is_file():
+        return "proton_experimental"
+    return "proton_11"
 
 
 def find_proton_binary(steam_root: Path) -> Path | None:
-    """Locate an installed Proton executable for running Windows setup.exe installers."""
+    """Locate an installed stable Proton executable for running Windows setup.exe installers."""
     common = steam_root / "steamapps" / "common"
-    for name in ("Proton - Experimental", "Proton 11.0", "Proton 10.0", "Proton 9.0"):
+    for name in ("Proton 11.0", "Proton 10.0", "Proton 9.0", "Proton - Experimental"):
         proton = common / name / "proton"
         if proton.is_file():
             return proton

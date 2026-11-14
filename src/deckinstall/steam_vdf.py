@@ -13,6 +13,7 @@ from pathlib import Path
 
 import vdf
 
+from .scanner import clean_game_name, detect_steam_appid
 from .steam_paths import SteamPaths, find_default_proton_name, is_steam_running
 
 
@@ -258,3 +259,75 @@ def remove_compat_tool(config_vdf: Path, appid_u32: int) -> None:
         _backup_file(config_vdf)
         del mapping[str(appid_u32)]
         config_vdf.write_text(vdf.dumps(data, pretty=True), encoding="utf-8")
+
+
+def infer_game_root_from_exe(exe_path: Path) -> Path:
+    """Infer the top-level game folder from an executable path."""
+    home = Path.home()
+    known_containers = {
+        (home / "Games").resolve(),
+        (home / "Downloads").resolve(),
+        (home / "Syncthing").resolve(),
+    }
+    resolved = exe_path.resolve()
+    for parent in resolved.parents:
+        if parent.parent in known_containers:
+            return parent
+    return resolved.parent
+
+
+def migrate_shortcut_to_games(
+    paths: SteamPaths,
+    entry: ShortcutEntry,
+    games_root: Path,
+    new_name: str | None = None,
+) -> tuple[int, Path, int | None]:
+    """Move a game folder to games_root/<clean_name>, preserve compatdata/saves, and update Steam.
+
+    Returns (new_appid_u32, new_exe_path, detected_steam_appid).
+    """
+    old_exe = Path(entry.exe.strip().strip('"'))
+    if not old_exe.is_file():
+        raise FileNotFoundError(f"Executável não encontrado: {old_exe}")
+
+    old_root = infer_game_root_from_exe(old_exe)
+    target_name = (new_name or "").strip() or clean_game_name(old_root.name)
+    new_root = games_root / target_name
+    games_root.mkdir(parents=True, exist_ok=True)
+
+    rel_exe = old_exe.resolve().relative_to(old_root.resolve())
+    if old_root.resolve() != new_root.resolve():
+        if new_root.exists():
+            raise FileExistsError(f"A pasta de destino já existe: {new_root}")
+        shutil.move(str(old_root), str(new_root))
+
+    new_exe = new_root / rel_exe
+    new_appid = add_or_update_shortcut(
+        paths=paths,
+        app_name=target_name,
+        exe_path=new_exe,
+        start_dir=new_exe.parent,
+        icon_path=Path(entry.icon) if entry.icon else None,
+        launch_options=entry.launch_options,
+        enable_proton=True,
+    )
+
+    if new_appid != entry.appid_u32:
+        old_compat = paths.compatdata_dir / str(entry.appid_u32)
+        new_compat = paths.compatdata_dir / str(new_appid)
+        if old_compat.is_dir() and not new_compat.exists():
+            shutil.move(str(old_compat), str(new_compat))
+
+        if paths.grid_dir.is_dir():
+            old_prefix = str(entry.appid_u32)
+            for art_file in paths.grid_dir.iterdir():
+                if art_file.is_file() and art_file.name.startswith(old_prefix):
+                    suffix = art_file.name[len(old_prefix) :]
+                    dest_art = paths.grid_dir / f"{new_appid}{suffix}"
+                    if not dest_art.exists():
+                        shutil.move(str(art_file), str(dest_art))
+
+        remove_shortcut(paths, entry.appid_u32)
+
+    steam_appid = detect_steam_appid(new_root)
+    return new_appid, new_exe, steam_appid

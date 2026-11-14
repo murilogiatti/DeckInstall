@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -40,7 +41,7 @@ from .extractor import (
     run_windows_installer,
     suggest_target_name,
 )
-from .scanner import DetectedGame, scan_all_games, scan_game_folder
+from .scanner import DetectedGame, clean_game_name, scan_all_games, scan_game_folder
 from .steam_paths import (
     SteamPaths,
     is_gamescope_session,
@@ -50,7 +51,9 @@ from .steam_paths import (
 from .steam_vdf import (
     ShortcutEntry,
     add_or_update_shortcut,
+    infer_game_root_from_exe,
     load_shortcuts,
+    migrate_shortcut_to_games,
     remove_shortcut,
     shutdown_steam,
     start_steam,
@@ -505,7 +508,7 @@ class MainWindow(QMainWindow):
         self.steam_match_combo.currentIndexChanged.connect(self._on_steam_match_changed)
         form.addRow("Correspondência:", self.steam_match_combo)
 
-        self.chk_proton = QCheckBox("Ativar Proton padrão automaticamente")
+        self.chk_proton = QCheckBox("Ativar Proton Stable automaticamente")
         self.chk_proton.setChecked(True)
         form.addRow("", self.chk_proton)
 
@@ -558,12 +561,15 @@ class MainWindow(QMainWindow):
         lib_layout.addWidget(self.shortcuts_list, 1)
 
         actions = QHBoxLayout()
+        btn_migrate = QPushButton("Migrar para ~/Games & Padronizar")
+        btn_migrate.setObjectName("primaryBtn")
+        btn_migrate.clicked.connect(self._migrate_selected_shortcut)
         btn_art = QPushButton("Baixar/Atualizar Artes do Selecionado")
-        btn_art.setObjectName("primaryBtn")
         btn_art.clicked.connect(self._update_selected_shortcut_art)
         btn_remove = QPushButton("Remover do Steam")
         btn_remove.setObjectName("dangerBtn")
         btn_remove.clicked.connect(self._remove_selected_shortcut)
+        actions.addWidget(btn_migrate)
         actions.addWidget(btn_art)
         actions.addStretch()
         actions.addWidget(btn_remove)
@@ -852,6 +858,56 @@ class MainWindow(QMainWindow):
         if removed:
             self._refresh_shortcuts()
             self.status_label.setText(f"Removido: {entry.app_name}")
+
+    def _migrate_selected_shortcut(self) -> None:
+        entry = self._selected_shortcut()
+        if not entry or not self.paths:
+            return
+        old_exe = Path(entry.exe.strip().strip('"'))
+        suggested = clean_game_name(infer_game_root_from_exe(old_exe).name)
+        new_name, ok = QInputDialog.getText(
+            self,
+            __app_name__,
+            "Nome padronizado do jogo (pasta em ~/Games e título no Steam):",
+            text=suggested,
+        )
+        if not ok or not new_name.strip():
+            return
+        if is_gamescope_session() and is_steam_running():
+            ans = QMessageBox.question(
+                self,
+                __app_name__,
+                "Você está no Modo Jogo (gamescope). Migrar reiniciará o Steam.\nContinuar?",
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+        try:
+            was_running = is_steam_running()
+            if was_running:
+                shutdown_steam()
+            new_appid, new_exe, steam_appid = migrate_shortcut_to_games(
+                paths=self.paths,
+                entry=entry,
+                games_root=Path.home() / "Games",
+                new_name=new_name.strip(),
+            )
+            if steam_appid is None:
+                matches = search_steam_games(new_name.strip(), limit=1)
+                if matches:
+                    steam_appid = matches[0].appid
+            art_msg = "Sem artes baixadas."
+            if steam_appid:
+                art = download_steam_artwork(steam_appid, new_appid, self.paths.grid_dir)
+                art_msg = f"Artes: {', '.join(art.saved_files.keys()) or 'nenhuma'}"
+            if was_running:
+                start_steam()
+            self._refresh_games()
+            self._refresh_shortcuts()
+            msg = f"Migrado para {new_exe} (ID {new_appid}). {art_msg}"
+            self.status_label.setText(msg)
+            QMessageBox.information(self, __app_name__, msg)
+        except Exception as exc:
+            QMessageBox.critical(self, __app_name__, str(exc))
 
 
 def main() -> int:

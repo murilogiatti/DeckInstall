@@ -13,6 +13,7 @@ if str(SRC) not in sys.path:
 
 from deckinstall.extractor import is_archive, suggest_target_name  # noqa: E402
 from deckinstall.scanner import clean_game_name, detect_steam_appid, scan_game_folder  # noqa: E402
+from deckinstall.steam_paths import find_default_proton_name  # noqa: E402
 
 
 class CoreTests(unittest.TestCase):
@@ -50,6 +51,21 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(detected.primary_exe, shipping)
             self.assertEqual(detected.steam_appid, 4078430)
             self.assertEqual(detect_steam_appid(game_dir), 4078430)
+
+    def test_nested_steam_appid_and_stable_proton(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nested = root / "StellarBlade" / "SB" / "Binaries" / "Win64"
+            nested.mkdir(parents=True)
+            (nested / "steam_appid.txt").write_text("3489700\n", encoding="utf-8")
+            self.assertEqual(detect_steam_appid(root / "StellarBlade"), 3489700)
+
+            common = root / "steam" / "steamapps" / "common"
+            (common / "Proton - Experimental").mkdir(parents=True)
+            (common / "Proton - Experimental" / "proton").write_text("", encoding="utf-8")
+            (common / "Proton 11.0").mkdir(parents=True)
+            (common / "Proton 11.0" / "proton").write_text("", encoding="utf-8")
+            self.assertEqual(find_default_proton_name(root / "steam"), "proton_11")
 
 
 if __name__ == "__main__":

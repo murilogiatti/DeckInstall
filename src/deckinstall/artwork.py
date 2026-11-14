@@ -9,7 +9,7 @@ import requests
 
 STEAM_SEARCH_URL = "https://store.steampowered.com/api/storesearch/"
 STEAM_CDN_BASE = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps"
-USER_AGENT = "DeckInstall/0.2.0"
+USER_AGENT = "DeckInstall/0.3.0"
 
 
 @dataclass(frozen=True)
