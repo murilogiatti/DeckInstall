@@ -393,6 +393,16 @@ class MainWindow(QMainWindow):
 
         def _cleanup() -> None:
             self._active_workers.discard(worker)
+            for attr in (
+                "_extract_worker",
+                "_search_worker",
+                "_preview_worker",
+                "_add_worker",
+                "_bulk_worker",
+                "_scan_worker",
+            ):
+                if getattr(self, attr, None) is worker:
+                    setattr(self, attr, None)
             worker.deleteLater()
 
         worker.finished.connect(_cleanup)
@@ -400,9 +410,14 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._extract_worker and self._extract_worker.isRunning():
             self._extract_worker.cancel()
+        still_running = False
         for worker in list(self._active_workers):
-            if worker.isRunning():
-                worker.wait(5000)
+            if worker.isRunning() and not worker.wait(5000):
+                still_running = True
+        if still_running:
+            self.status_label.setText("Aguardando operação em andamento terminar antes de fechar...")
+            event.ignore()
+            return
         super().closeEvent(event)
 
     def _build_ui(self) -> None:
@@ -687,7 +702,7 @@ class MainWindow(QMainWindow):
         btn_migrate.clicked.connect(self._migrate_selected_shortcut)
         btn_art = QPushButton("Atualizar Artes")
         btn_art.clicked.connect(self._update_selected_shortcut_art)
-        self.btn_cleanup = QPushButton("Limpar Prefixos...")
+        self.btn_cleanup = QPushButton("Limpar Prefixos Migrados...")
         self.btn_cleanup.clicked.connect(self._cleanup_old_prefixes)
         btn_remove = QPushButton("Remover do Steam")
         btn_remove.setObjectName("dangerBtn")
@@ -815,6 +830,7 @@ class MainWindow(QMainWindow):
             self._populate_game_form(self._detected_games[row])
 
     def _populate_game_form(self, game: DetectedGame) -> None:
+        self._search_req_id += 1
         self.add_name.setText(game.name)
         self.add_exe_combo.clear()
         for exe in game.executables:
@@ -837,6 +853,7 @@ class MainWindow(QMainWindow):
             "Executáveis (*.exe);;Todos (*)",
         )
         if path:
+            self._search_req_id += 1
             exe = Path(path)
             game = scan_game_folder(exe.parent)
             name = game.name if game else exe.stem
@@ -859,6 +876,7 @@ class MainWindow(QMainWindow):
         if not query:
             return
         if query.isdigit():
+            self._search_req_id += 1
             appid = int(query)
             self.steam_match_combo.clear()
             self.steam_match_combo.addItem(f"AppID manual: {appid}", appid)
@@ -1138,7 +1156,7 @@ class MainWindow(QMainWindow):
             return
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("Limpar Prefixos Antigos")
+        dlg.setWindowTitle("Limpar Prefixos Já Migrados e Órfãos")
         dlg.resize(680, 440)
         lay = QVBoxLayout(dlg)
         info = QLabel(
@@ -1154,8 +1172,9 @@ class MainWindow(QMainWindow):
             save_tag = " [TEM SAVES]" if cand.has_saves else ""
             item = QListWidgetItem(f"[{cand.category}] {cand.label} — {mb:.1f} MB{save_tag}")
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            auto_check = (not cand.has_saves) and cand.category != "Prefixo Externo"
             item.setCheckState(
-                Qt.CheckState.Unchecked if cand.has_saves else Qt.CheckState.Checked
+                Qt.CheckState.Checked if auto_check else Qt.CheckState.Unchecked
             )
             item.setData(Qt.ItemDataRole.UserRole, cand)
             lst.addItem(item)

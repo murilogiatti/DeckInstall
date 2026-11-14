@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
 import struct
 import subprocess
+import tempfile
+import threading
 import time
 import zlib
 from dataclasses import dataclass
@@ -15,7 +18,9 @@ from pathlib import Path
 import vdf
 
 from .scanner import clean_game_name, detect_steam_appid
-from .steam_paths import SteamPaths, find_default_proton_name, is_steam_running
+from .steam_paths import SteamPaths, find_default_proton_name, is_steam_running, list_steam_users
+
+_STEAM_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -50,11 +55,23 @@ def _quote_path(path: str) -> str:
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Write bytes to a temp file in the same directory and atomically replace target."""
+    """Write bytes to a unique temp file in the same directory and atomically replace target."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    with _STEAM_LOCK:
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -305,6 +322,21 @@ _SUBDIR_NAMES = {
 }
 
 
+_FORBIDDEN_ROOT_NAMES = {
+    ".config",
+    ".var",
+    ".local",
+    "heroic",
+    "lutris",
+    "prefixes",
+    "wine-prefixes",
+    "bottles",
+    "umu",
+    "steam",
+    "hydralauncher",
+}
+
+
 def infer_game_root_from_exe(exe_path: Path) -> Path:
     """Infer the top-level game folder from an executable path."""
     home = Path.home()
@@ -315,31 +347,41 @@ def infer_game_root_from_exe(exe_path: Path) -> Path:
         (home / "Syncthing").resolve(),
     }
     resolved = exe_path.resolve()
+    if any(part.lower() == "drive_c" for part in resolved.parts):
+        raise ValueError(
+            f"O executável está dentro de um prefixo Wine (drive_c): {resolved}. "
+            "Mova o jogo para uma pasta própria antes de migrar."
+        )
     if resolved.parent in known_containers:
         raise ValueError(
             f"O executável está solto diretamente em {resolved.parent}; "
             "coloque-o dentro de uma subpasta própria antes de migrar."
         )
+    candidate = resolved.parent
     for parent in resolved.parents:
         if parent.parent in known_containers:
-            return parent
+            candidate = parent
+            break
         if (
             len(parent.parts) >= 5
             and parent.parts[:3] == ("/", "run", "media")
             and parent.parent.name == "Games"
         ):
-            return parent
-    candidate = resolved.parent
-    while (
-        candidate.name.lower() in _SUBDIR_NAMES
-        and candidate.parent != candidate
-        and candidate.parent not in known_containers
-        and not (
-            len(candidate.parent.parts) <= 4
-            and candidate.parent.parts[:3] == ("/", "run", "media")
-        )
-    ):
-        candidate = candidate.parent
+            candidate = parent
+            break
+    else:
+        while (
+            candidate.name.lower() in _SUBDIR_NAMES
+            and candidate.parent != candidate
+            and candidate.parent not in known_containers
+            and not (
+                len(candidate.parent.parts) <= 4
+                and candidate.parent.parts[:3] == ("/", "run", "media")
+            )
+        ):
+            candidate = candidate.parent
+    if candidate.name.lower() in _FORBIDDEN_ROOT_NAMES or candidate in known_containers:
+        raise ValueError(f"Raiz inferida inválida ou protegida para migração: {candidate}")
     return candidate
 
 
@@ -365,46 +407,57 @@ def migrate_shortcut_to_games(
     games_root.mkdir(parents=True, exist_ok=True)
 
     rel_exe = old_exe.resolve().relative_to(old_root.resolve())
+    moved_root = False
     if old_root.resolve() != new_root.resolve():
         if new_root.exists():
             raise FileExistsError(f"A pasta de destino já existe: {new_root}")
         shutil.move(str(old_root), str(new_root))
+        moved_root = True
 
     new_exe = new_root / rel_exe
-    new_appid = add_or_update_shortcut(
-        paths=paths,
-        app_name=target_name,
-        exe_path=new_exe,
-        start_dir=new_exe.parent,
-        icon_path=Path(entry.icon) if entry.icon else None,
-        launch_options=entry.launch_options,
-        enable_proton=True,
-    )
+    try:
+        with _STEAM_LOCK:
+            new_appid = add_or_update_shortcut(
+                paths=paths,
+                app_name=target_name,
+                exe_path=new_exe,
+                start_dir=new_exe.parent,
+                icon_path=Path(entry.icon) if entry.icon else None,
+                launch_options=entry.launch_options,
+                enable_proton=True,
+            )
 
-    if new_appid != entry.appid_u32:
-        old_compat = paths.compatdata_dir / str(entry.appid_u32)
-        new_compat = paths.compatdata_dir / str(new_appid)
-        if old_compat.is_dir():
-            if new_compat.exists():
-                stamp = time.strftime("%Y%m%d-%H%M%S")
-                backup_compat = paths.compatdata_dir / f"{new_appid}.{stamp}.deckinstall.bak"
-                counter = 1
-                while backup_compat.exists():
-                    backup_compat = paths.compatdata_dir / f"{new_appid}.{stamp}.{counter}.deckinstall.bak"
-                    counter += 1
-                shutil.move(str(new_compat), str(backup_compat))
-            shutil.move(str(old_compat), str(new_compat))
+            if new_appid != entry.appid_u32:
+                old_compat = paths.compatdata_dir / str(entry.appid_u32)
+                new_compat = paths.compatdata_dir / str(new_appid)
+                if old_compat.is_dir():
+                    if new_compat.exists():
+                        stamp = time.strftime("%Y%m%d-%H%M%S")
+                        backup_compat = paths.compatdata_dir / f"{new_appid}.{stamp}.deckinstall.bak"
+                        counter = 1
+                        while backup_compat.exists():
+                            backup_compat = paths.compatdata_dir / f"{new_appid}.{stamp}.{counter}.deckinstall.bak"
+                            counter += 1
+                        shutil.move(str(new_compat), str(backup_compat))
+                    shutil.move(str(old_compat), str(new_compat))
 
-        if paths.grid_dir.is_dir():
-            old_prefix = str(entry.appid_u32)
-            for art_file in paths.grid_dir.iterdir():
-                if art_file.is_file() and art_file.name.startswith(old_prefix):
-                    suffix = art_file.name[len(old_prefix) :]
-                    dest_art = paths.grid_dir / f"{new_appid}{suffix}"
-                    if not dest_art.exists():
-                        shutil.move(str(art_file), str(dest_art))
+                if paths.grid_dir.is_dir():
+                    old_prefix = str(entry.appid_u32)
+                    for art_file in paths.grid_dir.iterdir():
+                        if art_file.is_file() and art_file.name.startswith(old_prefix):
+                            suffix = art_file.name[len(old_prefix) :]
+                            dest_art = paths.grid_dir / f"{new_appid}{suffix}"
+                            if not dest_art.exists():
+                                shutil.move(str(art_file), str(dest_art))
 
-        remove_shortcut(paths, entry.appid_u32)
+                remove_shortcut(paths, entry.appid_u32)
+    except Exception:
+        if moved_root and new_root.exists() and not old_root.exists():
+            try:
+                shutil.move(str(new_root), str(old_root))
+            except OSError:
+                logging.exception("Rollback failed moving %s back to %s", new_root, old_root)
+        raise
 
     steam_appid = detect_steam_appid(new_root)
     import_external_prefix_saves(
@@ -535,20 +588,43 @@ def import_external_prefix_saves(
     if not prefixes:
         return 0
     dst_users = paths.compatdata_dir / str(shortcut_appid_u32) / "pfx" / "drive_c" / "users"
+    dst_users.mkdir(parents=True, exist_ok=True)
+    dst_users_resolved = dst_users.resolve()
     copied = 0
+    errors: list[str] = []
     for prefix_dir in prefixes:
         src_users = _prefix_users_dir(prefix_dir)
         if src_users is None:
             continue
         for src_file, dst_file in _iter_prefix_save_pairs(src_users, dst_users):
             try:
+                if dst_file.is_symlink():
+                    continue
                 if dst_file.exists() and dst_file.stat().st_mtime >= src_file.stat().st_mtime:
                     continue
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src_file, dst_file)
+                if not dst_file.parent.resolve().is_relative_to(dst_users_resolved):
+                    continue
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f".{dst_file.name}.", suffix=".tmp", dir=str(dst_file.parent)
+                )
+                os.close(fd)
+                tmp_path = Path(tmp_name)
+                try:
+                    shutil.copy2(src_file, tmp_path, follow_symlinks=False)
+                    os.replace(tmp_path, dst_file)
+                except Exception:
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+                    raise
                 copied += 1
-            except OSError:
-                continue
+            except OSError as exc:
+                logging.warning("Falha ao importar save %s -> %s: %s", src_file, dst_file, exc)
+                errors.append(f"{src_file.name}: {exc}")
+    if errors:
+        raise RuntimeError(f"Falha ao importar {len(errors)} save(s): {errors[0]}")
     return copied
 
 
@@ -744,7 +820,14 @@ def find_cleanup_candidates(
                 )
             )
 
-    active_shortcuts = {e.appid_u32 for e in load_shortcuts(paths.shortcuts_vdf)}
+    active_shortcuts: set[int] = set()
+    all_users = list_steam_users(paths.steam_root)
+    if not all_users:
+        active_shortcuts = {e.appid_u32 for e in load_shortcuts(paths.shortcuts_vdf)}
+    else:
+        for uid in all_users:
+            sv = paths.steam_root / "userdata" / uid / "config" / "shortcuts.vdf"
+            active_shortcuts.update(e.appid_u32 for e in load_shortcuts(sv))
     installed_steam = _installed_steam_appids(paths.steam_root)
     if paths.compatdata_dir.is_dir():
         for child in paths.compatdata_dir.iterdir():
@@ -757,7 +840,7 @@ def find_cleanup_candidates(
                         label=child.name,
                         path=child,
                         size_bytes=_dir_size_bytes(child),
-                        has_saves=False,
+                        has_saves=_prefix_has_saves(child),
                     )
                 )
                 continue

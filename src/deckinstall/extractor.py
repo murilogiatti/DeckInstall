@@ -57,7 +57,7 @@ def _select_extract_cmd(archive: Path, out_dir: Path) -> list[str]:
 
 
 def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
-    """Move extracted contents to final_dir, merging safely if directories already exist."""
+    """Move extracted contents to final_dir, merging safely without following symlinks."""
     entries = list(temp_dir.iterdir())
     source_root = (
         entries[0]
@@ -65,11 +65,37 @@ def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
         else temp_dir
     )
     final_dir.mkdir(parents=True, exist_ok=True)
+    final_resolved = final_dir.resolve()
     for item in source_root.iterdir():
         dest = final_dir / item.name
+        if dest.is_symlink():
+            dest.unlink()
+        elif dest.exists() and not dest.resolve().is_relative_to(final_resolved):
+            raise RuntimeError(f"Destino fora da pasta permitida: {dest}")
         if dest.exists():
-            if item.is_dir() and dest.is_dir():
-                shutil.copytree(item, dest, dirs_exist_ok=True, symlinks=True)
+            if item.is_dir() and not item.is_symlink() and dest.is_dir():
+                for root_s, dirs_s, files_s in os.walk(item, followlinks=False):
+                    rel = Path(root_s).relative_to(item)
+                    target_sub = dest / rel
+                    if target_sub.is_symlink():
+                        target_sub.unlink()
+                    target_sub.mkdir(parents=True, exist_ok=True)
+                    for d in list(dirs_s):
+                        src_d = Path(root_s) / d
+                        dst_d = target_sub / d
+                        if src_d.is_symlink():
+                            dirs_s.remove(d)
+                            if dst_d.is_symlink() or dst_d.is_file():
+                                dst_d.unlink()
+                            elif dst_d.is_dir():
+                                shutil.rmtree(dst_d)
+                            shutil.copy2(src_d, dst_d, follow_symlinks=False)
+                    for f in files_s:
+                        src_f = Path(root_s) / f
+                        dst_f = target_sub / f
+                        if dst_f.is_symlink():
+                            dst_f.unlink()
+                        shutil.copy2(src_f, dst_f, follow_symlinks=False)
                 shutil.rmtree(item)
                 continue
             if dest.is_dir():
@@ -77,6 +103,47 @@ def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
             else:
                 dest.unlink()
         shutil.move(str(item), str(dest))
+
+
+def _drain_stream_lines(
+    proc: subprocess.Popen[bytes],
+    cancel_flag: Callable[[], bool] | None,
+    on_line: Callable[[str], None],
+    cancel_msg: str,
+) -> int:
+    """Read subprocess stdout non-blockingly so cancel_flag is checked every <=0.2s."""
+    assert proc.stdout is not None
+    fd = proc.stdout.fileno()
+    os.set_blocking(fd, False)
+    buf = ""
+    while True:
+        if cancel_flag and cancel_flag():
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+            raise RuntimeError(cancel_msg)
+        ready, _, _ = select.select([fd], [], [], 0.2)
+        if ready:
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                if buf.strip():
+                    on_line(buf)
+                break
+            buf += chunk.decode("utf-8", errors="replace")
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                on_line(line)
+        elif proc.poll() is not None:
+            if buf.strip():
+                on_line(buf)
+            break
+    rc = proc.wait()
+    if cancel_flag and cancel_flag():
+        raise RuntimeError(cancel_msg)
+    return rc
 
 
 def extract_archive(
@@ -101,42 +168,20 @@ def extract_archive(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            errors="replace",
         )
         pct = 10
-        assert proc.stdout is not None
-        while True:
-            if cancel_flag and cancel_flag():
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=2)
-                raise RuntimeError("Extração cancelada pelo usuário.")
-            ready, _, _ = select.select([proc.stdout], [], [], 0.2)
-            if ready:
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                m = re.search(r"(\d{1,3})%", line)
-                if m:
-                    pct = min(95, max(pct, int(m.group(1))))
-                elif pct < 90:
-                    pct = min(90, pct + 1)
-                if on_progress:
-                    on_progress(pct, line.strip()[:120] or f"Extraindo {archive.name}...")
-            elif proc.poll() is not None:
-                # Drain any remaining lines after process exit.
-                for line in proc.stdout:
-                    if on_progress and line.strip():
-                        on_progress(pct, line.strip()[:120])
-                break
 
-        rc = proc.wait()
-        if cancel_flag and cancel_flag():
-            raise RuntimeError("Extração cancelada pelo usuário.")
+        def _handle_line(line: str) -> None:
+            nonlocal pct
+            m = re.search(r"(\d{1,3})%", line)
+            if m:
+                pct = min(95, max(pct, int(m.group(1))))
+            elif pct < 90:
+                pct = min(90, pct + 1)
+            if on_progress:
+                on_progress(pct, line.strip()[:120] or f"Extraindo {archive.name}...")
+
+        rc = _drain_stream_lines(proc, cancel_flag, _handle_line, "Extração cancelada pelo usuário.")
         if rc != 0:
             raise RuntimeError(f"Falha ao extrair {archive.name} (código {rc}).")
 
@@ -179,31 +224,13 @@ def run_windows_installer(
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            errors="replace",
         )
-        if proc.stdout:
-            while True:
-                if cancel_flag and cancel_flag():
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait(timeout=2)
-                    raise RuntimeError("Instalador cancelado pelo usuário.")
-                ready, _, _ = select.select([proc.stdout], [], [], 0.25)
-                if ready:
-                    line = proc.stdout.readline()
-                    if not line:
-                        break
-                    if on_log and line.strip():
-                        on_log(line.strip()[:140])
-                elif proc.poll() is not None:
-                    break
-        rc = proc.wait()
-        if cancel_flag and cancel_flag():
-            raise RuntimeError("Instalador cancelado pelo usuário.")
+
+        def _handle_inst_line(line: str) -> None:
+            if on_log and line.strip():
+                on_log(line.strip()[:140])
+
+        rc = _drain_stream_lines(proc, cancel_flag, _handle_inst_line, "Instalador cancelado pelo usuário.")
         if rc != 0:
             raise RuntimeError(f"Instalador encerrou com código {rc}.")
     return target_dir

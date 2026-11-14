@@ -15,7 +15,9 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-if "vdf" not in sys.modules:
+try:
+    import vdf  # type: ignore  # noqa: F401
+except ImportError:
     fake_vdf = types.ModuleType("vdf")
     fake_vdf.binary_loads = lambda b: {"shortcuts": {}}
     fake_vdf.binary_dumps = lambda d: b"VDF"
@@ -420,6 +422,54 @@ class CoreTests(unittest.TestCase):
             self.assertGreaterEqual(freed, 2560)
             self.assertFalse(orphan.exists())
             self.assertTrue((compat_dir / "3000000001").exists())
+
+    def test_rollback_drive_c_guard_and_multiuser_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # 1) drive_c guard in infer_game_root_from_exe
+            pfx_exe = root / ".config" / "hydralauncher" / "wine-prefixes" / "123" / "drive_c" / "Game" / "g.exe"
+            pfx_exe.parent.mkdir(parents=True)
+            pfx_exe.write_bytes(b"MZ")
+            with self.assertRaises(ValueError):
+                infer_game_root_from_exe(pfx_exe)
+
+            # 2) rollback if add_or_update_shortcut fails after moving game dir
+            dl_game = root / "Downloads" / "RollbackGame"
+            dl_game.mkdir(parents=True)
+            exe = dl_game / "Game.exe"
+            exe.write_bytes(b"MZ")
+            games_root = root / "Games"
+            paths = SteamPaths(
+                steam_root=root / "Steam",
+                user_id="1",
+                userdata_dir=root / "Steam" / "userdata" / "1",
+                shortcuts_vdf=root / "Steam" / "userdata" / "1" / "config" / "shortcuts.vdf",
+                grid_dir=root / "Steam" / "userdata" / "1" / "config" / "grid",
+                config_vdf=root / "Steam" / "config" / "config.vdf",
+                compatdata_dir=root / "Steam" / "steamapps" / "compatdata",
+            )
+            entry = ShortcutEntry("0", 3000000002, "RollbackGame", f'"{exe}"', f'"{dl_game}"', "", "")
+            with mock.patch("deckinstall.steam_vdf.add_or_update_shortcut", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    migrate_shortcut_to_games(paths, entry, games_root, "RollbackGame")
+            self.assertTrue(dl_game.is_dir())
+            self.assertFalse((games_root / "RollbackGame").exists())
+
+            # 3) multi-user compatdata protection + backup has_saves detection
+            (root / "Steam" / "userdata" / "1").mkdir(parents=True, exist_ok=True)
+            (root / "Steam" / "userdata" / "2" / "config").mkdir(parents=True, exist_ok=True)
+            other_compat = paths.compatdata_dir / "3555555555"
+            (other_compat / "pfx" / "drive_c" / "users").mkdir(parents=True)
+            bak_with_save = paths.compatdata_dir / "3000000002.20261114.deckinstall.bak"
+            (bak_with_save / "pfx" / "drive_c" / "users" / "steamuser" / "Documents").mkdir(parents=True)
+            (bak_with_save / "pfx" / "drive_c" / "users" / "steamuser" / "Documents" / "s.dat").write_bytes(b"save")
+
+            other_entry = ShortcutEntry("0", 3555555555, "OtherUserGame", '"/g/o.exe"', '"/g"', "", "")
+            with mock.patch("deckinstall.steam_vdf.load_shortcuts", side_effect=[[], [other_entry]]):
+                cands = find_cleanup_candidates(paths, extra_external_roots=[])
+            self.assertNotIn(other_compat, {c.path for c in cands})
+            bak_cand = next(c for c in cands if c.path == bak_with_save)
+            self.assertTrue(bak_cand.has_saves)
 
 
 if __name__ == "__main__":
