@@ -56,7 +56,7 @@ from .steam_vdf import (
     MigrationPlanItem,
     ShortcutEntry,
     add_or_update_shortcut,
-    delete_cleanup_candidates,
+    delete_cleanup_candidates_checked,
     find_cleanup_candidates,
     import_external_prefix_saves,
     infer_game_root_from_exe,
@@ -328,12 +328,6 @@ class BulkMigrateWorker(QThread):
                         matches = search_steam_games(item.new_name, limit=1)
                         if matches:
                             steam_appid = matches[0].appid
-                            import_external_prefix_saves(
-                                paths=self.paths,
-                                shortcut_appid_u32=new_appid,
-                                game_name=item.new_name,
-                                steam_appid=steam_appid,
-                            )
                     if steam_appid:
                         download_steam_artwork(steam_appid, new_appid, self.paths.grid_dir)
                     migrated.append(item.new_name)
@@ -341,7 +335,7 @@ class BulkMigrateWorker(QThread):
                     errors.append(f"{item.entry.app_name}: {exc}")
 
             self.status.emit("Sincronizando e validando saves de todos os atalhos...")
-            checked, copied = sync_all_external_saves(self._paths)
+            checked, copied = sync_all_external_saves(self.paths)
 
             summary = (
                 f"Migrados ({len(migrated)}): {', '.join(migrated) or 'nenhum'}.\n"
@@ -356,6 +350,29 @@ class BulkMigrateWorker(QThread):
             if was_running and not is_steam_running():
                 self.status.emit("Reiniciando Steam...")
                 start_steam()
+
+
+def _is_wine_game_running() -> bool:
+    """Return True if a Windows .exe process appears to be running under Wine/Proton."""
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return False
+    for p in proc.iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            cmd = (
+                (p / "cmdline")
+                .read_bytes()
+                .replace(b"\x00", b" ")
+                .decode("utf-8", errors="ignore")
+                .lower()
+            )
+            if ".exe" in cmd and "wineserver" not in cmd:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _make_card() -> tuple[QFrame, QVBoxLayout]:
@@ -377,6 +394,7 @@ class MainWindow(QMainWindow):
         self.paths = resolve_steam_paths()
         self._detected_games: list[DetectedGame] = []
         self._active_workers: set[QThread] = set()
+        self._closing_pending = False
         self._search_req_id = 0
         self._preview_req_id = 0
         self._extract_worker: ExtractWorker | None = None
@@ -411,17 +429,17 @@ class MainWindow(QMainWindow):
                 if getattr(self, attr, None) is worker:
                     setattr(self, attr, None)
             worker.deleteLater()
+            if self._closing_pending and not any(w.isRunning() for w in self._active_workers):
+                self._closing_pending = False
+                self.close()
 
         worker.finished.connect(_cleanup)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._extract_worker and self._extract_worker.isRunning():
             self._extract_worker.cancel()
-        still_running = False
-        for worker in list(self._active_workers):
-            if worker.isRunning() and not worker.wait(5000):
-                still_running = True
-        if still_running:
+        if any(w.isRunning() for w in self._active_workers):
+            self._closing_pending = True
             self.status_label.setText("Aguardando operação em andamento terminar antes de fechar...")
             event.ignore()
             return
@@ -1211,6 +1229,10 @@ class MainWindow(QMainWindow):
 
                 def run(self) -> None:
                     try:
+                        if _is_wine_game_running():
+                            raise RuntimeError(
+                                "Feche o jogo Windows em execução antes de sincronizar saves."
+                            )
                         checked, copied = sync_all_external_saves(self._paths)
                         self.done.emit(checked, copied)
                     except Exception as exc:
@@ -1267,27 +1289,37 @@ class MainWindow(QMainWindow):
     def _cleanup_old_prefixes(self) -> None:
         if not self.paths:
             return
-        self.btn_cleanup.setEnabled(False)
+        self._set_steam_busy(True)
         self.status_label.setText("Buscando prefixos antigos e compatdata órfãos...")
 
         class _CleanupScanWorker(QThread):
             found = Signal(list)
+            failed = Signal(str)
 
             def __init__(self, paths: SteamPaths) -> None:
                 super().__init__()
                 self._paths = paths
 
             def run(self) -> None:
-                self.found.emit(find_cleanup_candidates(self._paths))
+                try:
+                    self.found.emit(find_cleanup_candidates(self._paths))
+                except Exception as exc:
+                    self.failed.emit(str(exc))
+
+        def _on_scan_failed(err: str) -> None:
+            self._set_steam_busy(False)
+            self.status_label.setText("Erro ao buscar prefixos.")
+            QMessageBox.critical(self, __app_name__, f"Erro ao buscar prefixos: {err}")
 
         worker = _CleanupScanWorker(self.paths)
         self._track_worker(worker)
         worker.found.connect(self._show_cleanup_dialog)
+        worker.failed.connect(_on_scan_failed)
         worker.start()
 
     def _show_cleanup_dialog(self, candidates: list[CleanupCandidate]) -> None:
-        self.btn_cleanup.setEnabled(True)
         if not candidates:
+            self._set_steam_busy(False)
             self.status_label.setText("Nenhum prefixo antigo ou órfão encontrado.")
             QMessageBox.information(self, __app_name__, "Tudo limpo! Nenhum prefixo antigo ou órfão encontrado.")
             return
@@ -1388,6 +1420,10 @@ class MainWindow(QMainWindow):
 
                 def run(self) -> None:
                     try:
+                        if _is_wine_game_running():
+                            raise RuntimeError(
+                                "Feche o jogo Windows em execução antes de validar saves."
+                            )
                         entries = load_shortcuts(self._paths.shortcuts_vdf)
                         pending_plan = plan_bulk_migration(
                             entries=entries,
@@ -1436,38 +1472,57 @@ class MainWindow(QMainWindow):
         btn_revalidate.clicked.connect(_revalidate_now)
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
+            self._set_steam_busy(False)
             return
         selected = [
             lst.item(i).data(Qt.ItemDataRole.UserRole)
             for i in range(lst.count())
             if lst.item(i).checkState() == Qt.CheckState.Checked
         ]
-        if not selected:
+        if not selected or not self.paths:
+            self._set_steam_busy(False)
             return
-        self._set_steam_busy(True)
         self.status_label.setText(f"Apagando {len(selected)} prefixo(s)/backup(s)...")
 
         class _CleanupDeleteWorker(QThread):
-            done = Signal(int, int)
+            done = Signal(int, int, list)
+            failed = Signal(str)
 
-            def __init__(self, items: list[CleanupCandidate]) -> None:
+            def __init__(self, paths: SteamPaths, items: list[CleanupCandidate]) -> None:
                 super().__init__()
+                self._paths = paths
                 self._items = items
 
             def run(self) -> None:
-                deleted, freed = delete_cleanup_candidates(self._items)
-                self.done.emit(deleted, freed)
+                try:
+                    deleted, freed, errs = delete_cleanup_candidates_checked(
+                        self._paths, self._items
+                    )
+                    self.done.emit(deleted, freed, errs)
+                except Exception as exc:
+                    self.failed.emit(str(exc))
 
-        worker = _CleanupDeleteWorker(selected)
+        worker = _CleanupDeleteWorker(self.paths, selected)
         self._track_worker(worker)
 
-        def _on_deleted(deleted: int, freed: int) -> None:
+        def _on_deleted(deleted: int, freed: int, errs: list[str]) -> None:
             self._set_steam_busy(False)
             msg = f"Removidos {deleted} item(ns), liberando {freed / (1024 * 1024):.1f} MB."
-            self.status_label.setText(msg)
-            QMessageBox.information(self, __app_name__, msg)
+            if errs:
+                msg += "\n\nAvisos/Erros:\n" + "\n".join(errs[:10])
+            self.status_label.setText(f"Removidos {deleted} item(ns).")
+            if errs:
+                QMessageBox.warning(self, __app_name__, msg)
+            else:
+                QMessageBox.information(self, __app_name__, msg)
+
+        def _on_delete_failed(err: str) -> None:
+            self._set_steam_busy(False)
+            self.status_label.setText("Erro ao apagar prefixos.")
+            QMessageBox.critical(self, __app_name__, f"Erro ao apagar prefixos: {err}")
 
         worker.done.connect(_on_deleted)
+        worker.failed.connect(_on_delete_failed)
         worker.start()
 
 

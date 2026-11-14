@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -392,10 +393,25 @@ def _rewrite_launch_options(
                 new_tok = upd
                 changed = True
         out_tokens.append(new_tok)
-    return shlex.join(out_tokens) if changed else launch_options
+    if not changed:
+        return launch_options
+    formatted: list[str] = []
+    for tok in out_tokens:
+        if "=" in tok and not tok.startswith("-"):
+            key, val = tok.split("=", 1)
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                formatted.append(f"{key}={shlex.quote(val)}")
+                continue
+        if tok in {"&&", "||", ";", "|"}:
+            formatted.append(tok)
+        else:
+            formatted.append(shlex.quote(tok))
+    return " ".join(formatted)
 
 
-def _has_proton_mapping(config_vdf: Path, appid_u32: int) -> bool:
+def _has_proton_mapping(
+    config_vdf: Path, appid_u32: int, expected_tool: str | None = None
+) -> bool:
     if not config_vdf.is_file():
         return False
     try:
@@ -408,7 +424,14 @@ def _has_proton_mapping(config_vdf: Path, appid_u32: int) -> bool:
             .get("CompatToolMapping", {})
         )
         entry = mapping.get(str(appid_u32))
-        return isinstance(entry, dict) and bool(str(entry.get("name") or "").strip())
+        if not isinstance(entry, dict):
+            return False
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            return False
+        if expected_tool:
+            return name == expected_tool
+        return True
     except Exception:
         return False
 
@@ -483,13 +506,6 @@ def migrate_shortcut_to_games(
     games_root.mkdir(parents=True, exist_ok=True)
 
     rel_exe = old_exe.resolve().relative_to(old_root.resolve())
-    moved_root = False
-    if old_root.resolve() != new_root.resolve():
-        if new_root.exists():
-            raise FileExistsError(f"A pasta de destino já existe: {new_root}")
-        shutil.move(str(old_root), str(new_root))
-        moved_root = True
-
     new_exe = new_root / rel_exe
     predicted_appid, _ = compute_shortcut_appid(_quote_path(str(new_exe)), target_name)
     old_compat = paths.compatdata_dir / str(entry.appid_u32)
@@ -504,12 +520,19 @@ def migrate_shortcut_to_games(
 
     shortcuts_snap = paths.shortcuts_vdf.read_bytes() if paths.shortcuts_vdf.is_file() else None
     config_snap = paths.config_vdf.read_bytes() if paths.config_vdf.is_file() else None
+    moved_root = False
     moved_compat_pair: tuple[Path, Path] | None = None
     copied_compat_dst: Path | None = None
     backed_compat_pair: tuple[Path, Path] | None = None
     moved_art_pairs: list[tuple[Path, Path]] = []
 
     try:
+        if old_root.resolve() != new_root.resolve():
+            if new_root.exists():
+                raise FileExistsError(f"A pasta de destino já existe: {new_root}")
+            shutil.move(str(old_root), str(new_root))
+            moved_root = True
+
         with _STEAM_LOCK:
             new_appid = add_or_update_shortcut(
                 paths=paths,
@@ -542,8 +565,8 @@ def migrate_shortcut_to_games(
                         shutil.move(str(new_compat), str(backup_compat))
                         backed_compat_pair = (backup_compat, new_compat)
                     if used_by_other:
-                        shutil.copytree(old_compat, new_compat, symlinks=True)
                         copied_compat_dst = new_compat
+                        shutil.copytree(old_compat, new_compat, symlinks=True)
                     else:
                         shutil.move(str(old_compat), str(new_compat))
                         moved_compat_pair = (new_compat, old_compat)
@@ -721,6 +744,18 @@ def _iter_prefix_save_pairs(src_users: Path, dst_users: Path):
                     yield src_file, dst_root / rel_dir / fname
 
 
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        while chunk := fh.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _strip_vdf_quotes(val: str) -> str:
+    return val.strip().strip('"').strip()
+
+
 def import_external_prefix_saves(
     paths: SteamPaths,
     shortcut_appid_u32: int,
@@ -754,6 +789,11 @@ def import_external_prefix_saves(
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
                 if not dst_file.parent.resolve().is_relative_to(dst_users_resolved):
                     continue
+                if dst_file.exists() and (
+                    dst_file.stat().st_size != src_file.stat().st_size
+                    or _file_sha256(dst_file) != _file_sha256(src_file)
+                ):
+                    _backup_file(dst_file, keep=3)
                 fd, tmp_name = tempfile.mkstemp(
                     prefix=f".{dst_file.name}.", suffix=".tmp", dir=str(dst_file.parent)
                 )
@@ -852,7 +892,11 @@ def plan_bulk_migration(
         already_named = entry.app_name == clean_name and old_root.resolve() == new_root.resolve()
         if already_in_games and already_named:
             steam_appid = detect_steam_appid(old_root)
-            needs_proton = bool(config_vdf and not _has_proton_mapping(config_vdf, entry.appid_u32))
+            expected_proton = find_default_proton_name(config_vdf.parent.parent) if config_vdf else None
+            needs_proton = bool(
+                config_vdf
+                and not _has_proton_mapping(config_vdf, entry.appid_u32, expected_tool=expected_proton)
+            )
             has_pending = _has_pending_external_saves(
                 compatdata_dir, entry.appid_u32, clean_name, steam_appid, search_roots
             )
@@ -903,17 +947,52 @@ def _dir_size_bytes(path: Path) -> int:
     return total
 
 
+_PROGRAMDATA_SKIP_DIRS = {
+    "microsoft",
+    "package cache",
+    "packages",
+    "usoshared",
+    "ssh",
+    "temp",
+    "nvidia",
+    "amd",
+}
+
+
+def _prefix_programdata_dir(prefix_dir: Path) -> Path | None:
+    for rel in (Path("pfx") / "drive_c" / "ProgramData", Path("drive_c") / "ProgramData"):
+        cand = prefix_dir / rel
+        if cand.is_dir():
+            return cand
+    return None
+
+
 def _prefix_has_saves(prefix_dir: Path) -> bool:
     src_users = _prefix_users_dir(prefix_dir)
     if src_users is None:
-        return False
+        return True
     dummy_dst = prefix_dir / "__unused__"
-    for src_file, _ in _iter_prefix_save_pairs(src_users, dummy_dst):
-        try:
-            if src_file.stat().st_size > 0:
+    try:
+        for src_file, _ in _iter_prefix_save_pairs(src_users, dummy_dst):
+            try:
+                if src_file.stat().st_size > 0:
+                    return True
+            except OSError:
                 return True
-        except OSError:
-            continue
+        prog_data = _prefix_programdata_dir(prefix_dir)
+        if prog_data is not None:
+            for dirpath, dirnames, filenames in os.walk(prog_data, followlinks=False):
+                dirnames[:] = [d for d in dirnames if d.lower() not in _PROGRAMDATA_SKIP_DIRS]
+                cur = Path(dirpath)
+                for fname in filenames:
+                    fp = cur / fname
+                    try:
+                        if not fp.is_symlink() and fp.is_file() and fp.stat().st_size > 0:
+                            return True
+                    except OSError:
+                        return True
+    except OSError:
+        return True
     return False
 
 
@@ -971,17 +1050,32 @@ def _infer_prefix_game_name(prefix_dir: Path) -> str:
                     except OSError:
                         inner = []
                     if inner:
-                        return inner[0].name
-                return sd.name
+                        for inn in inner:
+                            if any(p.is_file() for p in inn.rglob("*")):
+                                return inn.name
+                if any(p.is_file() for p in sd.rglob("*")):
+                    return sd.name
     return ""
 
 
 def _prefix_saves_verified_in_target(src_prefix: Path, dst_compatdata: Path) -> bool:
-    """Return True if src_prefix has >=1 non-empty save and all are present & up-to-date in dst_compatdata."""
+    """Return True if src_prefix has >=1 non-empty save and all are present, identical, and independent in dst."""
     src_users = _prefix_users_dir(src_prefix)
     dst_users = _prefix_users_dir(dst_compatdata)
     if src_users is None or dst_users is None:
         return False
+    prog_data = _prefix_programdata_dir(src_prefix)
+    if prog_data is not None:
+        for dirpath, dirnames, filenames in os.walk(prog_data, followlinks=False):
+            dirnames[:] = [d for d in dirnames if d.lower() not in _PROGRAMDATA_SKIP_DIRS]
+            cur = Path(dirpath)
+            for fname in filenames:
+                fp = cur / fname
+                try:
+                    if fp.is_file() and fp.stat().st_size > 0:
+                        return False
+                except OSError:
+                    return False
     any_nonempty = False
     for src_file, dst_file in _iter_prefix_save_pairs(src_users, dst_users):
         try:
@@ -994,12 +1088,37 @@ def _prefix_saves_verified_in_target(src_prefix: Path, dst_compatdata: Path) -> 
         if dst_file.is_symlink() or not dst_file.is_file():
             return False
         try:
+            if os.path.samefile(src_file, dst_file) or src_file.resolve() == dst_file.resolve():
+                return False
             dst_stat = dst_file.stat()
+            if (
+                dst_stat.st_size != src_stat.st_size
+                or dst_stat.st_mtime < src_stat.st_mtime
+                or _file_sha256(src_file) != _file_sha256(dst_file)
+            ):
+                return False
         except OSError:
             return False
-        if dst_stat.st_size == 0 or dst_stat.st_mtime < src_stat.st_mtime:
-            return False
     return any_nonempty
+
+
+def _entry_steam_appid(entry: ShortcutEntry) -> int | None:
+    start_str = _strip_vdf_quotes(entry.start_dir)
+    if start_str:
+        sa = detect_steam_appid(Path(start_str))
+        if sa:
+            return sa
+    exe_str = _strip_vdf_quotes(entry.exe)
+    if exe_str:
+        exe_path = Path(exe_str)
+        sa = detect_steam_appid(exe_path.parent)
+        if sa:
+            return sa
+        try:
+            return detect_steam_appid(infer_game_root_from_exe(exe_path))
+        except Exception:
+            pass
+    return None
 
 
 def sync_all_external_saves(
@@ -1014,12 +1133,13 @@ def sync_all_external_saves(
     checked = 0
     copied = 0
     for entry in entries:
-        if not entry.exe.lower().endswith(".exe") and not (
+        exe_clean = _strip_vdf_quotes(entry.exe)
+        if not exe_clean.lower().endswith(".exe") and not (
             paths.compatdata_dir / str(entry.appid_u32)
         ).is_dir():
             continue
         checked += 1
-        steam_appid = detect_steam_appid(Path(entry.start_dir)) if entry.start_dir else None
+        steam_appid = _entry_steam_appid(entry)
         roots = extra_external_roots
         if roots is None:
             roots = external_prefix_roots()
@@ -1059,6 +1179,27 @@ def _installed_steam_appids(steam_root: Path) -> set[int]:
     return appids
 
 
+def _is_prefix_referenced_by_shortcuts(
+    prefix_resolved: Path, entries: list[ShortcutEntry]
+) -> bool:
+    """Return True if any shortcut exe, start_dir, icon, or launch_options points inside prefix_resolved."""
+    prefix_str = str(prefix_resolved)
+    for entry in entries:
+        if prefix_str and prefix_str in entry.launch_options:
+            return True
+        for raw in (entry.exe, entry.start_dir, entry.icon):
+            cleaned = _strip_vdf_quotes(raw)
+            if not cleaned:
+                continue
+            try:
+                p = Path(cleaned).resolve()
+                if p == prefix_resolved or p.is_relative_to(prefix_resolved):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
 def find_cleanup_candidates(
     paths: SteamPaths,
     extra_external_roots: list[Path] | None = None,
@@ -1068,6 +1209,17 @@ def find_cleanup_candidates(
     seen: set[Path] = set()
 
     current_entries = load_shortcuts(paths.shortcuts_vdf)
+    all_users = list_steam_users(paths.steam_root)
+    all_user_entries: list[ShortcutEntry] = list(current_entries)
+    if all_users:
+        seen_ids = {e.appid_u32 for e in current_entries}
+        for uid in all_users:
+            sv = paths.steam_root / "userdata" / uid / "config" / "shortcuts.vdf"
+            for e in load_shortcuts(sv):
+                if e.appid_u32 not in seen_ids:
+                    all_user_entries.append(e)
+                    seen_ids.add(e.appid_u32)
+
     by_norm_key: dict[str, ShortcutEntry] = {}
     by_steam_appid: dict[str, ShortcutEntry] = {}
     by_appid_u32: dict[int, ShortcutEntry] = {}
@@ -1076,11 +1228,10 @@ def find_cleanup_candidates(
         nk = _norm_key(entry.app_name)
         if nk and nk not in by_norm_key:
             by_norm_key[nk] = entry
-        if entry.start_dir:
-            sa = detect_steam_appid(Path(entry.start_dir))
-            if sa:
-                by_steam_appid.setdefault(str(sa), entry)
-                by_steam_appid.setdefault(f"umu-{sa}", entry)
+        sa = _entry_steam_appid(entry)
+        if sa:
+            by_steam_appid.setdefault(str(sa), entry)
+            by_steam_appid.setdefault(f"umu-{sa}", entry)
 
     for root in extra_external_roots or external_prefix_roots():
         if not root.is_dir():
@@ -1094,10 +1245,15 @@ def find_cleanup_candidates(
                 continue
             if _prefix_users_dir(child) is None:
                 continue
-            resolved = child.resolve()
+            try:
+                resolved = child.resolve()
+            except OSError:
+                continue
             if resolved in seen:
                 continue
             seen.add(resolved)
+            if _is_prefix_referenced_by_shortcuts(resolved, all_user_entries):
+                continue
             matched_entry = by_steam_appid.get(child.name) or by_norm_key.get(_norm_key(child.name))
             has_saves = _prefix_has_saves(child)
             saves_verified = False
@@ -1118,21 +1274,14 @@ def find_cleanup_candidates(
                 )
             )
 
-    active_shortcuts: set[int] = set()
-    all_users = list_steam_users(paths.steam_root)
-    if not all_users:
-        active_shortcuts = {e.appid_u32 for e in current_entries}
-    else:
-        for uid in all_users:
-            sv = paths.steam_root / "userdata" / uid / "config" / "shortcuts.vdf"
-            active_shortcuts.update(e.appid_u32 for e in load_shortcuts(sv))
+    active_shortcuts = {e.appid_u32 for e in all_user_entries}
     installed_steam = _installed_steam_appids(paths.steam_root)
     if paths.compatdata_dir.is_dir():
         for child in paths.compatdata_dir.iterdir():
             if not child.is_dir():
                 continue
             if child.name.endswith(".deckinstall.bak"):
-                prefix_id = child.name.removesuffix(".deckinstall.bak")
+                prefix_id = child.name.split(".", 1)[0]
                 matched_entry = (
                     by_appid_u32.get(int(prefix_id)) if prefix_id.isdigit() else None
                 )
@@ -1205,3 +1354,38 @@ def delete_cleanup_candidates(candidates: list[CleanupCandidate]) -> tuple[int, 
         except OSError:
             continue
     return deleted, freed
+
+
+def delete_cleanup_candidates_checked(
+    paths: SteamPaths,
+    candidates: list[CleanupCandidate],
+    extra_external_roots: list[Path] | None = None,
+) -> tuple[int, int, list[str]]:
+    """Revalidate candidates immediately before deleting and return (deleted, freed, errors)."""
+    fresh_paths = {
+        c.path.resolve() for c in find_cleanup_candidates(paths, extra_external_roots=extra_external_roots)
+    }
+    deleted = 0
+    freed = 0
+    errors: list[str] = []
+    for item in candidates:
+        if not item.path.exists():
+            continue
+        try:
+            resolved = item.path.resolve()
+        except OSError as exc:
+            errors.append(f"{item.label}: {exc}")
+            continue
+        if resolved not in fresh_paths:
+            errors.append(f"{item.label}: ignorado por segurança (não é mais órfão/seguro).")
+            continue
+        try:
+            if item.path.is_dir() and not item.path.is_symlink():
+                shutil.rmtree(item.path)
+            else:
+                item.path.unlink()
+            deleted += 1
+            freed += item.size_bytes
+        except OSError as exc:
+            errors.append(f"{item.label}: {exc}")
+    return deleted, freed, errors

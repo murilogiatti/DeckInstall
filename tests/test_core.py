@@ -558,6 +558,58 @@ class CoreTests(unittest.TestCase):
                 self.assertTrue(after[0].saves_verified_migrated)
                 self.assertEqual(after[0].matched_game, "Hollow Knight")
 
+    def test_security_fixes_hash_active_prefix_and_shell_assign(self) -> None:
+        import subprocess
+        from deckinstall.steam_vdf import _prefix_saves_verified_in_target
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # 1) Truncated destination must not verify
+            src_pfx = root / "src_pfx"
+            dst_pfx = root / "dst_pfx"
+            sfile = src_pfx / "pfx" / "drive_c" / "users" / "steamuser" / "Documents" / "save.bin"
+            dfile = dst_pfx / "pfx" / "drive_c" / "users" / "steamuser" / "Documents" / "save.bin"
+            sfile.parent.mkdir(parents=True)
+            dfile.parent.mkdir(parents=True)
+            sfile.write_bytes(b"ABCD" * 100)
+            dfile.write_bytes(b"X")
+            self.assertFalse(_prefix_saves_verified_in_target(src_pfx, dst_pfx))
+
+            # 2) Shell assignment with spaces remains valid shell after rewrite
+            old_r = root / "Old Game"
+            new_r = root / "New Game"
+            rewritten = _rewrite_launch_options(f'MY_VAR="{old_r}/pfx" :', old_r, new_r)
+            proc = subprocess.run(["/bin/sh", "-c", rewritten], capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn(f"MY_VAR='{new_r}/pfx'", rewritten)
+
+            # 3) External prefix still referenced by shortcut exe is excluded from cleanup
+            steam_root = root / "Steam"
+            compat_dir = steam_root / "steamapps" / "compatdata"
+            compat_dir.mkdir(parents=True)
+            ext_root = root / "Heroic" / "Prefixes"
+            active_pfx = ext_root / "StillActive"
+            active_exe = active_pfx / "drive_c" / "Game" / "g.exe"
+            active_exe.parent.mkdir(parents=True)
+            active_exe.write_bytes(b"MZ")
+            (active_pfx / "drive_c" / "users" / "steamuser" / "Documents").mkdir(parents=True)
+            shortcuts_vdf = steam_root / "userdata" / "1" / "config" / "shortcuts.vdf"
+            shortcuts_vdf.parent.mkdir(parents=True)
+            shortcuts_vdf.write_bytes(b"VDF")
+            paths = SteamPaths(
+                steam_root=steam_root,
+                user_id="1",
+                userdata_dir=steam_root / "userdata" / "1",
+                shortcuts_vdf=shortcuts_vdf,
+                grid_dir=steam_root / "userdata" / "1" / "config" / "grid",
+                config_vdf=steam_root / "config" / "config.vdf",
+                compatdata_dir=compat_dir,
+            )
+            entry = ShortcutEntry("0", 3000000099, "StillActive", f'"{active_exe}"', f'"{active_exe.parent}"', "", "")
+            with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[entry]):
+                cands = find_cleanup_candidates(paths, extra_external_roots=[ext_root])
+            self.assertEqual(cands, [])
+
 
 if __name__ == "__main__":
     unittest.main()
