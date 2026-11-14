@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -406,20 +407,149 @@ def migrate_shortcut_to_games(
         remove_shortcut(paths, entry.appid_u32)
 
     steam_appid = detect_steam_appid(new_root)
-    if steam_appid:
-        import_hydra_umu_saves(paths, new_appid, steam_appid)
+    import_external_prefix_saves(
+        paths=paths,
+        shortcut_appid_u32=new_appid,
+        game_name=target_name,
+        steam_appid=steam_appid,
+    )
     return new_appid, new_exe, steam_appid
 
 
-_HYDRA_SKIP_DIRS = {"microsoft", "temp", "dxvk", "nvidia", "amd", "d3dscache"}
-_HYDRA_USER_SUBPATHS = (
-    Path("steamuser") / "Documents",
-    Path("steamuser") / "Saved Games",
-    Path("steamuser") / "AppData" / "Local",
-    Path("steamuser") / "AppData" / "LocalLow",
-    Path("steamuser") / "AppData" / "Roaming",
-    Path("Public") / "Documents",
+_PREFIX_SKIP_DIRS = {"microsoft", "temp", "dxvk", "nvidia", "amd", "d3dscache"}
+_PREFIX_REL_DIRS = (
+    Path("Documents"),
+    Path("Saved Games"),
+    Path("AppData") / "Local",
+    Path("AppData") / "LocalLow",
+    Path("AppData") / "Roaming",
 )
+
+
+def _norm_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", clean_game_name(name).lower())
+
+
+def external_prefix_roots() -> list[Path]:
+    """Return candidate directories where Hydra, Heroic, Lutris, Bottles, and UMU store prefixes."""
+    home = Path.home()
+    return [
+        home / ".config" / "hydralauncher" / "wine-prefixes",
+        home / ".config" / "hydralauncher" / "umu",
+        home / "Games" / "Heroic" / "Prefixes",
+        home / ".config" / "heroic" / "Prefixes",
+        home / ".var" / "app" / "com.heroicgameslauncher.hgl" / "config" / "heroic" / "Prefixes",
+        home / "Games" / "lutris",
+        home / ".local" / "share" / "lutris" / "prefixes",
+        home / ".var" / "app" / "net.lutris.Lutris" / "data" / "lutris" / "prefixes",
+        home / ".local" / "share" / "bottles" / "bottles",
+        home / ".var" / "app" / "com.usebottles.bottles" / "data" / "bottles" / "bottles",
+        home / ".local" / "share" / "umu",
+        home / "Games" / "Prefixes",
+        home / "Prefixes",
+    ]
+
+
+def _prefix_users_dir(prefix_dir: Path) -> Path | None:
+    for rel in (Path("pfx") / "drive_c" / "users", Path("drive_c") / "users"):
+        candidate = prefix_dir / rel
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def find_external_prefixes(
+    game_name: str,
+    steam_appid: int | None = None,
+    search_roots: list[Path] | None = None,
+) -> list[Path]:
+    """Find Wine/UMU/Heroic/Lutris/Bottles prefix directories matching game_name or steam_appid."""
+    key = _norm_key(game_name)
+    appid_names = {str(steam_appid), f"umu-{steam_appid}"} if steam_appid else set()
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for root in search_roots or external_prefix_roots():
+        if not root.is_dir():
+            continue
+        try:
+            children = list(root.iterdir())
+        except OSError:
+            continue
+        for child in children:
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            matched = (child.name in appid_names) or (bool(key) and _norm_key(child.name) == key)
+            if not matched or _prefix_users_dir(child) is None:
+                continue
+            try:
+                resolved = child.resolve()
+            except OSError:
+                continue
+            if resolved not in seen:
+                seen.add(resolved)
+                found.append(child)
+    return found
+
+
+def _iter_prefix_save_pairs(src_users: Path, dst_users: Path):
+    """Yield (src_file, dst_file) for user saves across steamuser/deck/Public."""
+    try:
+        user_dirs = [d for d in src_users.iterdir() if d.is_dir()]
+    except OSError:
+        return
+    for user_dir in user_dirs:
+        if user_dir.name.lower() == "public":
+            mappings = [(user_dir / "Documents", dst_users / "Public" / "Documents")]
+        else:
+            mappings = [
+                (user_dir / rel, dst_users / "steamuser" / rel)
+                for rel in _PREFIX_REL_DIRS
+            ]
+        for src_root, dst_root in mappings:
+            if not src_root.is_dir():
+                continue
+            for dirpath, dirnames, filenames in os.walk(src_root, followlinks=False):
+                dirnames[:] = [d for d in dirnames if d.lower() not in _PREFIX_SKIP_DIRS]
+                cur = Path(dirpath)
+                rel_dir = cur.relative_to(src_root)
+                for fname in filenames:
+                    src_file = cur / fname
+                    if src_file.is_symlink() or not src_file.is_file():
+                        continue
+                    yield src_file, dst_root / rel_dir / fname
+
+
+def import_external_prefix_saves(
+    paths: SteamPaths,
+    shortcut_appid_u32: int,
+    game_name: str,
+    steam_appid: int | None = None,
+    search_roots: list[Path] | None = None,
+) -> int:
+    """Import newer/missing save files from Hydra, Heroic, Lutris, Bottles, or UMU prefixes."""
+    prefixes = find_external_prefixes(
+        game_name=game_name,
+        steam_appid=steam_appid,
+        search_roots=search_roots,
+    )
+    if not prefixes:
+        return 0
+    dst_users = paths.compatdata_dir / str(shortcut_appid_u32) / "pfx" / "drive_c" / "users"
+    copied = 0
+    for prefix_dir in prefixes:
+        src_users = _prefix_users_dir(prefix_dir)
+        if src_users is None:
+            continue
+        for src_file, dst_file in _iter_prefix_save_pairs(src_users, dst_users):
+            try:
+                if dst_file.exists() and dst_file.stat().st_mtime >= src_file.stat().st_mtime:
+                    continue
+                dst_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_file, dst_file)
+                copied += 1
+            except OSError:
+                continue
+    return copied
 
 
 def import_hydra_umu_saves(
@@ -431,36 +561,35 @@ def import_hydra_umu_saves(
     """Import newer/missing save files from Hydra UMU wine-prefixes into Steam compatdata."""
     if not steam_appid:
         return 0
-    base = hydra_prefixes_root or (Path.home() / ".config" / "hydralauncher" / "wine-prefixes")
-    src_users = base / str(steam_appid) / "drive_c" / "users"
-    if not src_users.is_dir():
-        return 0
+    roots = [hydra_prefixes_root] if hydra_prefixes_root else None
+    return import_external_prefix_saves(
+        paths=paths,
+        shortcut_appid_u32=shortcut_appid_u32,
+        game_name="",
+        steam_appid=steam_appid,
+        search_roots=roots,
+    )
 
-    dst_users = paths.compatdata_dir / str(shortcut_appid_u32) / "pfx" / "drive_c" / "users"
-    copied = 0
-    for rel_sub in _HYDRA_USER_SUBPATHS:
-        src_root = src_users / rel_sub
-        if not src_root.is_dir():
+
+def _has_pending_external_saves(
+    compatdata_dir: Path,
+    shortcut_appid_u32: int,
+    game_name: str,
+    steam_appid: int | None,
+    search_roots: list[Path] | None = None,
+) -> bool:
+    dst_users = compatdata_dir / str(shortcut_appid_u32) / "pfx" / "drive_c" / "users"
+    for prefix_dir in find_external_prefixes(game_name, steam_appid, search_roots):
+        src_users = _prefix_users_dir(prefix_dir)
+        if src_users is None:
             continue
-        dst_root = dst_users / rel_sub
-        for dirpath, dirnames, filenames in os.walk(src_root, followlinks=False):
-            dirnames[:] = [d for d in dirnames if d.lower() not in _HYDRA_SKIP_DIRS]
-            cur = Path(dirpath)
-            rel_dir = cur.relative_to(src_root)
-            for fname in filenames:
-                src_file = cur / fname
-                if src_file.is_symlink() or not src_file.is_file():
-                    continue
-                dst_file = dst_root / rel_dir / fname
-                try:
-                    if dst_file.exists() and dst_file.stat().st_mtime >= src_file.stat().st_mtime:
-                        continue
-                    dst_file.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src_file, dst_file)
-                    copied += 1
-                except OSError:
-                    continue
-    return copied
+        for src_file, dst_file in _iter_prefix_save_pairs(src_users, dst_users):
+            try:
+                if not dst_file.exists() or dst_file.stat().st_mtime < src_file.stat().st_mtime:
+                    return True
+            except OSError:
+                continue
+    return False
 
 
 @dataclass(frozen=True)
@@ -478,8 +607,9 @@ def plan_bulk_migration(
     entries: list[ShortcutEntry],
     games_root: Path,
     compatdata_dir: Path,
+    search_roots: list[Path] | None = None,
 ) -> list[MigrationPlanItem]:
-    """Identify Windows .exe shortcuts that are not yet standardized in games_root."""
+    """Identify Windows .exe shortcuts needing standardization in games_root or external save import."""
     plan: list[MigrationPlanItem] = []
     games_resolved = games_root.resolve()
     for entry in entries:
@@ -495,7 +625,11 @@ def plan_bulk_migration(
         already_in_games = old_root.resolve().parent == games_resolved
         already_named = entry.app_name == clean_name and old_root.resolve() == new_root.resolve()
         if already_in_games and already_named:
-            continue
+            steam_appid = detect_steam_appid(old_root)
+            if not _has_pending_external_saves(
+                compatdata_dir, entry.appid_u32, clean_name, steam_appid, search_roots
+            ):
+                continue
         plan.append(
             MigrationPlanItem(
                 entry=entry,

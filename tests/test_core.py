@@ -42,6 +42,7 @@ from deckinstall.steam_vdf import (  # noqa: E402
     ShortcutEntry,
     _backup_file,
     compute_shortcut_appid,
+    import_external_prefix_saves,
     import_hydra_umu_saves,
     infer_game_root_from_exe,
     migrate_shortcut_to_games,
@@ -310,6 +311,57 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(dst_existing.read_bytes(), b"newer-steam-save")
             self.assertFalse(
                 (compat_dir / "3387715067" / "pfx" / "drive_c" / "users" / "steamuser" / "AppData" / "Local" / "Temp" / "junk.tmp").exists()
+            )
+
+    def test_heroic_lutris_prefix_import_and_plan_detects_pending_saves(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            games_root = root / "Games"
+            game_dir = games_root / "My Indie Game"
+            game_dir.mkdir(parents=True)
+            exe = game_dir / "Game.exe"
+            exe.write_bytes(b"MZ")
+
+            lutris_root = root / "lutris" / "prefixes"
+            save_file = lutris_root / "my-indie-game" / "drive_c" / "users" / "deck" / "Documents" / "save.sav"
+            save_file.parent.mkdir(parents=True)
+            save_file.write_bytes(b"lutris-save")
+
+            compat_dir = root / "Steam" / "steamapps" / "compatdata"
+            appid_u32, _ = compute_shortcut_appid(f'"{exe}"', "My Indie Game")
+            entry = ShortcutEntry(
+                index="0",
+                appid_u32=appid_u32,
+                app_name="My Indie Game",
+                exe=f'"{exe}"',
+                start_dir=f'"{game_dir}"',
+                icon="",
+                launch_options="",
+            )
+            plan = plan_bulk_migration([entry], games_root, compat_dir, search_roots=[lutris_root])
+            self.assertEqual(len(plan), 1)
+            self.assertEqual(plan[0].new_name, "My Indie Game")
+
+            paths = SteamPaths(
+                steam_root=root / "Steam",
+                user_id="1",
+                userdata_dir=root / "Steam" / "userdata" / "1",
+                shortcuts_vdf=root / "shortcuts.vdf",
+                grid_dir=root / "grid",
+                config_vdf=root / "config.vdf",
+                compatdata_dir=compat_dir,
+            )
+            copied = import_external_prefix_saves(
+                paths, appid_u32, "My Indie Game", search_roots=[lutris_root]
+            )
+            self.assertEqual(copied, 1)
+            self.assertEqual(
+                (compat_dir / str(appid_u32) / "pfx" / "drive_c" / "users" / "steamuser" / "Documents" / "save.sav").read_bytes(),
+                b"lutris-save",
+            )
+            self.assertEqual(
+                plan_bulk_migration([entry], games_root, compat_dir, search_roots=[lutris_root]),
+                [],
             )
 
 

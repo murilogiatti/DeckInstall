@@ -53,7 +53,7 @@ from .steam_vdf import (
     MigrationPlanItem,
     ShortcutEntry,
     add_or_update_shortcut,
-    import_hydra_umu_saves,
+    import_external_prefix_saves,
     infer_game_root_from_exe,
     load_shortcuts,
     migrate_shortcut_to_games,
@@ -255,11 +255,16 @@ class AddToSteamWorker(QThread):
                 enable_proton=self.enable_proton,
             )
 
+            imported = import_external_prefix_saves(
+                paths=self.paths,
+                shortcut_appid_u32=shortcut_id,
+                game_name=self.app_name,
+                steam_appid=self.steam_appid,
+            )
+            if imported:
+                self.status.emit(f"{imported} arquivo(s) de save importados de prefixo externo.")
             art_msg = "Sem artes baixadas."
             if self.steam_appid:
-                imported = import_hydra_umu_saves(self.paths, shortcut_id, self.steam_appid)
-                if imported:
-                    self.status.emit(f"{imported} arquivo(s) de save importados do Hydra UMU.")
                 self.status.emit(f"Baixando artes oficiais (AppID {self.steam_appid})...")
                 art = download_steam_artwork(
                     steam_appid=self.steam_appid,
@@ -317,7 +322,12 @@ class BulkMigrateWorker(QThread):
                         matches = search_steam_games(item.new_name, limit=1)
                         if matches:
                             steam_appid = matches[0].appid
-                            import_hydra_umu_saves(self.paths, new_appid, steam_appid)
+                            import_external_prefix_saves(
+                                paths=self.paths,
+                                shortcut_appid_u32=new_appid,
+                                game_name=item.new_name,
+                                steam_appid=steam_appid,
+                            )
                     if steam_appid:
                         download_steam_artwork(steam_appid, new_appid, self.paths.grid_dir)
                     migrated.append(item.new_name)
