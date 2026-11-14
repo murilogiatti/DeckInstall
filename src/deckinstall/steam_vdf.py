@@ -605,7 +605,18 @@ def migrate_shortcut_to_games(
     return new_appid, new_exe, steam_appid
 
 
-_PREFIX_SKIP_DIRS = {"microsoft", "temp", "dxvk", "nvidia", "amd", "d3dscache"}
+_PREFIX_SKIP_DIRS = {
+    "microsoft",
+    "temp",
+    "dxvk",
+    "nvidia",
+    "amd",
+    "d3dscache",
+    ".sentry-native",
+    "crashes",
+    "crashreportclient",
+}
+_PREFIX_SKIP_FILES = {"steam_autocloud.vdf", "player.log", "player-prev.log"}
 _PREFIX_REL_DIRS = (
     Path("Documents"),
     Path("Saved Games"),
@@ -702,6 +713,8 @@ def _iter_prefix_save_pairs(src_users: Path, dst_users: Path):
                 cur = Path(dirpath)
                 rel_dir = cur.relative_to(src_root)
                 for fname in filenames:
+                    if fname.lower() in _PREFIX_SKIP_FILES:
+                        continue
                     src_file = cur / fname
                     if src_file.is_symlink() or not src_file.is_file():
                         continue
@@ -947,12 +960,17 @@ def sync_all_external_saves(
             continue
         checked += 1
         steam_appid = detect_steam_appid(Path(entry.start_dir)) if entry.start_dir else None
+        roots = extra_external_roots
+        if roots is None:
+            roots = external_prefix_roots()
+            if steam_appid and paths.compatdata_dir.is_dir():
+                roots = [*roots, paths.compatdata_dir]
         copied += import_external_prefix_saves(
             paths=paths,
             shortcut_appid_u32=entry.appid_u32,
             game_name=entry.app_name,
             steam_appid=steam_appid,
-            search_roots=extra_external_roots,
+            search_roots=roots,
         )
     return checked, copied
 
@@ -1079,13 +1097,25 @@ def find_cleanup_candidates(
             appid = int(child.name)
             if appid in active_shortcuts or appid in installed_steam:
                 continue
+            has_saves = _prefix_has_saves(child)
+            saves_verified = False
+            matched_game = ""
+            if has_saves:
+                for entry in current_entries:
+                    dst_compat = paths.compatdata_dir / str(entry.appid_u32)
+                    if dst_compat.is_dir() and _prefix_saves_verified_in_target(child, dst_compat):
+                        saves_verified = True
+                        matched_game = entry.app_name
+                        break
             candidates.append(
                 CleanupCandidate(
                     category="Compatdata Órfão",
                     label=f"compatdata/{child.name}",
                     path=child,
                     size_bytes=_dir_size_bytes(child),
-                    has_saves=_prefix_has_saves(child),
+                    has_saves=has_saves,
+                    saves_verified_migrated=saves_verified,
+                    matched_game=matched_game,
                 )
             )
 
