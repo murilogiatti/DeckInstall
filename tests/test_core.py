@@ -1163,13 +1163,16 @@ class CoreTests(unittest.TestCase):
             steam_root = root / "Steam"
             grid = steam_root / "userdata" / "1" / "config" / "grid"
             grid.mkdir(parents=True)
+            config_vdf = steam_root / "config" / "config.vdf"
+            config_vdf.parent.mkdir(parents=True)
+            config_vdf.write_text('"InstallConfigStore"\n{\n}\n', encoding="utf-8")
             paths = SteamPaths(
                 steam_root=steam_root,
                 user_id="1",
                 userdata_dir=steam_root / "userdata" / "1",
                 shortcuts_vdf=steam_root / "userdata" / "1" / "config" / "shortcuts.vdf",
                 grid_dir=grid,
-                config_vdf=steam_root / "config" / "config.vdf",
+                config_vdf=config_vdf,
                 compatdata_dir=steam_root / "steamapps" / "compatdata",
             )
             exe = root / "Games" / "MyGame" / "game.exe"
@@ -1186,7 +1189,7 @@ class CoreTests(unittest.TestCase):
             # Remove shortcut cleans shortcuts.vdf and CompatToolMapping
             self.assertTrue(remove_shortcut(paths, appid))
             self.assertEqual(load_shortcuts(paths.shortcuts_vdf), [])
-            self.assertIsNone(get_shortcut_proton(paths.config_vdf, appid))
+            self.assertEqual(get_shortcut_proton(paths.config_vdf, appid), "")
 
     def test_v075_audit_regressions(self) -> None:
         """Cover v0.7.5 security, backend, frontend, i18n, and packaging regressions."""
