@@ -1152,6 +1152,12 @@ class CoreTests(unittest.TestCase):
         import vdf as _real_vdf
         if getattr(_real_vdf, "__file__", None) is None:
             self.skipTest("real vdf package not installed")
+        from deckinstall.steam_vdf import (
+            add_or_update_shortcut,
+            get_shortcut_proton,
+            load_shortcuts,
+            remove_shortcut,
+        )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             steam_root = root / "Steam"
