@@ -1732,6 +1732,33 @@ def _is_prefix_referenced_by_shortcuts(
     return False
 
 
+def _active_compat_tools(config_vdf: Path, active_appids: set[int]) -> set[str]:
+    """Return compatibility tool names currently mapped to active games/shortcuts."""
+    used: set[str] = set()
+    if not config_vdf.is_file():
+        return used
+    try:
+        data = vdf.loads(config_vdf.read_text(encoding="utf-8", errors="replace"))
+        mapping = (
+            data.get("InstallConfigStore", {})
+            .get("Software", {})
+            .get("Valve", {})
+            .get("Steam", {})
+            .get("CompatToolMapping", {})
+        )
+        if isinstance(mapping, dict):
+            for k, val in mapping.items():
+                if not (str(k).isascii() and str(k).isdigit()):
+                    continue
+                if int(k) in active_appids and isinstance(val, dict):
+                    tname = str(val.get("name") or "").strip()
+                    if tname:
+                        used.add(tname)
+    except Exception:
+        pass
+    return used
+
+
 def find_cleanup_candidates(
     paths: SteamPaths,
     extra_external_roots: list[Path] | None = None,
@@ -1989,12 +2016,17 @@ def find_cleanup_candidates(
                             )
                         )
 
+        active_tools = _active_compat_tools(paths.config_vdf, active_shortcuts | installed_steam)
+        sniper_in_use = any(
+            t.startswith(("proton_8", "proton_9", "proton_10", "GE-Proton", "UMU-Proton"))
+            for t in active_tools
+        )
         compat_tools = paths.steam_root / "compatibilitytools.d"
         if compat_tools.is_dir():
             for child in compat_tools.iterdir():
                 if child.is_symlink() or not child.is_dir():
                     continue
-                if child.name.startswith("UMU-Proton-"):
+                if child.name.startswith("UMU-Proton-") and child.name not in active_tools:
                     sz = _dir_size_bytes(child)
                     if sz > 0:
                         candidates.append(
@@ -2011,7 +2043,11 @@ def find_cleanup_candidates(
                         )
 
         common_dir = paths.steam_root / "steamapps" / "common"
-        if (common_dir / "Proton 11.0").is_dir() and (common_dir / "Proton 10.0").is_dir():
+        if (
+            (common_dir / "Proton 11.0").is_dir()
+            and (common_dir / "Proton 10.0").is_dir()
+            and not any(t.startswith("proton_10") for t in active_tools)
+        ):
             p10 = common_dir / "Proton 10.0"
             if not p10.is_symlink():
                 sz = _dir_size_bytes(p10)
@@ -2028,7 +2064,11 @@ def find_cleanup_candidates(
                             game_hint="",
                         )
                     )
-        if (common_dir / "SteamLinuxRuntime_4").is_dir() and (common_dir / "SteamLinuxRuntime_sniper").is_dir():
+        if (
+            not sniper_in_use
+            and (common_dir / "SteamLinuxRuntime_4").is_dir()
+            and (common_dir / "SteamLinuxRuntime_sniper").is_dir()
+        ):
             sniper = common_dir / "SteamLinuxRuntime_sniper"
             if not sniper.is_symlink():
                 sz = _dir_size_bytes(sniper)
@@ -2110,6 +2150,10 @@ def delete_cleanup_candidates_checked(
                     shutil.rmtree(item.path)
                 else:
                     item.path.unlink()
+                if item.label == "common/SteamLinuxRuntime_sniper":
+                    acf = paths.steam_root / "steamapps" / "appmanifest_1628350.acf"
+                    if acf.is_file() and not acf.is_symlink():
+                        acf.unlink()
                 deleted += 1
                 freed += item.size_bytes
             except OSError as exc:
