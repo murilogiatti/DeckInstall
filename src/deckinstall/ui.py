@@ -66,20 +66,24 @@ from .steam_paths import (
 )
 from .steam_vdf import (
     CleanupCandidate,
+    CompatMappingEntry,
     MigrationPlanItem,
     ShortcutEntry,
     add_or_update_shortcut,
     adopt_installer_prefix,
     apply_launch_presets,
     backup_all_saves,
+    bulk_migrate_compat_tool,
     delete_cleanup_candidates_checked,
     find_cleanup_candidates,
     get_shortcut_proton,
     import_external_prefix_saves,
     infer_game_root_from_exe,
+    list_compat_tool_usage,
     load_shortcuts,
     migrate_shortcut_to_games,
     plan_bulk_migration,
+    remove_compat_tools,
     remove_shortcut,
     restore_saves_backup,
     set_shortcut_proton,
@@ -988,6 +992,8 @@ class MainWindow(QMainWindow):
         self.act_revert_art.triggered.connect(self._revert_selected_shortcut_art)
         self.act_proton = QAction(tr("library.btn_proton"), self)
         self.act_proton.triggered.connect(self._change_selected_proton)
+        self.act_bulk_proton = QAction(tr("library.btn_bulk_proton"), self)
+        self.act_bulk_proton.triggered.connect(self._bulk_migrate_proton_dialog)
         self.act_launch_opts = QAction(tr("library.btn_launch_opts"), self)
         self.act_launch_opts.triggered.connect(self._edit_launch_options_presets)
         self.act_remove = QAction(tr("library.btn_remove"), self)
@@ -997,6 +1003,7 @@ class MainWindow(QMainWindow):
             self.act_art,
             self.act_revert_art,
             self.act_proton,
+            self.act_bulk_proton,
             self.act_launch_opts,
         ):
             self._game_actions_menu.addAction(act)
@@ -1422,6 +1429,7 @@ class MainWindow(QMainWindow):
             self.btn_bulk_migrate,
             self.act_migrate,
             self.act_proton,
+            self.act_bulk_proton,
             self.act_launch_opts,
             self.act_backup_saves,
             self.act_restore_saves,
@@ -1648,6 +1656,166 @@ class MainWindow(QMainWindow):
 
         worker.finished_ok.connect(_ok)
         worker.failed.connect(_err)
+        worker.start()
+
+    def _bulk_migrate_proton_dialog(self) -> None:
+        if not self.paths:
+            return
+        usage = list_compat_tool_usage(self.paths)
+        if not usage:
+            QMessageBox.information(self, __app_name__, tr("proton_bulk.empty"))
+            return
+        protons = list_installed_protons(self.paths.steam_root)
+        if not protons:
+            QMessageBox.warning(self, __app_name__, tr("proton.none_found"))
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("proton_bulk.title"))
+        dlg.resize(780, 560)
+        lay = QVBoxLayout(dlg)
+
+        by_tool: dict[str, list[CompatMappingEntry]] = {}
+        for u in usage:
+            by_tool.setdefault(u.tool_name or "(empty)", []).append(u)
+        summary_lines = [
+            f"• {tool}: {sum(1 for x in items if x.source != 'Orphan')} ativos, "
+            f"{sum(1 for x in items if x.source == 'Orphan')} órfãos"
+            for tool, items in sorted(by_tool.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+        ]
+        summary_box = QTextEdit()
+        summary_box.setReadOnly(True)
+        summary_box.setMaximumHeight(110)
+        summary_box.setPlainText("\n".join(summary_lines))
+        lay.addWidget(QLabel(tr("proton_bulk.summary_label")))
+        lay.addWidget(summary_box)
+
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel(tr("proton_bulk.filter_label")))
+        filter_combo = QComboBox()
+        filter_combo.addItem(tr("proton_bulk.filter_all"), "__ALL__")
+        filter_combo.addItem(tr("proton_bulk.filter_orphans"), "__ORPHAN__")
+        for tool in sorted(by_tool.keys()):
+            filter_combo.addItem(f"{tool} ({len(by_tool[tool])})", tool)
+        filter_row.addWidget(filter_combo, 1)
+
+        filter_row.addWidget(QLabel(tr("proton_bulk.target_label")))
+        target_combo = QComboBox()
+        for tid, disp in protons:
+            target_combo.addItem(disp, tid)
+        filter_row.addWidget(target_combo, 1)
+        lay.addLayout(filter_row)
+
+        lst = QListWidget()
+        lay.addWidget(lst, 1)
+
+        def _populate() -> None:
+            flt = filter_combo.currentData()
+            lst.clear()
+            for u in usage:
+                tkey = u.tool_name or "(empty)"
+                if flt == "__ORPHAN__" and u.source != "Orphan":
+                    continue
+                if flt not in ("__ALL__", "__ORPHAN__") and tkey != flt:
+                    continue
+                it = QListWidgetItem(
+                    f"[{u.source}] {u.name} ({u.appid_u32}) — {tkey}"
+                )
+                it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                auto_check = flt != "__ALL__"
+                it.setCheckState(Qt.CheckState.Checked if auto_check else Qt.CheckState.Unchecked)
+                it.setData(Qt.ItemDataRole.UserRole, u)
+                lst.addItem(it)
+
+        filter_combo.currentIndexChanged.connect(_populate)
+        _populate()
+
+        btn_row = QHBoxLayout()
+        btn_migrate = QPushButton(tr("proton_bulk.btn_migrate"))
+        btn_migrate.setObjectName("primaryBtn")
+        btn_clean_orphans = QPushButton(tr("proton_bulk.btn_clean_orphans"))
+        btn_close = QPushButton(tr("proton_bulk.btn_close"))
+        btn_row.addWidget(btn_migrate)
+        btn_row.addWidget(btn_clean_orphans)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_close)
+        lay.addLayout(btn_row)
+        btn_close.clicked.connect(dlg.reject)
+
+        action_mode = {"kind": ""}
+
+        def _selected_entries() -> list[CompatMappingEntry]:
+            out: list[CompatMappingEntry] = []
+            for i in range(lst.count()):
+                it = lst.item(i)
+                if it.checkState() == Qt.CheckState.Checked:
+                    out.append(it.data(Qt.ItemDataRole.UserRole))
+            return out
+
+        def _on_migrate() -> None:
+            if not _selected_entries():
+                QMessageBox.information(dlg, __app_name__, tr("proton_bulk.none_selected"))
+                return
+            action_mode["kind"] = "migrate"
+            dlg.accept()
+
+        def _on_clean_orphans() -> None:
+            orphans = [u for u in _selected_entries() if u.source == "Orphan"]
+            if not orphans:
+                QMessageBox.information(dlg, __app_name__, tr("proton_bulk.no_orphans_selected"))
+                return
+            action_mode["kind"] = "clean_orphans"
+            dlg.accept()
+
+        btn_migrate.clicked.connect(_on_migrate)
+        btn_clean_orphans.clicked.connect(_on_clean_orphans)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = _selected_entries()
+        if not selected or not self._confirm_close_steam_if_running():
+            return
+        paths = self.paths
+        self._set_steam_busy(True)
+        if action_mode["kind"] == "clean_orphans":
+            orphan_ids = [u.appid_u32 for u in selected if u.source == "Orphan"]
+            worker = SteamOpWorker(
+                lambda: remove_compat_tools(paths.config_vdf, orphan_ids),
+                need_steam_closed=True,
+            )
+            self._track_worker(worker)
+
+            def _ok_clean(count: object) -> None:
+                self._set_steam_busy(False)
+                msg = tr("proton_bulk.orphans_removed", count=count)
+                self.status_label.setText(msg)
+                QMessageBox.information(self, __app_name__, msg)
+
+            worker.finished_ok.connect(_ok_clean)
+        else:
+            target_tool = str(target_combo.currentData())
+            ids = [u.appid_u32 for u in selected]
+            worker = SteamOpWorker(
+                lambda: bulk_migrate_compat_tool(paths.config_vdf, ids, target_tool),
+                need_steam_closed=True,
+            )
+            self._track_worker(worker)
+
+            def _ok_mig(count: object) -> None:
+                self._set_steam_busy(False)
+                msg = tr("proton_bulk.migrated", count=count, tool=target_tool)
+                self.status_label.setText(msg)
+                QMessageBox.information(self, __app_name__, msg)
+
+            worker.finished_ok.connect(_ok_mig)
+
+        worker.status.connect(self.status_label.setText)
+        worker.failed.connect(
+            lambda err: (
+                self._set_steam_busy(False),
+                QMessageBox.critical(self, __app_name__, tr("proton.error", err=err)),
+            )
+        )
         worker.start()
 
     def _edit_launch_options_presets(self) -> None:

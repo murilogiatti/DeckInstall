@@ -1760,6 +1760,70 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(deleted, len(cands))
             self.assertTrue((steam / "steamapps" / "common" / "Proton 11.0").is_dir())
 
+    def test_bulk_proton_migration_and_orphan_mapping_cleanup(self) -> None:
+        """Verify list_compat_tool_usage, bulk_migrate_compat_tool, and remove_compat_tools."""
+        from deckinstall.steam_vdf import (
+            bulk_migrate_compat_tool,
+            list_compat_tool_usage,
+            remove_compat_tools,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            steam = root / "Steam"
+            (steam / "userdata" / "1" / "config").mkdir(parents=True)
+            (steam / "userdata" / "1" / "config" / "shortcuts.vdf").write_bytes(b"VDF")
+            (steam / "steamapps").mkdir(parents=True)
+            (steam / "config").mkdir(parents=True)
+            cfg = steam / "config" / "config.vdf"
+            cfg_data = {
+                "InstallConfigStore": {
+                    "Software": {
+                        "Valve": {
+                            "Steam": {
+                                "CompatToolMapping": {
+                                    "1001": {"name": "GE-Proton10-34", "config": "", "priority": "250"},
+                                    "2002": {"name": "GE-Proton10-34", "config": "", "priority": "250"},
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            paths = SteamPaths(
+                steam_root=steam,
+                user_id="1",
+                userdata_dir=steam / "userdata" / "1",
+                shortcuts_vdf=steam / "userdata" / "1" / "config" / "shortcuts.vdf",
+                grid_dir=steam / "userdata" / "1" / "config" / "grid",
+                config_vdf=cfg,
+                compatdata_dir=steam / "steamapps" / "compatdata",
+            )
+            cfg.write_text("{}", encoding="utf-8")
+            sc = ShortcutEntry("0", 1001, "ActiveGame", '"g.exe"', '"."', "", "")
+            with (
+                mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[sc]),
+                mock.patch("deckinstall.steam_vdf.vdf.loads", return_value=cfg_data),
+                mock.patch("deckinstall.steam_vdf.vdf.dumps", return_value="{}"),
+            ):
+                usage = list_compat_tool_usage(paths)
+                self.assertEqual([(u.appid_u32, u.source, u.name, u.tool_name) for u in usage], [
+                    (1001, "Non-Steam", "ActiveGame", "GE-Proton10-34"),
+                    (2002, "Orphan", "AppID 2002", "GE-Proton10-34"),
+                ])
+                migrated = bulk_migrate_compat_tool(cfg, [1001], "proton_11")
+                self.assertEqual(migrated, 1)
+                self.assertEqual(
+                    cfg_data["InstallConfigStore"]["Software"]["Valve"]["Steam"]["CompatToolMapping"]["1001"]["name"],
+                    "proton_11",
+                )
+                removed = remove_compat_tools(cfg, [2002])
+                self.assertEqual(removed, 1)
+                self.assertNotIn(
+                    "2002",
+                    cfg_data["InstallConfigStore"]["Software"]["Valve"]["Steam"]["CompatToolMapping"],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

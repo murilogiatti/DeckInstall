@@ -522,6 +522,151 @@ def remove_compat_tool(config_vdf: Path, appid_u32: int) -> None:
             _atomic_write_text(config_vdf, vdf.dumps(data, pretty=True))
 
 
+@dataclass(frozen=True)
+class CompatMappingEntry:
+    """One entry in Steam's CompatToolMapping resolved against active games."""
+
+    appid_u32: int
+    name: str
+    source: str
+    tool_name: str
+
+
+def _installed_steam_app_names(steam_root: Path) -> dict[int, str]:
+    """Return {appid: name} for installed Steam games across all library folders."""
+    names: dict[int, str] = {}
+    steamapps_dirs = [steam_root / "steamapps"]
+    lib_vdf = steam_root / "steamapps" / "libraryfolders.vdf"
+    if lib_vdf.is_file():
+        try:
+            data = vdf.loads(lib_vdf.read_text(encoding="utf-8", errors="replace"))
+            folders = data.get("libraryfolders") or data.get("LibraryFolders") or {}
+            for val in folders.values():
+                if isinstance(val, dict) and val.get("path"):
+                    steamapps_dirs.append(Path(str(val["path"])) / "steamapps")
+        except Exception:
+            pass
+    for sa in steamapps_dirs:
+        if not sa.is_dir():
+            continue
+        for acf in sa.glob("appmanifest_*.acf"):
+            stem_id = acf.stem.removeprefix("appmanifest_")
+            if not (stem_id.isascii() and stem_id.isdigit()):
+                continue
+            appid = int(stem_id)
+            app_name = f"AppID {appid}"
+            try:
+                parsed = vdf.loads(acf.read_text(encoding="utf-8", errors="replace"))
+                state = parsed.get("AppState") or parsed.get("appstate") or {}
+                if isinstance(state, dict) and state.get("name"):
+                    app_name = str(state["name"])
+            except Exception:
+                pass
+            names[appid] = app_name
+    return names
+
+
+def list_compat_tool_usage(paths: SteamPaths) -> list[CompatMappingEntry]:
+    """List all CompatToolMapping entries resolved against Non-Steam shortcuts and Steam games."""
+    shortcut_names: dict[int, str] = {}
+    for e in load_shortcuts(paths.shortcuts_vdf):
+        shortcut_names[e.appid_u32] = e.app_name
+    for uid in list_steam_users(paths.steam_root):
+        sv = paths.steam_root / "userdata" / uid / "config" / "shortcuts.vdf"
+        for e in load_shortcuts(sv):
+            shortcut_names.setdefault(e.appid_u32, e.app_name)
+
+    steam_names = _installed_steam_app_names(paths.steam_root)
+    results: list[CompatMappingEntry] = []
+    if not paths.config_vdf.is_file():
+        return results
+    try:
+        data = vdf.loads(paths.config_vdf.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return results
+    mapping = (
+        data.get("InstallConfigStore", {})
+        .get("Software", {})
+        .get("Valve", {})
+        .get("Steam", {})
+        .get("CompatToolMapping", {})
+    )
+    if not isinstance(mapping, dict):
+        return results
+    for k, val in mapping.items():
+        if not (str(k).isascii() and str(k).isdigit()) or not isinstance(val, dict):
+            continue
+        appid = int(k)
+        tool = str(val.get("name") or "")
+        if appid in shortcut_names:
+            source, name = "Non-Steam", shortcut_names[appid]
+        elif appid in steam_names:
+            source, name = "Steam", steam_names[appid]
+        else:
+            source, name = "Orphan", f"AppID {appid}"
+        results.append(CompatMappingEntry(appid_u32=appid, name=name, source=source, tool_name=tool))
+    rank = {"Non-Steam": 0, "Steam": 1, "Orphan": 2}
+    results.sort(key=lambda r: (rank.get(r.source, 9), r.name.lower(), r.appid_u32))
+    return results
+
+
+def bulk_migrate_compat_tool(config_vdf: Path, appids: list[int], target_tool: str) -> int:
+    """Migrate multiple AppIDs in CompatToolMapping to target_tool in one atomic write."""
+    if not appids or not target_tool.strip():
+        return 0
+    with _steam_transaction_lock(config_vdf):
+        if not config_vdf.is_file():
+            return 0
+        _backup_file(config_vdf)
+        data = vdf.loads(config_vdf.read_text(encoding="utf-8", errors="replace"))
+        store = data.setdefault("InstallConfigStore", {})
+        steam = (
+            store.setdefault("Software", {})
+            .setdefault("Valve", {})
+            .setdefault("Steam", {})
+        )
+        mapping = steam.setdefault("CompatToolMapping", {})
+        updated = 0
+        for appid in appids:
+            mapping[str(appid)] = {
+                "name": target_tool.strip(),
+                "config": "",
+                "priority": "250",
+            }
+            updated += 1
+        _atomic_write_text(config_vdf, vdf.dumps(data, pretty=True))
+        return updated
+
+
+def remove_compat_tools(config_vdf: Path, appids: list[int]) -> int:
+    """Remove multiple AppIDs from CompatToolMapping in one atomic write."""
+    if not appids:
+        return 0
+    with _steam_transaction_lock(config_vdf):
+        if not config_vdf.is_file():
+            return 0
+        data = vdf.loads(config_vdf.read_text(encoding="utf-8", errors="replace"))
+        mapping = (
+            data.get("InstallConfigStore", {})
+            .get("Software", {})
+            .get("Valve", {})
+            .get("Steam", {})
+            .get("CompatToolMapping", {})
+        )
+        if not isinstance(mapping, dict):
+            return 0
+        removed = 0
+        for appid in appids:
+            if str(appid) in mapping:
+                if removed == 0:
+                    _backup_file(config_vdf)
+                del mapping[str(appid)]
+                removed += 1
+        if removed:
+            _atomic_write_text(config_vdf, vdf.dumps(data, pretty=True))
+        return removed
+
+
 _SUBDIR_NAMES = {
     "win64",
     "win32",
