@@ -11,9 +11,47 @@ from pathlib import Path
 
 import requests
 
+from . import __version__
+
 STEAM_SEARCH_URL = "https://store.steampowered.com/api/storesearch/"
 STEAM_CDN_BASE = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps"
-USER_AGENT = "DeckInstall/0.7.4"
+USER_AGENT = f"DeckInstall/{__version__}"
+_MAX_IMAGE_BYTES = 16 * 1024 * 1024
+
+
+def _validate_appid(appid: int) -> int:
+    if isinstance(appid, bool) or not isinstance(appid, int) or appid <= 0:
+        raise ValueError(f"Invalid Steam AppID: {appid!r}")
+    return appid
+
+
+def _is_valid_image_bytes(data: bytes) -> bool:
+    if len(data) <= 512:
+        return False
+    if data.startswith(b"\xff\xd8\xff"):
+        return True
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return True
+    return False
+
+
+def _read_bounded_image(resp: requests.Response) -> bytes | None:
+    if resp.status_code != 200:
+        return None
+    ctype = str(resp.headers.get("Content-Type", "")).lower()
+    if ctype and not ctype.startswith("image/"):
+        return None
+    buf = bytearray()
+    for chunk in resp.iter_content(chunk_size=65536):
+        if not chunk:
+            continue
+        buf.extend(chunk)
+        if len(buf) > _MAX_IMAGE_BYTES:
+            return None
+    data = bytes(buf)
+    return data if _is_valid_image_bytes(data) else None
 
 
 @dataclass(frozen=True)
@@ -44,7 +82,11 @@ def search_steam_games(query: str, limit: int = 8) -> list[SteamMatch]:
         timeout=12,
     )
     resp.raise_for_status()
-    items = resp.json().get("items", [])
+    try:
+        payload = resp.json()
+    except ValueError:
+        return []
+    items = payload.get("items", []) if isinstance(payload, dict) else []
     matches: list[SteamMatch] = []
     for item in items[:limit]:
         appid = item.get("id")
@@ -60,21 +102,39 @@ def search_steam_games(query: str, limit: int = 8) -> list[SteamMatch]:
     return matches
 
 
-def _download_first(urls: list[str], dest: Path) -> bool:
+def fetch_header_preview(steam_appid: int) -> bytes | None:
+    """Fetch official Steam header.jpg bytes safely for UI preview."""
+    appid = _validate_appid(steam_appid)
+    url = f"{STEAM_CDN_BASE}/{appid}/header.jpg"
+    try:
+        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10, stream=True)
+        return _read_bounded_image(resp)
+    except requests.RequestException:
+        return None
+
+
+def _download_first(urls: list[str], dest: Path, alt_remove: list[Path] | None = None) -> bool:
     for url in urls:
         try:
-            resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=15)
-            if resp.status_code == 200 and len(resp.content) > 512:
+            resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=15, stream=True)
+            data = _read_bounded_image(resp)
+            if data is not None:
                 fd, tmp_name = tempfile.mkstemp(
                     prefix=f".{dest.name}.", suffix=".tmp", dir=str(dest.parent)
                 )
-                os.close(fd)
                 tmp_path = Path(tmp_name)
                 try:
-                    tmp_path.write_bytes(resp.content)
+                    with os.fdopen(fd, "wb") as fh:
+                        fh.write(data)
                     if dest.is_symlink():
                         dest.unlink()
                     os.replace(tmp_path, dest)
+                    for alt in alt_remove or ():
+                        if alt != dest and alt.exists() and not alt.is_symlink():
+                            try:
+                                alt.unlink()
+                            except OSError:
+                                pass
                     return True
                 except Exception:
                     try:
@@ -104,10 +164,18 @@ def _grid_files_for_appid(shortcut_appid_u32: int, grid_dir: Path) -> list[Path]
 
 def backup_steam_artwork(shortcut_appid_u32: int, grid_dir: Path) -> list[str]:
     """Back up existing Steam grid artwork for shortcut_appid_u32 before overwriting."""
+    if grid_dir.is_symlink():
+        return []
     bak_root = grid_dir / ".deckinstall_art_bak"
+    if bak_root.is_symlink():
+        return []
     bak_dir = bak_root / str(shortcut_appid_u32)
+    if bak_dir.is_symlink():
+        return []
     if bak_dir.is_dir():
-        existing_bak = [p.name for p in sorted(bak_dir.iterdir()) if p.is_file()]
+        existing_bak = [
+            p.name for p in sorted(bak_dir.iterdir()) if not p.is_symlink() and p.is_file()
+        ]
         if existing_bak:
             return existing_bak
     existing = _grid_files_for_appid(shortcut_appid_u32, grid_dir)
@@ -118,7 +186,9 @@ def backup_steam_artwork(shortcut_appid_u32: int, grid_dir: Path) -> list[str]:
     copied: list[str] = []
     try:
         for src in existing:
-            shutil.copy2(src, stage_dir / src.name)
+            if src.is_symlink():
+                continue
+            shutil.copy2(src, stage_dir / src.name, follow_symlinks=False)
             copied.append(src.name)
         if bak_dir.exists():
             shutil.rmtree(bak_dir, ignore_errors=True)
@@ -131,10 +201,13 @@ def backup_steam_artwork(shortcut_appid_u32: int, grid_dir: Path) -> list[str]:
 
 def restore_steam_artwork_backup(shortcut_appid_u32: int, grid_dir: Path) -> list[str]:
     """Restore previously backed-up Steam grid artwork for shortcut_appid_u32."""
-    bak_dir = grid_dir / ".deckinstall_art_bak" / str(shortcut_appid_u32)
-    if not bak_dir.is_dir():
+    if grid_dir.is_symlink():
         return []
-    bak_files = [p for p in sorted(bak_dir.iterdir()) if p.is_file()]
+    bak_root = grid_dir / ".deckinstall_art_bak"
+    bak_dir = bak_root / str(shortcut_appid_u32)
+    if bak_root.is_symlink() or bak_dir.is_symlink() or not bak_dir.is_dir():
+        return []
+    bak_files = [p for p in sorted(bak_dir.iterdir()) if not p.is_symlink() and p.is_file()]
     if not bak_files:
         return []
     for cur in _grid_files_for_appid(shortcut_appid_u32, grid_dir):
@@ -147,9 +220,11 @@ def restore_steam_artwork_backup(shortcut_appid_u32: int, grid_dir: Path) -> lis
         dst = grid_dir / src.name
         if dst.is_symlink():
             dst.unlink()
-        tmp_dst = grid_dir / f".{src.name}.tmp.{os.getpid()}"
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{src.name}.", suffix=".tmp", dir=str(grid_dir))
+        os.close(fd)
+        tmp_dst = Path(tmp_name)
         try:
-            shutil.copy2(src, tmp_dst)
+            shutil.copy2(src, tmp_dst, follow_symlinks=False)
             os.replace(tmp_dst, dst)
         finally:
             if tmp_dst.exists():
@@ -167,34 +242,39 @@ def download_steam_artwork(
     grid_dir: Path,
 ) -> ArtworkResult:
     """Download official capsule, header, hero, and logo into Steam's grid folder."""
+    appid = _validate_appid(steam_appid)
     grid_dir.mkdir(parents=True, exist_ok=True)
     backup_steam_artwork(shortcut_appid_u32, grid_dir)
-    base = f"{STEAM_CDN_BASE}/{steam_appid}"
+    base = f"{STEAM_CDN_BASE}/{appid}"
 
-    targets: dict[str, tuple[Path, list[str]]] = {
+    targets: dict[str, tuple[Path, list[str], list[Path]]] = {
         "capsule": (
             grid_dir / f"{shortcut_appid_u32}p.jpg",
             [f"{base}/library_600x900_2x.jpg", f"{base}/library_600x900.jpg"],
+            [grid_dir / f"{shortcut_appid_u32}p.png"],
         ),
         "header": (
             grid_dir / f"{shortcut_appid_u32}.jpg",
             [f"{base}/header.jpg", f"{base}/library_capsule.jpg"],
+            [grid_dir / f"{shortcut_appid_u32}.png"],
         ),
         "hero": (
             grid_dir / f"{shortcut_appid_u32}_hero.jpg",
             [f"{base}/library_hero_2x.jpg", f"{base}/library_hero.jpg"],
+            [grid_dir / f"{shortcut_appid_u32}_hero.png"],
         ),
         "logo": (
             grid_dir / f"{shortcut_appid_u32}_logo.png",
             [f"{base}/logo.png", f"{base}/library_logo.png"],
+            [grid_dir / f"{shortcut_appid_u32}_logo.jpg"],
         ),
     }
 
     saved: dict[str, Path] = {}
     with ThreadPoolExecutor(max_workers=4) as pool:
         futs = {
-            kind: pool.submit(_download_first, urls, dest)
-            for kind, (dest, urls) in targets.items()
+            kind: pool.submit(_download_first, urls, dest, alts)
+            for kind, (dest, urls, alts) in targets.items()
         }
         for kind, fut in futs.items():
             try:
@@ -203,4 +283,4 @@ def download_steam_artwork(
             except Exception:
                 continue
 
-    return ArtworkResult(steam_appid=steam_appid, saved_files=saved)
+    return ArtworkResult(steam_appid=appid, saved_files=saved)

@@ -24,7 +24,13 @@ from pathlib import Path
 import vdf
 
 from .scanner import clean_game_name, detect_steam_appid
-from .steam_paths import SteamPaths, find_default_proton_name, is_steam_running, list_steam_users
+from .steam_paths import (
+    SteamPaths,
+    find_default_proton_name,
+    is_flatpak_steam,
+    is_steam_running,
+    list_steam_users,
+)
 
 _STEAM_LOCK = threading.RLock()
 _THREAD_LOCAL = threading.local()
@@ -32,27 +38,31 @@ _THREAD_LOCAL = threading.local()
 
 @contextmanager
 def _steam_transaction_lock(anchor: Path):
-    """Acquire both intra-process RLock and cross-process flock for Steam VDF mutations."""
-    depth = getattr(_THREAD_LOCAL, "flock_depth", 0)
+    """Acquire both intra-process RLock and cross-process flock per lockfile for Steam VDF mutations."""
+    lock_dir = anchor.parent if anchor.parent.exists() else Path(tempfile.gettempdir())
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = (lock_dir / ".deckinstall.vdf.lock").resolve()
+    depths: dict[Path, int] = getattr(_THREAD_LOCAL, "flock_depths", None)
+    if depths is None:
+        depths = {}
+        _THREAD_LOCAL.flock_depths = depths
+    depth = depths.get(lock_path, 0)
     with _STEAM_LOCK:
         if depth > 0:
-            _THREAD_LOCAL.flock_depth = depth + 1
+            depths[lock_path] = depth + 1
             try:
                 yield
             finally:
-                _THREAD_LOCAL.flock_depth = depth
+                depths[lock_path] = depth
             return
-        lock_dir = anchor.parent if anchor.parent.exists() else Path(tempfile.gettempdir())
-        lock_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = lock_dir / ".deckinstall.vdf.lock"
         fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            _THREAD_LOCAL.flock_depth = 1
+            depths[lock_path] = 1
             try:
                 yield
             finally:
-                _THREAD_LOCAL.flock_depth = 0
+                depths.pop(lock_path, None)
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
@@ -101,6 +111,14 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, path)
+            try:
+                dir_fd = os.open(str(path.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                pass
         except Exception:
             try:
                 tmp.unlink()
@@ -114,18 +132,41 @@ def _atomic_write_text(path: Path, text: str) -> None:
     _atomic_write_bytes(path, text.encode("utf-8"))
 
 
-def _backup_file(path: Path, keep: int = 5) -> Path | None:
-    if not path.is_file():
+def _backup_file(path: Path, keep: int = 5, backup_dir: Path | None = None) -> Path | None:
+    if path.is_symlink() or not path.is_file():
         return None
+    dest_dir = backup_dir if backup_dir is not None else path.parent
+    dest_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup = path.with_name(f"{path.name}.{stamp}.deckinstall.bak")
+    backup = dest_dir / f"{path.name}.{stamp}.deckinstall.bak"
     counter = 1
     while backup.exists():
-        backup = path.with_name(f"{path.name}.{stamp}.{counter}.deckinstall.bak")
+        backup = dest_dir / f"{path.name}.{stamp}.{counter}.deckinstall.bak"
         counter += 1
-    shutil.copy2(path, backup)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".bak.tmp", dir=str(dest_dir))
+    tmp = Path(tmp_name)
+    try:
+        src_fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            with os.fdopen(src_fd, "rb") as src_fh, os.fdopen(fd, "wb") as dst_fh:
+                shutil.copyfileobj(src_fh, dst_fh, 65536)
+                dst_fh.flush()
+                os.fsync(dst_fh.fileno())
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        os.replace(tmp, backup)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
     old_backups = sorted(
-        path.parent.glob(f"{path.name}.*.deckinstall.bak"),
+        dest_dir.glob(f"{path.name}.*.deckinstall.bak"),
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
@@ -171,12 +212,18 @@ def load_shortcuts(shortcuts_vdf: Path) -> list[ShortcutEntry]:
     return entries
 
 
-def shutdown_steam(timeout_seconds: int = 15) -> bool:
+def shutdown_steam(timeout_seconds: int = 15, steam_root: Path | None = None) -> bool:
     """Gracefully shut down Steam and wait for exit."""
     if not is_steam_running():
         return True
+    use_flatpak = is_flatpak_steam(steam_root)
+    cmd = (
+        ["flatpak", "run", "com.valvesoftware.Steam", "-shutdown"]
+        if use_flatpak
+        else [shutil.which("steam") or "/usr/bin/steam", "-shutdown"]
+    )
     subprocess.run(
-        ["/usr/bin/steam", "-shutdown"],
+        cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
@@ -186,23 +233,36 @@ def shutdown_steam(timeout_seconds: int = 15) -> bool:
         if not is_steam_running():
             return True
         time.sleep(0.5)
-    subprocess.run(
-        ["pkill", "-TERM", "-x", "steam"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
+    if use_flatpak:
+        subprocess.run(
+            ["flatpak", "kill", "com.valvesoftware.Steam"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        subprocess.run(
+            ["pkill", "-u", str(os.getuid()), "-TERM", "-x", "steam"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
     time.sleep(2.0)
     return not is_steam_running()
 
 
-def start_steam() -> None:
+def start_steam(steam_root: Path | None = None) -> None:
     """Start Steam in the background using the current desktop environment."""
     env = os.environ.copy()
     if "DISPLAY" not in env:
         env["DISPLAY"] = ":0"
+    cmd = (
+        ["flatpak", "run", "com.valvesoftware.Steam", "-silent"]
+        if is_flatpak_steam(steam_root)
+        else [shutil.which("steam") or "/usr/bin/steam", "-silent"]
+    )
     subprocess.Popen(
-        ["/usr/bin/steam", "-silent"],
+        cmd,
         env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
@@ -245,6 +305,7 @@ def add_or_update_shortcut(
 
         shortcuts = data.setdefault("shortcuts", {})
         existing_meta: dict = {}
+        stale_appids: list[int] = []
         filtered = []
         for item in shortcuts.values():
             if not isinstance(item, dict):
@@ -253,9 +314,12 @@ def add_or_update_shortcut(
             item_u32 = s32_to_u32(int(item.get("appid", 0)))
             if preserve_from_appid is not None and item_u32 == preserve_from_appid:
                 existing_meta = dict(item)
-            if item_name == app_name:
+                continue
+            if item_u32 == appid_u32 or item_name == app_name:
                 if not existing_meta:
                     existing_meta = dict(item)
+                if item_u32 != appid_u32 and item_u32 != preserve_from_appid:
+                    stale_appids.append(item_u32)
                 continue
             filtered.append(item)
 
@@ -294,6 +358,11 @@ def add_or_update_shortcut(
                 if old_shortcuts_bytes is not None:
                     _atomic_write_bytes(paths.shortcuts_vdf, old_shortcuts_bytes)
                 raise
+        for stale_id in stale_appids:
+            try:
+                remove_compat_tool(paths.config_vdf, stale_id)
+            except Exception:
+                pass
 
     return appid_u32
 
@@ -355,13 +424,21 @@ def remove_shortcut(paths: SteamPaths, appid_u32: int) -> bool:
         return True
 
 
-def set_compat_tool(config_vdf: Path, appid_u32: int, tool_name: str) -> None:
+def set_compat_tool(
+    config_vdf: Path,
+    appid_u32: int,
+    tool_name: str,
+    create_if_missing: bool = False,
+) -> None:
     """Ensure CompatToolMapping for appid_u32 is set in Steam's config.vdf."""
     with _steam_transaction_lock(config_vdf):
-        if not config_vdf.is_file():
+        if config_vdf.is_file():
+            _backup_file(config_vdf)
+            data = vdf.loads(config_vdf.read_text(encoding="utf-8", errors="replace"))
+        elif create_if_missing:
+            data = {}
+        else:
             return
-        _backup_file(config_vdf)
-        data = vdf.loads(config_vdf.read_text(encoding="utf-8", errors="replace"))
         store = data.setdefault("InstallConfigStore", {})
         steam = (
             store.setdefault("Software", {})
@@ -506,7 +583,7 @@ def _rewrite_launch_options(
         except ValueError:
             tok = raw_tok
         new_raw = raw_tok
-        if "=" in tok and not tok.startswith("-"):
+        if _is_env_assignment(tok):
             key, val = tok.split("=", 1)
             upd = _rewrite_path_prefix(val, old_roots, new_root_str)
             if old_compats and new_compat_str:
@@ -646,8 +723,8 @@ def migrate_shortcut_to_games(
         new_compat=new_compat if predicted_appid != entry.appid_u32 else None,
     )
 
-    shortcuts_snap = paths.shortcuts_vdf.read_bytes() if paths.shortcuts_vdf.is_file() else None
-    config_snap = paths.config_vdf.read_bytes() if paths.config_vdf.is_file() else None
+    shortcuts_snap: bytes | None = None
+    config_snap: bytes | None = None
     moved_root = False
     moved_compat_pair: tuple[Path, Path] | None = None
     copied_compat_dst: Path | None = None
@@ -655,13 +732,14 @@ def migrate_shortcut_to_games(
     moved_art_pairs: list[tuple[Path, Path]] = []
 
     try:
-        if old_root.resolve() != new_root.resolve():
-            if new_root.exists():
-                raise FileExistsError(f"A pasta de destino já existe: {new_root}")
-            shutil.move(str(old_root), str(new_root))
-            moved_root = True
-
-        with _steam_transaction_lock(paths.shortcuts_vdf):
+        with _steam_transaction_lock(paths.shortcuts_vdf), _steam_transaction_lock(paths.config_vdf):
+            shortcuts_snap = paths.shortcuts_vdf.read_bytes() if paths.shortcuts_vdf.is_file() else None
+            config_snap = paths.config_vdf.read_bytes() if paths.config_vdf.is_file() else None
+            if old_root.resolve() != new_root.resolve():
+                if new_root.exists():
+                    raise FileExistsError(f"Destination folder already exists: {new_root}")
+                shutil.move(str(old_root), str(new_root))
+                moved_root = True
             new_appid = add_or_update_shortcut(
                 paths=paths,
                 app_name=target_name,
@@ -738,8 +816,10 @@ def migrate_shortcut_to_games(
                 if paths.grid_dir.is_dir():
                     old_prefix = str(entry.appid_u32)
                     for art_file in paths.grid_dir.iterdir():
-                        if art_file.is_file() and art_file.name.startswith(old_prefix):
+                        if not art_file.is_symlink() and art_file.is_file() and art_file.name.startswith(old_prefix):
                             suffix = art_file.name[len(old_prefix) :]
+                            if suffix and suffix[0] not in ("p", "_", "."):
+                                continue
                             dest_art = paths.grid_dir / f"{new_appid}{suffix}"
                             if not dest_art.exists():
                                 shutil.move(str(art_file), str(dest_art))
@@ -809,6 +889,15 @@ _PREFIX_SKIP_DIRS = {
     ".sentry-native",
     "crashes",
     "crashreportclient",
+    "cache",
+    "shadercache",
+    "gpucache",
+    "code cache",
+    "webcache",
+    "telemetry",
+    "logs",
+    "cef",
+    "crashdumps",
 }
 _PREFIX_SKIP_FILES = {"steam_autocloud.vdf", "player.log", "player-prev.log"}
 _PREFIX_REL_DIRS = (
@@ -871,7 +960,7 @@ def find_external_prefixes(
         except OSError:
             continue
         for child in children:
-            if not child.is_dir() or child.name.startswith("."):
+            if child.is_symlink() or not child.is_dir() or child.name.startswith("."):
                 continue
             matched = (child.name in appid_names) or (bool(key) and _norm_key(child.name) == key)
             if not matched or _prefix_users_dir(child) is None:
@@ -890,6 +979,9 @@ def _raise_oserror(exc: OSError) -> None:
     raise exc
 
 
+_NON_SAVE_USER_DIRS = {"public", "default", "default user", "all users"}
+
+
 def _iter_prefix_save_pairs(
     src_users: Path,
     dst_users: Path,
@@ -899,13 +991,17 @@ def _iter_prefix_save_pairs(
 ):
     """Yield (src_file, dst_file) for user saves across steamuser/deck/Public."""
     try:
-        user_dirs = [d for d in src_users.iterdir() if d.is_dir()]
+        user_dirs = [
+            d
+            for d in src_users.iterdir()
+            if not d.is_symlink() and d.is_dir() and d.name.lower() not in {"default", "default user", "all users"}
+        ]
     except OSError:
         if raise_on_error:
             raise
         return
     onerror = _raise_oserror if raise_on_error else None
-    non_public_count = sum(1 for d in user_dirs if d.name.lower() != "public")
+    non_public_count = sum(1 for d in user_dirs if d.name.lower() not in _NON_SAVE_USER_DIRS)
     for user_dir in user_dirs:
         if user_dir.name.lower() == "public":
             target_user = user_dir.name if preserve_user_dirs else "Public"
@@ -929,7 +1025,7 @@ def _iter_prefix_save_pairs(
                 cur = Path(dirpath)
                 rel_dir = cur.relative_to(src_root)
                 for fname in filenames:
-                    if fname.lower() in _PREFIX_SKIP_FILES:
+                    if fname.lower() in _PREFIX_SKIP_FILES or fname.lower().endswith(".deckinstall.bak"):
                         continue
                     src_file = cur / fname
                     if src_file.is_symlink() or not src_file.is_file():
@@ -962,7 +1058,8 @@ def _iter_programdata_save_pairs(
 
 def _file_sha256(path: Path) -> str:
     h = hashlib.sha256()
-    with path.open("rb") as fh:
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as fh:
         while chunk := fh.read(65536):
             h.update(chunk)
     return h.hexdigest()
@@ -990,7 +1087,7 @@ def _copy_save_pair_if_newer(
             dst_file.stat().st_size != src_file.stat().st_size
             or _file_sha256(dst_file) != _file_sha256(src_file)
         ):
-            _backup_file(dst_file, keep=3)
+            _backup_file(dst_file, keep=3, backup_dir=dst_root_resolved / ".deckinstall_bak")
         fd, tmp_name = tempfile.mkstemp(
             prefix=f".{dst_file.name}.", suffix=".tmp", dir=str(dst_file.parent)
         )
@@ -1419,19 +1516,22 @@ def sync_all_external_saves(
             roots = external_prefix_roots()
             if steam_appid and paths.compatdata_dir.is_dir():
                 roots = [*roots, paths.compatdata_dir]
-        copied += import_external_prefix_saves(
-            paths=paths,
-            shortcut_appid_u32=entry.appid_u32,
-            game_name=entry.app_name,
-            steam_appid=steam_appid,
-            search_roots=roots,
-        )
+        try:
+            copied += import_external_prefix_saves(
+                paths=paths,
+                shortcut_appid_u32=entry.appid_u32,
+                game_name=entry.app_name,
+                steam_appid=steam_appid,
+                search_roots=roots,
+            )
+        except Exception as exc:
+            logging.warning("Save sync skipped for %s: %s", entry.app_name, exc)
     return checked, copied
 
 
 def _installed_steam_appids(steam_root: Path) -> set[int]:
-    """Return installed Steam AppIDs from appmanifest_*.acf files."""
-    appids: set[int] = {0, 228980}
+    """Return installed Steam AppIDs and core runtime IDs from appmanifest_*.acf files."""
+    appids: set[int] = {0, 228980, 1070560, 1391110, 1493710, 1628350, 1887720}
     steamapps_dirs = [steam_root / "steamapps"]
     lib_vdf = steam_root / "steamapps" / "libraryfolders.vdf"
     if lib_vdf.is_file():
@@ -1448,7 +1548,7 @@ def _installed_steam_appids(steam_root: Path) -> set[int]:
             continue
         for acf in sa.glob("appmanifest_*.acf"):
             stem_id = acf.stem.removeprefix("appmanifest_")
-            if stem_id.isdigit():
+            if stem_id.isascii() and stem_id.isdigit():
                 appids.add(int(stem_id))
     return appids
 
@@ -1535,7 +1635,7 @@ def find_cleanup_candidates(
         except OSError:
             continue
         for child in children:
-            if not child.is_dir() or child.name.startswith("."):
+            if child.is_symlink() or not child.is_dir() or child.name.startswith("."):
                 continue
             if _prefix_users_dir(child) is None:
                 continue
@@ -1572,7 +1672,7 @@ def find_cleanup_candidates(
     installed_steam = _installed_steam_appids(paths.steam_root)
     if paths.compatdata_dir.is_dir():
         for child in paths.compatdata_dir.iterdir():
-            if not child.is_dir():
+            if child.is_symlink() or not child.is_dir():
                 continue
             if child.name.endswith(".deckinstall.bak"):
                 try:
@@ -1582,7 +1682,9 @@ def find_cleanup_candidates(
                     continue
                 prefix_id = child.name.split(".", 1)[0]
                 matched_entry = (
-                    by_appid_u32.get(int(prefix_id)) if prefix_id.isdigit() else None
+                    by_appid_u32.get(int(prefix_id))
+                    if (prefix_id.isascii() and prefix_id.isdigit())
+                    else None
                 )
                 has_saves = _prefix_has_saves(child)
                 saves_verified = False
@@ -1604,7 +1706,7 @@ def find_cleanup_candidates(
                     )
                 )
                 continue
-            if not child.name.isdigit():
+            if not (child.name.isascii() and child.name.isdigit()):
                 continue
             appid = int(child.name)
             if appid in active_shortcuts or appid in installed_steam:
@@ -1669,40 +1771,42 @@ def delete_cleanup_candidates_checked(
     deleted = 0
     freed = 0
     errors: list[str] = []
-    for item in candidates:
-        if not item.path.exists():
-            continue
-        try:
-            resolved = item.path.resolve()
-        except OSError as exc:
-            errors.append(f"{item.label}: {exc}")
-            continue
+    with _steam_transaction_lock(paths.shortcuts_vdf):
         fresh_by_path = {
             c.path.resolve(): c
             for c in find_cleanup_candidates(paths, extra_external_roots=extra_external_roots)
         }
-        fresh = fresh_by_path.get(resolved)
-        if fresh is None:
-            errors.append(f"{item.label}: ignorado por segurança (não é mais órfão/seguro).")
-            continue
-        if fresh.has_saves and not fresh.saves_verified_migrated:
-            errors.append(f"{item.label}: ignorado por segurança (saves não validados).")
-            continue
-        try:
-            if item.path.is_dir() and not item.path.is_symlink():
-                shutil.rmtree(item.path)
-            else:
-                item.path.unlink()
-            deleted += 1
-            freed += item.size_bytes
-        except OSError as exc:
-            errors.append(f"{item.label}: {exc}")
+        for item in candidates:
+            if not item.path.exists():
+                continue
+            try:
+                resolved = item.path.resolve()
+            except OSError as exc:
+                errors.append(f"{item.label}: {exc}")
+                continue
+            fresh = fresh_by_path.get(resolved)
+            if fresh is None:
+                errors.append(f"{item.label}: skipped for safety (no longer orphan/safe).")
+                continue
+            if fresh.has_saves and not fresh.saves_verified_migrated:
+                errors.append(f"{item.label}: skipped for safety (unvalidated saves).")
+                continue
+            try:
+                if item.path.is_dir() and not item.path.is_symlink():
+                    shutil.rmtree(item.path)
+                else:
+                    item.path.unlink()
+                deleted += 1
+                freed += item.size_bytes
+            except OSError as exc:
+                errors.append(f"{item.label}: {exc}")
     return deleted, freed, errors
 
 
 _RESTORE_MAX_FILE_BYTES = 512 * 1024 * 1024
 _RESTORE_MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024
 _MANIFEST_MAX_BYTES = 4 * 1024 * 1024
+_RESTORE_MAX_ENTRIES = 20_000
 
 
 def _reserve_unique_backup_zip(out_dir: Path, stamp: str) -> Path:
@@ -1759,7 +1863,9 @@ def backup_all_saves(
                             raise RuntimeError(f"Limite de tamanho de backup excedido em {src_file.name}")
                         rel = dst_rel.relative_to(dummy_dst)
                         arcname = f"{entry.appid_u32}/users/{rel.as_posix()}"
-                        zf.write(src_file, arcname)
+                        sfd = os.open(str(src_file), os.O_RDONLY | os.O_NOFOLLOW)
+                        with os.fdopen(sfd, "rb") as sfh:
+                            zf.writestr(arcname, sfh.read())
                         total_uncompressed += fsize
                         game_files += 1
                         files_backed += 1
@@ -1773,10 +1879,12 @@ def backup_all_saves(
                         if fsize == 0:
                             continue
                         if fsize > _RESTORE_MAX_FILE_BYTES or total_uncompressed + fsize > _RESTORE_MAX_TOTAL_BYTES:
-                            raise RuntimeError(f"Limite de tamanho de backup excedido em {src_file.name}")
+                            raise RuntimeError(f"Backup size limit exceeded on {src_file.name}")
                         rel = dst_rel.relative_to(dummy_pd)
                         arcname = f"{entry.appid_u32}/ProgramData/{rel.as_posix()}"
-                        zf.write(src_file, arcname)
+                        sfd = os.open(str(src_file), os.O_RDONLY | os.O_NOFOLLOW)
+                        with os.fdopen(sfd, "rb") as sfh:
+                            zf.writestr(arcname, sfh.read())
                         total_uncompressed += fsize
                         game_files += 1
                         files_backed += 1
@@ -1817,27 +1925,35 @@ def _safe_parents_within(base_dir: Path, base_resolved: Path, rel_parts: tuple[s
 
 def restore_saves_backup(paths: SteamPaths, zip_path: Path) -> tuple[int, int]:
     """Restore saves from a DeckInstall ZIP backup into matching Steam compatdata folders."""
-    entries = load_shortcuts(paths.shortcuts_vdf)
-    active_ids = {str(e.appid_u32) for e in entries}
-    by_exact = {e.app_name: str(e.appid_u32) for e in entries}
-    norm_counts: dict[str, list[str]] = {}
-    for e in entries:
-        nk = _norm_key(e.app_name)
-        if nk:
-            norm_counts.setdefault(nk, []).append(str(e.appid_u32))
-    by_norm = {nk: ids[0] for nk, ids in norm_counts.items() if len(ids) == 1}
+    with _steam_transaction_lock(paths.shortcuts_vdf):
+        entries = load_shortcuts(paths.shortcuts_vdf)
+        active_ids = {str(e.appid_u32) for e in entries}
+        by_exact = {e.app_name: str(e.appid_u32) for e in entries}
+        norm_counts: dict[str, list[str]] = {}
+        for e in entries:
+            nk = _norm_key(e.app_name)
+            if nk:
+                norm_counts.setdefault(nk, []).append(str(e.appid_u32))
+        by_norm = {nk: ids[0] for nk, ids in norm_counts.items() if len(ids) == 1}
 
-    paths.compatdata_dir.mkdir(parents=True, exist_ok=True)
-    compat_root_resolved = paths.compatdata_dir.resolve()
-    restored_games: set[str] = set()
-    restored_files = 0
-    total_bytes = 0
-    backed_up_targets: set[Path] = set()
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        manifest: dict[str, str] = {}
-        try:
-            minfo = zf.getinfo("manifest.json")
-            if minfo.file_size <= _MANIFEST_MAX_BYTES:
+        paths.compatdata_dir.mkdir(parents=True, exist_ok=True)
+        compat_root_resolved = paths.compatdata_dir.resolve()
+        restored_games: set[str] = set()
+        restored_files = 0
+        total_bytes = 0
+        backed_up_targets: set[Path] = set()
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            infolist = zf.infolist()
+            if len(infolist) > _RESTORE_MAX_ENTRIES:
+                raise RuntimeError(f"Backup exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})")
+            manifest: dict[str, str] = {}
+            try:
+                minfo = zf.getinfo("manifest.json")
+            except KeyError:
+                minfo = None
+            if minfo is not None:
+                if minfo.file_size > _MANIFEST_MAX_BYTES:
+                    raise ValueError("manifest.json exceeds size limit")
                 chunks: list[bytes] = []
                 read_len = 0
                 with zf.open(minfo, "r") as mfh:
@@ -1847,74 +1963,81 @@ def restore_saves_backup(paths: SteamPaths, zip_path: Path) -> tuple[int, int]:
                             raise ValueError("manifest.json exceeds size limit")
                         chunks.append(chunk)
                 raw_manifest = json.loads(b"".join(chunks).decode("utf-8", errors="replace"))
-                if isinstance(raw_manifest, dict):
-                    manifest = {str(k): str(v) for k, v in raw_manifest.items()}
-        except (KeyError, Exception):
-            manifest = {}
+                if not isinstance(raw_manifest, dict):
+                    raise ValueError("Invalid manifest.json format")
+                manifest = {str(k): str(v) for k, v in raw_manifest.items()}
 
-        for info in zf.infolist():
-            if info.is_dir() or info.filename == "manifest.json":
-                continue
-            parts = Path(info.filename).parts
-            if len(parts) < 3 or not parts[0].isdigit() or parts[1] not in ("users", "ProgramData"):
-                continue
-            appid_str = parts[0]
-            if appid_str not in active_ids:
-                if manifest:
-                    old_name = manifest.get(appid_str, "")
-                    mapped = by_exact.get(old_name) or by_norm.get(_norm_key(old_name))
-                    if not mapped:
-                        continue
-                    appid_str = mapped
-                elif entries:
+            for info in infolist:
+                if info.is_dir() or info.filename == "manifest.json":
                     continue
-            section = parts[1]
-            rel_parts = parts[2:]
-            if any(p in ("..", "", ".") for p in rel_parts):
-                continue
-            if info.file_size > _RESTORE_MAX_FILE_BYTES:
-                raise RuntimeError(f"Arquivo muito grande no backup: {info.filename}")
-            prefix_rel = (appid_str, "pfx", "drive_c", section, *rel_parts[:-1])
-            if not _safe_parents_within(paths.compatdata_dir, compat_root_resolved, prefix_rel):
-                continue
-            dst_base = paths.compatdata_dir / appid_str / "pfx" / "drive_c" / section
-            dst_base.mkdir(parents=True, exist_ok=True)
-            dst_base_resolved = dst_base.resolve()
-            if not dst_base_resolved.is_relative_to(compat_root_resolved):
-                continue
-            target = dst_base.joinpath(*rel_parts)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.parent.resolve().is_relative_to(dst_base_resolved):
-                continue
-            if target.is_symlink():
-                continue
-            if target.is_file() and target not in backed_up_targets:
-                _backup_file(target, keep=3)
-                backed_up_targets.add(target)
-            fd, tmp_name = tempfile.mkstemp(
-                prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
-            )
-            os.close(fd)
-            tmp_path = Path(tmp_name)
-            try:
-                copied_bytes = 0
-                with zf.open(info, "r") as src_fh, tmp_path.open("wb") as dst_fh:
-                    while chunk := src_fh.read(65536):
-                        copied_bytes += len(chunk)
-                        total_bytes += len(chunk)
-                        if copied_bytes > _RESTORE_MAX_FILE_BYTES or total_bytes > _RESTORE_MAX_TOTAL_BYTES:
-                            raise RuntimeError(f"Limite de descompactação excedido em {info.filename}")
-                        dst_fh.write(chunk)
-                os.replace(tmp_path, target)
-            except Exception:
+                parts = Path(info.filename).parts
+                if (
+                    len(parts) < 3
+                    or not (parts[0].isascii() and parts[0].isdigit())
+                    or parts[1] not in ("users", "ProgramData")
+                ):
+                    continue
+                appid_str = parts[0]
+                if appid_str not in active_ids:
+                    if manifest:
+                        old_name = manifest.get(appid_str, "")
+                        mapped = by_exact.get(old_name) or by_norm.get(_norm_key(old_name))
+                        if not mapped:
+                            continue
+                        appid_str = mapped
+                    else:
+                        continue
+                section = parts[1]
+                rel_parts = parts[2:]
+                if any(p in ("..", "", ".") for p in rel_parts):
+                    continue
+                if info.file_size > _RESTORE_MAX_FILE_BYTES:
+                    raise RuntimeError(f"Backup file too large: {info.filename}")
+                prefix_rel = (appid_str, "pfx", "drive_c", section, *rel_parts[:-1])
+                if not _safe_parents_within(paths.compatdata_dir, compat_root_resolved, prefix_rel):
+                    continue
+                dst_base = paths.compatdata_dir / appid_str / "pfx" / "drive_c" / section
+                dst_base.mkdir(parents=True, exist_ok=True)
+                dst_base_resolved = dst_base.resolve()
+                if not dst_base_resolved.is_relative_to(compat_root_resolved):
+                    continue
+                target = dst_base.joinpath(*rel_parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.parent.resolve().is_relative_to(dst_base_resolved):
+                    continue
+                if target.is_symlink():
+                    continue
+                if target.is_file() and target not in backed_up_targets:
+                    _backup_file(
+                        target,
+                        keep=3,
+                        backup_dir=paths.compatdata_dir / appid_str / ".deckinstall_bak",
+                    )
+                    backed_up_targets.add(target)
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+                )
+                os.close(fd)
+                tmp_path = Path(tmp_name)
                 try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
-                raise
-            restored_games.add(appid_str)
-            restored_files += 1
-    return len(restored_games), restored_files
+                    copied_bytes = 0
+                    with zf.open(info, "r") as src_fh, tmp_path.open("wb") as dst_fh:
+                        while chunk := src_fh.read(65536):
+                            copied_bytes += len(chunk)
+                            total_bytes += len(chunk)
+                            if copied_bytes > _RESTORE_MAX_FILE_BYTES or total_bytes > _RESTORE_MAX_TOTAL_BYTES:
+                                raise RuntimeError(f"Decompression limit exceeded on {info.filename}")
+                            dst_fh.write(chunk)
+                    os.replace(tmp_path, target)
+                except Exception:
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+                    raise
+                restored_games.add(appid_str)
+                restored_files += 1
+        return len(restored_games), restored_files
 
 
 def sync_prefix_symlinks(
@@ -2003,27 +2126,17 @@ def get_shortcut_proton(config_vdf: Path, appid_u32: int) -> str:
 
 def set_shortcut_proton(config_vdf: Path, appid_u32: int, tool_name: str) -> None:
     """Set compatibility tool for a Steam shortcut in config.vdf atomically."""
-    with _steam_transaction_lock(config_vdf):
-        if config_vdf.is_file():
-            _backup_file(config_vdf)
-            data = vdf.loads(config_vdf.read_text(encoding="utf-8", errors="replace"))
-        else:
-            data = {}
-        store = data.setdefault("InstallConfigStore", {})
-        sw = store.setdefault("Software", {})
-        valve = sw.setdefault("Valve", {})
-        steam = valve.setdefault("Steam", {})
-        mapping = steam.setdefault("CompatToolMapping", {})
-        mapping[str(appid_u32)] = {
-            "name": tool_name,
-            "config": "",
-            "priority": "250",
-        }
-        _atomic_write_bytes(config_vdf, vdf.dumps(data, pretty=True).encode("utf-8"))
+    set_compat_tool(config_vdf, appid_u32, tool_name, create_if_missing=True)
 
 
 _PRESET_ENV_KEYS = ("MANGOHUD", "PROTON_USE_WINED3D", "PROTON_NO_ESYNC", "PROTON_NO_FSYNC")
 _SHELL_OPS = {"&&", "||", ";", "|", ">", ">>", "<", "2>&1", "1>&2", "%command%"}
+_SAFE_UNQUOTED_DOLLAR_RE = re.compile(r"^[\w./:=+-]*\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})[\w./:=+-]*$")
+
+
+def _validate_launch_options(launch_options: str) -> None:
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in launch_options):
+        raise ValueError("Launch options cannot contain control characters or newlines.")
 
 
 def _is_env_assignment(tok: str) -> bool:
@@ -2036,14 +2149,14 @@ def _is_env_assignment(tok: str) -> bool:
 def _format_launch_token(tok: str) -> str:
     if tok in _SHELL_OPS:
         return tok
-    if '"' in tok or "'" in tok:
+    if ('"' in tok or "'" in tok) and "`" not in tok and "$(" not in tok:
         return tok
     if _is_env_assignment(tok):
         k, v = tok.split("=", 1)
-        if "$" in v and not re.search(r"[\s\"'()&|;<>]", v):
+        if "$" in v and _SAFE_UNQUOTED_DOLLAR_RE.fullmatch(v) and "`" not in v and "$(" not in v:
             return f"{k}={v}"
         return f"{k}={shlex.quote(v)}"
-    if "$" in tok and not re.search(r"[\s\"'()&|;<>]", tok):
+    if "$" in tok and _SAFE_UNQUOTED_DOLLAR_RE.fullmatch(tok) and "`" not in tok and "$(" not in tok:
         return tok
     return shlex.quote(tok)
 
@@ -2057,7 +2170,11 @@ def apply_launch_presets(
     no_fsync: bool,
 ) -> str:
     """Toggle common SteamOS/Proton launch presets while preserving existing custom options."""
-    tokens = _raw_shell_tokens(launch_options) if launch_options.strip() else []
+    _validate_launch_options(launch_options)
+    try:
+        tokens = _raw_shell_tokens(launch_options) if launch_options.strip() else []
+    except ValueError:
+        tokens = launch_options.split()
 
     # Strip existing managed presets
     filtered: list[str] = []
@@ -2094,5 +2211,7 @@ def apply_launch_presets(
         wrappers_out.append("gamemoderun")
     wrappers_out.extend(wrappers_before)
 
+    if not env_before and not preset_envs and not wrappers_out and not after_cmd:
+        return ""
     final_tokens = env_before + preset_envs + wrappers_out + ["%command%"] + after_cmd
     return " ".join(_format_launch_token(tok) for tok in final_tokens)

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import codecs
+import errno
 import os
 import re
 import select
 import shutil
+import signal
+import stat
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -14,7 +18,23 @@ from pathlib import Path
 from .scanner import clean_game_name
 from .steam_paths import find_proton_binary, find_steam_root
 
-ARCHIVE_SUFFIXES = (".zip", ".rar", ".7z", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.zst", ".tar.bz2", ".tar")
+ARCHIVE_SUFFIXES = (
+    ".tar.gz",
+    ".tgz",
+    ".tar.xz",
+    ".txz",
+    ".tar.zst",
+    ".tar.bz2",
+    ".tar",
+    ".part1.rar",
+    ".7z.001",
+    ".zip.001",
+    ".rar.001",
+    ".001",
+    ".zip",
+    ".rar",
+    ".7z",
+)
 
 
 def is_archive(path: Path) -> bool:
@@ -39,21 +59,59 @@ def sanitize_folder_name(name: str) -> str:
     """Ensure folder_name is a single safe directory name without path traversal."""
     cleaned = name.strip().strip("/\\")
     if not cleaned or cleaned in (".", "..") or "/" in cleaned or "\\" in cleaned:
-        raise ValueError(f"Nome de pasta inválido: {name!r}")
+        raise ValueError(f"Invalid folder name: {name!r}")
     return cleaned
 
 
 def _select_extract_cmd(archive: Path, out_dir: Path) -> list[str]:
-    low = archive.name.lower()
+    arc = archive.resolve()
+    low = arc.name.lower()
     if any(low.endswith(ext) for ext in (".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.zst", ".tar.bz2", ".tar")) and shutil.which("tar"):
-        return ["tar", "-xf", str(archive), "-C", str(out_dir)]
-    if low.endswith(".rar") and shutil.which("unrar"):
-        return ["unrar", "x", "-o+", "-y", str(archive), str(out_dir) + "/"]
+        return ["tar", "--no-same-owner", "--no-same-permissions", "-xf", str(arc), "-C", str(out_dir)]
+    if low.endswith((".rar", ".part1.rar", ".rar.001")) and shutil.which("unrar"):
+        return ["unrar", "x", "-o+", "-y", "-p-", "--", str(arc), str(out_dir) + "/"]
     if low.endswith(".zip") and shutil.which("unzip"):
-        return ["unzip", "-o", str(archive), "-d", str(out_dir)]
+        return ["unzip", "-o", "--", str(arc), "-d", str(out_dir)]
     if shutil.which("7z"):
-        return ["7z", "x", "-y", f"-o{out_dir}", str(archive)]
-    raise RuntimeError(f"Nenhuma ferramenta de extração encontrada para: {archive.name}")
+        return ["7z", "x", "-y", "-p-", f"-o{out_dir}", "--", str(arc)]
+    raise RuntimeError(f"No extraction tool found for: {archive.name}")
+
+
+def _strip_symlinks_and_specials(root: Path) -> None:
+    """Remove symlinks and special files from extracted staging directory before move."""
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False, followlinks=False):
+        dp = Path(dirpath)
+        for name in filenames:
+            p = dp / name
+            try:
+                st = p.lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                p.unlink(missing_ok=True)
+        for name in dirnames:
+            p = dp / name
+            try:
+                st = p.lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
+                p.unlink(missing_ok=True)
+
+
+def _move_file_replace(src_f: Path, dst_f: Path) -> None:
+    """Atomically replace dst_f with src_f on same filesystem, falling back to move."""
+    if dst_f.is_symlink():
+        dst_f.unlink()
+    elif dst_f.is_dir():
+        shutil.rmtree(dst_f)
+    try:
+        os.replace(src_f, dst_f)
+    except OSError as exc:
+        if exc.errno == errno.EXDEV:
+            shutil.move(str(src_f), str(dst_f))
+        else:
+            raise
 
 
 def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
@@ -65,41 +123,39 @@ def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
         else temp_dir
     )
     if final_dir.is_symlink():
-        raise RuntimeError(f"Pasta de destino não pode ser um link simbólico: {final_dir}")
+        raise RuntimeError(f"Destination folder cannot be a symlink: {final_dir}")
     final_dir.mkdir(parents=True, exist_ok=True)
     final_resolved = final_dir.resolve()
     for item in source_root.iterdir():
+        if item.is_symlink():
+            item.unlink(missing_ok=True)
+            continue
         dest = final_dir / item.name
         if dest.is_symlink():
             dest.unlink()
         elif dest.exists() and not dest.resolve().is_relative_to(final_resolved):
-            raise RuntimeError(f"Destino fora da pasta permitida: {dest}")
+            raise RuntimeError(f"Destination escapes target folder: {dest}")
         if dest.exists():
-            if item.is_dir() and not item.is_symlink() and dest.is_dir():
+            if item.is_dir() and dest.is_dir():
                 for root_s, dirs_s, files_s in os.walk(item, followlinks=False):
                     rel = Path(root_s).relative_to(item)
                     target_sub = dest / rel
                     if target_sub.is_symlink() or target_sub.is_file():
                         target_sub.unlink()
                     target_sub.mkdir(parents=True, exist_ok=True)
+                    if not target_sub.resolve().is_relative_to(final_resolved):
+                        raise RuntimeError(f"Destination escapes target folder: {target_sub}")
                     for d in list(dirs_s):
                         src_d = Path(root_s) / d
-                        dst_d = target_sub / d
                         if src_d.is_symlink():
                             dirs_s.remove(d)
-                            if dst_d.is_symlink() or dst_d.is_file():
-                                dst_d.unlink()
-                            elif dst_d.is_dir():
-                                shutil.rmtree(dst_d)
-                            shutil.copy2(src_d, dst_d, follow_symlinks=False)
+                            src_d.unlink(missing_ok=True)
                     for f in files_s:
                         src_f = Path(root_s) / f
-                        dst_f = target_sub / f
-                        if dst_f.is_symlink():
-                            dst_f.unlink()
-                        elif dst_f.is_dir():
-                            shutil.rmtree(dst_f)
-                        shutil.copy2(src_f, dst_f, follow_symlinks=False)
+                        if src_f.is_symlink():
+                            src_f.unlink(missing_ok=True)
+                            continue
+                        _move_file_replace(src_f, target_sub / f)
                 shutil.rmtree(item)
                 continue
             if dest.is_dir():
@@ -107,6 +163,17 @@ def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
             else:
                 dest.unlink()
         shutil.move(str(item), str(dest))
+
+
+def _kill_proc_group(proc: subprocess.Popen[bytes], sig: int) -> None:
+    """Signal the subprocess group when start_new_session=True, falling back to proc."""
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        if sig == signal.SIGKILL:
+            proc.kill()
+        else:
+            proc.terminate()
 
 
 def _drain_stream_lines(
@@ -119,35 +186,56 @@ def _drain_stream_lines(
     assert proc.stdout is not None
     fd = proc.stdout.fileno()
     os.set_blocking(fd, False)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     buf = ""
-    while True:
-        if cancel_flag and cancel_flag():
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=2)
-            raise RuntimeError(cancel_msg)
-        ready, _, _ = select.select([fd], [], [], 0.2)
-        if ready:
-            chunk = os.read(fd, 4096)
-            if not chunk:
+    try:
+        while True:
+            if cancel_flag and cancel_flag():
+                _kill_proc_group(proc, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    _kill_proc_group(proc, signal.SIGKILL)
+                    proc.wait(timeout=2)
+                raise RuntimeError(cancel_msg)
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if ready:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    buf += decoder.decode(b"", final=True)
+                    if buf.strip():
+                        on_line(buf)
+                    break
+                buf += decoder.decode(chunk, final=False)
+                while True:
+                    idx_n = buf.find("\n")
+                    idx_r = buf.find("\r")
+                    if idx_n == -1 and idx_r == -1:
+                        break
+                    if idx_n == -1:
+                        sep = idx_r
+                    elif idx_r == -1:
+                        sep = idx_n
+                    else:
+                        sep = min(idx_n, idx_r)
+                    line = buf[:sep]
+                    buf = buf[sep + 1 :]
+                    if line.strip():
+                        on_line(line)
+            elif proc.poll() is not None:
+                buf += decoder.decode(b"", final=True)
                 if buf.strip():
                     on_line(buf)
                 break
-            buf += chunk.decode("utf-8", errors="replace")
-            while "\n" in buf:
-                line, buf = buf.split("\n", 1)
-                on_line(line)
-        elif proc.poll() is not None:
-            if buf.strip():
-                on_line(buf)
-            break
-    rc = proc.wait()
-    if cancel_flag and cancel_flag():
-        raise RuntimeError(cancel_msg)
-    return rc
+        rc = proc.wait()
+        if cancel_flag and cancel_flag():
+            raise RuntimeError(cancel_msg)
+        return rc
+    finally:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
 
 
 def extract_archive(
@@ -166,12 +254,14 @@ def extract_archive(
         tmp_path = Path(tmp)
         cmd = _select_extract_cmd(archive, tmp_path)
         if on_progress:
-            on_progress(5, f"Extraindo {archive.name}...")
+            on_progress(5, f"Extracting {archive.name}...")
 
         proc = subprocess.Popen(
             cmd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
         pct = 10
 
@@ -183,19 +273,36 @@ def extract_archive(
             elif pct < 90:
                 pct = min(90, pct + 1)
             if on_progress:
-                on_progress(pct, line.strip()[:120] or f"Extraindo {archive.name}...")
+                on_progress(pct, line.strip()[:120] or f"Extracting {archive.name}...")
 
-        rc = _drain_stream_lines(proc, cancel_flag, _handle_line, "Extração cancelada pelo usuário.")
+        rc = _drain_stream_lines(proc, cancel_flag, _handle_line, "Extraction cancelled by user.")
         if rc != 0:
-            raise RuntimeError(f"Falha ao extrair {archive.name} (código {rc}).")
+            raise RuntimeError(f"Failed to extract {archive.name} (code {rc}).")
 
         if on_progress:
-            on_progress(96, "Organizando arquivos...")
+            on_progress(96, "Organizing files...")
+        _strip_symlinks_and_specials(tmp_path)
         _unwrap_single_folder(tmp_path, final_dir)
 
     if on_progress:
-        on_progress(100, f"Concluído em {final_dir}")
+        on_progress(100, f"Completed in {final_dir}")
     return final_dir
+
+
+def _copy_dir_no_symlinks(src_dir: Path, dst_dir: Path) -> None:
+    """Copy a directory tree skipping symlinks."""
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    for root_s, dirs_s, files_s in os.walk(src_dir, followlinks=False):
+        rel = Path(root_s).relative_to(src_dir)
+        target_sub = dst_dir / rel
+        target_sub.mkdir(parents=True, exist_ok=True)
+        for d in list(dirs_s):
+            if (Path(root_s) / d).is_symlink():
+                dirs_s.remove(d)
+        for f in files_s:
+            sf = Path(root_s) / f
+            if not sf.is_symlink() and sf.is_file():
+                shutil.copy2(sf, target_sub / f)
 
 
 def run_windows_installer(
@@ -207,48 +314,50 @@ def run_windows_installer(
     """Run a Windows setup.exe using Steam's Proton in a disposable prefix."""
     steam_root = find_steam_root()
     if steam_root is None:
-        raise RuntimeError("Steam não encontrado para executar o instalador via Proton.")
+        raise RuntimeError("Steam not found to run installer via Proton.")
     proton = find_proton_binary(steam_root)
     if proton is None:
-        raise RuntimeError("Nenhuma versão do Proton encontrada no Steam.")
+        raise RuntimeError("No Proton version found in Steam.")
 
     target_dir.mkdir(parents=True, exist_ok=True)
     pre_existing = {p for p in target_dir.rglob("*") if p.is_file()}
-    with tempfile.TemporaryDirectory(prefix="deckinstall_pfx_") as tmp_pfx:
+    with tempfile.TemporaryDirectory(prefix="deckinstall_pfx_", dir=str(target_dir.parent)) as tmp_pfx:
         env = os.environ.copy()
         env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_root)
         env["STEAM_COMPAT_DATA_PATH"] = tmp_pfx
         if on_log:
             on_log(
-                f"Iniciando {installer_exe.name} via Proton.\n"
-                f"Dica: no instalador, aponte o destino para Z:{target_dir}"
+                f"Starting {installer_exe.name} via Proton.\n"
+                f"Tip: in the installer, set destination to Z:{target_dir}"
             )
         proc = subprocess.Popen(
             [str(proton), "run", str(installer_exe)],
-            cwd=str(installer_exe.parent),
+            cwd=str(tmp_pfx),
             env=env,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
 
         def _handle_inst_line(line: str) -> None:
             if on_log and line.strip():
                 on_log(line.strip()[:140])
 
-        rc = _drain_stream_lines(proc, cancel_flag, _handle_inst_line, "Instalador cancelado pelo usuário.")
+        rc = _drain_stream_lines(proc, cancel_flag, _handle_inst_line, "Installer cancelled by user.")
         if rc != 0:
-            raise RuntimeError(f"Instalador encerrou com código {rc}.")
+            raise RuntimeError(f"Installer exited with code {rc}.")
 
         has_installed = bool({p for p in target_dir.rglob("*") if p.is_file()} - pre_existing)
         if not has_installed:
             drive_c = Path(tmp_pfx) / "pfx" / "drive_c"
             copied_any = False
-            for sub in ("Games", "Program Files", "Program Files (x86)"):
+            for sub in ("Games", "GOG Games", "Program Files", "Program Files (x86)"):
                 base = drive_c / sub
-                if not base.is_dir():
+                if not base.is_dir() or base.is_symlink():
                     continue
                 for cand in base.iterdir():
-                    if not cand.is_dir() or cand.name.lower() in {
+                    if cand.is_symlink() or not cand.is_dir() or cand.name.lower() in {
                         "common files",
                         "internet explorer",
                         "windows media player",
@@ -256,12 +365,12 @@ def run_windows_installer(
                         "uninstall information",
                     }:
                         continue
-                    if any(p.is_file() and p.suffix.lower() == ".exe" for p in cand.rglob("*")):
-                        shutil.copytree(cand, target_dir / cand.name, dirs_exist_ok=True, symlinks=False)
+                    if any(p.is_file() and not p.is_symlink() and p.suffix.lower() == ".exe" for p in cand.rglob("*")):
+                        _copy_dir_no_symlinks(cand, target_dir / cand.name)
                         copied_any = True
             if not copied_any:
                 raise RuntimeError(
-                    f"Nenhum arquivo foi instalado em {target_dir}. "
-                    "Aponte o instalador para Z:" + str(target_dir)
+                    f"No files were installed in {target_dir}. "
+                    "Point the installer to Z:" + str(target_dir)
                 )
     return target_dir

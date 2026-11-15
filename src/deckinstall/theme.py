@@ -71,8 +71,8 @@ QLineEdit, QComboBox, QListWidget, QTextEdit {
     color: #e6ebf5;
     min-height: 20px;
 }
-QLineEdit:focus, QComboBox:focus, QListWidget:focus {
-    border-color: #3daee9;
+QLineEdit:focus, QComboBox:focus, QListWidget:focus, QTextEdit:focus {
+    border: 2px solid #3daee9;
 }
 QListWidget::item {
     padding: 8px 10px;
@@ -81,6 +81,18 @@ QListWidget::item {
 QListWidget::item:selected {
     background-color: #1d6fa5;
     color: #ffffff;
+}
+QListWidget::item:focus {
+    border: 1px solid #3daee9;
+}
+QCheckBox:focus {
+    outline: 1px solid #3daee9;
+    color: #ffffff;
+}
+QLabel#PreviewBox {
+    border: 1px solid #344157;
+    border-radius: 8px;
+    background-color: #11141a;
 }
 QPushButton {
     background-color: #242a38;
@@ -94,8 +106,13 @@ QPushButton {
 QPushButton:hover {
     background-color: #2e3648;
 }
+QPushButton:focus, #Sidebar QPushButton:focus {
+    border: 2px solid #3daee9;
+}
 QPushButton:disabled {
-    opacity: 0.45;
+    background-color: #181c26;
+    border-color: #232938;
+    color: #6b768d;
 }
 QPushButton#primaryBtn {
     background-color: #1d6fa5;
@@ -106,6 +123,11 @@ QPushButton#primaryBtn {
 QPushButton#primaryBtn:hover {
     background-color: #2584c4;
 }
+QPushButton#primaryBtn:disabled {
+    background-color: #173a54;
+    border-color: #234c6b;
+    color: #7da3be;
+}
 QPushButton#dangerBtn {
     background-color: #7c242b;
     border-color: #b83b44;
@@ -113,6 +135,17 @@ QPushButton#dangerBtn {
 }
 QPushButton#dangerBtn:hover {
     background-color: #962c34;
+}
+QPushButton#dangerBtn:disabled {
+    background-color: #421b20;
+    border-color: #5b252b;
+    color: #9b7377;
+}
+QLineEdit:disabled, QComboBox:disabled {
+    background-color: #151922;
+    border-color: #232938;
+    color: #6b768d;
+}
 }
 QProgressBar {
     background-color: #11141a;
@@ -189,8 +222,8 @@ QLineEdit, QComboBox, QListWidget, QTextEdit {
     color: #1b2230;
     min-height: 20px;
 }
-QLineEdit:focus, QComboBox:focus, QListWidget:focus {
-    border-color: #1d6fa5;
+QLineEdit:focus, QComboBox:focus, QListWidget:focus, QTextEdit:focus {
+    border: 2px solid #1d6fa5;
 }
 QListWidget::item {
     padding: 8px 10px;
@@ -199,6 +232,18 @@ QListWidget::item {
 QListWidget::item:selected {
     background-color: #1d6fa5;
     color: #ffffff;
+}
+QListWidget::item:focus {
+    border: 1px solid #1d6fa5;
+}
+QCheckBox:focus {
+    outline: 1px solid #1d6fa5;
+    color: #0e3a58;
+}
+QLabel#PreviewBox {
+    border: 1px solid #c9d3e3;
+    border-radius: 8px;
+    background-color: #ffffff;
 }
 QPushButton {
     background-color: #e9eef6;
@@ -212,6 +257,14 @@ QPushButton {
 QPushButton:hover {
     background-color: #dde5f0;
 }
+QPushButton:focus, #Sidebar QPushButton:focus {
+    border: 2px solid #1d6fa5;
+}
+QPushButton:disabled {
+    background-color: #eef1f6;
+    border-color: #dce2ec;
+    color: #8b96aa;
+}
 QPushButton#primaryBtn {
     background-color: #1d6fa5;
     border-color: #155885;
@@ -221,10 +274,25 @@ QPushButton#primaryBtn {
 QPushButton#primaryBtn:hover {
     background-color: #2584c4;
 }
+QPushButton#primaryBtn:disabled {
+    background-color: #9dc0d9;
+    border-color: #88aecb;
+    color: #eef4f9;
+}
 QPushButton#dangerBtn {
     background-color: #c93b44;
     border-color: #a62b33;
     color: #ffffff;
+}
+QPushButton#dangerBtn:disabled {
+    background-color: #dfb2b5;
+    border-color: #d09fa3;
+    color: #f9eff0;
+}
+QLineEdit:disabled, QComboBox:disabled {
+    background-color: #f1f4f9;
+    border-color: #dce2ec;
+    color: #8b96aa;
 }
 QProgressBar {
     background-color: #e9eef6;
@@ -266,11 +334,35 @@ def apply_theme(app: QApplication, mode: ThemeMode = "auto") -> bool:
     if dark:
         palette.setColor(QPalette.ColorRole.Window, QColor("#13161d"))
         palette.setColor(QPalette.ColorRole.WindowText, QColor("#e6ebf5"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#11141a"))
+        palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#181c26"))
+        palette.setColor(QPalette.ColorRole.Text, QColor("#e6ebf5"))
+        palette.setColor(QPalette.ColorRole.Button, QColor("#242a38"))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor("#e6ebf5"))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor("#1d6fa5"))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#7c88a0"))
+        palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#1c212c"))
+        palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#e6ebf5"))
+        palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#6b768d"))
+        palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#6b768d"))
         app.setPalette(palette)
         app.setStyleSheet(DARK_QSS)
     else:
         palette.setColor(QPalette.ColorRole.Window, QColor("#f3f5f9"))
         palette.setColor(QPalette.ColorRole.WindowText, QColor("#1b2230"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#e9eef6"))
+        palette.setColor(QPalette.ColorRole.Text, QColor("#1b2230"))
+        palette.setColor(QPalette.ColorRole.Button, QColor("#e9eef6"))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor("#1b2230"))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor("#1d6fa5"))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.PlaceholderText, QColor("#6b768d"))
+        palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#ffffff"))
+        palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#1b2230"))
+        palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#8b96aa"))
+        palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#8b96aa"))
         app.setPalette(palette)
         app.setStyleSheet(LIGHT_QSS)
     return dark

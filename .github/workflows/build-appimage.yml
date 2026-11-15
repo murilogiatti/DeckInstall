@@ -2,8 +2,15 @@ name: Build DeckInstall AppImage
 
 on:
   push:
+    branches:
+      - "main"
+      - "master"
     tags:
       - "v*"
+  pull_request:
+    branches:
+      - "main"
+      - "master"
   workflow_dispatch:
 
 permissions:
@@ -11,7 +18,7 @@ permissions:
 
 jobs:
   build-appimage:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout repository
@@ -32,12 +39,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install nuitka
+          pip install nuitka ruff
 
-      - name: Read version
+      - name: Read and verify version
         id: meta
         run: |
           VERSION=$(cat VERSION | tr -d '[:space:]')
+          PKG_VER=$(PYTHONPATH=src python -c "import deckinstall; print(deckinstall.__version__)")
+          test "$VERSION" = "$PKG_VER"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Verify 256x256 PNG icon
@@ -46,9 +55,9 @@ jobs:
             rsvg-convert -w 256 -h 256 assets/icon.svg -o assets/icon.png
           fi
 
-      - name: Run unit tests
+      - name: Run unit tests (strict ResourceWarning + headless Qt)
         run: |
-          python -m unittest discover -s tests -v
+          QT_QPA_PLATFORM=offscreen PYTHONPATH=src python -W error::ResourceWarning -m unittest discover -s tests -v
 
       - name: Compile standalone binary with Nuitka
         run: |
@@ -56,25 +65,41 @@ jobs:
             --standalone \
             --enable-plugin=pyside6 \
             --include-package=deckinstall \
-            --include-data-dir=src/deckinstall/locales=locales \
+            --include-data-dir=src/deckinstall/locales=deckinstall/locales \
             --include-data-dir=assets=assets \
             --output-dir=build \
             --output-filename=deckinstall \
             main.py
 
-      - name: Prepare AppDir
+      - name: Prepare AppDir and validate metadata
         run: |
           APPDIR="build/DeckInstall.AppDir"
           mv build/main.dist "$APPDIR"
           cp assets/deckinstall.desktop "$APPDIR/deckinstall.desktop"
+          desktop-file-validate "$APPDIR/deckinstall.desktop"
           cp assets/icon.png "$APPDIR/deckinstall.png"
           mkdir -p "$APPDIR/usr/share/icons/hicolor/256x256/apps"
           cp assets/icon.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/deckinstall.png"
-          ln -s deckinstall "$APPDIR/AppRun"
+          cat <<'EOF' > "$APPDIR/AppRun"
+          #!/usr/bin/env bash
+          set -euo pipefail
+          HERE="$(dirname "$(readlink -f "$0")")"
+          export PATH="$HERE:$PATH"
+          export QT_QPA_PLATFORMTHEME="${QT_QPA_PLATFORMTHEME:-xdgdesktopportal}"
+          exec "$HERE/deckinstall" "$@"
+          EOF
+          chmod +x "$APPDIR/AppRun"
+
+      - name: Smoke test packaged AppDir
+        run: |
+          APPDIR="build/DeckInstall.AppDir"
+          "$APPDIR/AppRun" --version
+          QT_QPA_PLATFORM=offscreen "$APPDIR/AppRun" --smoke-test
 
       - name: Build AppImage
         run: |
           wget -q https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool-x86_64.AppImage" | sha256sum -c -
           chmod +x appimagetool-x86_64.AppImage
           ARCH=x86_64 ./appimagetool-x86_64.AppImage --appimage-extract-and-run \
             build/DeckInstall.AppDir \

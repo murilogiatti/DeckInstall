@@ -25,7 +25,21 @@ IGNORED_EXE_PATTERNS = (
     "redist",
     "easyanticheat",
     "battleye",
+)
+
+UTILITY_EXE_PATTERNS = (
     "launcher",
+    "updater",
+    "config",
+    "settings",
+    "benchmark",
+    "server",
+    "dedicated",
+    "editor",
+    "crashpad",
+    "cefprocess",
+    "webview",
+    "helper",
 )
 
 SCENE_TAG_RE = re.compile(
@@ -55,18 +69,40 @@ def clean_game_name(raw_name: str) -> str:
 
 def detect_steam_appid(game_dir: Path) -> int | None:
     """Check common Steam emulator/appid files for an official numeric Steam AppID."""
-    for appid_file in [game_dir / "steam_appid.txt", *game_dir.rglob("steam_appid.txt")]:
+    appid_files: list[Path] = []
+    ini_files: dict[str, list[Path]] = {
+        "steam_emu.ini": [],
+        "rune.ini": [],
+        "tenoke.ini": [],
+        "flt.ini": [],
+    }
+    base_parts = len(game_dir.parts)
+    for dirpath, dirnames, filenames in os.walk(game_dir, followlinks=False):
+        cur = Path(dirpath)
+        depth = len(cur.parts) - base_parts
+        if depth >= 3:
+            dirnames[:] = []
+        else:
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        for fname in filenames:
+            low = fname.lower()
+            if low == "steam_appid.txt":
+                appid_files.append(cur / fname)
+            elif low in ini_files:
+                ini_files[low].append(cur / fname)
+
+    for appid_file in appid_files:
         if not appid_file.is_file():
             continue
         try:
             text = appid_file.read_text(encoding="utf-8", errors="ignore").strip()
         except OSError:
             continue
-        if text.isdigit():
+        if text.isascii() and text.isdigit():
             return int(text)
 
     for ini_name in ("steam_emu.ini", "rune.ini", "tenoke.ini", "flt.ini"):
-        for match in game_dir.rglob(ini_name):
+        for match in ini_files[ini_name]:
             try:
                 content = match.read_text(encoding="utf-8", errors="ignore")
             except OSError:
@@ -109,16 +145,17 @@ def rank_executables(game_dir: Path) -> list[Path]:
                 continue
             candidates.append(path)
 
-    def score(exe: Path) -> tuple[int, int, int, int]:
+    def score(exe: Path) -> tuple[int, int, int, int, int]:
         name_low = exe.name.lower()
         rel_depth = len(exe.relative_to(game_dir).parts)
+        is_utility = 1 if any(pat in name_low for pat in UTILITY_EXE_PATTERNS) else 0
         is_shipping = 0 if "win64-shipping.exe" in name_low else 1
         is_root = 0 if rel_depth == 1 else 1
         try:
             size_neg = -exe.stat().st_size
         except OSError:
             size_neg = 0
-        return (is_shipping, is_root, rel_depth, size_neg)
+        return (is_utility, is_shipping, is_root, rel_depth, size_neg)
 
     candidates.sort(key=score)
     return candidates
@@ -171,7 +208,12 @@ def default_scan_roots() -> list[Path]:
             except OSError:
                 sub_children = []
             for sub in sub_children:
-                if not _safe_is_dir(sub):
+                if (
+                    not _safe_is_dir(sub)
+                    or sub.is_symlink()
+                    or sub.name.startswith(".")
+                    or sub.name in {"steamapps", "lost+found", "System Volume Information"}
+                ):
                     continue
                 sub_games = sub / "Games"
                 roots.append(sub_games if _safe_is_dir(sub_games) else sub)

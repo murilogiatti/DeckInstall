@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deckinstall"
-version = "0.7.4"
+dynamic = ["version"]
 description = "Non-Steam Game Installer, Prefix Migrator, Save Validator & Artwork Manager for Steam Deck"
 readme = "README.md"
 license = {text = "MIT"}
@@ -26,6 +26,9 @@ deckinstall = "deckinstall.ui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "deckinstall.__version__"}
 
 [tool.setuptools.package-data]
 deckinstall = ["locales/*.json", "assets/*"]

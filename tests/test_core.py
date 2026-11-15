@@ -1147,6 +1147,182 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(cand_pfx.parent.exists())
             self.assertTrue(errs)
 
+    def test_real_vdf_roundtrip(self) -> None:
+        """Verify shortcuts.vdf and config.vdf round-trip against the real vdf package."""
+        import vdf as _real_vdf
+        if getattr(_real_vdf, "__file__", None) is None:
+            self.skipTest("real vdf package not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            steam_root = root / "Steam"
+            grid = steam_root / "userdata" / "1" / "config" / "grid"
+            grid.mkdir(parents=True)
+            paths = SteamPaths(
+                steam_root=steam_root,
+                user_id="1",
+                userdata_dir=steam_root / "userdata" / "1",
+                shortcuts_vdf=steam_root / "userdata" / "1" / "config" / "shortcuts.vdf",
+                grid_dir=grid,
+                config_vdf=steam_root / "config" / "config.vdf",
+                compatdata_dir=steam_root / "steamapps" / "compatdata",
+            )
+            exe = root / "Games" / "MyGame" / "game.exe"
+            exe.parent.mkdir(parents=True)
+            exe.write_bytes(b"MZ")
+            with mock.patch("deckinstall.steam_vdf.find_default_proton_name", return_value="proton_experimental"):
+                appid = add_or_update_shortcut(paths, "MyGame", exe, exe.parent, enable_proton=True)
+            loaded = load_shortcuts(paths.shortcuts_vdf)
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0].appid_u32, appid)
+            self.assertEqual(loaded[0].app_name, "MyGame")
+            self.assertEqual(get_shortcut_proton(paths.config_vdf, appid), "proton_experimental")
+
+            # Remove shortcut cleans shortcuts.vdf and CompatToolMapping
+            self.assertTrue(remove_shortcut(paths, appid))
+            self.assertEqual(load_shortcuts(paths.shortcuts_vdf), [])
+            self.assertIsNone(get_shortcut_proton(paths.config_vdf, appid))
+
+    def test_v075_audit_regressions(self) -> None:
+        """Cover v0.7.5 security, backend, frontend, i18n, and packaging regressions."""
+        import tarfile
+        from deckinstall.artwork import _is_valid_image_bytes, _validate_appid, fetch_header_preview
+        from deckinstall.i18n import tr, tr_plural
+        from deckinstall.scanner import default_scan_roots, rank_executables
+        from deckinstall.steam_paths import _proton_version_key
+        from deckinstall.steam_vdf import (
+            _iter_prefix_save_pairs,
+            _steam_transaction_lock,
+            apply_launch_presets,
+        )
+
+        # 1) Split archive detection & tar symlink stripping + flags
+        self.assertTrue(is_archive(Path("game.part1.rar")))
+        self.assertTrue(is_archive(Path("game.7z.001")))
+        self.assertTrue(is_archive(Path("game.zip.001")))
+        tar_cmd = _select_extract_cmd(Path("game.tar.gz"), Path("/tmp/out"))
+        self.assertIn("--no-same-owner", tar_cmd)
+        self.assertIn("--no-same-permissions", tar_cmd)
+        sevenz_cmd = _select_extract_cmd(Path("game.7z"), Path("/tmp/out"))
+        self.assertIn("-p-", sevenz_cmd)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tgz = root / "sym.tar.gz"
+            with tarfile.open(tgz, "w:gz") as tf:
+                ti = tarfile.TarInfo("Game/ok.txt")
+                payload = b"hello"
+                ti.size = len(payload)
+                tf.addfile(ti, fileobj=tarfile.io.BytesIO(payload))
+                sym = tarfile.TarInfo("Game/evil_link")
+                sym.type = tarfile.SYMTYPE
+                sym.linkname = "/etc/passwd"
+                tf.addfile(sym)
+            out = extract_archive(tgz, root / "Games", "SymGame")
+            self.assertTrue((out / "ok.txt").is_file())
+            self.assertFalse((out / "evil_link").exists() or (out / "evil_link").is_symlink())
+
+        # 2) Launcher.exe ranked above utility executables + /run/media steamapps skipped
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            l_exe = root / "Launcher.exe"
+            c_exe = root / "CrashHandler.exe"
+            l_exe.write_bytes(b"MZ" + b"\x00" * 100)
+            c_exe.write_bytes(b"MZ" + b"\x00" * 100)
+            ranked = rank_executables(root)
+            self.assertEqual(ranked[0], l_exe)
+
+            media_mnt = root / "card1"
+            (media_mnt / "steamapps").mkdir(parents=True)
+            (media_mnt / "Games").mkdir(parents=True)
+            real_iterdir = Path.iterdir
+            with (
+                mock.patch("deckinstall.scanner.Path.exists", return_value=True),
+                mock.patch("deckinstall.scanner.Path.is_dir", return_value=True),
+                mock.patch(
+                    "deckinstall.scanner.Path.iterdir",
+                    autospec=True,
+                    side_effect=lambda p: [media_mnt] if str(p) == "/run/media" else list(real_iterdir(p)),
+                ),
+            ):
+                roots = default_scan_roots()
+            self.assertNotIn(media_mnt / "steamapps", roots)
+
+        # 3) Numeric Proton sorting (10.0 > 9.0)
+        self.assertGreater(_proton_version_key(Path("Proton 10.0")), _proton_version_key(Path("Proton 9.0")))
+
+        # 4) Artwork validation & fetch_header_preview size/type guards
+        with self.assertRaises(ValueError):
+            _validate_appid(0)
+        self.assertTrue(_is_valid_image_bytes(b"\xff\xd8\xff\xe0" + b"0" * 600))
+        self.assertTrue(_is_valid_image_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 600))
+        self.assertFalse(_is_valid_image_bytes(b"<html>not image</html>"))
+        fake_resp = mock.MagicMock()
+        fake_resp.status_code = 200
+        fake_resp.headers = {"Content-Type": "text/html"}
+        fake_resp.iter_content.return_value = [b"<html>oops</html>"]
+        fake_resp.__enter__ = lambda s: s
+        fake_resp.__exit__ = lambda s, *a: False
+        with mock.patch("deckinstall.artwork.requests.get", return_value=fake_resp):
+            self.assertIsNone(fetch_header_preview(12345))
+
+        # 5) Launch options safety + empty preset + reentrant flock + Default user skip
+        _preset_off = dict(gamemode=False, mangohud=False, wined3d=False, no_esync=False, no_fsync=False)
+        with self.assertRaises(ValueError):
+            apply_launch_presets("FOO=1\nrm -rf /", **_preset_off)
+        quoted_cmd = apply_launch_presets("$(whoami)", **_preset_off)
+        self.assertIn("'$(whoami)'", quoted_cmd)
+        self.assertEqual(apply_launch_presets("", **_preset_off), "")
+        with tempfile.TemporaryDirectory() as tmp:
+            troot = Path(tmp)
+            with _steam_transaction_lock(troot / "shortcuts.vdf"):
+                with _steam_transaction_lock(troot / "shortcuts.vdf"):
+                    self.assertTrue((troot / ".deckinstall.vdf.lock").exists())
+
+            pfx = troot / "pfx"
+            (pfx / "drive_c" / "users" / "Default" / "Documents").mkdir(parents=True)
+            (pfx / "drive_c" / "users" / "Default" / "Documents" / "sys.dat").write_bytes(b"DEF")
+            (pfx / "drive_c" / "users" / "All Users" / "Documents").mkdir(parents=True)
+            (pfx / "drive_c" / "users" / "All Users" / "Documents" / "all.dat").write_bytes(b"ALL")
+            (pfx / "drive_c" / "users" / "steamuser" / "Documents").mkdir(parents=True)
+            (pfx / "drive_c" / "users" / "steamuser" / "Documents" / "save.dat").write_bytes(b"SAV")
+            pairs = list(_iter_prefix_save_pairs(pfx / "drive_c" / "users", troot / "dst_pfx" / "drive_c" / "users"))
+            self.assertTrue(all("Default" not in str(s) and "All Users" not in str(s) for s, _ in pairs))
+            self.assertTrue(any("steamuser" in str(s) for s, _ in pairs))
+
+        # 6) i18n tr_plural + placeholder parity
+        self.assertEqual(tr_plural("add.search_count", 3), tr("add.search_count", count=3))
+
+    def test_qt_ui_smoke(self) -> None:
+        """Smoke test MainWindow, FlowLayout, and theme switching in offscreen Qt."""
+        try:
+            from PySide6.QtWidgets import QApplication, QPushButton, QWidget
+        except ImportError:
+            self.skipTest("PySide6 not installed in this environment")
+        from deckinstall.theme import apply_theme
+        from deckinstall.ui import FlowLayout, MainWindow
+
+        app = QApplication.instance() or QApplication([])
+        apply_theme(app, "dark")
+        apply_theme(app, "light")
+        host = QWidget()
+        fl = FlowLayout(host)
+        b1 = QPushButton("Visible")
+        b2 = QPushButton("Hidden")
+        b2.hide()
+        fl.addWidget(b1)
+        fl.addWidget(b2)
+        self.assertGreater(fl.minimumSize().width(), 0)
+        with (
+            mock.patch("deckinstall.ui.resolve_steam_paths", return_value=None),
+            mock.patch("deckinstall.ui.scan_all_games", return_value=[]),
+        ):
+            win = MainWindow(app)
+            self.assertIn("DeckInstall", win.windowTitle())
+            for w in list(win._active_workers):
+                w.wait(2000)
+            win.close()
+            app.processEvents()
+
 
 if __name__ == "__main__":
     unittest.main()

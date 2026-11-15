@@ -98,10 +98,26 @@ def tr(key: str, **kwargs: object) -> str:
     """Translate key using active locale, falling back to English, then key itself."""
     if not _en_catalog:
         set_language(DEFAULT_LANG)
-    text = _active_catalog.get(key) or _en_catalog.get(key) or key
+    if key in _active_catalog:
+        text = _active_catalog[key]
+    elif key in _en_catalog:
+        text = _en_catalog[key]
+    else:
+        text = key
     if kwargs:
         try:
             return text.format(**kwargs)
         except Exception:
             return text
     return text
+
+
+def tr_plural(key: str, count: int, **kwargs: object) -> str:
+    """Translate a count-aware key using _one/_other variants when available."""
+    if not _en_catalog:
+        set_language(DEFAULT_LANG)
+    suffix = "_one" if count == 1 else "_other"
+    variant = f"{key}{suffix}"
+    if variant in _active_catalog or variant in _en_catalog:
+        return tr(variant, count=count, **kwargs)
+    return tr(key, count=count, **kwargs)

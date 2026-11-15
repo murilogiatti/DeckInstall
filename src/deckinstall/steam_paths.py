@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,11 +28,21 @@ def find_steam_root() -> Path | None:
         Path.home() / ".local" / "share" / "Steam",
         Path.home() / ".steam" / "steam",
         Path.home() / ".steam" / "root",
+        Path.home() / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam",
+        Path.home() / ".var" / "app" / "com.valvesoftware.Steam" / ".steam" / "steam",
     ]
     for candidate in candidates:
         if (candidate / "userdata").is_dir():
             return candidate.resolve()
     return None
+
+
+def is_flatpak_steam(steam_root: Path | None = None) -> bool:
+    """Return True if the active Steam installation is Flatpak Steam."""
+    root = steam_root or find_steam_root()
+    if root is None:
+        return False
+    return "com.valvesoftware.Steam" in root.parts
 
 
 def _parse_loginusers_priority(steam_root: Path) -> dict[str, tuple[int, int]]:
@@ -50,14 +61,15 @@ def _parse_loginusers_priority(steam_root: Path) -> dict[str, tuple[int, int]]:
         return {}
     priority: dict[str, tuple[int, int]] = {}
     for steam64_str, info in users_map.items():
-        if not isinstance(info, dict) or not str(steam64_str).isdigit():
+        s64 = str(steam64_str)
+        if not isinstance(info, dict) or not (s64.isascii() and s64.isdigit()):
             continue
-        account_id = int(steam64_str) - 76561197960265728
+        account_id = int(s64) - 76561197960265728
         if account_id <= 0:
             continue
         most_recent = 1 if str(info.get("MostRecent", "0")) == "1" else 0
         ts_str = str(info.get("Timestamp", "0"))
-        ts = int(ts_str) if ts_str.isdigit() else 0
+        ts = int(ts_str) if (ts_str.isascii() and ts_str.isdigit()) else 0
         priority[str(account_id)] = (most_recent, ts)
     return priority
 
@@ -70,7 +82,7 @@ def list_steam_users(steam_root: Path) -> list[str]:
     users = [
         p
         for p in userdata.iterdir()
-        if p.is_dir() and p.name.isdigit() and p.name != "0"
+        if p.is_dir() and p.name.isascii() and p.name.isdigit() and p.name != "0"
     ]
     login_prio = _parse_loginusers_priority(steam_root)
 
@@ -167,6 +179,7 @@ def _iter_compat_tool_dirs(steam_root: Path) -> list[Path]:
         steam_root / "compatibilitytools.d",
         Path.home() / ".local" / "share" / "Steam" / "compatibilitytools.d",
         Path.home() / ".steam" / "root" / "compatibilitytools.d",
+        Path.home() / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam" / "compatibilitytools.d",
     ]
     out: list[Path] = []
     visited: set[Path] = set()
@@ -184,6 +197,11 @@ def _iter_compat_tool_dirs(steam_root: Path) -> list[Path]:
     return out
 
 
+def _proton_version_key(entry: Path) -> tuple[tuple[int, ...], str]:
+    nums = tuple(int(n) for n in re.findall(r"\d+", entry.name))
+    return (nums, entry.name.lower())
+
+
 def find_default_proton_name(steam_root: Path) -> str:
     """Return the Steam CompatToolMapping name for the newest stable Proton."""
     libs = _list_steam_library_roots(steam_root)
@@ -199,16 +217,16 @@ def find_default_proton_name(steam_root: Path) -> str:
     for lib in libs:
         common = lib / "steamapps" / "common"
         if common.is_dir():
-            for entry in sorted(common.glob("Proton [0-9]*"), reverse=True):
+            for entry in sorted(common.glob("Proton [0-9]*"), key=_proton_version_key, reverse=True):
                 if (entry / "proton").is_file():
-                    major = entry.name.split()[1].split(".")[0]
-                    if major.isdigit():
-                        return f"proton_{major}"
+                    m = re.match(r"Proton\s+(\d+)", entry.name)
+                    if m:
+                        return f"proton_{m.group(1)}"
     for lib in libs:
         if (lib / "steamapps" / "common" / "Proton - Experimental" / "proton").is_file():
             return "proton_experimental"
     for compat_tools in _iter_compat_tool_dirs(steam_root):
-        for entry in sorted(compat_tools.iterdir(), reverse=True):
+        for entry in sorted(compat_tools.iterdir(), key=_proton_version_key, reverse=True):
             vdf_file = entry / "compatibilitytool.vdf"
             if entry.is_dir() and vdf_file.is_file() and (entry / "proton").is_file():
                 return _read_compat_tool_id(vdf_file, entry.name)
@@ -226,12 +244,12 @@ def find_proton_binary(steam_root: Path) -> Path | None:
     for lib in libs:
         common = lib / "steamapps" / "common"
         if common.is_dir():
-            for entry in sorted(common.glob("Proton*"), reverse=True):
+            for entry in sorted(common.glob("Proton*"), key=_proton_version_key, reverse=True):
                 proton = entry / "proton"
                 if proton.is_file():
                     return proton
     for compat_tools in _iter_compat_tool_dirs(steam_root):
-        for entry in sorted(compat_tools.iterdir(), reverse=True):
+        for entry in sorted(compat_tools.iterdir(), key=_proton_version_key, reverse=True):
             proton = entry / "proton"
             if entry.is_dir() and proton.is_file():
                 return proton
@@ -243,23 +261,8 @@ def list_installed_protons(steam_root: Path) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     seen: set[str] = set()
 
-    compat_dirs = [
-        steam_root / "compatibilitytools.d",
-        Path.home() / ".local" / "share" / "Steam" / "compatibilitytools.d",
-        Path.home() / ".steam" / "root" / "compatibilitytools.d",
-    ]
-    visited_compat: set[Path] = set()
-    for compat_tools in compat_dirs:
-        if not compat_tools.is_dir():
-            continue
-        try:
-            res_dir = compat_tools.resolve()
-        except OSError:
-            res_dir = compat_tools
-        if res_dir in visited_compat:
-            continue
-        visited_compat.add(res_dir)
-        for entry in sorted(compat_tools.iterdir(), reverse=True):
+    for compat_tools in _iter_compat_tool_dirs(steam_root):
+        for entry in sorted(compat_tools.iterdir(), key=_proton_version_key, reverse=True):
             vdf_file = entry / "compatibilitytool.vdf"
             if entry.is_dir() and vdf_file.is_file():
                 tool_id = _read_compat_tool_id(vdf_file, entry.name)
@@ -276,7 +279,7 @@ def list_installed_protons(steam_root: Path) -> list[tuple[str, str]]:
         common = lib / "steamapps" / "common"
         if not common.is_dir():
             continue
-        for entry in sorted(common.glob("Proton*"), reverse=True):
+        for entry in sorted(common.glob("Proton*"), key=_proton_version_key, reverse=True):
             if not (entry / "proton").is_file():
                 continue
             folder = entry.name
@@ -285,9 +288,8 @@ def list_installed_protons(steam_root: Path) -> list[tuple[str, str]]:
             elif "Hotfix" in folder:
                 tool_id = "proton_hotfix"
             else:
-                parts = folder.replace("Proton ", "").strip().split(".")
-                major = parts[0] if parts and parts[0].isdigit() else ""
-                tool_id = f"proton_{major}" if major else folder.lower().replace(" ", "_")
+                m = re.match(r"Proton\s+(\d+)", folder)
+                tool_id = f"proton_{m.group(1)}" if m else folder.lower().replace(" ", "_")
             if tool_id not in seen:
                 seen.add(tool_id)
                 found.append((tool_id, f"{folder} ({tool_id})"))
@@ -302,7 +304,7 @@ def is_gamescope_session() -> bool:
         return True
     try:
         res = subprocess.run(
-            ["pgrep", "-x", "gamescope"],
+            ["pgrep", "-u", str(os.getuid()), "-x", "gamescope"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -316,7 +318,7 @@ def is_steam_running() -> bool:
     """Return True if a Steam client process is currently running."""
     try:
         res = subprocess.run(
-            ["pgrep", "-x", "steam"],
+            ["pgrep", "-u", str(os.getuid()), "-x", "steam"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,

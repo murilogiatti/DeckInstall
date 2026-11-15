@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import faulthandler
 import logging
+import logging.handlers
 import os
 import sys
 from pathlib import Path
@@ -15,15 +16,13 @@ _LOG_DIR = Path.home() / ".local" / "share" / "DeckInstall"
 _LOG_FILE = _LOG_DIR / "deckinstall.log"
 try:
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
-    if _LOG_FILE.is_file() and _LOG_FILE.stat().st_size > 1_048_576:
-        _LOG_FILE.write_text("", encoding="utf-8")
     _fault_fh = _LOG_FILE.open("a", encoding="utf-8")
     faulthandler.enable(file=_fault_fh, all_threads=True)
-    logging.basicConfig(
-        filename=str(_LOG_FILE),
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    _handler = logging.handlers.RotatingFileHandler(
+        _LOG_FILE, maxBytes=1_048_576, backupCount=2, encoding="utf-8"
     )
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+    logging.basicConfig(level=logging.INFO, handlers=[_handler])
 except OSError:
     pass
 
