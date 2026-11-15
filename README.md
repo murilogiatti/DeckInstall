@@ -4,7 +4,7 @@
 
 Non-Steam game installer, Proton prefix migrator, save validator, and official Steam artwork manager for **Steam Deck / SteamOS** (KDE Plasma + Qt6).
 
-**Current version:** `0.7.6`
+**Current version:** `0.7.7`
 
 ## Features
 - **Extract & Install**: Extracts `.zip`, `.rar`, `.7z`, and `.tar.*` into `~/Games/<Game>` (automatically unwrapping nested single root folders and merging without wiping existing files), or runs Windows `setup.exe` installers via Proton and automatically adopts the resulting `.deckinstall_installer_pfx` prefix into Steam `compatdata`.
@@ -19,10 +19,10 @@ Non-Steam game installer, Proton prefix migrator, save validator, and official S
 Download `DeckInstall-<version>-x86_64.AppImage` from [GitHub Releases](https://github.com/murilogiatti/DeckInstall/releases):
 
 ```bash
-chmod +x DeckInstall-0.7.6-x86_64.AppImage
-./DeckInstall-0.7.6-x86_64.AppImage --version
-QT_QPA_PLATFORM=offscreen ./DeckInstall-0.7.6-x86_64.AppImage --smoke-test
-./DeckInstall-0.7.6-x86_64.AppImage
+chmod +x DeckInstall-0.7.7-x86_64.AppImage
+./DeckInstall-0.7.7-x86_64.AppImage --version
+QT_QPA_PLATFORM=offscreen ./DeckInstall-0.7.7-x86_64.AppImage --smoke-test
+./DeckInstall-0.7.7-x86_64.AppImage
 ```
 
 ## Translating DeckInstall
@@ -45,7 +45,7 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -W error::ResourceWarning -m un
 ```
 
 ## Build AppImage (GitHub Actions)
-Push a semantic tag matching `VERSION` (e.g. `v0.7.6`) to automatically run the test suite, compile a standalone binary with Nuitka, smoke-test the packaged `AppDir`, build `DeckInstall-<version>-x86_64.AppImage`, and attach it to the GitHub Release.
+Push a semantic tag matching `VERSION` (e.g. `v0.7.7`) to automatically run the test suite, compile a standalone binary with Nuitka, smoke-test the packaged `AppDir`, build `DeckInstall-<version>-x86_64.AppImage`, and attach it to the GitHub Release.
 
 ## License
 Distributed under the [MIT License](LICENSE).
