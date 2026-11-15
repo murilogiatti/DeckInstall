@@ -10,7 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QRect, QSettings, QSize, Qt, QThread, Signal, qInstallMessageHandler
-from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QIcon, QPixmap
+from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -969,50 +970,72 @@ class MainWindow(QMainWindow):
         lib_layout.addWidget(self.vdf_error_banner)
 
         self.shortcuts_list = QListWidget()
+        self.shortcuts_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.shortcuts_list.customContextMenuRequested.connect(self._show_shortcut_context_menu)
         lib_layout.addWidget(self.shortcuts_list, 1)
 
         actions = FlowLayout(spacing=8)
         self.btn_bulk_migrate = QPushButton(tr("library.btn_bulk_migrate"))
         self.btn_bulk_migrate.setObjectName("primaryBtn")
         self.btn_bulk_migrate.clicked.connect(self._bulk_migrate_shortcuts)
-        self.btn_migrate = QPushButton(tr("library.btn_migrate_one"))
-        self.btn_migrate.clicked.connect(self._migrate_selected_shortcut)
-        self.btn_art = QPushButton(tr("library.btn_update_art"))
-        self.btn_art.clicked.connect(self._update_selected_shortcut_art)
-        self.btn_revert_art = QPushButton(tr("library.btn_revert_art"))
-        self.btn_revert_art.clicked.connect(self._revert_selected_shortcut_art)
-        self.btn_proton = QPushButton(tr("library.btn_proton"))
-        self.btn_proton.clicked.connect(self._change_selected_proton)
-        self.btn_launch_opts = QPushButton(tr("library.btn_launch_opts"))
-        self.btn_launch_opts.clicked.connect(self._edit_launch_options_presets)
-        self.btn_backup_saves = QPushButton(tr("library.btn_backup_saves"))
-        self.btn_backup_saves.clicked.connect(self._backup_all_saves)
-        self.btn_restore_saves = QPushButton(tr("library.btn_restore_saves"))
-        self.btn_restore_saves.clicked.connect(self._restore_saves_backup)
-        self.btn_link_prefixes = QPushButton(tr("library.btn_link_prefixes"))
-        self.btn_link_prefixes.clicked.connect(self._sync_prefix_links)
-        self.btn_cleanup = QPushButton(tr("library.btn_cleanup"))
-        self.btn_cleanup.clicked.connect(self._cleanup_old_prefixes)
-        self.btn_remove = QPushButton(tr("library.btn_remove"))
-        self.btn_remove.setObjectName("dangerBtn")
-        self.btn_remove.clicked.connect(self._remove_selected_shortcut)
-        for b in (
-            self.btn_bulk_migrate,
-            self.btn_migrate,
-            self.btn_art,
-            self.btn_revert_art,
-            self.btn_proton,
-            self.btn_launch_opts,
-            self.btn_backup_saves,
-            self.btn_restore_saves,
-            self.btn_link_prefixes,
-            self.btn_cleanup,
-            self.btn_remove,
+
+        self._game_actions_menu = QMenu(self)
+        self.act_migrate = QAction(tr("library.btn_migrate_one"), self)
+        self.act_migrate.triggered.connect(self._migrate_selected_shortcut)
+        self.act_art = QAction(tr("library.btn_update_art"), self)
+        self.act_art.triggered.connect(self._update_selected_shortcut_art)
+        self.act_revert_art = QAction(tr("library.btn_revert_art"), self)
+        self.act_revert_art.triggered.connect(self._revert_selected_shortcut_art)
+        self.act_proton = QAction(tr("library.btn_proton"), self)
+        self.act_proton.triggered.connect(self._change_selected_proton)
+        self.act_launch_opts = QAction(tr("library.btn_launch_opts"), self)
+        self.act_launch_opts.triggered.connect(self._edit_launch_options_presets)
+        self.act_remove = QAction(tr("library.btn_remove"), self)
+        self.act_remove.triggered.connect(self._remove_selected_shortcut)
+        for act in (
+            self.act_migrate,
+            self.act_art,
+            self.act_revert_art,
+            self.act_proton,
+            self.act_launch_opts,
         ):
+            self._game_actions_menu.addAction(act)
+        self._game_actions_menu.addSeparator()
+        self._game_actions_menu.addAction(self.act_remove)
+
+        self.btn_game_actions = QPushButton(tr("library.btn_game_actions"))
+        self.btn_game_actions.setMenu(self._game_actions_menu)
+
+        self._tools_menu = QMenu(self)
+        self.act_backup_saves = QAction(tr("library.btn_backup_saves"), self)
+        self.act_backup_saves.triggered.connect(self._backup_all_saves)
+        self.act_restore_saves = QAction(tr("library.btn_restore_saves"), self)
+        self.act_restore_saves.triggered.connect(self._restore_saves_backup)
+        self.act_link_prefixes = QAction(tr("library.btn_link_prefixes"), self)
+        self.act_link_prefixes.triggered.connect(self._sync_prefix_links)
+        self.act_cleanup = QAction(tr("library.btn_cleanup"), self)
+        self.act_cleanup.triggered.connect(self._cleanup_old_prefixes)
+        for act in (self.act_backup_saves, self.act_restore_saves, self.act_link_prefixes):
+            self._tools_menu.addAction(act)
+        self._tools_menu.addSeparator()
+        self._tools_menu.addAction(self.act_cleanup)
+
+        self.btn_tools_menu = QPushButton(tr("library.btn_tools_menu"))
+        self.btn_tools_menu.setMenu(self._tools_menu)
+
+        for b in (self.btn_bulk_migrate, self.btn_game_actions, self.btn_tools_menu):
             actions.addWidget(b)
         lib_layout.addLayout(actions)
         layout.addWidget(lib_card, 1)
         return page
+
+    def _show_shortcut_context_menu(self, pos: QPoint) -> None:
+        item = self.shortcuts_list.itemAt(pos)
+        if item is not None:
+            self.shortcuts_list.setCurrentItem(item)
+        if self._selected_shortcut() is None:
+            return
+        self._game_actions_menu.exec(self.shortcuts_list.viewport().mapToGlobal(pos))
 
     def _apply_saved_theme(self) -> None:
         saved = str(self.settings.value("theme", "auto"))
@@ -1397,12 +1420,12 @@ class MainWindow(QMainWindow):
         for w in (
             self.btn_add_steam,
             self.btn_bulk_migrate,
-            self.btn_migrate,
-            self.btn_proton,
-            self.btn_launch_opts,
-            self.btn_backup_saves,
-            self.btn_restore_saves,
-            self.btn_remove,
+            self.act_migrate,
+            self.act_proton,
+            self.act_launch_opts,
+            self.act_backup_saves,
+            self.act_restore_saves,
+            self.act_remove,
         ):
             w.setEnabled(enabled)
 
@@ -1411,10 +1434,12 @@ class MainWindow(QMainWindow):
         for w in (
             self.btn_reload,
             self.shortcuts_list,
-            self.btn_art,
-            self.btn_revert_art,
-            self.btn_link_prefixes,
-            self.btn_cleanup,
+            self.btn_game_actions,
+            self.btn_tools_menu,
+            self.act_art,
+            self.act_revert_art,
+            self.act_link_prefixes,
+            self.act_cleanup,
         ):
             w.setEnabled(enabled)
         self._set_vdf_write_enabled(enabled and not self._vdf_corrupt)
@@ -2054,7 +2079,7 @@ class MainWindow(QMainWindow):
 
             def run(self) -> None:
                 try:
-                    self.found.emit(find_cleanup_candidates(self._paths))
+                    self.found.emit(find_cleanup_candidates(self._paths, include_system_caches=True))
                 except Exception as exc:
                     self.failed.emit(str(exc))
 
@@ -2118,6 +2143,11 @@ class MainWindow(QMainWindow):
                     "backup": tr("cleanup.cat_backup"),
                     "Compatdata Órfão": tr("cleanup.cat_orphan"),
                     "orphan_compatdata": tr("cleanup.cat_orphan"),
+                    "Orphan Shadercache": tr("cleanup.cat_shadercache"),
+                    "Steam Logs": tr("cleanup.cat_logs"),
+                    "Trash": tr("cleanup.cat_trash"),
+                    "App Cache": tr("cleanup.cat_cache"),
+                    "Old Proton/Runtime": tr("cleanup.cat_runtime"),
                 }
                 cat_disp = cat_map.get(cand.category, cand.category)
                 hint = f" ({cand.game_hint})" if cand.game_hint else ""
@@ -2127,6 +2157,8 @@ class MainWindow(QMainWindow):
                     auto_check = bool(cand.matched_game) and (
                         (not cand.has_saves) or cand.saves_verified_migrated
                     )
+                elif cand.category == "Old Proton/Runtime":
+                    auto_check = False
                 else:
                     auto_check = (not cand.has_saves) or cand.saves_verified_migrated
                 item.setCheckState(
@@ -2191,7 +2223,7 @@ class MainWindow(QMainWindow):
                             config_vdf=self._paths.config_vdf,
                         )
                         checked, copied = sync_all_external_saves(self._paths)
-                        new_cands = find_cleanup_candidates(self._paths)
+                        new_cands = find_cleanup_candidates(self._paths, include_system_caches=True)
                         self.done.emit(new_cands, checked, copied, len(pending_plan))
                     except Exception as exc:
                         self.failed.emit(str(exc))
@@ -2259,7 +2291,7 @@ class MainWindow(QMainWindow):
                     if _is_wine_game_running():
                         raise RuntimeError(tr("cleanup.wine_running"))
                     deleted, freed, errs = delete_cleanup_candidates_checked(
-                        self._paths, self._items
+                        self._paths, self._items, include_system_caches=True
                     )
                     self.done.emit(deleted, freed, errs)
                 except Exception as exc:

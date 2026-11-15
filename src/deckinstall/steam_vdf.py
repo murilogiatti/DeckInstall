@@ -1735,8 +1735,10 @@ def _is_prefix_referenced_by_shortcuts(
 def find_cleanup_candidates(
     paths: SteamPaths,
     extra_external_roots: list[Path] | None = None,
+    include_system_caches: bool = False,
+    home_dir: Path | None = None,
 ) -> list[CleanupCandidate]:
-    """Find old external prefixes, orphan Steam compatdata folders, and DeckInstall backups."""
+    """Find old external prefixes, orphan Steam compatdata/shadercache, backups, and optional system caches."""
     candidates: list[CleanupCandidate] = []
     seen: set[Path] = set()
 
@@ -1881,6 +1883,169 @@ def find_cleanup_candidates(
                 )
             )
 
+    shadercache_dir = paths.steam_root / "steamapps" / "shadercache"
+    if shadercache_dir.is_dir():
+        for child in shadercache_dir.iterdir():
+            if child.is_symlink() or not child.is_dir():
+                continue
+            if not (child.name.isascii() and child.name.isdigit()):
+                continue
+            appid = int(child.name)
+            if appid == 0 or appid in active_shortcuts or appid in installed_steam:
+                continue
+            sz = _dir_size_bytes(child)
+            if sz > 0:
+                candidates.append(
+                    CleanupCandidate(
+                        category="Orphan Shadercache",
+                        label=f"shadercache/{child.name}",
+                        path=child,
+                        size_bytes=sz,
+                        has_saves=False,
+                        saves_verified_migrated=False,
+                        matched_game="",
+                        game_hint="",
+                    )
+                )
+
+    steam_logs_dir = paths.steam_root / "logs"
+    if steam_logs_dir.is_dir() and not steam_logs_dir.is_symlink():
+        sz = _dir_size_bytes(steam_logs_dir)
+        if sz >= 1024 * 1024:
+            candidates.append(
+                CleanupCandidate(
+                    category="Steam Logs",
+                    label="Steam/logs",
+                    path=steam_logs_dir,
+                    size_bytes=sz,
+                    has_saves=False,
+                    saves_verified_migrated=False,
+                    matched_game="",
+                    game_hint="",
+                )
+            )
+
+    if include_system_caches:
+        home = home_dir or Path.home()
+        trash_files = home / ".local" / "share" / "Trash" / "files"
+        if trash_files.is_dir() and not trash_files.is_symlink():
+            sz = _dir_size_bytes(trash_files)
+            if sz > 0:
+                candidates.append(
+                    CleanupCandidate(
+                        category="Trash",
+                        label="Trash/files",
+                        path=trash_files,
+                        size_bytes=sz,
+                        has_saves=False,
+                        saves_verified_migrated=False,
+                        matched_game="",
+                        game_hint="",
+                    )
+                )
+
+        user_cache = home / ".cache"
+        if user_cache.is_dir() and not user_cache.is_symlink():
+            for child in user_cache.iterdir():
+                if child.is_symlink() or child.name in ("fontconfig", "dconf"):
+                    continue
+                try:
+                    sz = _dir_size_bytes(child) if child.is_dir() else child.stat().st_size
+                except OSError:
+                    continue
+                if sz >= 5 * 1024 * 1024:
+                    candidates.append(
+                        CleanupCandidate(
+                            category="App Cache",
+                            label=f".cache/{child.name}",
+                            path=child,
+                            size_bytes=sz,
+                            has_saves=False,
+                            saves_verified_migrated=False,
+                            matched_game="",
+                            game_hint="",
+                        )
+                    )
+
+        var_app = home / ".var" / "app"
+        if var_app.is_dir() and not var_app.is_symlink():
+            for app_dir in var_app.iterdir():
+                if app_dir.is_symlink() or not app_dir.is_dir():
+                    continue
+                cdir = app_dir / "cache"
+                if cdir.is_dir() and not cdir.is_symlink():
+                    sz = _dir_size_bytes(cdir)
+                    if sz >= 5 * 1024 * 1024:
+                        candidates.append(
+                            CleanupCandidate(
+                                category="App Cache",
+                                label=f"Flatpak/{app_dir.name}/cache",
+                                path=cdir,
+                                size_bytes=sz,
+                                has_saves=False,
+                                saves_verified_migrated=False,
+                                matched_game="",
+                                game_hint="",
+                            )
+                        )
+
+        compat_tools = paths.steam_root / "compatibilitytools.d"
+        if compat_tools.is_dir():
+            for child in compat_tools.iterdir():
+                if child.is_symlink() or not child.is_dir():
+                    continue
+                if child.name.startswith("UMU-Proton-"):
+                    sz = _dir_size_bytes(child)
+                    if sz > 0:
+                        candidates.append(
+                            CleanupCandidate(
+                                category="Old Proton/Runtime",
+                                label=f"compatibilitytools.d/{child.name}",
+                                path=child,
+                                size_bytes=sz,
+                                has_saves=False,
+                                saves_verified_migrated=False,
+                                matched_game="",
+                                game_hint="",
+                            )
+                        )
+
+        common_dir = paths.steam_root / "steamapps" / "common"
+        if (common_dir / "Proton 11.0").is_dir() and (common_dir / "Proton 10.0").is_dir():
+            p10 = common_dir / "Proton 10.0"
+            if not p10.is_symlink():
+                sz = _dir_size_bytes(p10)
+                if sz > 0:
+                    candidates.append(
+                        CleanupCandidate(
+                            category="Old Proton/Runtime",
+                            label="common/Proton 10.0",
+                            path=p10,
+                            size_bytes=sz,
+                            has_saves=False,
+                            saves_verified_migrated=False,
+                            matched_game="",
+                            game_hint="",
+                        )
+                    )
+        if (common_dir / "SteamLinuxRuntime_4").is_dir() and (common_dir / "SteamLinuxRuntime_sniper").is_dir():
+            sniper = common_dir / "SteamLinuxRuntime_sniper"
+            if not sniper.is_symlink():
+                sz = _dir_size_bytes(sniper)
+                if sz > 0:
+                    candidates.append(
+                        CleanupCandidate(
+                            category="Old Proton/Runtime",
+                            label="common/SteamLinuxRuntime_sniper",
+                            path=sniper,
+                            size_bytes=sz,
+                            has_saves=False,
+                            saves_verified_migrated=False,
+                            matched_game="",
+                            game_hint="",
+                        )
+                    )
+
     candidates.sort(key=lambda c: c.size_bytes, reverse=True)
     return candidates
 
@@ -1908,6 +2073,8 @@ def delete_cleanup_candidates_checked(
     paths: SteamPaths,
     candidates: list[CleanupCandidate],
     extra_external_roots: list[Path] | None = None,
+    include_system_caches: bool = False,
+    home_dir: Path | None = None,
 ) -> tuple[int, int, list[str]]:
     """Revalidate each candidate immediately before deleting it and return (deleted, freed, errors)."""
     deleted = 0
@@ -1916,7 +2083,12 @@ def delete_cleanup_candidates_checked(
     with _steam_transaction_lock(paths.shortcuts_vdf):
         fresh_by_path = {
             c.path.resolve(): c
-            for c in find_cleanup_candidates(paths, extra_external_roots=extra_external_roots)
+            for c in find_cleanup_candidates(
+                paths,
+                extra_external_roots=extra_external_roots,
+                include_system_caches=include_system_caches,
+                home_dir=home_dir,
+            )
         }
         for item in candidates:
             if not item.path.exists():

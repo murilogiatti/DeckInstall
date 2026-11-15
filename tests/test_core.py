@@ -1690,6 +1690,76 @@ class CoreTests(unittest.TestCase):
                         win.close()
                         app.processEvents()
 
+    def test_system_and_steam_cleanup_discovery(self) -> None:
+        """Verify expanded cleanup discovers orphan shadercache, logs, trash, app caches, and old runtimes."""
+        from deckinstall.steam_vdf import delete_cleanup_candidates_checked, find_cleanup_candidates
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            steam = root / "Steam"
+            (steam / "userdata" / "1" / "config").mkdir(parents=True)
+            (steam / "userdata" / "1" / "config" / "shortcuts.vdf").write_bytes(b"VDF")
+            (steam / "config").mkdir(parents=True)
+            (steam / "config" / "config.vdf").write_text("{}", encoding="utf-8")
+            (steam / "steamapps" / "shadercache" / "99999").mkdir(parents=True)
+            (steam / "steamapps" / "shadercache" / "99999" / "shader.bin").write_bytes(b"S" * 1024)
+            (steam / "steamapps" / "shadercache" / "0").mkdir(parents=True)
+            (steam / "steamapps" / "shadercache" / "0" / "sys.bin").write_bytes(b"X" * 1024)
+            (steam / "logs").mkdir(parents=True)
+            (steam / "logs" / "content_log.txt").write_bytes(b"L" * (1024 * 1024 + 10))
+            (home / ".local" / "share" / "Trash" / "files").mkdir(parents=True)
+            (home / ".local" / "share" / "Trash" / "files" / "old.zip").write_bytes(b"T" * 1024)
+            (home / ".cache" / "mesa_shader_cache").mkdir(parents=True)
+            (home / ".cache" / "mesa_shader_cache" / "c.bin").write_bytes(b"C" * (5 * 1024 * 1024 + 10))
+            (home / ".var" / "app" / "com.google.Chrome" / "cache").mkdir(parents=True)
+            (home / ".var" / "app" / "com.google.Chrome" / "cache" / "c.bin").write_bytes(b"F" * (5 * 1024 * 1024 + 10))
+            (steam / "compatibilitytools.d" / "UMU-Proton-10.0-4").mkdir(parents=True)
+            (steam / "compatibilitytools.d" / "UMU-Proton-10.0-4" / "proton").write_bytes(b"U" * 1024)
+            (steam / "steamapps" / "common" / "Proton 11.0").mkdir(parents=True)
+            (steam / "steamapps" / "common" / "Proton 10.0").mkdir(parents=True)
+            (steam / "steamapps" / "common" / "Proton 10.0" / "p").write_bytes(b"P" * 1024)
+            (steam / "steamapps" / "common" / "SteamLinuxRuntime_4").mkdir(parents=True)
+            (steam / "steamapps" / "common" / "SteamLinuxRuntime_sniper").mkdir(parents=True)
+            (steam / "steamapps" / "common" / "SteamLinuxRuntime_sniper" / "r").write_bytes(b"R" * 1024)
+
+            paths = SteamPaths(
+                steam_root=steam,
+                user_id="1",
+                userdata_dir=steam / "userdata" / "1",
+                shortcuts_vdf=steam / "userdata" / "1" / "config" / "shortcuts.vdf",
+                grid_dir=steam / "userdata" / "1" / "config" / "grid",
+                config_vdf=steam / "config" / "config.vdf",
+                compatdata_dir=steam / "steamapps" / "compatdata",
+            )
+            with (
+                mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[]),
+                mock.patch("pathlib.Path.home", return_value=home),
+            ):
+                cands = find_cleanup_candidates(
+                    paths, extra_external_roots=[], include_system_caches=True, home_dir=home
+                )
+            labels = {c.label for c in cands}
+            self.assertIn("shadercache/99999", labels)
+            self.assertNotIn("shadercache/0", labels)
+            self.assertIn("Steam/logs", labels)
+            self.assertIn("Trash/files", labels)
+            self.assertIn(".cache/mesa_shader_cache", labels)
+            self.assertIn("Flatpak/com.google.Chrome/cache", labels)
+            self.assertIn("compatibilitytools.d/UMU-Proton-10.0-4", labels)
+            self.assertIn("common/Proton 10.0", labels)
+            self.assertIn("common/SteamLinuxRuntime_sniper", labels)
+            with (
+                mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[]),
+                mock.patch("pathlib.Path.home", return_value=home),
+            ):
+                deleted, _, errs = delete_cleanup_candidates_checked(
+                    paths, cands, extra_external_roots=[], include_system_caches=True, home_dir=home
+                )
+            self.assertEqual(errs, [])
+            self.assertEqual(deleted, len(cands))
+            self.assertTrue((steam / "steamapps" / "common" / "Proton 11.0").is_dir())
+
 
 if __name__ == "__main__":
     unittest.main()
