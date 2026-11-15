@@ -208,7 +208,11 @@ def _safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:
                 raise RuntimeError(f"Archive member escapes destination: {member.name}")
             if member.issym() or member.islnk():
                 link_target = Path(member.linkname)
-                if link_target.is_absolute() or ".." in link_target.parts:
+                if link_target.is_absolute():
+                    raise RuntimeError(f"Unsafe archive link target: {member.linkname}")
+                base = target_path.parent if member.issym() else dest_resolved
+                resolved_link = (base / link_target).resolve()
+                if resolved_link != dest_resolved and dest_resolved not in resolved_link.parents:
                     raise RuntimeError(f"Unsafe archive link target: {member.linkname}")
         tf.extractall(dest_dir, members=members)
 

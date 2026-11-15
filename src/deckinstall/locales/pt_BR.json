@@ -195,7 +195,7 @@
   "library.vdf_error": "Não foi possível ler shortcuts.vdf da Steam ({err}). Edições na biblioteca estão desativadas até recarregar sem erros.",
   "library.removing": "Removendo \"{name}\" do Steam...",
   "restore.pick_qt": "Arquivos Zip (*.zip);;Todos os arquivos (*)",
-  "runtime.btn_update": "Atualizar Runtimes (umu + GE-Proton11)",
+  "runtime.btn_update": "Atualizar Runtimes",
   "runtime.checking": "Verificando/atualizando umu-run e GE-Proton11+...",
   "runtime.updated": "Runtimes prontos: {umu} | {proton}",
   "runtime.up_to_date": "Runtimes atualizados: {umu} | {proton}",

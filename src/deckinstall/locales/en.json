@@ -195,7 +195,7 @@
   "library.vdf_error": "Could not read Steam shortcuts.vdf ({err}). Library edits are disabled until reloaded cleanly.",
   "library.removing": "Removing \"{name}\" from Steam...",
   "restore.pick_qt": "Zip Archives (*.zip);;All Files (*)",
-  "runtime.btn_update": "Update Runtimes (umu + GE-Proton11)",
+  "runtime.btn_update": "Update Runtimes",
   "runtime.checking": "Checking/updating umu-run and GE-Proton11+...",
   "runtime.updated": "Runtimes ready: {umu} | {proton}",
   "runtime.up_to_date": "Runtimes up to date: {umu} | {proton}",

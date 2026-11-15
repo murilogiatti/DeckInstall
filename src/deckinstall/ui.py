@@ -896,6 +896,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.lang_combo)
 
         self.btn_update_runtimes = QPushButton(tr("runtime.btn_update"))
+        self.btn_update_runtimes.setToolTip("umu-run + GE-Proton11+")
         self.btn_update_runtimes.clicked.connect(self._update_runtimes)
         layout.addWidget(self.btn_update_runtimes)
 

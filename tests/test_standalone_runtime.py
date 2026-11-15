@@ -60,8 +60,47 @@ class RuntimeManagerTests(unittest.TestCase):
     def test_parse_ge_proton_version(self) -> None:
         self.assertEqual(runtime_manager._parse_ge_proton_version("GE-Proton11-12"), (11, 12))
         self.assertEqual(runtime_manager._parse_ge_proton_version("GE-Proton12-1"), (12, 1))
-        self.assertIsNone(runtime_manager._parse_ge_proton_version("GE-Proton10-34"))
+        self.assertEqual(runtime_manager._parse_ge_proton_version("GE-Proton10-34"), None)
         self.assertIsNone(runtime_manager._parse_ge_proton_version("GE-Proton9-27"))
+
+    def test_safe_extract_tar_allows_internal_relative_symlinks_and_blocks_escapes(self) -> None:
+        import io
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ok_tar = root / "ok.tar"
+            with tarfile.open(ok_tar, "w") as tf:
+                target_info = tarfile.TarInfo("GE-Proton11-12/files/lib/wine/i386-windows/start.exe")
+                data = b"MZ"
+                target_info.size = len(data)
+                tf.addfile(target_info, io.BytesIO(data))
+
+                link_info = tarfile.TarInfo(
+                    "GE-Proton11-12/files/share/default_pfx/drive_c/windows/system32/start.exe"
+                )
+                link_info.type = tarfile.SYMTYPE
+                link_info.linkname = "../../../../../lib/wine/i386-windows/start.exe"
+                tf.addfile(link_info)
+
+            dest_ok = root / "dest_ok"
+            dest_ok.mkdir()
+            runtime_manager._safe_extract_tar(ok_tar, dest_ok)
+            self.assertTrue(
+                (dest_ok / "GE-Proton11-12/files/share/default_pfx/drive_c/windows/system32/start.exe").is_symlink()
+            )
+
+            bad_tar = root / "bad.tar"
+            with tarfile.open(bad_tar, "w") as tf:
+                bad_link = tarfile.TarInfo("GE-Proton11-12/escape")
+                bad_link.type = tarfile.SYMTYPE
+                bad_link.linkname = "../../../../etc/passwd"
+                tf.addfile(bad_link)
+
+            dest_bad = root / "dest_bad"
+            dest_bad.mkdir()
+            with self.assertRaises(RuntimeError):
+                runtime_manager._safe_extract_tar(bad_tar, dest_bad)
 
     def test_validate_steamrt4_integrity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
