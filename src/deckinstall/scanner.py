@@ -67,6 +67,17 @@ def clean_game_name(raw_name: str) -> str:
     return cleaned or raw_name
 
 
+def _parse_valid_appid(raw: str) -> int | None:
+    s = raw.strip()
+    if not s or len(s) > 10 or not (s.isascii() and s.isdigit()):
+        return None
+    try:
+        val = int(s)
+    except ValueError:
+        return None
+    return val if 1 <= val <= 0xFFFFFFFF else None
+
+
 def detect_steam_appid(game_dir: Path) -> int | None:
     """Check common Steam emulator/appid files for an official numeric Steam AppID."""
     appid_files: list[Path] = []
@@ -98,8 +109,9 @@ def detect_steam_appid(game_dir: Path) -> int | None:
             text = appid_file.read_text(encoding="utf-8", errors="ignore").strip()
         except OSError:
             continue
-        if text.isascii() and text.isdigit():
-            return int(text)
+        parsed = _parse_valid_appid(text)
+        if parsed is not None:
+            return parsed
 
     for ini_name in ("steam_emu.ini", "rune.ini", "tenoke.ini", "flt.ini"):
         for match in ini_files[ini_name]:
@@ -109,7 +121,9 @@ def detect_steam_appid(game_dir: Path) -> int | None:
                 continue
             m = re.search(r"^\s*AppId\s*=\s*(\d+)", content, re.MULTILINE | re.IGNORECASE)
             if m:
-                return int(m.group(1))
+                parsed = _parse_valid_appid(m.group(1))
+                if parsed is not None:
+                    return parsed
     return None
 
 
@@ -242,7 +256,10 @@ def scan_all_games(roots: list[Path] | None = None) -> list[DetectedGame]:
                 continue
             if resolved in seen:
                 continue
-            detected = scan_game_folder(child)
+            try:
+                detected = scan_game_folder(child)
+            except Exception:
+                continue
             if detected is not None:
                 seen.add(resolved)
                 results.append(detected)

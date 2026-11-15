@@ -48,6 +48,7 @@
   "add.search_empty": "Nenhum jogo encontrado na Steam com esse nome.",
   "add.steam_missing": "Instalação do Steam não encontrada.",
   "add.invalid_input": "Informe um nome e executável válido.",
+  "add.invalid_appid": "AppID da Steam inválido (deve estar entre 1 e 4294967295).",
   "add.gamescope_confirm": "Você está no Modo Jogo (gamescope). Reiniciar o Steam aqui recarrega a interface.\nDeseja continuar?",
   "add.closing_steam": "Fechando Steam com segurança...",
   "add.close_steam_timeout": "Não foi possível fechar o Steam a tempo.",
@@ -169,6 +170,7 @@
   "art.searching": "Buscando na Loja Steam por \"{name}\"...",
   "art.match_item": "{name} (AppID {appid})",
   "library.no_shortcuts": "Nenhum atalho Non-Steam encontrado para o usuário ativo.",
+  "library.vdf_error": "Não foi possível ler shortcuts.vdf da Steam ({err}). Edições na biblioteca estão desativadas até recarregar sem erros.",
   "library.removing": "Removendo \"{name}\" do Steam...",
   "restore.pick_qt": "Arquivos Zip (*.zip);;Todos os arquivos (*)"
 }

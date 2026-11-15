@@ -373,4 +373,11 @@ def run_windows_installer(
                     f"No files were installed in {target_dir}. "
                     "Point the installer to Z:" + str(target_dir)
                 )
+        inst_pfx = Path(tmp_pfx) / "pfx"
+        if (inst_pfx / "drive_c").is_dir() and not inst_pfx.is_symlink():
+            saved_pfx = target_dir / ".deckinstall_installer_pfx"
+            if saved_pfx.exists() and not saved_pfx.is_symlink():
+                shutil.rmtree(saved_pfx, ignore_errors=True)
+            if not saved_pfx.exists():
+                _copy_dir_no_symlinks(inst_pfx, saved_pfx)
     return target_dir

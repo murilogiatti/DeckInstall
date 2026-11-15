@@ -277,7 +277,7 @@ def add_or_update_shortcut(
     exe_path: Path,
     start_dir: Path | None = None,
     icon_path: Path | None = None,
-    launch_options: str = "",
+    launch_options: str | None = None,
     enable_proton: bool = True,
     preserve_from_appid: int | None = None,
 ) -> int:
@@ -291,11 +291,9 @@ def add_or_update_shortcut(
 
     with _steam_transaction_lock(paths.shortcuts_vdf):
         paths.shortcuts_vdf.parent.mkdir(parents=True, exist_ok=True)
-        old_shortcuts_bytes = (
-            paths.shortcuts_vdf.read_bytes()
-            if paths.shortcuts_vdf.is_file() and paths.shortcuts_vdf.stat().st_size > 0
-            else None
-        )
+        existed_before = paths.shortcuts_vdf.is_file()
+        raw_before = paths.shortcuts_vdf.read_bytes() if existed_before else None
+        old_shortcuts_bytes = raw_before if (raw_before and len(raw_before) > 0) else None
         _backup_file(paths.shortcuts_vdf)
 
         if old_shortcuts_bytes is not None:
@@ -323,14 +321,18 @@ def add_or_update_shortcut(
                 continue
             filtered.append(item)
 
+        resolved_icon = str(icon_path) if icon_path is not None else str(existing_meta.get("icon", ""))
+        resolved_launch = (
+            launch_options if launch_options is not None else str(existing_meta.get("LaunchOptions", ""))
+        )
         new_entry = {
             "appid": appid_s32,
             "AppName": app_name,
             "Exe": exe_quoted,
             "StartDir": dir_quoted,
-            "icon": str(icon_path) if icon_path else "",
+            "icon": resolved_icon,
             "ShortcutPath": existing_meta.get("ShortcutPath", ""),
-            "LaunchOptions": launch_options,
+            "LaunchOptions": resolved_launch,
             "IsHidden": existing_meta.get("IsHidden", 0),
             "AllowDesktopConfig": existing_meta.get("AllowDesktopConfig", 1),
             "AllowOverlay": existing_meta.get("AllowOverlay", 1),
@@ -348,16 +350,63 @@ def add_or_update_shortcut(
         _atomic_write_bytes(paths.shortcuts_vdf, vdf.binary_dumps(data))
 
         if enable_proton:
-            try:
-                set_compat_tool(
-                    paths.config_vdf,
-                    appid_u32,
-                    find_default_proton_name(paths.steam_root),
-                )
-            except Exception:
-                if old_shortcuts_bytes is not None:
-                    _atomic_write_bytes(paths.shortcuts_vdf, old_shortcuts_bytes)
-                raise
+            existing_proton = get_shortcut_proton(paths.config_vdf, appid_u32)
+            if not existing_proton:
+                inherited_proton = ""
+                if preserve_from_appid is not None:
+                    inherited_proton = get_shortcut_proton(paths.config_vdf, preserve_from_appid)
+                elif stale_appids:
+                    for sid in stale_appids:
+                        inherited_proton = get_shortcut_proton(paths.config_vdf, sid)
+                        if inherited_proton:
+                            break
+                target_proton = inherited_proton or find_default_proton_name(paths.steam_root)
+                try:
+                    set_compat_tool(
+                        paths.config_vdf,
+                        appid_u32,
+                        target_proton,
+                    )
+                except Exception:
+                    if existed_before and raw_before is not None:
+                        _atomic_write_bytes(paths.shortcuts_vdf, raw_before)
+                    else:
+                        paths.shortcuts_vdf.unlink(missing_ok=True)
+                    raise
+        if preserve_from_appid is None and stale_appids:
+            new_compat = paths.compatdata_dir / str(appid_u32)
+            for old_id in stale_appids:
+                old_compat = paths.compatdata_dir / str(old_id)
+                if old_compat.is_dir() and not old_compat.is_symlink() and not new_compat.exists():
+                    used_by_other = False
+                    for uid in list_steam_users(paths.steam_root):
+                        if uid == paths.user_id:
+                            continue
+                        other_sv = paths.steam_root / "userdata" / uid / "config" / "shortcuts.vdf"
+                        if any(e.appid_u32 == old_id for e in load_shortcuts(other_sv)):
+                            used_by_other = True
+                            break
+                    try:
+                        new_compat.parent.mkdir(parents=True, exist_ok=True)
+                        if used_by_other:
+                            shutil.copytree(old_compat, new_compat, symlinks=True)
+                        else:
+                            shutil.move(str(old_compat), str(new_compat))
+                    except OSError:
+                        logging.warning("Failed migrating compatdata %s -> %s", old_id, appid_u32)
+                if paths.grid_dir.is_dir():
+                    old_prefix = str(old_id)
+                    for art_file in paths.grid_dir.iterdir():
+                        if not art_file.is_symlink() and art_file.is_file() and art_file.name.startswith(old_prefix):
+                            suffix = art_file.name[len(old_prefix) :]
+                            if suffix and suffix[0] not in ("p", "_", "."):
+                                continue
+                            dest_art = paths.grid_dir / f"{appid_u32}{suffix}"
+                            if not dest_art.exists():
+                                try:
+                                    shutil.move(str(art_file), str(dest_art))
+                                except OSError:
+                                    pass
         for stale_id in stale_appids:
             try:
                 remove_compat_tool(paths.config_vdf, stale_id)
@@ -752,6 +801,7 @@ def migrate_shortcut_to_games(
             )
 
             # Update other Steam users' shortcuts that pointed into old_root
+            other_sv_snaps: list[tuple[Path, bytes]] = []
             for uid in list_steam_users(paths.steam_root):
                 if uid == paths.user_id:
                     continue
@@ -759,30 +809,33 @@ def migrate_shortcut_to_games(
                 if not other_sv.is_file() or other_sv.stat().st_size == 0:
                     continue
                 try:
-                    other_data = vdf.binary_loads(other_sv.read_bytes())
-                    other_sc = other_data.get("shortcuts", {})
-                    other_changed = False
-                    for item in other_sc.values():
-                        if not isinstance(item, dict):
-                            continue
-                        for field in ("Exe", "StartDir", "icon"):
-                            val = str(item.get(field) or "")
-                            cleaned = _strip_vdf_quotes(val)
-                            if not cleaned:
+                    with _steam_transaction_lock(other_sv):
+                        orig_other_bytes = other_sv.read_bytes()
+                        other_data = vdf.binary_loads(orig_other_bytes)
+                        other_sc = other_data.get("shortcuts", {})
+                        other_changed = False
+                        for item in other_sc.values():
+                            if not isinstance(item, dict):
                                 continue
-                            upd = _rewrite_path_prefix(cleaned, old_roots, str(new_root))
-                            if upd != cleaned:
-                                item[field] = _quote_path(upd) if field != "icon" else upd
-                                other_changed = True
-                        lo = str(item.get("LaunchOptions") or "")
-                        if lo:
-                            upd_lo = _rewrite_launch_options(lo, old_root, new_root)
-                            if upd_lo != lo:
-                                item["LaunchOptions"] = upd_lo
-                                other_changed = True
-                    if other_changed:
-                        _backup_file(other_sv)
-                        _atomic_write_bytes(other_sv, vdf.binary_dumps(other_data))
+                            for field in ("Exe", "StartDir", "icon"):
+                                val = str(item.get(field) or "")
+                                cleaned = _strip_vdf_quotes(val)
+                                if not cleaned:
+                                    continue
+                                upd = _rewrite_path_prefix(cleaned, old_roots, str(new_root))
+                                if upd != cleaned:
+                                    item[field] = _quote_path(upd) if field != "icon" else upd
+                                    other_changed = True
+                            lo = str(item.get("LaunchOptions") or "")
+                            if lo:
+                                upd_lo = _rewrite_launch_options(lo, old_root, new_root)
+                                if upd_lo != lo:
+                                    item["LaunchOptions"] = upd_lo
+                                    other_changed = True
+                        if other_changed:
+                            other_sv_snaps.append((other_sv, orig_other_bytes))
+                            _backup_file(other_sv)
+                            _atomic_write_bytes(other_sv, vdf.binary_dumps(other_data))
                 except Exception as exc:
                     logging.warning("Could not update other user %s shortcuts: %s", uid, exc)
 
@@ -848,6 +901,12 @@ def migrate_shortcut_to_games(
                 shutil.move(str(backed_compat_pair[0]), str(backed_compat_pair[1]))
             except OSError:
                 pass
+        for other_sv, orig_other in reversed(locals().get("other_sv_snaps", [])):
+            try:
+                with _steam_transaction_lock(other_sv):
+                    _atomic_write_bytes(other_sv, orig_other)
+            except OSError:
+                logging.exception("Rollback failed restoring %s", other_sv)
         try:
             if shortcuts_snap is not None:
                 _atomic_write_bytes(paths.shortcuts_vdf, shortcuts_snap)
@@ -935,7 +994,13 @@ def external_prefix_roots() -> list[Path]:
 
 
 def _prefix_users_dir(prefix_dir: Path) -> Path | None:
+    try:
+        base_resolved = prefix_dir.resolve()
+    except OSError:
+        return None
     for rel in (Path("pfx") / "drive_c" / "users", Path("drive_c") / "users"):
+        if not _safe_parents_within(prefix_dir, base_resolved, rel.parts):
+            continue
         candidate = prefix_dir / rel
         if candidate.is_dir():
             return candidate
@@ -1016,7 +1081,7 @@ def _iter_prefix_save_pairs(
                 for rel in _PREFIX_REL_DIRS
             ]
         for src_root, dst_root in mappings:
-            if not src_root.is_dir():
+            if src_root.is_symlink() or not src_root.is_dir():
                 continue
             for dirpath, dirnames, filenames in os.walk(
                 src_root, followlinks=False, onerror=onerror
@@ -1040,7 +1105,7 @@ def _iter_programdata_save_pairs(
     raise_on_error: bool = False,
 ):
     """Yield (src_file, dst_file) for non-system ProgramData save files."""
-    if not src_progdata.is_dir():
+    if src_progdata.is_symlink() or not src_progdata.is_dir():
         return
     onerror = _raise_oserror if raise_on_error else None
     for dirpath, dirnames, filenames in os.walk(
@@ -1072,11 +1137,20 @@ def _strip_vdf_quotes(val: str) -> str:
 def _copy_save_pair_if_newer(
     src_file: Path,
     dst_file: Path,
+    dst_root: Path,
     dst_root_resolved: Path,
     errors: list[str],
 ) -> int:
     try:
         if dst_file.is_symlink():
+            return 0
+        try:
+            rel_parent = dst_file.parent.relative_to(dst_root)
+        except ValueError:
+            return 0
+        if rel_parent.parts and not _safe_parents_within(
+            dst_root, dst_root_resolved, rel_parent.parts
+        ):
             return 0
         if dst_file.exists() and dst_file.stat().st_mtime >= src_file.stat().st_mtime:
             return 0
@@ -1109,6 +1183,30 @@ def _copy_save_pair_if_newer(
         return 0
 
 
+def adopt_installer_prefix(
+    paths: SteamPaths,
+    game_root: Path,
+    shortcut_appid_u32: int,
+) -> bool:
+    """Adopt `.deckinstall_installer_pfx` saved by setup.exe into compatdata/<appid>/pfx."""
+    saved_pfx = game_root / ".deckinstall_installer_pfx"
+    if not saved_pfx.is_dir() or saved_pfx.is_symlink():
+        return False
+    paths.compatdata_dir.mkdir(parents=True, exist_ok=True)
+    compat_root_resolved = paths.compatdata_dir.resolve()
+    if not _safe_parents_within(
+        paths.compatdata_dir, compat_root_resolved, (str(shortcut_appid_u32),)
+    ):
+        raise OSError(f"Unsafe compatdata path for {shortcut_appid_u32}")
+    target_compat = paths.compatdata_dir / str(shortcut_appid_u32)
+    target_pfx = target_compat / "pfx"
+    if target_pfx.exists() or target_pfx.is_symlink():
+        return False
+    target_compat.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(saved_pfx), str(target_pfx))
+    return True
+
+
 def import_external_prefix_saves(
     paths: SteamPaths,
     shortcut_appid_u32: int,
@@ -1124,10 +1222,20 @@ def import_external_prefix_saves(
     )
     if not prefixes:
         return 0
+    paths.compatdata_dir.mkdir(parents=True, exist_ok=True)
+    compat_root_resolved = paths.compatdata_dir.resolve()
+    if not _safe_parents_within(
+        paths.compatdata_dir,
+        compat_root_resolved,
+        (str(shortcut_appid_u32), "pfx", "drive_c", "users"),
+    ):
+        raise OSError(f"Unsafe compatdata users path for {shortcut_appid_u32}")
     dst_drive_c = paths.compatdata_dir / str(shortcut_appid_u32) / "pfx" / "drive_c"
     dst_users = dst_drive_c / "users"
     dst_users.mkdir(parents=True, exist_ok=True)
     dst_users_resolved = dst_users.resolve()
+    if not dst_users_resolved.is_relative_to(compat_root_resolved):
+        raise OSError(f"Resolved users path escapes compatdata: {dst_users_resolved}")
     dst_progdata = dst_drive_c / "ProgramData"
     copied = 0
     errors: list[str] = []
@@ -1139,20 +1247,28 @@ def import_external_prefix_saves(
                     src_users, dst_users, raise_on_error=True
                 ):
                     copied += _copy_save_pair_if_newer(
-                        src_file, dst_file, dst_users_resolved, errors
+                        src_file, dst_file, dst_users, dst_users_resolved, errors
                     )
             except OSError as exc:
                 errors.append(f"{src_users}: {exc}")
         src_progdata = _prefix_programdata_dir(prefix_dir)
         if src_progdata is not None:
+            if not _safe_parents_within(
+                paths.compatdata_dir,
+                compat_root_resolved,
+                (str(shortcut_appid_u32), "pfx", "drive_c", "ProgramData"),
+            ):
+                raise OSError(f"Unsafe compatdata ProgramData path for {shortcut_appid_u32}")
             dst_progdata.mkdir(parents=True, exist_ok=True)
             dst_progdata_resolved = dst_progdata.resolve()
+            if not dst_progdata_resolved.is_relative_to(compat_root_resolved):
+                raise OSError(f"Resolved ProgramData path escapes compatdata: {dst_progdata_resolved}")
             try:
                 for src_file, dst_file in _iter_programdata_save_pairs(
                     src_progdata, dst_progdata, raise_on_error=True
                 ):
                     copied += _copy_save_pair_if_newer(
-                        src_file, dst_file, dst_progdata_resolved, errors
+                        src_file, dst_file, dst_progdata, dst_progdata_resolved, errors
                     )
             except OSError as exc:
                 errors.append(f"{src_progdata}: {exc}")
@@ -1304,7 +1420,13 @@ _PROGRAMDATA_SKIP_DIRS = {
 
 
 def _prefix_programdata_dir(prefix_dir: Path) -> Path | None:
+    try:
+        base_resolved = prefix_dir.resolve()
+    except OSError:
+        return None
     for rel in (Path("pfx") / "drive_c" / "ProgramData", Path("drive_c") / "ProgramData"):
+        if not _safe_parents_within(prefix_dir, base_resolved, rel.parts):
+            continue
         cand = prefix_dir / rel
         if cand.is_dir():
             return cand
@@ -1319,6 +1441,29 @@ _DRIVE_C_SYSTEM_DIRS = {
     "programdata",
     "vr",
 }
+
+
+def _prefix_has_unconventional_saves(prefix_dir: Path, src_users: Path | None = None) -> bool:
+    """Return True if drive_c contains non-symlink files outside standard Windows user/system dirs."""
+    users_dir = src_users if src_users is not None else _prefix_users_dir(prefix_dir)
+    if users_dir is None:
+        return True
+    drive_c = users_dir.parent
+    if drive_c.is_symlink() or not drive_c.is_dir():
+        return True
+    try:
+        for sub in drive_c.iterdir():
+            if sub.is_symlink() or not sub.is_dir() or sub.name.lower() in _DRIVE_C_SYSTEM_DIRS:
+                continue
+            for dirpath, _, filenames in os.walk(sub, followlinks=False, onerror=_raise_oserror):
+                cur = Path(dirpath)
+                for fname in filenames:
+                    fp = cur / fname
+                    if not fp.is_symlink() and fp.is_file():
+                        return True
+    except OSError:
+        return True
+    return False
 
 
 def _prefix_has_saves(prefix_dir: Path) -> bool:
@@ -1339,13 +1484,8 @@ def _prefix_has_saves(prefix_dir: Path) -> bool:
             ):
                 if src_file.stat().st_size > 0:
                     return True
-        drive_c = src_users.parent
-        for sub in drive_c.iterdir():
-            if not sub.is_dir() or sub.name.lower() in _DRIVE_C_SYSTEM_DIRS:
-                continue
-            for _, _, filenames in os.walk(sub, followlinks=False, onerror=_raise_oserror):
-                if filenames:
-                    return True
+        if _prefix_has_unconventional_saves(prefix_dir, src_users):
+            return True
     except OSError:
         return True
     return False
@@ -1438,6 +1578,8 @@ def _prefix_saves_verified_in_target(src_prefix: Path, dst_compatdata: Path) -> 
     src_users = _prefix_users_dir(src_prefix)
     dst_users = _prefix_users_dir(dst_compatdata)
     if src_users is None or dst_users is None:
+        return False
+    if _prefix_has_unconventional_saves(src_prefix, src_users):
         return False
     any_nonempty = False
     try:
@@ -1859,6 +2001,8 @@ def backup_all_saves(
                         fsize = src_file.stat().st_size
                         if fsize == 0:
                             continue
+                        if files_backed + 1 >= _RESTORE_MAX_ENTRIES:
+                            raise RuntimeError(f"Backup exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})")
                         if fsize > _RESTORE_MAX_FILE_BYTES or total_uncompressed + fsize > _RESTORE_MAX_TOTAL_BYTES:
                             raise RuntimeError(f"Limite de tamanho de backup excedido em {src_file.name}")
                         rel = dst_rel.relative_to(dummy_dst)
@@ -1878,6 +2022,8 @@ def backup_all_saves(
                         fsize = src_file.stat().st_size
                         if fsize == 0:
                             continue
+                        if files_backed + 1 >= _RESTORE_MAX_ENTRIES:
+                            raise RuntimeError(f"Backup exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})")
                         if fsize > _RESTORE_MAX_FILE_BYTES or total_uncompressed + fsize > _RESTORE_MAX_TOTAL_BYTES:
                             raise RuntimeError(f"Backup size limit exceeded on {src_file.name}")
                         rel = dst_rel.relative_to(dummy_pd)

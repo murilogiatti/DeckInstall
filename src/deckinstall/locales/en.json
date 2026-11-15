@@ -48,6 +48,7 @@
   "add.search_empty": "No games found on Steam with that name.",
   "add.steam_missing": "Steam installation not found.",
   "add.invalid_input": "Please provide a valid name and executable.",
+  "add.invalid_appid": "Invalid Steam AppID (must be between 1 and 4294967295).",
   "add.gamescope_confirm": "You are in Gaming Mode (gamescope). Restarting Steam here reloads the UI.\nDo you want to continue?",
   "add.closing_steam": "Safely closing Steam...",
   "add.close_steam_timeout": "Could not close Steam in time.",
@@ -169,6 +170,7 @@
   "art.searching": "Searching Steam Store for \"{name}\"...",
   "art.match_item": "{name} (AppID {appid})",
   "library.no_shortcuts": "No Non-Steam shortcuts found for the active user.",
+  "library.vdf_error": "Could not read Steam shortcuts.vdf ({err}). Library edits are disabled until reloaded cleanly.",
   "library.removing": "Removing \"{name}\" from Steam...",
   "restore.pick_qt": "Zip Archives (*.zip);;All Files (*)"
 }

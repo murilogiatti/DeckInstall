@@ -68,6 +68,7 @@ from .steam_vdf import (
     MigrationPlanItem,
     ShortcutEntry,
     add_or_update_shortcut,
+    adopt_installer_prefix,
     apply_launch_presets,
     backup_all_saves,
     delete_cleanup_candidates_checked,
@@ -245,7 +246,13 @@ class PreviewWorker(QThread):
         self.steam_appid = steam_appid
 
     def run(self) -> None:
-        data = fetch_header_preview(self.steam_appid)
+        if isinstance(self.steam_appid, bool) or not isinstance(self.steam_appid, int) or self.steam_appid <= 0:
+            self.failed.emit(self.req_id)
+            return
+        try:
+            data = fetch_header_preview(self.steam_appid)
+        except Exception:
+            data = None
         if data:
             self.loaded.emit(self.req_id, data)
         else:
@@ -306,7 +313,7 @@ class AddToSteamWorker(QThread):
 
     status = Signal(str)
     finished_ok = Signal(str)
-    failed = Signal(str)
+    failed = Signal(str, bool)
 
     def __init__(
         self,
@@ -326,6 +333,8 @@ class AddToSteamWorker(QThread):
         self.restart_steam = restart_steam
 
     def run(self) -> None:
+        was_running = False
+        shortcut_written = False
         try:
             was_running = is_steam_running()
             if was_running:
@@ -341,6 +350,10 @@ class AddToSteamWorker(QThread):
                 start_dir=self.exe_path.parent,
                 enable_proton=self.enable_proton,
             )
+            shortcut_written = True
+
+            game_root = infer_game_root_from_exe(self.exe_path) or self.exe_path.parent
+            adopt_installer_prefix(self.paths, game_root, shortcut_id)
 
             imported = import_external_prefix_saves(
                 paths=self.paths,
@@ -363,15 +376,18 @@ class AddToSteamWorker(QThread):
                     files=", ".join(art.saved_files.keys()) or tr("art.none"),
                 )
 
-            if was_running and self.restart_steam:
-                self.status.emit(tr("add.restarting_steam"))
-                start_steam()
-
             self.finished_ok.emit(
                 tr("add.done", name=self.app_name, appid=shortcut_id, art=art_msg)
             )
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(str(exc), shortcut_written)
+        finally:
+            if was_running and self.restart_steam:
+                try:
+                    self.status.emit(tr("add.restarting_steam"))
+                    start_steam()
+                except Exception:
+                    logging.exception("Failed restarting Steam after AddToSteamWorker")
 
 
 class BulkMigrateWorker(QThread):
@@ -574,6 +590,7 @@ class MainWindow(QMainWindow):
         self._detected_games: list[DetectedGame] = []
         self._active_workers: set[QThread] = set()
         self._closing_pending = False
+        self._vdf_corrupt = False
         self._search_req_id = 0
         self._preview_req_id = 0
         self._extract_worker: ExtractWorker | None = None
@@ -942,6 +959,15 @@ class MainWindow(QMainWindow):
         top.addWidget(self.btn_reload)
         lib_layout.addLayout(top)
 
+        self.vdf_error_banner = QLabel()
+        self.vdf_error_banner.setWordWrap(True)
+        self.vdf_error_banner.setStyleSheet(
+            "color: #ff8a8a; background-color: rgba(180, 40, 40, 0.18); "
+            "border: 1px solid #b83b44; border-radius: 6px; padding: 8px;"
+        )
+        self.vdf_error_banner.setVisible(False)
+        lib_layout.addWidget(self.vdf_error_banner)
+
         self.shortcuts_list = QListWidget()
         lib_layout.addWidget(self.shortcuts_list, 1)
 
@@ -1186,7 +1212,13 @@ class MainWindow(QMainWindow):
             return
         if query.isascii() and query.isdigit():
             self._search_req_id += 1
-            appid = int(query)
+            appid = int(query) if len(query) <= 10 else 0
+            if not (1 <= appid <= 0xFFFFFFFF):
+                self._preview_req_id += 1
+                self.steam_match_combo.clear()
+                self.preview_label.setText(tr("add.art_placeholder"))
+                self.status_label.setText(tr("add.invalid_appid"))
+                return
             self.steam_match_combo.clear()
             self.steam_match_combo.addItem(tr("add.appid_label", appid=appid), appid)
             self.status_label.setText(tr("add.appid_status", appid=appid))
@@ -1222,7 +1254,7 @@ class MainWindow(QMainWindow):
     def _on_steam_match_changed(self) -> None:
         appid = self.steam_match_combo.currentData()
         self._preview_req_id += 1
-        if not isinstance(appid, int):
+        if isinstance(appid, bool) or not isinstance(appid, int) or appid <= 0:
             self.preview_label.setText(tr("add.art_placeholder"))
             return
         req_id = self._preview_req_id
@@ -1259,6 +1291,13 @@ class MainWindow(QMainWindow):
         if not self.paths:
             QMessageBox.critical(self, __app_name__, tr("add.steam_missing"))
             return
+        if self._vdf_corrupt:
+            QMessageBox.critical(
+                self,
+                __app_name__,
+                self.vdf_error_banner.text() or tr("library.vdf_error", err="shortcuts.vdf"),
+            )
+            return
         app_name = self.add_name.text().strip()
         exe_str = self.add_exe_combo.currentText().strip()
         if not app_name or not exe_str or not Path(exe_str).is_file():
@@ -1275,8 +1314,14 @@ class MainWindow(QMainWindow):
                 return
 
         steam_appid = self.steam_match_combo.currentData()
-        if steam_appid is None and self.steam_search_input.text().strip().isdigit():
-            steam_appid = int(self.steam_search_input.text().strip())
+        if isinstance(steam_appid, bool) or not isinstance(steam_appid, int) or not (1 <= steam_appid <= 0xFFFFFFFF):
+            steam_appid = None
+        if steam_appid is None:
+            raw_q = self.steam_search_input.text().strip()
+            if raw_q.isascii() and raw_q.isdigit() and len(raw_q) <= 10:
+                candidate = int(raw_q)
+                if 1 <= candidate <= 0xFFFFFFFF:
+                    steam_appid = candidate
 
         self._set_steam_busy(True)
         self._add_worker = AddToSteamWorker(
@@ -1300,19 +1345,37 @@ class MainWindow(QMainWindow):
         if not self._closing_pending:
             QMessageBox.information(self, __app_name__, msg)
 
-    def _on_add_failed(self, err: str) -> None:
+    def _on_add_failed(self, err: str, partial_written: bool = False) -> None:
         self._set_steam_busy(False)
+        if partial_written:
+            self._refresh_shortcuts()
         if not self._closing_pending:
             QMessageBox.critical(self, __app_name__, err)
 
     def _refresh_shortcuts(self) -> None:
         self.shortcuts_list.clear()
         if not self.paths:
+            self._vdf_corrupt = False
+            self.vdf_error_banner.hide()
+            self._set_vdf_write_enabled(True)
             empty_item = QListWidgetItem(tr("library.no_shortcuts"))
             empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
             self.shortcuts_list.addItem(empty_item)
             return
-        entries = load_shortcuts(self.paths.shortcuts_vdf)
+        try:
+            entries = load_shortcuts(self.paths.shortcuts_vdf)
+        except Exception as exc:
+            self._vdf_corrupt = True
+            self.vdf_error_banner.setText(tr("library.vdf_error", err=exc))
+            self.vdf_error_banner.show()
+            self._set_vdf_write_enabled(False)
+            err_item = QListWidgetItem(tr("library.no_shortcuts"))
+            err_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.shortcuts_list.addItem(err_item)
+            return
+        self._vdf_corrupt = False
+        self.vdf_error_banner.hide()
+        self._set_vdf_write_enabled(True)
         if not entries:
             empty_item = QListWidgetItem(tr("library.no_shortcuts"))
             empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
@@ -1330,25 +1393,31 @@ class MainWindow(QMainWindow):
         data = item.data(Qt.ItemDataRole.UserRole)
         return data if isinstance(data, ShortcutEntry) else None
 
-    def _set_steam_busy(self, busy: bool) -> None:
-        enabled = not busy
+    def _set_vdf_write_enabled(self, enabled: bool) -> None:
         for w in (
             self.btn_add_steam,
-            self.btn_reload,
-            self.shortcuts_list,
             self.btn_bulk_migrate,
             self.btn_migrate,
-            self.btn_art,
-            self.btn_revert_art,
             self.btn_proton,
             self.btn_launch_opts,
             self.btn_backup_saves,
             self.btn_restore_saves,
-            self.btn_link_prefixes,
-            self.btn_cleanup,
             self.btn_remove,
         ):
             w.setEnabled(enabled)
+
+    def _set_steam_busy(self, busy: bool) -> None:
+        enabled = not busy
+        for w in (
+            self.btn_reload,
+            self.shortcuts_list,
+            self.btn_art,
+            self.btn_revert_art,
+            self.btn_link_prefixes,
+            self.btn_cleanup,
+        ):
+            w.setEnabled(enabled)
+        self._set_vdf_write_enabled(enabled and not self._vdf_corrupt)
 
     def _update_selected_shortcut_art(self) -> None:
         entry = self._selected_shortcut()
@@ -2242,8 +2311,12 @@ def main() -> int:
     win = MainWindow(app)
     if "--smoke-test" in args:
         for w in list(win._active_workers):
-            w.wait(5000)
-        win.close()
+            if not w.wait(5000):
+                print("Smoke test failed: background worker timed out", file=sys.stderr)
+                return 1
+        if not win.close():
+            print("Smoke test failed: MainWindow did not close cleanly", file=sys.stderr)
+            return 1
         app.processEvents()
         return 0
     win.show()
