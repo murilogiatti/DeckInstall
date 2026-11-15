@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 import requests
-from PySide6.QtCore import QSettings, Qt, QThread, Signal, qInstallMessageHandler
+from PySide6.QtCore import QPoint, QRect, QSettings, QSize, Qt, QThread, Signal, qInstallMessageHandler
 from PySide6.QtGui import QCloseEvent, QDragEnterEvent, QDropEvent, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLayout,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -30,6 +31,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QStackedWidget,
     QTextEdit,
     QVBoxLayout,
@@ -57,6 +60,7 @@ from .steam_paths import (
     SteamPaths,
     is_gamescope_session,
     is_steam_running,
+    list_installed_protons,
     resolve_steam_paths,
 )
 from .steam_vdf import (
@@ -64,17 +68,23 @@ from .steam_vdf import (
     MigrationPlanItem,
     ShortcutEntry,
     add_or_update_shortcut,
+    apply_launch_presets,
+    backup_all_saves,
     delete_cleanup_candidates_checked,
     find_cleanup_candidates,
+    get_shortcut_proton,
     import_external_prefix_saves,
     infer_game_root_from_exe,
     load_shortcuts,
     migrate_shortcut_to_games,
     plan_bulk_migration,
     remove_shortcut,
+    restore_saves_backup,
+    set_shortcut_proton,
     shutdown_steam,
     start_steam,
     sync_all_external_saves,
+    sync_prefix_symlinks,
 )
 from .theme import ThemeMode, apply_theme
 
@@ -383,6 +393,76 @@ def _is_wine_game_running() -> bool:
     return False
 
 
+class FlowLayout(QLayout):
+    """Responsive wrapping layout so action buttons never clip horizontally."""
+
+    def __init__(self, parent: QWidget | None = None, margin: int = 0, spacing: int = 8) -> None:
+        super().__init__(parent)
+        self.setContentsMargins(margin, margin, margin, margin)
+        self._spacing = spacing
+        self._items: list = []
+
+    def __del__(self) -> None:
+        while self._items:
+            self.takeAt(0)
+
+    def addItem(self, item) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self) -> Qt.Orientation:
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self) -> QSize:
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        size += QSize(m.left() + m.right(), m.top() + m.bottom())
+        return size
+
+    def _do_layout(self, rect: QRect, test_only: bool) -> int:
+        m = self.contentsMargins()
+        eff = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x = eff.x()
+        y = eff.y()
+        line_height = 0
+        for item in self._items:
+            hint = item.sizeHint()
+            next_x = x + hint.width() + self._spacing
+            if next_x - self._spacing > eff.right() and line_height > 0:
+                x = eff.x()
+                y += line_height + self._spacing
+                next_x = x + hint.width() + self._spacing
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x
+            line_height = max(line_height, hint.height())
+        return y + line_height - rect.y() + m.bottom()
+
+
 def _make_card() -> tuple[QFrame, QVBoxLayout]:
     card = QFrame()
     card.setObjectName("Card")
@@ -414,7 +494,8 @@ class MainWindow(QMainWindow):
         self._scan_worker: ScanWorker | None = None
 
         self.setWindowTitle(f"{__app_name__} v{__version__}")
-        self.resize(980, 660)
+        self.resize(1080, 700)
+        self.setMinimumSize(840, 560)
         self._build_ui()
         self._apply_saved_theme()
         self._refresh_games()
@@ -468,10 +549,17 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(22, 20, 22, 14)
         right_layout.setSpacing(12)
 
+        def _wrap_scroll(w: QWidget) -> QScrollArea:
+            sa = QScrollArea()
+            sa.setWidgetResizable(True)
+            sa.setFrameShape(QFrame.Shape.NoFrame)
+            sa.setWidget(w)
+            return sa
+
         self.stack = QStackedWidget()
-        self.stack.addWidget(self._build_extract_page())
-        self.stack.addWidget(self._build_add_page())
-        self.stack.addWidget(self._build_library_page())
+        self.stack.addWidget(_wrap_scroll(self._build_extract_page()))
+        self.stack.addWidget(_wrap_scroll(self._build_add_page()))
+        self.stack.addWidget(_wrap_scroll(self._build_library_page()))
         right_layout.addWidget(self.stack)
 
         self.status_label = QLabel(tr("status.ready"))
@@ -746,7 +834,7 @@ class MainWindow(QMainWindow):
         self.shortcuts_list = QListWidget()
         lib_layout.addWidget(self.shortcuts_list, 1)
 
-        actions = QHBoxLayout()
+        actions = FlowLayout(spacing=8)
         self.btn_bulk_migrate = QPushButton(tr("library.btn_bulk_migrate"))
         self.btn_bulk_migrate.setObjectName("primaryBtn")
         self.btn_bulk_migrate.clicked.connect(self._bulk_migrate_shortcuts)
@@ -756,18 +844,35 @@ class MainWindow(QMainWindow):
         self.btn_art.clicked.connect(self._update_selected_shortcut_art)
         self.btn_revert_art = QPushButton(tr("library.btn_revert_art"))
         self.btn_revert_art.clicked.connect(self._revert_selected_shortcut_art)
+        self.btn_proton = QPushButton(tr("library.btn_proton"))
+        self.btn_proton.clicked.connect(self._change_selected_proton)
+        self.btn_launch_opts = QPushButton(tr("library.btn_launch_opts"))
+        self.btn_launch_opts.clicked.connect(self._edit_launch_options_presets)
+        self.btn_backup_saves = QPushButton(tr("library.btn_backup_saves"))
+        self.btn_backup_saves.clicked.connect(self._backup_all_saves)
+        self.btn_restore_saves = QPushButton(tr("library.btn_restore_saves"))
+        self.btn_restore_saves.clicked.connect(self._restore_saves_backup)
+        self.btn_link_prefixes = QPushButton(tr("library.btn_link_prefixes"))
+        self.btn_link_prefixes.clicked.connect(self._sync_prefix_links)
         self.btn_cleanup = QPushButton(tr("library.btn_cleanup"))
         self.btn_cleanup.clicked.connect(self._cleanup_old_prefixes)
         self.btn_remove = QPushButton(tr("library.btn_remove"))
         self.btn_remove.setObjectName("dangerBtn")
         self.btn_remove.clicked.connect(self._remove_selected_shortcut)
-        actions.addWidget(self.btn_bulk_migrate)
-        actions.addWidget(self.btn_migrate)
-        actions.addWidget(self.btn_art)
-        actions.addWidget(self.btn_revert_art)
-        actions.addWidget(self.btn_cleanup)
-        actions.addStretch()
-        actions.addWidget(self.btn_remove)
+        for b in (
+            self.btn_bulk_migrate,
+            self.btn_migrate,
+            self.btn_art,
+            self.btn_revert_art,
+            self.btn_proton,
+            self.btn_launch_opts,
+            self.btn_backup_saves,
+            self.btn_restore_saves,
+            self.btn_link_prefixes,
+            self.btn_cleanup,
+            self.btn_remove,
+        ):
+            actions.addWidget(b)
         lib_layout.addLayout(actions)
         layout.addWidget(lib_card, 1)
         return page
@@ -1079,6 +1184,11 @@ class MainWindow(QMainWindow):
             self.btn_migrate,
             self.btn_art,
             self.btn_revert_art,
+            self.btn_proton,
+            self.btn_launch_opts,
+            self.btn_backup_saves,
+            self.btn_restore_saves,
+            self.btn_link_prefixes,
             self.btn_cleanup,
             self.btn_remove,
         ):
@@ -1211,6 +1321,182 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, __app_name__, msg)
         except Exception as exc:
             QMessageBox.critical(self, __app_name__, tr("art.revert_error", err=exc))
+
+    def _change_selected_proton(self) -> None:
+        entry = self._selected_shortcut()
+        if not entry or not self.paths:
+            return
+        protons = list_installed_protons(self.paths.steam_root)
+        current = get_shortcut_proton(self.paths.config_vdf, entry.appid_u32) or "default"
+        labels = [disp for _, disp in protons]
+        cur_idx = next((i for i, (tid, _) in enumerate(protons) if tid == current), 0)
+        choice, ok = QInputDialog.getItem(
+            self,
+            tr("proton.title"),
+            tr("proton.label", name=entry.app_name, current=current),
+            labels,
+            cur_idx,
+            False,
+        )
+        if not ok or not choice:
+            return
+        tool_id = protons[labels.index(choice)][0]
+        try:
+            set_shortcut_proton(self.paths.config_vdf, entry.appid_u32, tool_id)
+            msg = tr("proton.updated", name=entry.app_name, tool=tool_id)
+            self.status_label.setText(msg)
+            QMessageBox.information(self, __app_name__, msg)
+        except Exception as exc:
+            QMessageBox.critical(self, __app_name__, tr("proton.error", err=exc))
+
+    def _edit_launch_options_presets(self) -> None:
+        entry = self._selected_shortcut()
+        if not entry or not self.paths:
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("launch.title", name=entry.app_name))
+        dlg.resize(520, 300)
+        lay = QVBoxLayout(dlg)
+
+        opts_now = entry.launch_options or ""
+        chk_gm = QCheckBox(tr("launch.gamemode"))
+        chk_gm.setChecked("gamemoderun" in opts_now.split())
+        chk_mh = QCheckBox(tr("launch.mangohud"))
+        chk_mh.setChecked("MANGOHUD=1" in opts_now)
+        chk_w3d = QCheckBox(tr("launch.wined3d"))
+        chk_w3d.setChecked("PROTON_USE_WINED3D=1" in opts_now)
+        chk_esync = QCheckBox(tr("launch.no_esync"))
+        chk_esync.setChecked("PROTON_NO_ESYNC=1" in opts_now)
+        chk_fsync = QCheckBox(tr("launch.no_fsync"))
+        chk_fsync.setChecked("PROTON_NO_FSYNC=1" in opts_now)
+
+        raw_lbl = QLabel(tr("launch.raw_label"))
+        raw_edit = QLineEdit(opts_now)
+
+        def _sync_preview() -> None:
+            raw_edit.setText(
+                apply_launch_presets(
+                    opts_now,
+                    gamemode=chk_gm.isChecked(),
+                    mangohud=chk_mh.isChecked(),
+                    wined3d=chk_w3d.isChecked(),
+                    no_esync=chk_esync.isChecked(),
+                    no_fsync=chk_fsync.isChecked(),
+                )
+            )
+
+        for chk in (chk_gm, chk_mh, chk_w3d, chk_esync, chk_fsync):
+            chk.toggled.connect(_sync_preview)
+            lay.addWidget(chk)
+        lay.addWidget(raw_lbl)
+        lay.addWidget(raw_edit)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_opts = raw_edit.text().strip()
+        try:
+            exe_p = Path(entry.exe.strip().strip('"'))
+            start_p = Path(entry.start_dir.strip().strip('"')) if entry.start_dir else exe_p.parent
+            add_or_update_shortcut(
+                paths=self.paths,
+                app_name=entry.app_name,
+                exe_path=exe_p,
+                start_dir=start_p,
+                icon_path=Path(entry.icon.strip('"')) if entry.icon else None,
+                launch_options=new_opts,
+                enable_proton=False,
+            )
+            self._refresh_shortcuts()
+            msg = tr("launch.saved", name=entry.app_name)
+            self.status_label.setText(msg)
+            QMessageBox.information(self, __app_name__, msg)
+        except Exception as exc:
+            QMessageBox.critical(self, __app_name__, str(exc))
+
+    def _backup_all_saves(self) -> None:
+        if not self.paths:
+            return
+        self._set_steam_busy(True)
+        self.status_label.setText(tr("backup.running"))
+
+        class _BackupWorker(QThread):
+            done = Signal(str, int, int)
+            failed = Signal(str)
+
+            def __init__(self, paths: SteamPaths) -> None:
+                super().__init__()
+                self._paths = paths
+
+            def run(self) -> None:
+                try:
+                    zpath, games, files = backup_all_saves(self._paths)
+                    self.done.emit(str(zpath), games, files)
+                except Exception as exc:
+                    self.failed.emit(str(exc))
+
+        def _ok(zpath: str, games: int, files: int) -> None:
+            self._set_steam_busy(False)
+            if files == 0:
+                Path(zpath).unlink(missing_ok=True)
+                msg = tr("backup.empty")
+            else:
+                msg = tr("backup.done", files=files, games=games, path=zpath)
+            self.status_label.setText(msg.splitlines()[0])
+            QMessageBox.information(self, __app_name__, msg)
+
+        def _err(err: str) -> None:
+            self._set_steam_busy(False)
+            QMessageBox.critical(self, __app_name__, tr("backup.error", err=err))
+
+        w = _BackupWorker(self.paths)
+        self._track_worker(w)
+        w.done.connect(_ok)
+        w.failed.connect(_err)
+        w.start()
+
+    def _restore_saves_backup(self) -> None:
+        if not self.paths:
+            return
+        bak_dir = Path.home() / "Backups" / "DeckInstall"
+        start_dir = str(bak_dir if bak_dir.is_dir() else Path.home())
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, tr("restore.pick"), start_dir, "Zip Archives (*.zip)"
+        )
+        if not chosen:
+            return
+        zpath = Path(chosen)
+        if (
+            QMessageBox.question(
+                self, __app_name__, tr("restore.confirm", name=zpath.name)
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        try:
+            games, files = restore_saves_backup(self.paths, zpath)
+            msg = tr("restore.done", files=files, games=games)
+            self.status_label.setText(msg)
+            QMessageBox.information(self, __app_name__, msg)
+        except Exception as exc:
+            QMessageBox.critical(self, __app_name__, tr("restore.error", err=exc))
+
+    def _sync_prefix_links(self) -> None:
+        if not self.paths:
+            return
+        try:
+            created, removed = sync_prefix_symlinks(self.paths)
+            msg = tr("links.done", created=created, removed=removed)
+            self.status_label.setText(msg)
+            QMessageBox.information(self, __app_name__, msg)
+        except Exception as exc:
+            QMessageBox.critical(self, __app_name__, tr("links.error", err=exc))
 
     def _remove_selected_shortcut(self) -> None:
         entry = self._selected_shortcut()

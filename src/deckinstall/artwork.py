@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import requests
 
 STEAM_SEARCH_URL = "https://store.steampowered.com/api/storesearch/"
 STEAM_CDN_BASE = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps"
-USER_AGENT = "DeckInstall/0.7.1"
+USER_AGENT = "DeckInstall/0.7.2"
 
 
 @dataclass(frozen=True)
@@ -150,8 +151,13 @@ def download_steam_artwork(
     }
 
     saved: dict[str, Path] = {}
-    for kind, (dest, urls) in targets.items():
-        if _download_first(urls, dest):
-            saved[kind] = dest
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futs = {
+            kind: pool.submit(_download_first, urls, dest)
+            for kind, (dest, urls) in targets.items()
+        }
+        for kind, fut in futs.items():
+            if fut.result():
+                saved[kind] = targets[kind][0]
 
     return ArtworkResult(steam_appid=steam_appid, saved_files=saved)

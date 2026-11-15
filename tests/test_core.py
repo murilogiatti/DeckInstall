@@ -644,6 +644,70 @@ class CoreTests(unittest.TestCase):
             self.assertEqual((grid / f"{appid}p.jpg").read_bytes(), b"ORIG_CAPSULE")
             self.assertFalse((grid / f"{appid}_hero.jpg").exists())
 
+    def test_backup_restore_symlinks_proton_and_launch_presets(self) -> None:
+        from deckinstall.steam_paths import list_installed_protons
+        from deckinstall.steam_vdf import (
+            apply_launch_presets,
+            backup_all_saves,
+            restore_saves_backup,
+            sync_prefix_symlinks,
+        )
+
+        # 1) Launch presets
+        opts = apply_launch_presets("--fullscreen", gamemode=True, mangohud=True, wined3d=False, no_esync=True, no_fsync=False)
+        self.assertIn("MANGOHUD=1", opts)
+        self.assertIn("PROTON_NO_ESYNC=1", opts)
+        self.assertIn("gamemoderun", opts)
+        self.assertIn("%command%", opts)
+        self.assertIn("--fullscreen", opts)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            steam_root = root / "Steam"
+            compat_dir = steam_root / "steamapps" / "compatdata"
+            compat_tools = steam_root / "compatibilitytools.d" / "GE-Proton9-20"
+            compat_tools.mkdir(parents=True)
+            (compat_tools / "compatibilitytool.vdf").write_text("{}", encoding="utf-8")
+            proton_exp = steam_root / "steamapps" / "common" / "Proton - Experimental"
+            proton_exp.mkdir(parents=True)
+            (proton_exp / "proton").write_bytes(b"#!/bin/sh\n")
+
+            protons = dict(list_installed_protons(steam_root))
+            self.assertIn("GE-Proton9-20", protons)
+            self.assertIn("proton_experimental", protons)
+
+            appid = 3222222222
+            save_file = compat_dir / str(appid) / "pfx" / "drive_c" / "users" / "steamuser" / "Documents" / "save.dat"
+            save_file.parent.mkdir(parents=True)
+            save_file.write_bytes(b"MY_SAVE_DATA")
+
+            shortcuts_vdf = steam_root / "userdata" / "1" / "config" / "shortcuts.vdf"
+            shortcuts_vdf.parent.mkdir(parents=True)
+            shortcuts_vdf.write_bytes(b"VDF")
+            paths = SteamPaths(
+                steam_root=steam_root,
+                user_id="1",
+                userdata_dir=steam_root / "userdata" / "1",
+                shortcuts_vdf=shortcuts_vdf,
+                grid_dir=steam_root / "userdata" / "1" / "config" / "grid",
+                config_vdf=steam_root / "config" / "config.vdf",
+                compatdata_dir=compat_dir,
+            )
+            entry = ShortcutEntry("0", appid, "TestGame", '"/g/t.exe"', '"/g"', "", "")
+            with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[entry]):
+                zpath, games, files = backup_all_saves(paths, dest_root=root / "Backups")
+                self.assertEqual((games, files), (1, 1))
+                self.assertTrue(zpath.is_file())
+
+                save_file.write_bytes(b"CORRUPTED")
+                rgames, rfiles = restore_saves_backup(paths, zpath)
+                self.assertEqual((rgames, rfiles), (1, 1))
+                self.assertEqual(save_file.read_bytes(), b"MY_SAVE_DATA")
+
+                created, removed = sync_prefix_symlinks(paths, links_root=root / "Links")
+                self.assertEqual((created, removed), (1, 0))
+                self.assertTrue((root / "Links" / "TestGame").is_symlink())
+
 
 if __name__ == "__main__":
     unittest.main()

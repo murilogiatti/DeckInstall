@@ -144,6 +144,43 @@ def find_proton_binary(steam_root: Path) -> Path | None:
     return None
 
 
+def list_installed_protons(steam_root: Path) -> list[tuple[str, str]]:
+    """Return list of (internal_tool_name, display_label) for installed Proton/GE-Proton versions."""
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    compat_tools = steam_root / "compatibilitytools.d"
+    if compat_tools.is_dir():
+        for entry in sorted(compat_tools.iterdir(), reverse=True):
+            if entry.is_dir() and (entry / "compatibilitytool.vdf").is_file():
+                name = entry.name
+                if name not in seen:
+                    seen.add(name)
+                    found.append((name, f"{name} (Custom / GE-Proton)"))
+
+    common = steam_root / "steamapps" / "common"
+    if common.is_dir():
+        for entry in sorted(common.glob("Proton*"), reverse=True):
+            if not (entry / "proton").is_file():
+                continue
+            folder = entry.name
+            if "Experimental" in folder:
+                tool_id = "proton_experimental"
+            elif "Hotfix" in folder:
+                tool_id = "proton_hotfix"
+            else:
+                parts = folder.replace("Proton ", "").strip().split(".")
+                major = parts[0] if parts and parts[0].isdigit() else ""
+                tool_id = f"proton_{major}" if major else folder.lower().replace(" ", "_")
+            if tool_id not in seen:
+                seen.add(tool_id)
+                found.append((tool_id, f"{folder} ({tool_id})"))
+
+    if not found:
+        found.append(("proton_experimental", "Proton Experimental (proton_experimental)"))
+    return found
+
+
 def is_gamescope_session() -> bool:
     """Return True if currently running inside SteamOS Gaming Mode (gamescope)."""
     desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()

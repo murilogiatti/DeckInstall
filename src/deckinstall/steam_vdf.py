@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -13,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import zipfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -744,12 +746,24 @@ def _iter_prefix_save_pairs(src_users: Path, dst_users: Path):
                     yield src_file, dst_root / rel_dir / fname
 
 
+_HASH_CACHE: dict[tuple[str, int, int], str] = {}
+
+
 def _file_sha256(path: Path) -> str:
+    st = path.stat()
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    cached = _HASH_CACHE.get(key)
+    if cached is not None:
+        return cached
     h = hashlib.sha256()
     with path.open("rb") as fh:
         while chunk := fh.read(65536):
             h.update(chunk)
-    return h.hexdigest()
+    digest = h.hexdigest()
+    if len(_HASH_CACHE) >= 4096:
+        _HASH_CACHE.clear()
+    _HASH_CACHE[key] = digest
+    return digest
 
 
 def _strip_vdf_quotes(val: str) -> str:
@@ -1395,3 +1409,226 @@ def delete_cleanup_candidates_checked(
         except OSError as exc:
             errors.append(f"{item.label}: {exc}")
     return deleted, freed, errors
+
+
+def backup_all_saves(
+    paths: SteamPaths,
+    dest_root: Path | None = None,
+) -> tuple[Path, int, int]:
+    """Create a timestamped ZIP backup of saves for all active Non-Steam shortcuts."""
+    out_dir = dest_root or (Path.home() / "Backups" / "DeckInstall")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    zip_path = out_dir / f"saves-{stamp}.zip"
+    entries = load_shortcuts(paths.shortcuts_vdf)
+    manifest: dict[str, str] = {}
+    games_backed = 0
+    files_backed = 0
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for entry in entries:
+            compat_dir = paths.compatdata_dir / str(entry.appid_u32)
+            src_users = _prefix_users_dir(compat_dir)
+            if src_users is None:
+                continue
+            game_files = 0
+            dummy_dst = compat_dir / "__bak_rel__"
+            for src_file, dst_rel in _iter_prefix_save_pairs(src_users, dummy_dst):
+                try:
+                    if src_file.stat().st_size == 0:
+                        continue
+                    rel = dst_rel.relative_to(dummy_dst)
+                except (OSError, ValueError):
+                    continue
+                arcname = f"{entry.appid_u32}/users/{rel.as_posix()}"
+                zf.write(src_file, arcname)
+                game_files += 1
+                files_backed += 1
+            if game_files > 0:
+                manifest[str(entry.appid_u32)] = entry.app_name
+                games_backed += 1
+        zf.writestr("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False))
+    return zip_path, games_backed, files_backed
+
+
+def restore_saves_backup(paths: SteamPaths, zip_path: Path) -> tuple[int, int]:
+    """Restore saves from a DeckInstall ZIP backup into matching Steam compatdata folders."""
+    restored_games: set[str] = set()
+    restored_files = 0
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for info in zf.infolist():
+            if info.is_dir() or info.filename == "manifest.json":
+                continue
+            parts = Path(info.filename).parts
+            if len(parts) < 3 or not parts[0].isdigit() or parts[1] != "users":
+                continue
+            appid_str = parts[0]
+            rel_parts = parts[2:]
+            if any(p in ("..", "", ".") for p in rel_parts):
+                continue
+            dst_users = (paths.compatdata_dir / appid_str / "pfx" / "drive_c" / "users")
+            dst_users.mkdir(parents=True, exist_ok=True)
+            dst_users_resolved = dst_users.resolve()
+            target = dst_users.joinpath(*rel_parts)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.parent.resolve().is_relative_to(dst_users_resolved):
+                continue
+            if target.is_symlink():
+                continue
+            if target.is_file():
+                _backup_file(target, keep=3)
+            data = zf.read(info.filename)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+            )
+            os.close(fd)
+            tmp_path = Path(tmp_name)
+            try:
+                tmp_path.write_bytes(data)
+                os.replace(tmp_path, target)
+            except Exception:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+                raise
+            restored_games.add(appid_str)
+            restored_files += 1
+    return len(restored_games), restored_files
+
+
+def sync_prefix_symlinks(
+    paths: SteamPaths,
+    links_root: Path | None = None,
+) -> tuple[int, int]:
+    """Create Shortix-style named symlinks in ~/Games/.prefixes/<Game> -> compatdata/<appid>."""
+    root = links_root or (Path.home() / "Games" / ".prefixes")
+    root.mkdir(parents=True, exist_ok=True)
+    entries = load_shortcuts(paths.shortcuts_vdf)
+    expected: dict[str, Path] = {}
+    for entry in entries:
+        compat = paths.compatdata_dir / str(entry.appid_u32)
+        if not compat.is_dir():
+            continue
+        safe = re.sub(r'[\\/:*?"<>|]+', " ", entry.app_name).strip() or str(entry.appid_u32)
+        if safe in expected:
+            safe = f"{safe} ({entry.appid_u32})"
+        expected[safe] = compat
+
+    created = 0
+    removed = 0
+    for child in root.iterdir():
+        if child.is_symlink() and child.name not in expected:
+            child.unlink()
+            removed += 1
+    for name, target in expected.items():
+        link = root / name
+        if link.is_symlink():
+            try:
+                if link.resolve() == target.resolve():
+                    continue
+            except OSError:
+                pass
+            link.unlink()
+        elif link.exists():
+            continue
+        link.symlink_to(target)
+        created += 1
+    return created, removed
+
+
+def get_shortcut_proton(config_vdf: Path, appid_u32: int) -> str:
+    """Return configured compatibility tool name for appid_u32, or ''."""
+    if not config_vdf.is_file():
+        return ""
+    try:
+        data = vdf.loads(config_vdf.read_text(encoding="utf-8", errors="replace"))
+        entry = (
+            data.get("InstallConfigStore", {})
+            .get("Software", {})
+            .get("Valve", {})
+            .get("Steam", {})
+            .get("CompatToolMapping", {})
+            .get(str(appid_u32), {})
+        )
+        return str(entry.get("name") or "").strip() if isinstance(entry, dict) else ""
+    except Exception:
+        return ""
+
+
+def set_shortcut_proton(config_vdf: Path, appid_u32: int, tool_name: str) -> None:
+    """Set compatibility tool for a Steam shortcut in config.vdf atomically."""
+    with _STEAM_LOCK:
+        if config_vdf.is_file():
+            _backup_file(config_vdf)
+            data = vdf.loads(config_vdf.read_text(encoding="utf-8", errors="replace"))
+        else:
+            data = {}
+        store = data.setdefault("InstallConfigStore", {})
+        sw = store.setdefault("Software", {})
+        valve = sw.setdefault("Valve", {})
+        steam = valve.setdefault("Steam", {})
+        mapping = steam.setdefault("CompatToolMapping", {})
+        mapping[str(appid_u32)] = {
+            "name": tool_name,
+            "config": "",
+            "priority": "250",
+        }
+        _atomic_write_bytes(config_vdf, vdf.dumps(data, pretty=True).encode("utf-8"))
+
+
+_PRESET_ENV_KEYS = ("MANGOHUD", "PROTON_USE_WINED3D", "PROTON_NO_ESYNC", "PROTON_NO_FSYNC")
+
+
+def apply_launch_presets(
+    launch_options: str,
+    gamemode: bool,
+    mangohud: bool,
+    wined3d: bool,
+    no_esync: bool,
+    no_fsync: bool,
+) -> str:
+    """Toggle common SteamOS/Proton launch presets while preserving existing custom options."""
+    try:
+        tokens = shlex.split(launch_options) if launch_options.strip() else []
+    except ValueError:
+        tokens = launch_options.split()
+
+    # Strip existing managed presets
+    filtered: list[str] = []
+    for tok in tokens:
+        if tok == "gamemoderun":
+            continue
+        if "=" in tok and tok.split("=", 1)[0] in _PRESET_ENV_KEYS:
+            continue
+        filtered.append(tok)
+
+    if "%command%" not in filtered:
+        filtered.append("%command%")
+
+    cmd_idx = filtered.index("%command%")
+    prefix_tokens: list[str] = []
+    if mangohud:
+        prefix_tokens.append("MANGOHUD=1")
+    if wined3d:
+        prefix_tokens.append("PROTON_USE_WINED3D=1")
+    if no_esync:
+        prefix_tokens.append("PROTON_NO_ESYNC=1")
+    if no_fsync:
+        prefix_tokens.append("PROTON_NO_FSYNC=1")
+    if gamemode:
+        prefix_tokens.append("gamemoderun")
+
+    final_tokens = prefix_tokens + filtered[:cmd_idx] + ["%command%"] + filtered[cmd_idx + 1 :]
+    out: list[str] = []
+    for tok in final_tokens:
+        if "=" in tok and not tok.startswith("-"):
+            k, v = tok.split("=", 1)
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k):
+                out.append(f"{k}={shlex.quote(v)}")
+                continue
+        if tok in {"&&", "||", ";", "|", "%command%"}:
+            out.append(tok)
+        else:
+            out.append(shlex.quote(tok))
+    return " ".join(out)
