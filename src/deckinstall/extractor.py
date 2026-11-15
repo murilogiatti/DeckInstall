@@ -15,6 +15,7 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+from . import runtime_manager
 from .scanner import clean_game_name
 from .steam_paths import find_proton_binary, find_steam_root
 
@@ -311,46 +312,61 @@ def run_windows_installer(
     on_log: Callable[[str], None] | None = None,
     cancel_flag: Callable[[], bool] | None = None,
 ) -> Path:
-    """Run a Windows setup.exe using Steam's Proton in a disposable prefix."""
+    """Run a Windows setup.exe using Steam's Proton or umu-run in a disposable prefix."""
     steam_root = find_steam_root()
-    if steam_root is None:
-        raise RuntimeError("Steam not found to run installer via Proton.")
-    proton = find_proton_binary(steam_root)
-    if proton is None:
-        raise RuntimeError("No Proton version found in Steam.")
+    proton = find_proton_binary(steam_root) if steam_root is not None else None
+    use_steam_proton = steam_root is not None and proton is not None
 
     target_dir.mkdir(parents=True, exist_ok=True)
     pre_existing = {p for p in target_dir.rglob("*") if p.is_file()}
     with tempfile.TemporaryDirectory(prefix="deckinstall_pfx_", dir=str(target_dir.parent)) as tmp_pfx:
-        env = os.environ.copy()
-        env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_root)
-        env["STEAM_COMPAT_DATA_PATH"] = tmp_pfx
-        if on_log:
-            on_log(
-                f"Starting {installer_exe.name} via Proton.\n"
-                f"Tip: in the installer, set destination to Z:{target_dir}"
+        if use_steam_proton:
+            env = os.environ.copy()
+            env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_root)
+            env["STEAM_COMPAT_DATA_PATH"] = tmp_pfx
+            if on_log:
+                on_log(
+                    f"Starting {installer_exe.name} via Proton.\n"
+                    f"Tip: in the installer, set destination to Z:{target_dir}"
+                )
+            proc = subprocess.Popen(
+                [str(proton), "run", str(installer_exe)],
+                cwd=str(tmp_pfx),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
             )
-        proc = subprocess.Popen(
-            [str(proton), "run", str(installer_exe)],
-            cwd=str(tmp_pfx),
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
 
-        def _handle_inst_line(line: str) -> None:
-            if on_log and line.strip():
-                on_log(line.strip()[:140])
+            def _handle_inst_line(line: str) -> None:
+                if on_log and line.strip():
+                    on_log(line.strip()[:140])
 
-        rc = _drain_stream_lines(proc, cancel_flag, _handle_inst_line, "Installer cancelled by user.")
-        if rc != 0:
-            raise RuntimeError(f"Installer exited with code {rc}.")
+            rc = _drain_stream_lines(proc, cancel_flag, _handle_inst_line, "Installer cancelled by user.")
+            if rc != 0:
+                raise RuntimeError(f"Installer exited with code {rc}.")
+            inst_pfx = Path(tmp_pfx) / "pfx"
+        else:
+            if cancel_flag and cancel_flag():
+                raise RuntimeError("Installer cancelled by user.")
+            if on_log:
+                on_log(
+                    f"Starting {installer_exe.name} via umu-run.\n"
+                    f"Tip: in the installer, set destination to Z:{target_dir}"
+                )
+            res = runtime_manager.run_with_umu(
+                installer_exe,
+                Path(tmp_pfx),
+                cwd=Path(tmp_pfx),
+            )
+            if res.returncode != 0:
+                raise RuntimeError(f"Installer exited with code {res.returncode}.")
+            inst_pfx = Path(tmp_pfx)
 
         has_installed = bool({p for p in target_dir.rglob("*") if p.is_file()} - pre_existing)
         if not has_installed:
-            drive_c = Path(tmp_pfx) / "pfx" / "drive_c"
+            drive_c = inst_pfx / "drive_c"
             copied_any = False
             for sub in ("Games", "GOG Games", "Program Files", "Program Files (x86)"):
                 base = drive_c / sub
@@ -373,7 +389,6 @@ def run_windows_installer(
                     f"No files were installed in {target_dir}. "
                     "Point the installer to Z:" + str(target_dir)
                 )
-        inst_pfx = Path(tmp_pfx) / "pfx"
         if (inst_pfx / "drive_c").is_dir() and not inst_pfx.is_symlink():
             saved_pfx = target_dir / ".deckinstall_installer_pfx"
             if saved_pfx.exists() and not saved_pfx.is_symlink():

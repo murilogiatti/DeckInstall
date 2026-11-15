@@ -91,7 +91,7 @@ def detect_steam_appid(game_dir: Path) -> int | None:
     for dirpath, dirnames, filenames in os.walk(game_dir, followlinks=False):
         cur = Path(dirpath)
         depth = len(cur.parts) - base_parts
-        if depth >= 3:
+        if depth >= 8:
             dirnames[:] = []
         else:
             dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
@@ -119,12 +119,39 @@ def detect_steam_appid(game_dir: Path) -> int | None:
                 content = match.read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 continue
-            m = re.search(r"^\s*AppId\s*=\s*(\d+)", content, re.MULTILINE | re.IGNORECASE)
+            pattern = (
+                r"^\s*(?:AppId|id)\s*=\s*(\d+)"
+                if ini_name == "tenoke.ini"
+                else r"^\s*AppId\s*=\s*(\d+)"
+            )
+            m = re.search(pattern, content, re.MULTILINE | re.IGNORECASE)
             if m:
                 parsed = _parse_valid_appid(m.group(1))
                 if parsed is not None:
                     return parsed
     return None
+
+
+def detect_exe_kind(exe_path: Path) -> str:
+    """Inspect executable magic bytes and return windows_pe, dos_mz, linux_elf, or unknown."""
+    try:
+        with open(exe_path, "rb") as handle:
+            header = handle.read(64)
+            if header.startswith(b"\x7fELF"):
+                return "linux_elf"
+            if header.startswith(b"MZ"):
+                if len(header) < 64:
+                    return "dos_mz"
+                e_lfanew = int.from_bytes(header[60:64], "little")
+                if e_lfanew < 4:
+                    return "dos_mz"
+                handle.seek(e_lfanew)
+                if handle.read(4) == b"PE\x00\x00":
+                    return "windows_pe"
+                return "dos_mz"
+    except OSError:
+        return "unknown"
+    return "unknown"
 
 
 def _is_ignored_exe(exe: Path) -> bool:

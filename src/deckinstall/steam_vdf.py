@@ -1943,6 +1943,32 @@ def find_cleanup_candidates(
             by_steam_appid.setdefault(str(sa), entry)
             by_steam_appid.setdefault(f"umu-{sa}", entry)
 
+    home = home_dir or Path.home()
+    games_dir = home / "Games"
+    standalone_prefixes_dir = games_dir / ".prefixes"
+    standalone_prefix_paths: set[Path] = set()
+    if games_dir.is_dir():
+        try:
+            for gdir in games_dir.iterdir():
+                if not gdir.is_dir() or gdir.name.startswith("."):
+                    continue
+                manifest = gdir / ".deckinstall_standalone.json"
+                if manifest.is_file():
+                    try:
+                        mdata = json.loads(manifest.read_text(encoding="utf-8", errors="replace"))
+                        p_raw = mdata.get("prefix_dir")
+                        if p_raw:
+                            standalone_prefix_paths.add(Path(str(p_raw)).resolve())
+                    except Exception:
+                        pass
+                    if standalone_prefixes_dir.is_dir():
+                        try:
+                            standalone_prefix_paths.add((standalone_prefixes_dir / gdir.name).resolve())
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+
     for root in extra_external_roots or external_prefix_roots():
         if not root.is_dir():
             continue
@@ -1950,6 +1976,12 @@ def find_cleanup_candidates(
             children = list(root.iterdir())
         except OSError:
             continue
+        is_standalone_prefixes_root = False
+        if standalone_prefixes_dir.is_dir():
+            try:
+                is_standalone_prefixes_root = root.resolve() == standalone_prefixes_dir.resolve()
+            except OSError:
+                pass
         for child in children:
             if child.is_symlink() or not child.is_dir() or child.name.startswith("."):
                 continue
@@ -1962,6 +1994,13 @@ def find_cleanup_candidates(
             if resolved in seen:
                 continue
             seen.add(resolved)
+            if resolved in standalone_prefix_paths:
+                continue
+            if is_standalone_prefixes_root and (
+                (games_dir / child.name / ".deckinstall_standalone.json").is_file()
+                or (games_dir / child.name).is_dir()
+            ):
+                continue
             if _is_prefix_referenced_by_shortcuts(resolved, all_user_entries):
                 continue
             matched_entry = by_steam_appid.get(child.name) or by_norm_key.get(_norm_key(child.name))
@@ -2636,7 +2675,16 @@ def set_shortcut_proton(config_vdf: Path, appid_u32: int, tool_name: str) -> Non
     set_compat_tool(config_vdf, appid_u32, tool_name, create_if_missing=True)
 
 
-_PRESET_ENV_KEYS = ("MANGOHUD", "PROTON_USE_WINED3D", "PROTON_NO_ESYNC", "PROTON_NO_FSYNC")
+_PRESET_ENV_KEYS = (
+    "MANGOHUD",
+    "PROTON_USE_WINED3D",
+    "PROTON_NO_ESYNC",
+    "PROTON_NO_FSYNC",
+    "WINEDLLOVERRIDES",
+)
+_HELIXSR_OPTISCALER_DLLS = frozenset(
+    {"dxgi", "amd_fidelityfx_dx12", "amd_fidelityfx_vk", "winmm", "version"}
+)
 _SHELL_OPS = {"&&", "||", ";", "|", ">", ">>", "<", "2>&1", "1>&2", "%command%"}
 _SAFE_UNQUOTED_DOLLAR_RE = re.compile(r"^[\w./:=+-]*\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})[\w./:=+-]*$")
 
@@ -2668,6 +2716,60 @@ def _format_launch_token(tok: str) -> str:
     return shlex.quote(tok)
 
 
+def _format_winedlloverrides_token(winedlloverrides: str) -> str:
+    val = winedlloverrides.strip()
+    if not any(ch in val for ch in ('"', "$", "`", "\\")):
+        return f'WINEDLLOVERRIDES="{val}"'
+    return f"WINEDLLOVERRIDES={shlex.quote(val)}"
+
+
+def detect_helixsr_lsfg_conflict(launch_options: str, winedlloverrides: str = "") -> bool:
+    """Return True if lsfg-vk / ENABLE_LSFG is enabled alongside HelixSR/OptiScaler DLL overrides."""
+    try:
+        tokens = _raw_shell_tokens(launch_options) if launch_options.strip() else []
+    except ValueError:
+        tokens = launch_options.split()
+
+    lsfg_enabled = False
+    dll_strings: list[str] = []
+    if winedlloverrides.strip():
+        dll_strings.append(winedlloverrides.strip())
+
+    for tok in tokens:
+        stripped = tok.strip("\"'")
+        if stripped.lower() == "lsfg-vk":
+            lsfg_enabled = True
+        if _is_env_assignment(tok):
+            k, v = tok.split("=", 1)
+            v_clean = v.strip("\"'").strip()
+            if k == "ENABLE_LSFG" and v_clean.lower() not in ("", "0", "false", "no", "off"):
+                lsfg_enabled = True
+            elif k == "WINEDLLOVERRIDES" and v_clean:
+                dll_strings.append(v_clean)
+
+    if not lsfg_enabled or not dll_strings:
+        return False
+
+    for dll_str in dll_strings:
+        for entry in dll_str.split(";"):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if "=" in entry:
+                names_part, mode_part = entry.split("=", 1)
+                if mode_part.strip().lower() == "d":
+                    continue
+            else:
+                names_part = entry
+            for dll_name in names_part.split(","):
+                norm = dll_name.strip().lstrip("*").lower()
+                if norm.endswith(".dll"):
+                    norm = norm[:-4]
+                if norm in _HELIXSR_OPTISCALER_DLLS:
+                    return True
+    return False
+
+
 def apply_launch_presets(
     launch_options: str,
     gamemode: bool,
@@ -2675,9 +2777,11 @@ def apply_launch_presets(
     wined3d: bool,
     no_esync: bool,
     no_fsync: bool,
+    winedlloverrides: str = "",
 ) -> str:
     """Toggle common SteamOS/Proton launch presets while preserving existing custom options."""
     _validate_launch_options(launch_options)
+    _validate_launch_options(winedlloverrides)
     try:
         tokens = _raw_shell_tokens(launch_options) if launch_options.strip() else []
     except ValueError:
@@ -2712,6 +2816,8 @@ def apply_launch_presets(
         preset_envs.append("PROTON_NO_ESYNC=1")
     if no_fsync:
         preset_envs.append("PROTON_NO_FSYNC=1")
+    if winedlloverrides.strip():
+        preset_envs.append(_format_winedlloverrides_token(winedlloverrides))
 
     wrappers_out: list[str] = []
     if gamemode:

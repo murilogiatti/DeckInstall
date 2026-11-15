@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -41,6 +42,13 @@ from PySide6.QtWidgets import (
 )
 
 from . import __app_name__, __version__
+from .app_updater import (
+    GITHUB_RELEASES_URL,
+    AppUpdateInfo,
+    check_app_update,
+    download_and_replace_appimage,
+    relaunch_appimage,
+)
 from .artwork import (
     SteamMatch,
     download_steam_artwork,
@@ -56,7 +64,22 @@ from .extractor import (
     sanitize_folder_name,
     suggest_target_name,
 )
-from .scanner import DetectedGame, clean_game_name, scan_all_games, scan_game_folder
+from .runtime_manager import (
+    check_runtime_updates,
+    check_ubuntu_bwrap_userns,
+    ensure_ge_proton11,
+    ensure_umu_run,
+)
+from .scanner import DetectedGame, clean_game_name, detect_exe_kind, scan_all_games, scan_game_folder
+from .standalone import (
+    StandaloneGame,
+    export_steam_to_standalone,
+    import_standalone_to_steam,
+    install_standalone_game,
+    list_standalone_games,
+    remove_standalone_game,
+    update_standalone_launch_options,
+)
 from .steam_paths import (
     SteamPaths,
     is_gamescope_session,
@@ -75,6 +98,7 @@ from .steam_vdf import (
     backup_all_saves,
     bulk_migrate_compat_tool,
     delete_cleanup_candidates_checked,
+    detect_helixsr_lsfg_conflict,
     find_cleanup_candidates,
     get_shortcut_proton,
     import_external_prefix_saves,
@@ -393,6 +417,116 @@ class AddToSteamWorker(QThread):
                     start_steam()
                 except Exception:
                     logging.exception("Failed restarting Steam after AddToSteamWorker")
+
+
+class RuntimeUpdateWorker(QThread):
+    """Background worker to check and update umu-run and GE-Proton11+ runtimes."""
+
+    status = Signal(str)
+    finished_ok = Signal(str, str)
+    failed = Signal(str)
+
+    def run(self) -> None:
+        try:
+            self.status.emit(tr("runtime.checking"))
+            info = check_runtime_updates(force=True)
+            umu_info = info.get("umu", {})
+            ge_info = info.get("ge_proton", {})
+            any_updated = bool(
+                umu_info.get("update_available")
+                or ge_info.get("update_available")
+                or not umu_info.get("installed")
+                or not ge_info.get("installed")
+            )
+            umu_path = ensure_umu_run(
+                force_update=True,
+                progress_cb=lambda msg, _pct: self.status.emit(msg),
+            )
+            ge_path = ensure_ge_proton11(
+                force_update=True,
+                progress_cb=lambda msg, _pct: self.status.emit(msg),
+            )
+            bwrap_warn = check_ubuntu_bwrap_userns() or ""
+            msg = (
+                tr("runtime.updated", umu=umu_path.name, proton=ge_path.name)
+                if any_updated
+                else tr("runtime.up_to_date", umu=umu_path.name, proton=ge_path.name)
+            )
+            self.finished_ok.emit(msg, bwrap_warn)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class AppUpdateCheckWorker(QThread):
+    """Background worker to query GitHub Releases for a newer DeckInstall AppImage."""
+
+    checked = Signal(object)
+    failed = Signal(str)
+
+    def run(self) -> None:
+        try:
+            self.checked.emit(check_app_update())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class AppUpdateDownloadWorker(QThread):
+    """Background worker to download, verify, and replace the running AppImage."""
+
+    progress = Signal(int)
+    finished_ok = Signal(Path)
+    failed = Signal(str)
+
+    def __init__(self, info: AppUpdateInfo) -> None:
+        super().__init__()
+        self.info = info
+
+    def run(self) -> None:
+        try:
+            updated_path = download_and_replace_appimage(
+                self.info,
+                progress_cb=self.progress.emit,
+            )
+            self.finished_ok.emit(updated_path)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class StandaloneInstallWorker(QThread):
+    """Background worker to prepare runtimes and install a game in standalone mode."""
+
+    status = Signal(str)
+    finished_ok = Signal(object, str)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        app_name: str,
+        exe_path: Path,
+        steam_appid: int | None,
+    ) -> None:
+        super().__init__()
+        self.app_name = app_name
+        self.exe_path = exe_path
+        self.steam_appid = steam_appid
+
+    def run(self) -> None:
+        try:
+            self.status.emit(tr("add.preparing_runtime"))
+            ensure_umu_run(progress_cb=lambda msg, _pct: self.status.emit(msg))
+            ge_dir = ensure_ge_proton11(progress_cb=lambda msg, _pct: self.status.emit(msg))
+            game_dir = infer_game_root_from_exe(self.exe_path) or self.exe_path.parent
+            game = install_standalone_game(
+                game_name=self.app_name,
+                exe_path=self.exe_path,
+                game_dir=game_dir,
+                proton_name=ge_dir.name,
+                steam_appid=self.steam_appid,
+            )
+            bwrap_warn = check_ubuntu_bwrap_userns() or ""
+            self.finished_ok.emit(game, bwrap_warn)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class BulkMigrateWorker(QThread):
@@ -761,6 +895,14 @@ class MainWindow(QMainWindow):
         self.lang_combo.currentIndexChanged.connect(self._on_language_changed)
         layout.addWidget(self.lang_combo)
 
+        self.btn_update_runtimes = QPushButton(tr("runtime.btn_update"))
+        self.btn_update_runtimes.clicked.connect(self._update_runtimes)
+        layout.addWidget(self.btn_update_runtimes)
+
+        self.btn_app_update = QPushButton(tr("app_update.btn"))
+        self.btn_app_update.clicked.connect(self._check_and_update_app)
+        layout.addWidget(self.btn_app_update)
+
         btn_about = QPushButton(tr("header.about"))
         btn_about.clicked.connect(self._show_about_dialog)
         layout.addWidget(btn_about)
@@ -936,6 +1078,10 @@ class MainWindow(QMainWindow):
         self.btn_add_steam.setObjectName("primaryBtn")
         self.btn_add_steam.clicked.connect(self._add_selected_to_steam)
         cfg_layout.addWidget(self.btn_add_steam)
+
+        self.btn_add_standalone = QPushButton(tr("install.btn_add_standalone"))
+        self.btn_add_standalone.clicked.connect(self._add_selected_standalone)
+        cfg_layout.addWidget(self.btn_add_standalone)
         layout.addWidget(cfg_card, 1)
         return page
 
@@ -976,6 +1122,7 @@ class MainWindow(QMainWindow):
         self.shortcuts_list = QListWidget()
         self.shortcuts_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.shortcuts_list.customContextMenuRequested.connect(self._show_shortcut_context_menu)
+        self.shortcuts_list.currentItemChanged.connect(lambda _c, _p: self._update_library_action_states())
         lib_layout.addWidget(self.shortcuts_list, 1)
 
         actions = FlowLayout(spacing=8)
@@ -996,6 +1143,10 @@ class MainWindow(QMainWindow):
         self.act_bulk_proton.triggered.connect(self._bulk_migrate_proton_dialog)
         self.act_launch_opts = QAction(tr("library.btn_launch_opts"), self)
         self.act_launch_opts.triggered.connect(self._edit_launch_options_presets)
+        self.act_export_standalone = QAction(tr("library.btn_export_standalone"), self)
+        self.act_export_standalone.triggered.connect(self._export_selected_to_standalone)
+        self.act_import_steam = QAction(tr("library.btn_import_steam"), self)
+        self.act_import_steam.triggered.connect(self._import_selected_to_steam)
         self.act_remove = QAction(tr("library.btn_remove"), self)
         self.act_remove.triggered.connect(self._remove_selected_shortcut)
         for act in (
@@ -1005,6 +1156,8 @@ class MainWindow(QMainWindow):
             self.act_proton,
             self.act_bulk_proton,
             self.act_launch_opts,
+            self.act_export_standalone,
+            self.act_import_steam,
         ):
             self._game_actions_menu.addAction(act)
         self._game_actions_menu.addSeparator()
@@ -1040,8 +1193,9 @@ class MainWindow(QMainWindow):
         item = self.shortcuts_list.itemAt(pos)
         if item is not None:
             self.shortcuts_list.setCurrentItem(item)
-        if self._selected_shortcut() is None:
+        if self._selected_library_item() is None:
             return
+        self._update_library_action_states()
         self._game_actions_menu.exec(self.shortcuts_list.viewport().mapToGlobal(pos))
 
     def _apply_saved_theme(self) -> None:
@@ -1072,6 +1226,151 @@ class MainWindow(QMainWindow):
             tr("about.title", app=__app_name__),
             tr("about.body", app=__app_name__, version=__version__),
         )
+
+    def _update_runtimes(self) -> None:
+        self.btn_update_runtimes.setEnabled(False)
+        self.status_label.setText(tr("runtime.checking"))
+        worker = RuntimeUpdateWorker()
+        self._track_worker(worker)
+        worker.status.connect(self.status_label.setText)
+
+        def _ok(msg: str, bwrap_warn: str) -> None:
+            self.btn_update_runtimes.setEnabled(True)
+            self.status_label.setText(msg)
+            if self._closing_pending:
+                return
+            if bwrap_warn:
+                QMessageBox.warning(self, __app_name__, tr("runtime.bwrap_warning", msg=bwrap_warn))
+            QMessageBox.information(self, __app_name__, msg)
+
+        def _err(err: str) -> None:
+            self.btn_update_runtimes.setEnabled(True)
+            msg = tr("runtime.error", err=err)
+            self.status_label.setText(msg)
+            if not self._closing_pending:
+                QMessageBox.critical(self, __app_name__, msg)
+
+        worker.finished_ok.connect(_ok)
+        worker.failed.connect(_err)
+        worker.start()
+
+    def _check_and_update_app(self) -> None:
+        self.btn_app_update.setEnabled(False)
+        self.status_label.setText(tr("app_update.checking"))
+        worker = AppUpdateCheckWorker()
+        self._track_worker(worker)
+
+        def _on_checked(info: AppUpdateInfo) -> None:
+            self.btn_app_update.setEnabled(True)
+            if self._closing_pending:
+                return
+            if not info.has_update:
+                msg = tr("app_update.up_to_date", version=info.current_version)
+                self.status_label.setText(msg)
+                QMessageBox.information(self, __app_name__, msg)
+                return
+
+            if not info.can_self_update:
+                url = info.html_url or GITHUB_RELEASES_URL
+                if info.cannot_update_reason == "not_appimage":
+                    msg = tr(
+                        "app_update.manual_not_appimage",
+                        latest=info.latest_version,
+                        current=info.current_version,
+                        url=url,
+                    )
+                    QMessageBox.information(self, __app_name__, msg)
+                elif info.cannot_update_reason == "not_writable":
+                    msg = tr(
+                        "app_update.manual_not_writable",
+                        latest=info.latest_version,
+                        current=info.current_version,
+                        path=str(info.appimage_path or ""),
+                        url=url,
+                    )
+                    QMessageBox.warning(self, __app_name__, msg)
+                else:
+                    msg = tr(
+                        "app_update.manual_no_asset",
+                        latest=info.latest_version,
+                        url=url,
+                    )
+                    QMessageBox.information(self, __app_name__, msg)
+                self.status_label.setText(msg.splitlines()[0])
+                return
+
+            ans = QMessageBox.question(
+                self,
+                __app_name__,
+                tr(
+                    "app_update.available",
+                    latest=info.latest_version,
+                    current=info.current_version,
+                ),
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+
+            prog_dlg = QProgressDialog(
+                tr("app_update.downloading", latest=info.latest_version),
+                "",
+                0,
+                100,
+                self,
+            )
+            prog_dlg.setWindowTitle(__app_name__)
+            prog_dlg.setCancelButton(None)
+            prog_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+            prog_dlg.setAutoClose(False)
+            prog_dlg.setAutoReset(False)
+            prog_dlg.setValue(0)
+            prog_dlg.show()
+
+            dl_worker = AppUpdateDownloadWorker(info)
+            self._track_worker(dl_worker)
+            dl_worker.progress.connect(prog_dlg.setValue)
+
+            def _dl_ok(updated_path: Path) -> None:
+                prog_dlg.close()
+                prog_dlg.deleteLater()
+                if self._closing_pending:
+                    return
+                if is_gamescope_session():
+                    msg = tr("app_update.done_gamescope", latest=info.latest_version)
+                    self.status_label.setText(msg)
+                    QMessageBox.information(self, __app_name__, msg)
+                else:
+                    relaunch = QMessageBox.question(
+                        self,
+                        __app_name__,
+                        tr("app_update.done_relaunch", latest=info.latest_version),
+                    )
+                    if relaunch == QMessageBox.StandardButton.Yes:
+                        relaunch_appimage(updated_path)
+                        QApplication.quit()
+
+            def _dl_err(err: str) -> None:
+                prog_dlg.close()
+                prog_dlg.deleteLater()
+                msg = tr("app_update.error", err=err)
+                self.status_label.setText(msg)
+                if not self._closing_pending:
+                    QMessageBox.critical(self, __app_name__, msg)
+
+            dl_worker.finished_ok.connect(_dl_ok)
+            dl_worker.failed.connect(_dl_err)
+            dl_worker.start()
+
+        def _on_err(err: str) -> None:
+            self.btn_app_update.setEnabled(True)
+            msg = tr("app_update.error", err=err)
+            self.status_label.setText(msg)
+            if not self._closing_pending:
+                QMessageBox.critical(self, __app_name__, msg)
+
+        worker.checked.connect(_on_checked)
+        worker.failed.connect(_on_err)
+        worker.start()
 
     def _set_extract_source(self, path_str: str) -> None:
         p = Path(path_str)
@@ -1317,6 +1616,30 @@ class MainWindow(QMainWindow):
         else:
             self.preview_label.setText(tr("add.art_placeholder"))
 
+    def _validate_add_inputs(self) -> tuple[str, Path] | None:
+        app_name = self.add_name.text().strip()
+        exe_str = self.add_exe_combo.currentText().strip()
+        exe_path = Path(exe_str) if exe_str else Path()
+        if not app_name or not exe_str or not exe_path.is_file():
+            QMessageBox.warning(self, __app_name__, tr("add.invalid_input"))
+            return None
+        if detect_exe_kind(exe_path) == "dos_mz":
+            QMessageBox.warning(self, __app_name__, tr("add.dos_unsupported", name=exe_path.name))
+            return None
+        return app_name, exe_path
+
+    def _resolve_selected_steam_appid(self) -> int | None:
+        steam_appid = self.steam_match_combo.currentData()
+        if isinstance(steam_appid, bool) or not isinstance(steam_appid, int) or not (1 <= steam_appid <= 0xFFFFFFFF):
+            steam_appid = None
+        if steam_appid is None:
+            raw_q = self.steam_search_input.text().strip()
+            if raw_q.isascii() and raw_q.isdigit() and len(raw_q) <= 10:
+                candidate = int(raw_q)
+                if 1 <= candidate <= 0xFFFFFFFF:
+                    steam_appid = candidate
+        return steam_appid
+
     def _add_selected_to_steam(self) -> None:
         if not self.paths:
             QMessageBox.critical(self, __app_name__, tr("add.steam_missing"))
@@ -1328,11 +1651,10 @@ class MainWindow(QMainWindow):
                 self.vdf_error_banner.text() or tr("library.vdf_error", err="shortcuts.vdf"),
             )
             return
-        app_name = self.add_name.text().strip()
-        exe_str = self.add_exe_combo.currentText().strip()
-        if not app_name or not exe_str or not Path(exe_str).is_file():
-            QMessageBox.warning(self, __app_name__, tr("add.invalid_input"))
+        validated = self._validate_add_inputs()
+        if validated is None:
             return
+        app_name, exe_path = validated
 
         if is_gamescope_session() and is_steam_running():
             ans = QMessageBox.question(
@@ -1343,21 +1665,13 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.StandardButton.Yes:
                 return
 
-        steam_appid = self.steam_match_combo.currentData()
-        if isinstance(steam_appid, bool) or not isinstance(steam_appid, int) or not (1 <= steam_appid <= 0xFFFFFFFF):
-            steam_appid = None
-        if steam_appid is None:
-            raw_q = self.steam_search_input.text().strip()
-            if raw_q.isascii() and raw_q.isdigit() and len(raw_q) <= 10:
-                candidate = int(raw_q)
-                if 1 <= candidate <= 0xFFFFFFFF:
-                    steam_appid = candidate
+        steam_appid = self._resolve_selected_steam_appid()
 
         self._set_steam_busy(True)
         self._add_worker = AddToSteamWorker(
             paths=self.paths,
             app_name=app_name,
-            exe_path=Path(exe_str),
+            exe_path=exe_path,
             steam_appid=steam_appid,
             enable_proton=self.chk_proton.isChecked(),
             restart_steam=self.chk_restart.isChecked(),
@@ -1367,6 +1681,42 @@ class MainWindow(QMainWindow):
         self._add_worker.finished_ok.connect(self._on_add_done)
         self._add_worker.failed.connect(self._on_add_failed)
         self._add_worker.start()
+
+    def _add_selected_standalone(self) -> None:
+        validated = self._validate_add_inputs()
+        if validated is None:
+            return
+        app_name, exe_path = validated
+        steam_appid = self._resolve_selected_steam_appid()
+
+        self._set_steam_busy(True)
+        worker = StandaloneInstallWorker(
+            app_name=app_name,
+            exe_path=exe_path,
+            steam_appid=steam_appid,
+        )
+        self._track_worker(worker)
+        worker.status.connect(self.status_label.setText)
+
+        def _ok(game: StandaloneGame, bwrap_warn: str) -> None:
+            self._set_steam_busy(False)
+            self._refresh_shortcuts()
+            msg = tr("add.done_standalone", name=game.name, path=str(game.game_dir))
+            self.status_label.setText(msg)
+            if self._closing_pending:
+                return
+            if bwrap_warn:
+                QMessageBox.warning(self, __app_name__, tr("runtime.bwrap_warning", msg=bwrap_warn))
+            QMessageBox.information(self, __app_name__, msg)
+
+        def _err(err: str) -> None:
+            self._set_steam_busy(False)
+            if not self._closing_pending:
+                QMessageBox.critical(self, __app_name__, err)
+
+        worker.finished_ok.connect(_ok)
+        worker.failed.connect(_err)
+        worker.start()
 
     def _on_add_done(self, msg: str) -> None:
         self._set_steam_busy(False)
@@ -1384,44 +1734,73 @@ class MainWindow(QMainWindow):
 
     def _refresh_shortcuts(self) -> None:
         self.shortcuts_list.clear()
+        entries: list[ShortcutEntry] = []
         if not self.paths:
             self._vdf_corrupt = False
             self.vdf_error_banner.hide()
             self._set_vdf_write_enabled(True)
+        else:
+            try:
+                entries = load_shortcuts(self.paths.shortcuts_vdf)
+                self._vdf_corrupt = False
+                self.vdf_error_banner.hide()
+                self._set_vdf_write_enabled(True)
+            except Exception as exc:
+                self._vdf_corrupt = True
+                self.vdf_error_banner.setText(tr("library.vdf_error", err=exc))
+                self.vdf_error_banner.show()
+                self._set_vdf_write_enabled(False)
+
+        standalone_games = list_standalone_games()
+        if not entries and not standalone_games:
             empty_item = QListWidgetItem(tr("library.no_shortcuts"))
             empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
             self.shortcuts_list.addItem(empty_item)
+            self._update_library_action_states()
             return
-        try:
-            entries = load_shortcuts(self.paths.shortcuts_vdf)
-        except Exception as exc:
-            self._vdf_corrupt = True
-            self.vdf_error_banner.setText(tr("library.vdf_error", err=exc))
-            self.vdf_error_banner.show()
-            self._set_vdf_write_enabled(False)
-            err_item = QListWidgetItem(tr("library.no_shortcuts"))
-            err_item.setFlags(Qt.ItemFlag.NoItemFlags)
-            self.shortcuts_list.addItem(err_item)
-            return
-        self._vdf_corrupt = False
-        self.vdf_error_banner.hide()
-        self._set_vdf_write_enabled(True)
-        if not entries:
-            empty_item = QListWidgetItem(tr("library.no_shortcuts"))
-            empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
-            self.shortcuts_list.addItem(empty_item)
-            return
+
         for entry in entries:
             item = QListWidgetItem(f"{entry.app_name}  ({entry.appid_u32})  —  {entry.exe}")
-            item.setData(Qt.ItemDataRole.UserRole, entry)
+            item.setData(Qt.ItemDataRole.UserRole, ("steam", entry))
             self.shortcuts_list.addItem(item)
 
-    def _selected_shortcut(self) -> ShortcutEntry | None:
+        standalone_tag = tr("library.tag_standalone")
+        for game in standalone_games:
+            item = QListWidgetItem(f"{standalone_tag} {game.name}  —  {game.exe_path}")
+            item.setData(Qt.ItemDataRole.UserRole, ("standalone", game))
+            self.shortcuts_list.addItem(item)
+
+        self._update_library_action_states()
+
+    def _selected_library_item(self) -> tuple[str, ShortcutEntry | StandaloneGame] | None:
         item = self.shortcuts_list.currentItem()
         if item is None:
             return None
         data = item.data(Qt.ItemDataRole.UserRole)
-        return data if isinstance(data, ShortcutEntry) else None
+        if isinstance(data, tuple) and len(data) == 2 and data[0] in ("steam", "standalone"):
+            return data
+        return None
+
+    def _selected_shortcut(self) -> ShortcutEntry | None:
+        sel = self._selected_library_item()
+        if sel is None or sel[0] != "steam":
+            return None
+        return sel[1] if isinstance(sel[1], ShortcutEntry) else None
+
+    def _update_library_action_states(self) -> None:
+        sel = self._selected_library_item()
+        is_steam = sel is not None and sel[0] == "steam"
+        is_standalone = sel is not None and sel[0] == "standalone"
+        can_write_vdf = bool(self.paths) and not self._vdf_corrupt
+
+        self.act_migrate.setEnabled(is_steam and can_write_vdf)
+        self.act_art.setEnabled(is_steam and bool(self.paths))
+        self.act_revert_art.setEnabled(is_steam and bool(self.paths))
+        self.act_proton.setEnabled(is_steam and can_write_vdf)
+        self.act_export_standalone.setEnabled(is_steam and bool(self.paths))
+        self.act_import_steam.setEnabled(is_standalone and can_write_vdf)
+        self.act_launch_opts.setEnabled((is_steam and can_write_vdf) or is_standalone)
+        self.act_remove.setEnabled((is_steam and can_write_vdf) or is_standalone)
 
     def _set_vdf_write_enabled(self, enabled: bool) -> None:
         for w in (
@@ -1433,6 +1812,7 @@ class MainWindow(QMainWindow):
             self.act_launch_opts,
             self.act_backup_saves,
             self.act_restore_saves,
+            self.act_import_steam,
             self.act_remove,
         ):
             w.setEnabled(enabled)
@@ -1441,6 +1821,7 @@ class MainWindow(QMainWindow):
         enabled = not busy
         for w in (
             self.btn_reload,
+            self.btn_add_standalone,
             self.shortcuts_list,
             self.btn_game_actions,
             self.btn_tools_menu,
@@ -1448,9 +1829,12 @@ class MainWindow(QMainWindow):
             self.act_revert_art,
             self.act_link_prefixes,
             self.act_cleanup,
+            self.act_export_standalone,
         ):
             w.setEnabled(enabled)
         self._set_vdf_write_enabled(enabled and not self._vdf_corrupt)
+        if enabled:
+            self._update_library_action_states()
 
     def _update_selected_shortcut_art(self) -> None:
         entry = self._selected_shortcut()
@@ -1819,19 +2203,34 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _edit_launch_options_presets(self) -> None:
-        entry = self._selected_shortcut()
-        if not entry or not self.paths:
+        sel = self._selected_library_item()
+        if not sel:
             return
+        kind, obj = sel
+        if kind == "steam" and not self.paths:
+            return
+
+        title_name = obj.app_name if kind == "steam" else obj.name
+        opts_now = (obj.launch_options or "") if kind == "steam" else (obj.launch_options or "")
+        try:
+            tokens_list = shlex.split(opts_now)
+        except ValueError:
+            tokens_list = opts_now.split()
+        tokens_now = set(tokens_list)
+
+        if kind == "standalone":
+            winedll_now = obj.winedlloverrides or ""
+        else:
+            winedll_now = ""
+            for tok in tokens_list:
+                if tok.startswith("WINEDLLOVERRIDES="):
+                    winedll_now = tok.split("=", 1)[1]
+
         dlg = QDialog(self)
-        dlg.setWindowTitle(tr("launch.title", name=entry.app_name))
-        dlg.resize(520, 300)
+        dlg.setWindowTitle(tr("launch.title", name=title_name))
+        dlg.resize(540, 380)
         lay = QVBoxLayout(dlg)
 
-        opts_now = entry.launch_options or ""
-        try:
-            tokens_now = set(shlex.split(opts_now))
-        except ValueError:
-            tokens_now = set(opts_now.split())
         chk_gm = QCheckBox(tr("launch.gamemode"))
         chk_gm.setChecked("gamemoderun" in tokens_now)
         chk_mh = QCheckBox(tr("launch.mangohud"))
@@ -1842,12 +2241,37 @@ class MainWindow(QMainWindow):
         chk_esync.setChecked("PROTON_NO_ESYNC=1" in tokens_now)
         chk_fsync = QCheckBox(tr("launch.no_fsync"))
         chk_fsync.setChecked("PROTON_NO_FSYNC=1" in tokens_now)
+        chk_helixsr = QCheckBox(tr("launch.helixsr_preset"))
+        chk_helixsr.setChecked(
+            any(p.strip().lower() == "dxgi=n,b" for p in winedll_now.split(";") if p.strip())
+        )
+
+        winedll_lbl = QLabel(tr("launch.winedlloverrides_label"))
+        winedll_edit = QLineEdit(winedll_now)
+
+        conflict_warn = QLabel(tr("launch.helixsr_lsfg_warn"))
+        conflict_warn.setWordWrap(True)
+        conflict_warn.setStyleSheet(
+            "color: #ffd180; background-color: rgba(180, 110, 20, 0.22); "
+            "border: 1px solid #c77c1a; border-radius: 6px; padding: 6px;"
+        )
+        conflict_warn.setVisible(False)
 
         raw_lbl = QLabel(tr("launch.raw_label"))
         raw_edit = QLineEdit(opts_now)
 
+        syncing = {"active": False}
+
+        def _update_conflict_warning() -> None:
+            has_conflict = detect_helixsr_lsfg_conflict(raw_edit.text(), winedll_edit.text())
+            conflict_warn.setVisible(has_conflict)
+
         def _sync_preview() -> None:
+            if syncing["active"]:
+                return
+            syncing["active"] = True
             try:
+                dll_val = winedll_edit.text().strip() if kind == "steam" else ""
                 updated = apply_launch_presets(
                     raw_edit.text(),
                     gamemode=chk_gm.isChecked(),
@@ -1855,16 +2279,38 @@ class MainWindow(QMainWindow):
                     wined3d=chk_w3d.isChecked(),
                     no_esync=chk_esync.isChecked(),
                     no_fsync=chk_fsync.isChecked(),
+                    winedlloverrides=dll_val,
                 )
                 raw_edit.setText(updated)
             except ValueError:
                 pass
+            finally:
+                syncing["active"] = False
+            _update_conflict_warning()
+
+        def _on_helixsr_toggled(checked: bool) -> None:
+            parts = [p.strip() for p in winedll_edit.text().split(";") if p.strip()]
+            if checked:
+                if not any(p.lower().startswith("dxgi=") for p in parts):
+                    parts.append("dxgi=n,b")
+            else:
+                parts = [p for p in parts if p.lower() != "dxgi=n,b"]
+            winedll_edit.setText(";".join(parts))
 
         for chk in (chk_gm, chk_mh, chk_w3d, chk_esync, chk_fsync):
             chk.toggled.connect(_sync_preview)
             lay.addWidget(chk)
+        chk_helixsr.toggled.connect(_on_helixsr_toggled)
+        lay.addWidget(chk_helixsr)
+        lay.addWidget(winedll_lbl)
+        lay.addWidget(winedll_edit)
+        lay.addWidget(conflict_warn)
         lay.addWidget(raw_lbl)
         lay.addWidget(raw_edit)
+
+        winedll_edit.textChanged.connect(_sync_preview)
+        raw_edit.textChanged.connect(_update_conflict_warning)
+        _update_conflict_warning()
 
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -1875,13 +2321,34 @@ class MainWindow(QMainWindow):
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+
+        new_opts = raw_edit.text().strip()
+        new_dll = winedll_edit.text().strip()
+
+        if kind == "standalone":
+            try:
+                update_standalone_launch_options(
+                    obj.game_dir,
+                    winedlloverrides=new_dll,
+                    launch_options=new_opts,
+                )
+            except Exception as exc:
+                QMessageBox.critical(self, __app_name__, str(exc))
+                return
+            self._refresh_shortcuts()
+            msg = tr("launch.saved", name=title_name)
+            self.status_label.setText(msg)
+            if not self._closing_pending:
+                QMessageBox.information(self, __app_name__, msg)
+            return
+
         if not self._confirm_close_steam_if_running():
             return
-        new_opts = raw_edit.text().strip()
         paths = self.paths
+        assert paths is not None
         self._set_steam_busy(True)
         worker = SteamOpWorker(
-            lambda: update_shortcut_launch_options(paths, entry.appid_u32, new_opts),
+            lambda: update_shortcut_launch_options(paths, obj.appid_u32, new_opts),
             need_steam_closed=True,
         )
         self._track_worker(worker)
@@ -1890,7 +2357,7 @@ class MainWindow(QMainWindow):
         def _ok(_res: object) -> None:
             self._set_steam_busy(False)
             self._refresh_shortcuts()
-            msg = tr("launch.saved", name=entry.app_name)
+            msg = tr("launch.saved", name=title_name)
             self.status_label.setText(msg)
             if not self._closing_pending:
                 QMessageBox.information(self, __app_name__, msg)
@@ -2033,9 +2500,111 @@ class MainWindow(QMainWindow):
         worker.failed.connect(_err)
         worker.start()
 
-    def _remove_selected_shortcut(self) -> None:
+    def _export_selected_to_standalone(self) -> None:
         entry = self._selected_shortcut()
         if not entry or not self.paths:
+            return
+        ans = QMessageBox.question(
+            self,
+            __app_name__,
+            tr("library.export_confirm", name=entry.app_name),
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        paths = self.paths
+        self._set_steam_busy(True)
+        self.status_label.setText(tr("add.preparing_runtime"))
+        worker = SteamOpWorker(
+            lambda: (
+                ensure_umu_run(),
+                ensure_ge_proton11(),
+                export_steam_to_standalone(paths, entry, remove_from_steam=False),
+            )[-1],
+            need_steam_closed=False,
+        )
+        self._track_worker(worker)
+        worker.status.connect(self.status_label.setText)
+
+        def _ok(res: object) -> None:
+            self._set_steam_busy(False)
+            self._refresh_shortcuts()
+            game_path = str(res.game_dir) if isinstance(res, StandaloneGame) else ""
+            msg = tr("library.export_done", name=entry.app_name, path=game_path)
+            self.status_label.setText(msg)
+            if not self._closing_pending:
+                QMessageBox.information(self, __app_name__, msg)
+
+        def _err(err: str) -> None:
+            self._set_steam_busy(False)
+            if not self._closing_pending:
+                QMessageBox.critical(self, __app_name__, err)
+
+        worker.finished_ok.connect(_ok)
+        worker.failed.connect(_err)
+        worker.start()
+
+    def _import_selected_to_steam(self) -> None:
+        sel = self._selected_library_item()
+        if not sel or sel[0] != "standalone" or not self.paths:
+            return
+        game = sel[1]
+        assert isinstance(game, StandaloneGame)
+        if is_gamescope_session() and is_steam_running():
+            ans = QMessageBox.question(self, __app_name__, tr("add.gamescope_confirm"))
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+        paths = self.paths
+        self._set_steam_busy(True)
+        worker = SteamOpWorker(
+            lambda: import_standalone_to_steam(paths, game, remove_standalone_files=False),
+            need_steam_closed=True,
+        )
+        self._track_worker(worker)
+        worker.status.connect(self.status_label.setText)
+
+        def _ok(res: object) -> None:
+            self._set_steam_busy(False)
+            self._refresh_shortcuts()
+            msg = tr("library.import_done", name=game.name, appid=res)
+            self.status_label.setText(msg)
+            if not self._closing_pending:
+                QMessageBox.information(self, __app_name__, msg)
+
+        def _err(err: str) -> None:
+            self._set_steam_busy(False)
+            if not self._closing_pending:
+                QMessageBox.critical(self, __app_name__, err)
+
+        worker.finished_ok.connect(_ok)
+        worker.failed.connect(_err)
+        worker.start()
+
+    def _remove_selected_shortcut(self) -> None:
+        sel = self._selected_library_item()
+        if not sel:
+            return
+        kind, obj = sel
+        if kind == "standalone":
+            assert isinstance(obj, StandaloneGame)
+            ans = QMessageBox.question(
+                self,
+                __app_name__,
+                tr("library.standalone_remove_confirm", name=obj.name),
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                remove_standalone_game(obj, delete_files=False)
+            except Exception as exc:
+                QMessageBox.critical(self, __app_name__, str(exc))
+                return
+            self._refresh_shortcuts()
+            self.status_label.setText(tr("library.removed", name=obj.name))
+            return
+
+        entry = obj
+        assert isinstance(entry, ShortcutEntry)
+        if not self.paths:
             return
         ans = QMessageBox.question(
             self,
@@ -2302,8 +2871,15 @@ class MainWindow(QMainWindow):
                     save_tag = tr("cleanup.tag_unverified")
                 elif cand.category in ("Prefixo Externo", "external_prefix") and not cand.matched_game:
                     save_tag = tr("cleanup.tag_no_steam")
-                else:
+                elif cand.category in (
+                    "Prefixo Externo",
+                    "external_prefix",
+                    "Compatdata Órfão",
+                    "orphan_compatdata",
+                ):
                     save_tag = tr("cleanup.tag_no_saves")
+                else:
+                    save_tag = ""
                 cat_map = {
                     "Prefixo Externo": tr("cleanup.cat_external"),
                     "external_prefix": tr("cleanup.cat_external"),
