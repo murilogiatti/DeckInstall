@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import requests
 
 STEAM_SEARCH_URL = "https://store.steampowered.com/api/storesearch/"
 STEAM_CDN_BASE = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps"
-USER_AGENT = "DeckInstall/0.6.6"
+USER_AGENT = "DeckInstall/0.7.0"
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,57 @@ def _download_first(urls: list[str], dest: Path) -> bool:
     return False
 
 
+def _grid_files_for_appid(shortcut_appid_u32: int, grid_dir: Path) -> list[Path]:
+    if not grid_dir.is_dir():
+        return []
+    prefix = str(shortcut_appid_u32)
+    matched: list[Path] = []
+    for p in sorted(grid_dir.iterdir()):
+        if not p.is_file() or not p.name.startswith(prefix):
+            continue
+        rest = p.name[len(prefix) :]
+        if rest and not (rest[0] in ("p", "_", ".")):
+            continue
+        matched.append(p)
+    return matched
+
+
+def backup_steam_artwork(shortcut_appid_u32: int, grid_dir: Path) -> list[str]:
+    """Back up existing Steam grid artwork for shortcut_appid_u32 before overwriting."""
+    existing = _grid_files_for_appid(shortcut_appid_u32, grid_dir)
+    if not existing:
+        return []
+    bak_dir = grid_dir / ".deckinstall_art_bak" / str(shortcut_appid_u32)
+    if bak_dir.exists():
+        shutil.rmtree(bak_dir, ignore_errors=True)
+    bak_dir.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    for src in existing:
+        shutil.copy2(src, bak_dir / src.name)
+        copied.append(src.name)
+    return copied
+
+
+def restore_steam_artwork_backup(shortcut_appid_u32: int, grid_dir: Path) -> list[str]:
+    """Restore previously backed-up Steam grid artwork for shortcut_appid_u32."""
+    bak_dir = grid_dir / ".deckinstall_art_bak" / str(shortcut_appid_u32)
+    if not bak_dir.is_dir():
+        return []
+    bak_files = [p for p in sorted(bak_dir.iterdir()) if p.is_file()]
+    if not bak_files:
+        return []
+    for cur in _grid_files_for_appid(shortcut_appid_u32, grid_dir):
+        try:
+            cur.unlink()
+        except OSError:
+            pass
+    restored: list[str] = []
+    for src in bak_files:
+        shutil.copy2(src, grid_dir / src.name)
+        restored.append(src.name)
+    return restored
+
+
 def download_steam_artwork(
     steam_appid: int,
     shortcut_appid_u32: int,
@@ -75,6 +127,7 @@ def download_steam_artwork(
 ) -> ArtworkResult:
     """Download official capsule, header, hero, and logo into Steam's grid folder."""
     grid_dir.mkdir(parents=True, exist_ok=True)
+    backup_steam_artwork(shortcut_appid_u32, grid_dir)
     base = f"{STEAM_CDN_BASE}/{steam_appid}"
 
     targets: dict[str, tuple[Path, list[str]]] = {

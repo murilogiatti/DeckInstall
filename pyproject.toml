@@ -4,9 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deckinstall"
-version = "0.6.6"
-description = "Easy Non-Steam Game Installer & Artwork Manager for Steam Deck"
+version = "0.7.0"
+description = "Non-Steam Game Installer, Prefix Migrator, Save Validator & Artwork Manager for Steam Deck"
 readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Murilo Giatti"}]
 requires-python = ">=3.10"
 dependencies = [
     "PySide6>=6.7.0",
@@ -14,5 +16,16 @@ dependencies = [
     "requests>=2.31.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/murilogiatti/DeckInstall"
+Repository = "https://github.com/murilogiatti/DeckInstall"
+Issues = "https://github.com/murilogiatti/DeckInstall/issues"
+
 [project.scripts]
 deckinstall = "deckinstall.ui:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+deckinstall = ["locales/*.json"]

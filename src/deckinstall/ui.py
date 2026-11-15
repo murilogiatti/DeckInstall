@@ -37,7 +37,15 @@ from PySide6.QtWidgets import (
 )
 
 from . import __app_name__, __version__
-from .artwork import STEAM_CDN_BASE, USER_AGENT, SteamMatch, download_steam_artwork, search_steam_games
+from .artwork import (
+    STEAM_CDN_BASE,
+    USER_AGENT,
+    SteamMatch,
+    download_steam_artwork,
+    restore_steam_artwork_backup,
+    search_steam_games,
+)
+from .i18n import available_languages, get_language, set_language, tr
 from .extractor import (
     extract_archive,
     is_archive,
@@ -391,6 +399,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.app = app
         self.settings = QSettings(__app_name__, __app_name__)
+        set_language(str(self.settings.value("language", "auto")))
         self.paths = resolve_steam_paths()
         self._detected_games: list[DetectedGame] = []
         self._active_workers: set[QThread] = set()
@@ -465,7 +474,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self._build_library_page())
         right_layout.addWidget(self.stack)
 
-        self.status_label = QLabel("Pronto.")
+        self.status_label = QLabel(tr("status.ready"))
         self.status_label.setObjectName("MutedText")
         right_layout.addWidget(self.status_label)
 
@@ -505,9 +514,9 @@ class MainWindow(QMainWindow):
 
         self._nav_buttons: list[QPushButton] = []
         nav_items = [
-            "Extrair / Instalar",
-            "Adicionar ao Steam",
-            "Biblioteca Não-Steam",
+            tr("tabs.install"),
+            tr("install.btn_add_steam").split(" (")[0],
+            tr("tabs.library"),
         ]
         for idx, label in enumerate(nav_items):
             btn = QPushButton(label)
@@ -526,15 +535,33 @@ class MainWindow(QMainWindow):
         steam_lbl.setObjectName("MutedText")
         layout.addWidget(steam_lbl)
 
-        theme_lbl = QLabel("Tema")
+        theme_lbl = QLabel(tr("header.theme"))
         theme_lbl.setObjectName("MutedText")
         layout.addWidget(theme_lbl)
         self.theme_combo = QComboBox()
-        self.theme_combo.addItem("Automático", "auto")
-        self.theme_combo.addItem("Escuro", "dark")
-        self.theme_combo.addItem("Claro", "light")
+        self.theme_combo.addItem(tr("header.theme.auto"), "auto")
+        self.theme_combo.addItem(tr("header.theme.dark"), "dark")
+        self.theme_combo.addItem(tr("header.theme.light"), "light")
         self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
         layout.addWidget(self.theme_combo)
+
+        lang_lbl = QLabel(tr("header.language"))
+        lang_lbl.setObjectName("MutedText")
+        layout.addWidget(lang_lbl)
+        self.lang_combo = QComboBox()
+        self.lang_combo.addItem(tr("header.language.auto"), "auto")
+        for code, disp in available_languages():
+            self.lang_combo.addItem(disp, code)
+        saved_lang = str(self.settings.value("language", "auto"))
+        lidx = self.lang_combo.findData(saved_lang)
+        if lidx >= 0:
+            self.lang_combo.setCurrentIndex(lidx)
+        self.lang_combo.currentIndexChanged.connect(self._on_language_changed)
+        layout.addWidget(self.lang_combo)
+
+        btn_about = QPushButton(tr("header.about"))
+        btn_about.clicked.connect(self._show_about_dialog)
+        layout.addWidget(btn_about)
         return sidebar
 
     def _build_extract_page(self) -> QWidget:
@@ -720,21 +747,24 @@ class MainWindow(QMainWindow):
         lib_layout.addWidget(self.shortcuts_list, 1)
 
         actions = QHBoxLayout()
-        self.btn_bulk_migrate = QPushButton("Migrar Todos para ~/Games")
+        self.btn_bulk_migrate = QPushButton(tr("library.btn_bulk_migrate"))
         self.btn_bulk_migrate.setObjectName("primaryBtn")
         self.btn_bulk_migrate.clicked.connect(self._bulk_migrate_shortcuts)
-        self.btn_migrate = QPushButton("Migrar Selecionado")
+        self.btn_migrate = QPushButton(tr("library.btn_migrate_one"))
         self.btn_migrate.clicked.connect(self._migrate_selected_shortcut)
-        self.btn_art = QPushButton("Atualizar Artes")
+        self.btn_art = QPushButton(tr("library.btn_update_art"))
         self.btn_art.clicked.connect(self._update_selected_shortcut_art)
-        self.btn_cleanup = QPushButton("Limpar Prefixos Migrados...")
+        self.btn_revert_art = QPushButton(tr("library.btn_revert_art"))
+        self.btn_revert_art.clicked.connect(self._revert_selected_shortcut_art)
+        self.btn_cleanup = QPushButton(tr("library.btn_cleanup"))
         self.btn_cleanup.clicked.connect(self._cleanup_old_prefixes)
-        self.btn_remove = QPushButton("Remover do Steam")
+        self.btn_remove = QPushButton(tr("library.btn_remove"))
         self.btn_remove.setObjectName("dangerBtn")
         self.btn_remove.clicked.connect(self._remove_selected_shortcut)
         actions.addWidget(self.btn_bulk_migrate)
         actions.addWidget(self.btn_migrate)
         actions.addWidget(self.btn_art)
+        actions.addWidget(self.btn_revert_art)
         actions.addWidget(self.btn_cleanup)
         actions.addStretch()
         actions.addWidget(self.btn_remove)
@@ -754,6 +784,23 @@ class MainWindow(QMainWindow):
         mode = self.theme_combo.currentData()
         self.settings.setValue("theme", mode)
         apply_theme(self.app, mode)
+
+    def _on_language_changed(self) -> None:
+        code = str(self.lang_combo.currentData() or "auto")
+        self.settings.setValue("language", code)
+        set_language(code)
+        QMessageBox.information(
+            self,
+            __app_name__,
+            tr("lang.changed", name=self.lang_combo.currentText()),
+        )
+
+    def _show_about_dialog(self) -> None:
+        QMessageBox.about(
+            self,
+            tr("about.title", app=__app_name__),
+            tr("about.body", app=__app_name__, version=__version__),
+        )
 
     def _set_extract_source(self, path_str: str) -> None:
         p = Path(path_str)
@@ -1031,6 +1078,7 @@ class MainWindow(QMainWindow):
             self.btn_bulk_migrate,
             self.btn_migrate,
             self.btn_art,
+            self.btn_revert_art,
             self.btn_cleanup,
             self.btn_remove,
         ):
@@ -1040,35 +1088,87 @@ class MainWindow(QMainWindow):
         entry = self._selected_shortcut()
         if not entry or not self.paths:
             return
-        self._set_steam_busy(True)
-        self.status_label.setText(f"Buscando artes para '{entry.app_name}'...")
+        exe_clean = entry.exe.strip().strip('"')
+        is_flatpak_or_native = ("flatpak" in exe_clean.lower()) or (
+            bool(exe_clean) and not exe_clean.lower().endswith(".exe")
+        )
+        if is_flatpak_or_native:
+            ans = QMessageBox.question(
+                self,
+                __app_name__,
+                tr("art.flatpak_confirm", name=entry.app_name, exe=exe_clean),
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
 
-        class _ArtUpdateWorker(QThread):
-            done = Signal(str)
+        self._set_steam_busy(True)
+        self.status_label.setText(f"Searching Steam Store for '{entry.app_name}'...")
+
+        class _ArtSearchWorker(QThread):
+            found = Signal(list)
             failed = Signal(str)
 
-            def __init__(self, paths: SteamPaths, shortcut: ShortcutEntry) -> None:
+            def __init__(self, app_name: str) -> None:
                 super().__init__()
-                self._paths = paths
-                self._shortcut = shortcut
+                self._app_name = app_name
 
             def run(self) -> None:
                 try:
-                    matches = search_steam_games(self._shortcut.app_name, limit=1)
-                    if not matches:
-                        self.done.emit(f"Não encontrei '{self._shortcut.app_name}' na loja Steam.")
-                        return
-                    res = download_steam_artwork(
-                        matches[0].appid, self._shortcut.appid_u32, self._paths.grid_dir
-                    )
-                    self.done.emit(
-                        f"Artes de '{matches[0].name}' atualizadas: "
-                        f"{', '.join(res.saved_files.keys()) or 'nenhuma'}"
-                    )
+                    self.found.emit(search_steam_games(self._app_name, limit=5))
                 except Exception as exc:
                     self.failed.emit(str(exc))
 
-        worker = _ArtUpdateWorker(self.paths, entry)
+        def _on_search_found(matches: list[SteamMatch]) -> None:
+            if not matches:
+                self._set_steam_busy(False)
+                msg = tr("art.not_found", name=entry.app_name)
+                self.status_label.setText(msg)
+                QMessageBox.information(self, __app_name__, msg)
+                return
+            labels = [f"{m.name} (AppID {m.appid})" for m in matches]
+            choice, ok = QInputDialog.getItem(
+                self,
+                tr("art.pick_title"),
+                tr("art.pick_label", name=entry.app_name),
+                labels,
+                0,
+                False,
+            )
+            if not ok or not choice:
+                self._set_steam_busy(False)
+                self.status_label.setText(tr("status.ready"))
+                return
+            chosen = matches[labels.index(choice)]
+
+            class _ArtDownloadWorker(QThread):
+                done = Signal(str)
+                failed = Signal(str)
+
+                def __init__(self, paths: SteamPaths, shortcut: ShortcutEntry, match: SteamMatch) -> None:
+                    super().__init__()
+                    self._paths = paths
+                    self._shortcut = shortcut
+                    self._match = match
+
+                def run(self) -> None:
+                    try:
+                        res = download_steam_artwork(
+                            self._match.appid, self._shortcut.appid_u32, self._paths.grid_dir
+                        )
+                        files_str = ", ".join(res.saved_files.keys()) or tr("art.none")
+                        self.done.emit(
+                            tr("art.updated", name=self._match.name, files=files_str)
+                        )
+                    except Exception as exc:
+                        self.failed.emit(str(exc))
+
+            dl_worker = _ArtDownloadWorker(self.paths, entry, chosen)
+            self._track_worker(dl_worker)
+            dl_worker.done.connect(_ok)
+            dl_worker.failed.connect(_err)
+            dl_worker.start()
+
+        worker = _ArtSearchWorker(entry.app_name)
         self._track_worker(worker)
 
         def _ok(msg: str) -> None:
@@ -1078,11 +1178,39 @@ class MainWindow(QMainWindow):
 
         def _err(err: str) -> None:
             self._set_steam_busy(False)
-            QMessageBox.critical(self, __app_name__, f"Erro ao atualizar artes: {err}")
+            QMessageBox.critical(self, __app_name__, tr("art.error", err=err))
 
-        worker.done.connect(_ok)
+        worker.found.connect(_on_search_found)
         worker.failed.connect(_err)
         worker.start()
+
+    def _revert_selected_shortcut_art(self) -> None:
+        entry = self._selected_shortcut()
+        if not entry or not self.paths:
+            return
+        bak_dir = self.paths.grid_dir / ".deckinstall_art_bak" / str(entry.appid_u32)
+        bak_files = [p.name for p in sorted(bak_dir.iterdir()) if p.is_file()] if bak_dir.is_dir() else []
+        if not bak_files:
+            QMessageBox.information(
+                self, __app_name__, tr("art.revert_none", name=entry.app_name)
+            )
+            return
+        if (
+            QMessageBox.question(
+                self,
+                __app_name__,
+                tr("art.revert_confirm", name=entry.app_name, files=", ".join(bak_files)),
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        try:
+            restored = restore_steam_artwork_backup(entry.appid_u32, self.paths.grid_dir)
+            msg = tr("art.revert_done", name=entry.app_name, files=", ".join(restored))
+            self.status_label.setText(msg)
+            QMessageBox.information(self, __app_name__, msg)
+        except Exception as exc:
+            QMessageBox.critical(self, __app_name__, tr("art.revert_error", err=exc))
 
     def _remove_selected_shortcut(self) -> None:
         entry = self._selected_shortcut()
@@ -1325,13 +1453,10 @@ class MainWindow(QMainWindow):
             return
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("Limpar Prefixos Já Migrados e Órfãos")
+        dlg.setWindowTitle(tr("cleanup.title"))
         dlg.resize(720, 460)
         lay = QVBoxLayout(dlg)
-        info = QLabel(
-            "Revise os prefixos antigos/órfãos antes de apagar. "
-            "Só vêm marcados automaticamente os prefixos sem saves ou cujos saves já foram validados no Steam."
-        )
+        info = QLabel(tr("cleanup.info"))
         info.setWordWrap(True)
         lay.addWidget(info)
 
@@ -1347,7 +1472,7 @@ class MainWindow(QMainWindow):
                 if it.checkState() == Qt.CheckState.Checked:
                     c: CleanupCandidate = it.data(Qt.ItemDataRole.UserRole)
                     sel_bytes += c.size_bytes
-            total_lbl.setText(f"Espaço selecionado para liberar: {sel_bytes / (1024 * 1024):.1f} MB")
+            total_lbl.setText(tr("cleanup.total", mb=sel_bytes / (1024 * 1024)))
 
         def _populate_list(items: list[CleanupCandidate]) -> None:
             lst.blockSignals(True)
@@ -1355,15 +1480,21 @@ class MainWindow(QMainWindow):
             for cand in items:
                 mb = cand.size_bytes / (1024 * 1024)
                 if cand.saves_verified_migrated:
-                    save_tag = f" [SAVES VALIDADOS ✓: {cand.matched_game}]"
+                    save_tag = tr("cleanup.tag_verified", game=cand.matched_game)
                 elif cand.has_saves:
-                    save_tag = " [TEM SAVES - NÃO VALIDADO]"
+                    save_tag = tr("cleanup.tag_unverified")
                 elif cand.category == "Prefixo Externo" and not cand.matched_game:
-                    save_tag = " [SEM JOGO NO STEAM]"
+                    save_tag = tr("cleanup.tag_no_steam")
                 else:
-                    save_tag = " [SEM SAVES]"
+                    save_tag = tr("cleanup.tag_no_saves")
+                cat_map = {
+                    "Prefixo Externo": tr("cleanup.cat_external"),
+                    "Backup": tr("cleanup.cat_backup"),
+                    "Compatdata Órfão": tr("cleanup.cat_orphan"),
+                }
+                cat_disp = cat_map.get(cand.category, cand.category)
                 hint = f" ({cand.game_hint})" if cand.game_hint else ""
-                item = QListWidgetItem(f"[{cand.category}] {cand.label}{hint} — {mb:.1f} MB{save_tag}")
+                item = QListWidgetItem(f"[{cat_disp}] {cand.label}{hint} — {mb:.1f} MB{save_tag}")
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 if cand.category == "Prefixo Externo":
                     auto_check = bool(cand.matched_game) and (
@@ -1387,9 +1518,9 @@ class MainWindow(QMainWindow):
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         ok_btn = btns.button(QDialogButtonBox.StandardButton.Ok)
-        ok_btn.setText("Apagar Selecionados")
+        ok_btn.setText(tr("cleanup.btn_delete"))
         btn_revalidate = btns.addButton(
-            "Validar e Importar Saves", QDialogButtonBox.ButtonRole.ActionRole
+            tr("cleanup.btn_revalidate"), QDialogButtonBox.ButtonRole.ActionRole
         )
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)

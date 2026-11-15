@@ -616,6 +616,34 @@ class CoreTests(unittest.TestCase):
                 cands = find_cleanup_candidates(paths, extra_external_roots=[ext_root])
             self.assertEqual(cands, [])
 
+    def test_i18n_and_artwork_backup_restore(self) -> None:
+        from deckinstall.artwork import backup_steam_artwork, restore_steam_artwork_backup
+        from deckinstall.i18n import available_languages, set_language, tr
+
+        langs = dict(available_languages())
+        self.assertIn("en", langs)
+        self.assertIn("pt_BR", langs)
+        self.assertEqual(set_language("en"), "en")
+        self.assertEqual(tr("header.about"), "About")
+        self.assertEqual(set_language("pt_BR"), "pt_BR")
+        self.assertEqual(tr("header.about"), "Sobre")
+        self.assertEqual(set_language("unknown_xx"), "en")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            grid = Path(tmp) / "grid"
+            grid.mkdir()
+            appid = 3111111111
+            (grid / f"{appid}p.jpg").write_bytes(b"ORIG_CAPSULE")
+            (grid / f"{appid}.jpg").write_bytes(b"ORIG_HEADER")
+            backed = backup_steam_artwork(appid, grid)
+            self.assertEqual(set(backed), {f"{appid}p.jpg", f"{appid}.jpg"})
+            (grid / f"{appid}p.jpg").write_bytes(b"WRONG_ART")
+            (grid / f"{appid}_hero.jpg").write_bytes(b"WRONG_HERO")
+            restored = restore_steam_artwork_backup(appid, grid)
+            self.assertEqual(set(restored), {f"{appid}p.jpg", f"{appid}.jpg"})
+            self.assertEqual((grid / f"{appid}p.jpg").read_bytes(), b"ORIG_CAPSULE")
+            self.assertFalse((grid / f"{appid}_hero.jpg").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
