@@ -886,6 +886,267 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(sorted(used - set(en.keys())), [])
         self.assertEqual(sorted(set(en.keys()) - used), [])
 
+    def test_v074_audit_regressions(self) -> None:
+        from deckinstall.artwork import restore_steam_artwork_backup
+        from deckinstall.steam_paths import find_proton_binary
+        from deckinstall.steam_vdf import (
+            _is_prefix_referenced_by_shortcuts,
+            _iter_prefix_save_pairs,
+            _prefix_saves_verified_in_target,
+            _verify_save_pair_exact,
+            add_or_update_shortcut,
+            apply_launch_presets,
+            backup_all_saves,
+            delete_cleanup_candidates_checked,
+            restore_saves_backup,
+            sync_prefix_symlinks,
+        )
+
+        # 1) Desktop included & distinct Wine user profiles preserved when >1 non-public user
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pfx = root / "pfx"
+            dst_pfx = root / "dst_pfx"
+            (pfx / "drive_c" / "users" / "steamuser" / "Desktop").mkdir(parents=True)
+            (pfx / "drive_c" / "users" / "deck" / "Documents").mkdir(parents=True)
+            src_desktop = pfx / "drive_c" / "users" / "steamuser" / "Desktop" / "save.dat"
+            src_desktop.write_bytes(b"A")
+            (pfx / "drive_c" / "users" / "deck" / "Documents" / "save.dat").write_bytes(b"B")
+            pairs = list(_iter_prefix_save_pairs(
+                pfx / "drive_c" / "users",
+                dst_pfx / "drive_c" / "users",
+                preserve_user_dirs=True,
+            ))
+            dsts = {str(dst.relative_to(dst_pfx / "drive_c" / "users")) for _, dst in pairs}
+            self.assertIn("steamuser/Desktop/save.dat", dsts)
+            self.assertIn("deck/Documents/save.dat", dsts)
+
+            # 2) Self-verification guard: dst inside src_prefix must fail
+            self.assertFalse(_verify_save_pair_exact(src_desktop, src_desktop, pfx.resolve()))
+            self.assertFalse(_prefix_saves_verified_in_target(pfx, pfx))
+
+        # 3) $HOME expansion in shortcut reference & symlink-safe artwork restore
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            steam_root = root / "Steam"
+            compat = steam_root / "steamapps" / "compatdata"
+            compat.mkdir(parents=True)
+            grid = steam_root / "userdata" / "1" / "config" / "grid"
+            bak = grid / ".deckinstall_art_bak" / "12345"
+            bak.mkdir(parents=True)
+            (bak / "12345p.jpg").write_bytes(b"NEWIMG")
+            victim = root / "victim.txt"
+            victim.write_bytes(b"KEEP")
+            (grid / "12345p.jpg").symlink_to(victim)
+            restored = restore_steam_artwork_backup(12345, grid)
+            self.assertEqual(restored, ["12345p.jpg"])
+            self.assertEqual(victim.read_bytes(), b"KEEP")
+            self.assertFalse((grid / "12345p.jpg").is_symlink())
+            self.assertEqual((grid / "12345p.jpg").read_bytes(), b"NEWIMG")
+
+            # $HOME expansion in _is_prefix_referenced_by_shortcuts
+            fake_home = root / "home"
+            ext_pfx = fake_home / "Games" / "MyPrefix"
+            (ext_pfx / "drive_c").mkdir(parents=True)
+            entry = ShortcutEntry(
+                index="0",
+                appid_u32=1,
+                app_name="Test",
+                exe=f'"{ext_pfx}/drive_c/game.exe"',
+                start_dir="$HOME/Games/MyPrefix",
+                icon="",
+                launch_options="",
+            )
+            with mock.patch("deckinstall.steam_vdf.Path.home", return_value=fake_home):
+                self.assertTrue(_is_prefix_referenced_by_shortcuts(ext_pfx, [entry]))
+
+            # 4) sync_prefix_symlinks preserves unmanaged symlinks
+            links_root = root / "Links"
+            links_root.mkdir()
+            user_target = root / "UserCustomTarget"
+            user_target.mkdir()
+            (links_root / "My Custom Link").symlink_to(user_target)
+            compat_entry = compat / "1"
+            compat_entry.mkdir()
+            paths_links = SteamPaths(
+                steam_root=steam_root,
+                user_id="1",
+                userdata_dir=steam_root / "userdata" / "1",
+                shortcuts_vdf=steam_root / "userdata" / "1" / "config" / "shortcuts.vdf",
+                grid_dir=grid,
+                config_vdf=steam_root / "config" / "config.vdf",
+                compatdata_dir=compat,
+            )
+            paths_links.shortcuts_vdf.parent.mkdir(parents=True, exist_ok=True)
+            paths_links.shortcuts_vdf.write_bytes(b"VDF")
+            with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[entry]):
+                sync_prefix_symlinks(paths_links, links_root=links_root)
+            self.assertTrue((links_root / "My Custom Link").is_symlink())
+            self.assertEqual((links_root / "My Custom Link").resolve(), user_target.resolve())
+            self.assertTrue((links_root / "Test").is_symlink())
+
+        # 5) apply_launch_presets preserves quoted operators and redirections
+        out = apply_launch_presets(
+            "FOO=\"a b\" ';' >\"/tmp/game log\" $USER_VAR %command% --windowed",
+            gamemode=True,
+            mangohud=True,
+            wined3d=False,
+            no_esync=False,
+            no_fsync=False,
+        )
+        self.assertIn("';'", out)
+        self.assertIn('>"/tmp/game log"', out)
+        self.assertIn("$USER_VAR", out)
+        self.assertIn("MANGOHUD=1", out)
+        self.assertIn("gamemoderun", out)
+
+        # 6) backup_all_saves creates unique zips & restore rejects escaping/orphan targets
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            steam_root = root / "Steam"
+            compat = steam_root / "steamapps" / "compatdata"
+            pfx_saves = compat / "999" / "pfx" / "drive_c" / "users" / "steamuser" / "Documents"
+            pfx_saves.mkdir(parents=True)
+            (pfx_saves / "s.sav").write_bytes(b"SAVE")
+            paths = SteamPaths(
+                steam_root=steam_root,
+                user_id="1",
+                userdata_dir=steam_root / "userdata" / "1",
+                shortcuts_vdf=steam_root / "userdata" / "1" / "config" / "shortcuts.vdf",
+                grid_dir=steam_root / "userdata" / "1" / "config" / "grid",
+                config_vdf=steam_root / "config" / "config.vdf",
+                compatdata_dir=compat,
+            )
+            paths.shortcuts_vdf.parent.mkdir(parents=True, exist_ok=True)
+            paths.shortcuts_vdf.write_bytes(b"VDF")
+            fake_entry = ShortcutEntry("0", 999, "Game999", '"/g/a.exe"', '"/g"', "", "")
+            out_dir = root / "backups"
+            with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[fake_entry]):
+                z1, g1, f1 = backup_all_saves(paths, out_dir)
+                z2, g2, f2 = backup_all_saves(paths, out_dir)
+            self.assertNotEqual(z1, z2)
+            self.assertEqual((g1, f1), (1, 1))
+            self.assertEqual((g2, f2), (1, 1))
+
+            # Malicious manifest escaping compatdata must fail
+            bad_zip = root / "evil.zip"
+            import json as _json
+            with zipfile.ZipFile(bad_zip, "w") as zf:
+                zf.writestr(
+                    "manifest.json",
+                    _json.dumps({"entries": [{"appid": "999", "prefix": str(root / "outside"), "files": ["999/a.sav"]}]}),
+                )
+                zf.writestr("999/a.sav", b"X")
+            with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[fake_entry]):
+                restored_games, restored_files = restore_saves_backup(paths, bad_zip)
+            self.assertEqual((restored_games, restored_files), (0, 0))
+            self.assertFalse((root / "outside").exists())
+
+        # 7) compatibilitytools.d discovery when no official Proton exists
+        with tempfile.TemporaryDirectory() as tmp:
+            steam_root = Path(tmp) / "Steam"
+            ge_dir = steam_root / "compatibilitytools.d" / "GE-Proton9-20"
+            ge_dir.mkdir(parents=True)
+            (ge_dir / "proton").write_text("#!/bin/sh\n")
+            (ge_dir / "compatibilitytool.vdf").write_text(
+                '"compatibilitytools" { "compat_tools" { "GE-Proton9-20" { "install_path" "." } } }'
+            )
+            with mock.patch("deckinstall.steam_paths.Path.home", return_value=Path(tmp)):
+                self.assertEqual(find_default_proton_name(steam_root), "GE-Proton9-20")
+                self.assertEqual(find_proton_binary(steam_root), ge_dir / "proton")
+
+        # 8) extract_archive handles file-vs-dir merge conflict
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            zpath = root / "patch.zip"
+            with zipfile.ZipFile(zpath, "w") as zf:
+                zf.writestr("root.txt", "root")
+                zf.writestr("sub/new.txt", "ok")
+            dest_root = root / "Games"
+            game_dir = dest_root / "ConflictGame"
+            game_dir.mkdir(parents=True)
+            (game_dir / "sub").write_text("old-file")
+            out = extract_archive(zpath, dest_root, "ConflictGame")
+            self.assertTrue((out / "sub" / "new.txt").is_file())
+
+        # 9) Rollback shortcuts.vdf if set_compat_tool fails + preserve metadata
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            steam_root = root / "Steam"
+            s_vdf = steam_root / "userdata" / "1" / "config" / "shortcuts.vdf"
+            c_vdf = steam_root / "config" / "config.vdf"
+            s_vdf.parent.mkdir(parents=True, exist_ok=True)
+            s_vdf.write_bytes(b"ORIGINAL_SHORTCUTS")
+            paths_rb = SteamPaths(
+                steam_root=steam_root,
+                user_id="1",
+                userdata_dir=steam_root / "userdata" / "1",
+                shortcuts_vdf=s_vdf,
+                grid_dir=steam_root / "userdata" / "1" / "config" / "grid",
+                config_vdf=c_vdf,
+                compatdata_dir=steam_root / "steamapps" / "compatdata",
+            )
+            stored = {
+                "shortcuts": {
+                    "0": {
+                        "appid": 111,
+                        "AppName": "OldName",
+                        "Exe": '"/old/a.exe"',
+                        "StartDir": '"/old"',
+                        "IsHidden": 1,
+                        "tags": {"0": "Fav"},
+                    }
+                }
+            }
+            written: list[dict] = []
+            with (
+                mock.patch("deckinstall.steam_vdf.vdf.binary_loads", return_value=stored),
+                mock.patch(
+                    "deckinstall.steam_vdf.vdf.binary_dumps",
+                    side_effect=lambda d: (written.append(d), b"MODIFIED")[1],
+                ),
+                mock.patch("deckinstall.steam_vdf.set_compat_tool", side_effect=OSError("disk full")),
+            ):
+                with self.assertRaises(OSError):
+                    add_or_update_shortcut(
+                        paths=paths_rb,
+                        app_name="NewName",
+                        exe_path=root / "b.exe",
+                        start_dir=root,
+                        enable_proton=True,
+                        preserve_from_appid=111,
+                    )
+            self.assertEqual(written[0]["shortcuts"]["0"]["IsHidden"], 1)
+            self.assertEqual(written[0]["shortcuts"]["0"]["tags"], {"0": "Fav"})
+            self.assertEqual(s_vdf.read_bytes(), b"ORIGINAL_SHORTCUTS")
+
+        # 10) delete_cleanup_candidates_checked skips candidate if shortcut appears before deletion
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            steam_root = root / "Steam"
+            compat = steam_root / "steamapps" / "compatdata"
+            cand_pfx = compat / "555" / "pfx"
+            (cand_pfx / "drive_c").mkdir(parents=True)
+            paths = SteamPaths(
+                steam_root=steam_root,
+                user_id="1",
+                userdata_dir=steam_root / "userdata" / "1",
+                shortcuts_vdf=steam_root / "userdata" / "1" / "config" / "shortcuts.vdf",
+                grid_dir=steam_root / "userdata" / "1" / "config" / "grid",
+                config_vdf=steam_root / "config" / "config.vdf",
+                compatdata_dir=compat,
+            )
+            paths.shortcuts_vdf.parent.mkdir(parents=True, exist_ok=True)
+            paths.shortcuts_vdf.write_bytes(b"VDF")
+            from deckinstall.steam_vdf import CleanupCandidate
+            cand = CleanupCandidate("orphan", "Orphan", cand_pfx.parent, 100, False)
+            live_entry = ShortcutEntry("0", 555, "Orphan", '"/g/a.exe"', '"/g"', "", "")
+            with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[live_entry]):
+                deleted, freed, errs = delete_cleanup_candidates_checked(paths, [cand])
+            self.assertEqual(deleted, 0)
+            self.assertTrue(cand_pfx.parent.exists())
+            self.assertTrue(errs)
+
 
 if __name__ == "__main__":
     unittest.main()

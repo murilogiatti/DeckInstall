@@ -380,7 +380,11 @@ class BulkMigrateWorker(QThread):
                     errors.append(f"{item.entry.app_name}: {exc}")
 
             self.status.emit(tr("migrate.sync_all"))
-            checked, copied = sync_all_external_saves(self.paths)
+            checked, copied = 0, 0
+            try:
+                checked, copied = sync_all_external_saves(self.paths)
+            except Exception as exc:
+                errors.append(f"sync_all_external_saves: {exc}")
 
             summary = tr(
                 "migrate.summary",
@@ -560,7 +564,7 @@ class MainWindow(QMainWindow):
             self._extract_worker.cancel()
         if any(w.isRunning() for w in self._active_workers):
             self._closing_pending = True
-            self.status_label.setText("Aguardando operação em andamento terminar antes de fechar...")
+            self.status_label.setText(tr("status.closing_wait"))
             event.ignore()
             return
         super().closeEvent(event)
@@ -738,7 +742,7 @@ class MainWindow(QMainWindow):
         self.btn_extract = QPushButton(tr("install.btn_extract"))
         self.btn_extract.setObjectName("primaryBtn")
         self.btn_extract.clicked.connect(self._start_extract)
-        self.btn_cancel_extract = QPushButton("Cancel")
+        self.btn_cancel_extract = QPushButton(tr("install.btn_cancel"))
         self.btn_cancel_extract.setEnabled(False)
         self.btn_cancel_extract.clicked.connect(self._cancel_extract)
         self.btn_use_extracted = QPushButton(tr("install.btn_add_steam"))
@@ -822,7 +826,7 @@ class MainWindow(QMainWindow):
         self.steam_match_combo.currentIndexChanged.connect(self._on_steam_match_changed)
         form.addRow(tr("add.match_label"), self.steam_match_combo)
 
-        self.chk_proton = QCheckBox(tr("install.btn_add_steam"))
+        self.chk_proton = QCheckBox(tr("install.enable_proton"))
         self.chk_proton.setChecked(True)
         form.addRow("", self.chk_proton)
 
@@ -1546,6 +1550,8 @@ class MainWindow(QMainWindow):
 
             def run(self) -> None:
                 try:
+                    if _is_wine_game_running():
+                        raise RuntimeError(tr("cleanup.wine_running"))
                     games, files = restore_saves_backup(self._paths, self._zip_file)
                     self.done.emit(games, files)
                 except Exception as exc:
@@ -1621,7 +1627,7 @@ class MainWindow(QMainWindow):
             self._set_steam_busy(False)
             if removed:
                 self._refresh_shortcuts()
-                self.status_label.setText(f"Removido: {entry.app_name}")
+                self.status_label.setText(tr("library.removed", name=entry.app_name))
 
         def _on_remove_err(err: str) -> None:
             self._set_steam_busy(False)
@@ -1990,6 +1996,8 @@ class MainWindow(QMainWindow):
 
             def run(self) -> None:
                 try:
+                    if _is_wine_game_running():
+                        raise RuntimeError(tr("cleanup.wine_running"))
                     deleted, freed, errs = delete_cleanup_candidates_checked(
                         self._paths, self._items
                     )

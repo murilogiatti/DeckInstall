@@ -13,7 +13,7 @@ import requests
 
 STEAM_SEARCH_URL = "https://store.steampowered.com/api/storesearch/"
 STEAM_CDN_BASE = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps"
-USER_AGENT = "DeckInstall/0.7.3"
+USER_AGENT = "DeckInstall/0.7.4"
 
 
 @dataclass(frozen=True)
@@ -144,7 +144,19 @@ def restore_steam_artwork_backup(shortcut_appid_u32: int, grid_dir: Path) -> lis
             pass
     restored: list[str] = []
     for src in bak_files:
-        shutil.copy2(src, grid_dir / src.name)
+        dst = grid_dir / src.name
+        if dst.is_symlink():
+            dst.unlink()
+        tmp_dst = grid_dir / f".{src.name}.tmp.{os.getpid()}"
+        try:
+            shutil.copy2(src, tmp_dst)
+            os.replace(tmp_dst, dst)
+        finally:
+            if tmp_dst.exists():
+                try:
+                    tmp_dst.unlink()
+                except OSError:
+                    pass
         restored.append(src.name)
     return restored
 

@@ -79,7 +79,7 @@ def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
                 for root_s, dirs_s, files_s in os.walk(item, followlinks=False):
                     rel = Path(root_s).relative_to(item)
                     target_sub = dest / rel
-                    if target_sub.is_symlink():
+                    if target_sub.is_symlink() or target_sub.is_file():
                         target_sub.unlink()
                     target_sub.mkdir(parents=True, exist_ok=True)
                     for d in list(dirs_s):
@@ -97,6 +97,8 @@ def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
                         dst_f = target_sub / f
                         if dst_f.is_symlink():
                             dst_f.unlink()
+                        elif dst_f.is_dir():
+                            shutil.rmtree(dst_f)
                         shutil.copy2(src_f, dst_f, follow_symlinks=False)
                 shutil.rmtree(item)
                 continue
@@ -211,6 +213,7 @@ def run_windows_installer(
         raise RuntimeError("Nenhuma versão do Proton encontrada no Steam.")
 
     target_dir.mkdir(parents=True, exist_ok=True)
+    pre_existing = {p for p in target_dir.rglob("*") if p.is_file()}
     with tempfile.TemporaryDirectory(prefix="deckinstall_pfx_") as tmp_pfx:
         env = os.environ.copy()
         env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_root)
@@ -236,7 +239,7 @@ def run_windows_installer(
         if rc != 0:
             raise RuntimeError(f"Instalador encerrou com código {rc}.")
 
-        has_installed = any(p.is_file() for p in target_dir.rglob("*"))
+        has_installed = bool({p for p in target_dir.rglob("*") if p.is_file()} - pre_existing)
         if not has_installed:
             drive_c = Path(tmp_pfx) / "pfx" / "drive_c"
             copied_any = False

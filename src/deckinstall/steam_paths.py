@@ -161,6 +161,29 @@ def _read_compat_tool_id(vdf_path: Path, fallback: str) -> str:
     return fallback
 
 
+def _iter_compat_tool_dirs(steam_root: Path) -> list[Path]:
+    """Return deduplicated existing compatibilitytools.d directories."""
+    compat_dirs = [
+        steam_root / "compatibilitytools.d",
+        Path.home() / ".local" / "share" / "Steam" / "compatibilitytools.d",
+        Path.home() / ".steam" / "root" / "compatibilitytools.d",
+    ]
+    out: list[Path] = []
+    visited: set[Path] = set()
+    for compat_tools in compat_dirs:
+        if not compat_tools.is_dir():
+            continue
+        try:
+            res_dir = compat_tools.resolve()
+        except OSError:
+            res_dir = compat_tools
+        if res_dir in visited:
+            continue
+        visited.add(res_dir)
+        out.append(compat_tools)
+    return out
+
+
 def find_default_proton_name(steam_root: Path) -> str:
     """Return the Steam CompatToolMapping name for the newest stable Proton."""
     libs = _list_steam_library_roots(steam_root)
@@ -184,6 +207,11 @@ def find_default_proton_name(steam_root: Path) -> str:
     for lib in libs:
         if (lib / "steamapps" / "common" / "Proton - Experimental" / "proton").is_file():
             return "proton_experimental"
+    for compat_tools in _iter_compat_tool_dirs(steam_root):
+        for entry in sorted(compat_tools.iterdir(), reverse=True):
+            vdf_file = entry / "compatibilitytool.vdf"
+            if entry.is_dir() and vdf_file.is_file() and (entry / "proton").is_file():
+                return _read_compat_tool_id(vdf_file, entry.name)
     return "proton_11"
 
 
@@ -202,6 +230,11 @@ def find_proton_binary(steam_root: Path) -> Path | None:
                 proton = entry / "proton"
                 if proton.is_file():
                     return proton
+    for compat_tools in _iter_compat_tool_dirs(steam_root):
+        for entry in sorted(compat_tools.iterdir(), reverse=True):
+            proton = entry / "proton"
+            if entry.is_dir() and proton.is_file():
+                return proton
     return None
 
 

@@ -151,5 +151,9 @@
   "migrate.errors_header": "\nErros:\n{errs}",
   "about.title": "Sobre o {app}",
   "about.body": "<h3>{app} v{version}</h3><p>Instalador de jogos Não-Steam, migrador de prefixos, validador de saves e gerenciador de artes para SteamOS / Steam Deck.</p><p><b>Licença:</b> MIT License<br><b>Autor:</b> Murilo Giatti<br><b>Repositório:</b> <a href='https://github.com/murilogiatti/DeckInstall'>github.com/murilogiatti/DeckInstall</a></p><p>As traduções ficam em <code>locales/*.json</code>. O idioma principal é o inglês.</p>",
-  "lang.changed": "Idioma definido para {name}. Reinicie o DeckInstall para aplicar em toda a interface."
+  "lang.changed": "Idioma definido para {name}. Reinicie o DeckInstall para aplicar em toda a interface.",
+  "status.closing_wait": "Aguardando operação em andamento terminar antes de fechar...",
+  "install.btn_cancel": "Cancelar",
+  "install.enable_proton": "Ativar camada de compatibilidade Proton automaticamente",
+  "library.removed": "Removido: {name}"
 }
