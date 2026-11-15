@@ -146,7 +146,6 @@ QLineEdit:disabled, QComboBox:disabled {
     border-color: #232938;
     color: #6b768d;
 }
-}
 QProgressBar {
     background-color: #11141a;
     border: 1px solid #2c3445;

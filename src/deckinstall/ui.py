@@ -2241,6 +2241,8 @@ def main() -> int:
         app.setWindowIcon(QIcon(str(icon_file)))
     win = MainWindow(app)
     if "--smoke-test" in args:
+        for w in list(win._active_workers):
+            w.wait(5000)
         win.close()
         app.processEvents()
         return 0
