@@ -1441,6 +1441,19 @@ class CoreTests(unittest.TestCase):
                 )
                 with (
                     mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[entry]),
+                    mock.patch(
+                        "deckinstall.steam_vdf.vdf.binary_loads",
+                        return_value={
+                            "shortcuts": {
+                                "0": {
+                                    "appid": 123456,
+                                    "AppName": "Game",
+                                    "Exe": f'"{src_exe}"',
+                                    "StartDir": f'"{src_exe.parent}"',
+                                }
+                            }
+                        },
+                    ),
                     mock.patch("deckinstall.steam_vdf.vdf.binary_dumps", return_value=b"NEW_VDF"),
                     mock.patch("deckinstall.steam_vdf.set_compat_tool", side_effect=OSError("disk full")),
                 ):
