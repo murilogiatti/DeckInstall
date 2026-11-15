@@ -7,7 +7,9 @@ import locale
 import os
 from pathlib import Path
 
-LOCALES_DIR = Path(__file__).resolve().parent / "locales"
+_PKG_LOCALES = Path(__file__).resolve().parent / "locales"
+_ROOT_LOCALES = Path(__file__).resolve().parent.parent / "locales"
+LOCALES_DIR = _PKG_LOCALES if _PKG_LOCALES.is_dir() else _ROOT_LOCALES
 DEFAULT_LANG = "en"
 
 _LANGUAGE_NAMES: dict[str, str] = {

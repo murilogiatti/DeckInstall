@@ -56,7 +56,7 @@ jobs:
             --standalone \
             --enable-plugin=pyside6 \
             --include-package=deckinstall \
-            --include-data-dir=src/deckinstall/locales=deckinstall/locales \
+            --include-data-dir=src/deckinstall/locales=locales \
             --include-data-dir=assets=assets \
             --output-dir=build \
             --output-filename=deckinstall \
