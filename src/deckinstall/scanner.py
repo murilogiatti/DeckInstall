@@ -29,7 +29,7 @@ IGNORED_EXE_PATTERNS = (
 )
 
 SCENE_TAG_RE = re.compile(
-    r"[\.\-_ ]?(InsaneRamZes|RUNE|CODEX|EMPRESS|FLT|TENOKE|ElAmigos|FitGirl|DODI|GOG|Portable|Complete[.\-_ ]Edition|Ultimate[.\-_ ]Edition|Deluxe[.\-_ ]Edition).*$",
+    r"(?:^|[\.\-_ ])(InsaneRamZes|RUNE|CODEX|EMPRESS|FLT|TENOKE|ElAmigos|FitGirl|DODI|GOG|Portable|Complete[.\-_ ]Edition|Ultimate[.\-_ ]Edition|Deluxe[.\-_ ]Edition)(?=$|[\.\-_ ]).*$",
     re.IGNORECASE,
 )
 

@@ -107,40 +107,101 @@ def resolve_steam_paths(user_id: str | None = None) -> SteamPaths | None:
     )
 
 
+def _list_steam_library_roots(steam_root: Path) -> list[Path]:
+    """Return all Steam library root directories (main steam_root + libraryfolders.vdf)."""
+    roots: list[Path] = [steam_root]
+    seen: set[Path] = set()
+    try:
+        seen.add(steam_root.resolve())
+    except OSError:
+        seen.add(steam_root)
+
+    lib_vdf = steam_root / "steamapps" / "libraryfolders.vdf"
+    if not lib_vdf.is_file():
+        return roots
+    try:
+        import vdf
+
+        data = vdf.loads(lib_vdf.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return roots
+    folders = data.get("libraryfolders") or data.get("LibraryFolders") or {}
+    if isinstance(folders, dict):
+        for val in folders.values():
+            raw_path = val.get("path") if isinstance(val, dict) else (val if isinstance(val, str) else None)
+            if not raw_path:
+                continue
+            cand = Path(str(raw_path))
+            try:
+                res = cand.resolve()
+            except OSError:
+                res = cand
+            if cand.is_dir() and res not in seen:
+                seen.add(res)
+                roots.append(cand)
+    return roots
+
+
+def _read_compat_tool_id(vdf_path: Path, fallback: str) -> str:
+    """Read internal tool identifier from compatibilitytool.vdf when available."""
+    try:
+        import vdf
+
+        data = vdf.loads(vdf_path.read_text(encoding="utf-8", errors="replace"))
+        tools = (
+            data.get("compatibilitytools", {}).get("compat_tools")
+            or data.get("compat_tools")
+        )
+        if isinstance(tools, dict) and tools:
+            first_key = next(iter(tools.keys()))
+            if isinstance(first_key, str) and first_key.strip():
+                return first_key.strip()
+    except Exception:
+        pass
+    return fallback
+
+
 def find_default_proton_name(steam_root: Path) -> str:
     """Return the Steam CompatToolMapping name for the newest stable Proton."""
-    common = steam_root / "steamapps" / "common"
+    libs = _list_steam_library_roots(steam_root)
     for candidate_dir, tool_name in [
         ("Proton 11.0", "proton_11"),
         ("Proton 10.0", "proton_10"),
         ("Proton 9.0", "proton_9"),
         ("Proton 9.0 (Beta)", "proton_9"),
     ]:
-        if (common / candidate_dir / "proton").is_file():
-            return tool_name
-    if common.is_dir():
-        for entry in sorted(common.glob("Proton [0-9]*"), reverse=True):
-            if (entry / "proton").is_file():
-                major = entry.name.split()[1].split(".")[0]
-                if major.isdigit():
-                    return f"proton_{major}"
-    if (common / "Proton - Experimental" / "proton").is_file():
-        return "proton_experimental"
+        for lib in libs:
+            if (lib / "steamapps" / "common" / candidate_dir / "proton").is_file():
+                return tool_name
+    for lib in libs:
+        common = lib / "steamapps" / "common"
+        if common.is_dir():
+            for entry in sorted(common.glob("Proton [0-9]*"), reverse=True):
+                if (entry / "proton").is_file():
+                    major = entry.name.split()[1].split(".")[0]
+                    if major.isdigit():
+                        return f"proton_{major}"
+    for lib in libs:
+        if (lib / "steamapps" / "common" / "Proton - Experimental" / "proton").is_file():
+            return "proton_experimental"
     return "proton_11"
 
 
 def find_proton_binary(steam_root: Path) -> Path | None:
     """Locate an installed stable Proton executable for running Windows setup.exe installers."""
-    common = steam_root / "steamapps" / "common"
+    libs = _list_steam_library_roots(steam_root)
     for name in ("Proton 11.0", "Proton 10.0", "Proton 9.0", "Proton - Experimental"):
-        proton = common / name / "proton"
-        if proton.is_file():
-            return proton
-    if common.is_dir():
-        for entry in sorted(common.glob("Proton*"), reverse=True):
-            proton = entry / "proton"
+        for lib in libs:
+            proton = lib / "steamapps" / "common" / name / "proton"
             if proton.is_file():
                 return proton
+    for lib in libs:
+        common = lib / "steamapps" / "common"
+        if common.is_dir():
+            for entry in sorted(common.glob("Proton*"), reverse=True):
+                proton = entry / "proton"
+                if proton.is_file():
+                    return proton
     return None
 
 
@@ -149,17 +210,39 @@ def list_installed_protons(steam_root: Path) -> list[tuple[str, str]]:
     found: list[tuple[str, str]] = []
     seen: set[str] = set()
 
-    compat_tools = steam_root / "compatibilitytools.d"
-    if compat_tools.is_dir():
+    compat_dirs = [
+        steam_root / "compatibilitytools.d",
+        Path.home() / ".local" / "share" / "Steam" / "compatibilitytools.d",
+        Path.home() / ".steam" / "root" / "compatibilitytools.d",
+    ]
+    visited_compat: set[Path] = set()
+    for compat_tools in compat_dirs:
+        if not compat_tools.is_dir():
+            continue
+        try:
+            res_dir = compat_tools.resolve()
+        except OSError:
+            res_dir = compat_tools
+        if res_dir in visited_compat:
+            continue
+        visited_compat.add(res_dir)
         for entry in sorted(compat_tools.iterdir(), reverse=True):
-            if entry.is_dir() and (entry / "compatibilitytool.vdf").is_file():
-                name = entry.name
-                if name not in seen:
-                    seen.add(name)
-                    found.append((name, f"{name} (Custom / GE-Proton)"))
+            vdf_file = entry / "compatibilitytool.vdf"
+            if entry.is_dir() and vdf_file.is_file():
+                tool_id = _read_compat_tool_id(vdf_file, entry.name)
+                if tool_id not in seen:
+                    seen.add(tool_id)
+                    label = (
+                        f"{entry.name} (Custom / GE-Proton)"
+                        if tool_id == entry.name
+                        else f"{entry.name} ({tool_id})"
+                    )
+                    found.append((tool_id, label))
 
-    common = steam_root / "steamapps" / "common"
-    if common.is_dir():
+    for lib in _list_steam_library_roots(steam_root):
+        common = lib / "steamapps" / "common"
+        if not common.is_dir():
+            continue
         for entry in sorted(common.glob("Proton*"), reverse=True):
             if not (entry / "proton").is_file():
                 continue
@@ -176,8 +259,6 @@ def list_installed_protons(steam_root: Path) -> list[tuple[str, str]]:
                 seen.add(tool_id)
                 found.append((tool_id, f"{folder} ({tool_id})"))
 
-    if not found:
-        found.append(("proton_experimental", "Proton Experimental (proton_experimental)"))
     return found
 
 

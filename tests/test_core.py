@@ -575,10 +575,14 @@ class CoreTests(unittest.TestCase):
             dfile.write_bytes(b"X")
             self.assertFalse(_prefix_saves_verified_in_target(src_pfx, dst_pfx))
 
-            # 1b) Strictly newer Steam save (played after migration) must verify
+            # 1b) Different/truncated newer Steam save must NOT verify as identical
             dfile.write_bytes(b"NEWER_STEAM_SAVE_DATA_12345")
             newer_ts = sfile.stat().st_mtime + 120
             os.utime(dfile, (newer_ts, newer_ts))
+            self.assertFalse(_prefix_saves_verified_in_target(src_pfx, dst_pfx))
+
+            # 1c) Exact same content verifies
+            dfile.write_bytes(b"ABCD" * 100)
             self.assertTrue(_prefix_saves_verified_in_target(src_pfx, dst_pfx))
 
             # 2) Shell assignment with spaces remains valid shell after rewrite
@@ -707,6 +711,180 @@ class CoreTests(unittest.TestCase):
                 created, removed = sync_prefix_symlinks(paths, links_root=root / "Links")
                 self.assertEqual((created, removed), (1, 0))
                 self.assertTrue((root / "Links" / "TestGame").is_symlink())
+
+    def test_v073_audit_regressions(self) -> None:
+        from deckinstall.artwork import backup_steam_artwork
+        from deckinstall.scanner import clean_game_name
+        from deckinstall.steam_paths import SteamPaths
+        from deckinstall.steam_vdf import (
+            CleanupCandidate,
+            ShortcutEntry,
+            _file_sha256,
+            apply_launch_presets,
+            backup_all_saves,
+            delete_cleanup_candidates_checked,
+            restore_saves_backup,
+            sync_prefix_symlinks,
+            update_shortcut_launch_options,
+        )
+
+        # 1) clean_game_name preserves legitimate words containing scene tag substrings
+        self.assertEqual(clean_game_name("Old School RuneScape"), "Old School RuneScape")
+        self.assertEqual(clean_game_name("Hades.II-RUNE"), "Hades II")
+
+        # 2) apply_launch_presets keeps env vars before gamemoderun and game flags after %command%
+        opts = apply_launch_presets(
+            "FOO=bar --fullscreen",
+            gamemode=True,
+            mangohud=True,
+            wined3d=False,
+            no_esync=False,
+            no_fsync=False,
+        )
+        self.assertEqual(opts, "FOO=bar MANGOHUD=1 gamemoderun %command% --fullscreen")
+        opts_env = apply_launch_presets(
+            "LOG=$HOME/out.log %command% -windowed",
+            gamemode=True,
+            mangohud=False,
+            wined3d=False,
+            no_esync=False,
+            no_fsync=False,
+        )
+        self.assertIn("LOG=$HOME/out.log", opts_env)
+        self.assertTrue(opts_env.endswith("%command% -windowed"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            # 3) _file_sha256 detects replacement with identical size & mtime_ns (different inode)
+            f1 = root / "save.dat"
+            f1.write_bytes(b"AAAA")
+            ts_ns = 1_700_000_000_000_000_000
+            os.utime(f1, ns=(ts_ns, ts_ns))
+            h1 = _file_sha256(f1)
+            f2 = root / "save.dat.new"
+            f2.write_bytes(b"BBBB")
+            os.utime(f2, ns=(ts_ns, ts_ns))
+            os.replace(f2, f1)
+            h2 = _file_sha256(f1)
+            self.assertNotEqual(h1, h2)
+
+            # 4) backup_steam_artwork preserves original backup on repeated runs
+            grid = root / "grid"
+            grid.mkdir()
+            (grid / "123p.jpg").write_bytes(b"ORIGINAL")
+            backup_steam_artwork(123, grid)
+            (grid / "123p.jpg").write_bytes(b"BAD_ART")
+            backup_steam_artwork(123, grid)
+            self.assertEqual(
+                (grid / ".deckinstall_art_bak" / "123" / "123p.jpg").read_bytes(),
+                b"ORIGINAL",
+            )
+
+            # 5) ZIP backup/restore preserves distinct Wine profiles + ProgramData + manifest remapping
+            steam_root = root / "Steam"
+            compat_dir = steam_root / "steamapps" / "compatdata"
+            old_id = 3111111111
+            new_id = 3999999999
+            u1 = compat_dir / str(old_id) / "pfx" / "drive_c" / "users" / "deck" / "Documents" / "s.dat"
+            u2 = compat_dir / str(old_id) / "pfx" / "drive_c" / "users" / "steamuser" / "Documents" / "s.dat"
+            pd = compat_dir / str(old_id) / "pfx" / "drive_c" / "ProgramData" / "MyGame" / "cfg.ini"
+            for p, data in ((u1, b"DECK_PROFILE"), (u2, b"STEAMUSER_PROFILE"), (pd, b"PD_CFG")):
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(data)
+
+            paths = SteamPaths(
+                steam_root=steam_root,
+                user_id="1",
+                userdata_dir=steam_root / "userdata" / "1",
+                shortcuts_vdf=steam_root / "userdata" / "1" / "config" / "shortcuts.vdf",
+                grid_dir=grid,
+                config_vdf=steam_root / "config" / "config.vdf",
+                compatdata_dir=compat_dir,
+            )
+            old_entry = ShortcutEntry("0", old_id, "Cool Game", '"/g/a.exe"', '"/g"', "", "")
+            new_entry = ShortcutEntry("0", new_id, "Cool Game", '"/Games/Cool Game/a.exe"', '"/Games/Cool Game"', "", "")
+            with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[old_entry]):
+                zpath, games, files = backup_all_saves(paths, dest_root=root / "Backups")
+                self.assertEqual((games, files), (1, 3))
+            with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[new_entry]):
+                rgames, rfiles = restore_saves_backup(paths, zpath)
+                self.assertEqual((rgames, rfiles), (1, 3))
+            self.assertEqual(
+                (compat_dir / str(new_id) / "pfx" / "drive_c" / "users" / "deck" / "Documents" / "s.dat").read_bytes(),
+                b"DECK_PROFILE",
+            )
+            self.assertEqual(
+                (compat_dir / str(new_id) / "pfx" / "drive_c" / "users" / "steamuser" / "Documents" / "s.dat").read_bytes(),
+                b"STEAMUSER_PROFILE",
+            )
+            self.assertEqual(
+                (compat_dir / str(new_id) / "pfx" / "drive_c" / "ProgramData" / "MyGame" / "cfg.ini").read_bytes(),
+                b"PD_CFG",
+            )
+
+            # 6) sync_prefix_symlinks does not delete non-DeckInstall symlinks
+            links_root = root / "Links"
+            links_root.mkdir()
+            manual_target = root / "OtherTarget"
+            manual_target.mkdir()
+            (links_root / "ManualLink").symlink_to(manual_target)
+            with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[]):
+                sync_prefix_symlinks(paths, links_root=links_root)
+            self.assertTrue((links_root / "ManualLink").is_symlink())
+
+            # 7) delete_cleanup_candidates_checked refuses prefix that gained unverified saves
+            orphan_pfx = compat_dir / "2888888888"
+            (orphan_pfx / "pfx" / "drive_c" / "users" / "steamuser" / "Documents").mkdir(parents=True)
+            cand = CleanupCandidate("Compatdata Órfão", "compatdata/2888888888", orphan_pfx, 0, False, False)
+            (orphan_pfx / "pfx" / "drive_c" / "users" / "steamuser" / "Documents" / "new.sav").write_bytes(b"DATA")
+            with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[]):
+                deleted, _, errs = delete_cleanup_candidates_checked(paths, [cand])
+            self.assertEqual(deleted, 0)
+            self.assertTrue(orphan_pfx.exists())
+            self.assertTrue(errs)
+
+            # 8) update_shortcut_launch_options preserves AppID and metadata
+            stored = {
+                "shortcuts": {
+                    "0": {
+                        "appid": -123456,
+                        "AppName": "Cool Game",
+                        "Exe": '"/g/a.exe"',
+                        "StartDir": '"/g"',
+                        "LaunchOptions": "",
+                        "IsHidden": 1,
+                        "tags": {"0": "Deck"},
+                    }
+                }
+            }
+            paths.shortcuts_vdf.parent.mkdir(parents=True, exist_ok=True)
+            paths.shortcuts_vdf.write_bytes(b"DUMMY")
+            written: list[dict] = []
+            with (
+                mock.patch("deckinstall.steam_vdf.vdf.binary_loads", return_value=stored),
+                mock.patch(
+                    "deckinstall.steam_vdf.vdf.binary_dumps",
+                    side_effect=lambda d: (written.append(d), b"OUT")[1],
+                ),
+            ):
+                ok = update_shortcut_launch_options(paths, (-123456) & 0xFFFFFFFF, "MANGOHUD=1 %command%")
+            self.assertTrue(ok)
+            self.assertEqual(written[0]["shortcuts"]["0"]["IsHidden"], 1)
+            self.assertEqual(written[0]["shortcuts"]["0"]["tags"], {"0": "Deck"})
+            self.assertEqual(written[0]["shortcuts"]["0"]["LaunchOptions"], "MANGOHUD=1 %command%")
+
+        # 9) i18n parity and zero unused keys
+        import json
+        import re
+
+        en = json.loads(Path(__file__).resolve().parents[1].joinpath("src/deckinstall/locales/en.json").read_text())
+        pt = json.loads(Path(__file__).resolve().parents[1].joinpath("src/deckinstall/locales/pt_BR.json").read_text())
+        self.assertEqual(set(en.keys()), set(pt.keys()))
+        ui_src = Path(__file__).resolve().parents[1].joinpath("src/deckinstall/ui.py").read_text()
+        used = set(re.findall(r'\btr\(\s*["\']([^"\']+)["\']', ui_src))
+        self.assertEqual(sorted(used - set(en.keys())), [])
+        self.assertEqual(sorted(set(en.keys()) - used), [])
 
 
 if __name__ == "__main__":

@@ -64,6 +64,8 @@ def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
         if len(entries) == 1 and entries[0].is_dir() and not entries[0].is_symlink()
         else temp_dir
     )
+    if final_dir.is_symlink():
+        raise RuntimeError(f"Pasta de destino não pode ser um link simbólico: {final_dir}")
     final_dir.mkdir(parents=True, exist_ok=True)
     final_resolved = final_dir.resolve()
     for item in source_root.iterdir():
@@ -233,4 +235,30 @@ def run_windows_installer(
         rc = _drain_stream_lines(proc, cancel_flag, _handle_inst_line, "Instalador cancelado pelo usuário.")
         if rc != 0:
             raise RuntimeError(f"Instalador encerrou com código {rc}.")
+
+        has_installed = any(p.is_file() for p in target_dir.rglob("*"))
+        if not has_installed:
+            drive_c = Path(tmp_pfx) / "pfx" / "drive_c"
+            copied_any = False
+            for sub in ("Games", "Program Files", "Program Files (x86)"):
+                base = drive_c / sub
+                if not base.is_dir():
+                    continue
+                for cand in base.iterdir():
+                    if not cand.is_dir() or cand.name.lower() in {
+                        "common files",
+                        "internet explorer",
+                        "windows media player",
+                        "windows nt",
+                        "uninstall information",
+                    }:
+                        continue
+                    if any(p.is_file() and p.suffix.lower() == ".exe" for p in cand.rglob("*")):
+                        shutil.copytree(cand, target_dir / cand.name, dirs_exist_ok=True, symlinks=False)
+                        copied_any = True
+            if not copied_any:
+                raise RuntimeError(
+                    f"Nenhum arquivo foi instalado em {target_dir}. "
+                    "Aponte o instalador para Z:" + str(target_dir)
+                )
     return target_dir

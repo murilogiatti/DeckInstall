@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import shutil
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,7 +13,7 @@ import requests
 
 STEAM_SEARCH_URL = "https://store.steampowered.com/api/storesearch/"
 STEAM_CDN_BASE = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps"
-USER_AGENT = "DeckInstall/0.7.2"
+USER_AGENT = "DeckInstall/0.7.3"
 
 
 @dataclass(frozen=True)
@@ -63,9 +65,24 @@ def _download_first(urls: list[str], dest: Path) -> bool:
         try:
             resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=15)
             if resp.status_code == 200 and len(resp.content) > 512:
-                dest.write_bytes(resp.content)
-                return True
-        except requests.RequestException:
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f".{dest.name}.", suffix=".tmp", dir=str(dest.parent)
+                )
+                os.close(fd)
+                tmp_path = Path(tmp_name)
+                try:
+                    tmp_path.write_bytes(resp.content)
+                    if dest.is_symlink():
+                        dest.unlink()
+                    os.replace(tmp_path, dest)
+                    return True
+                except Exception:
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
+                    raise
+        except (requests.RequestException, OSError):
             continue
     return False
 
@@ -76,7 +93,7 @@ def _grid_files_for_appid(shortcut_appid_u32: int, grid_dir: Path) -> list[Path]
     prefix = str(shortcut_appid_u32)
     matched: list[Path] = []
     for p in sorted(grid_dir.iterdir()):
-        if not p.is_file() or not p.name.startswith(prefix):
+        if p.is_symlink() or not p.is_file() or not p.name.startswith(prefix):
             continue
         rest = p.name[len(prefix) :]
         if rest and not (rest[0] in ("p", "_", ".")):
@@ -87,17 +104,28 @@ def _grid_files_for_appid(shortcut_appid_u32: int, grid_dir: Path) -> list[Path]
 
 def backup_steam_artwork(shortcut_appid_u32: int, grid_dir: Path) -> list[str]:
     """Back up existing Steam grid artwork for shortcut_appid_u32 before overwriting."""
+    bak_root = grid_dir / ".deckinstall_art_bak"
+    bak_dir = bak_root / str(shortcut_appid_u32)
+    if bak_dir.is_dir():
+        existing_bak = [p.name for p in sorted(bak_dir.iterdir()) if p.is_file()]
+        if existing_bak:
+            return existing_bak
     existing = _grid_files_for_appid(shortcut_appid_u32, grid_dir)
     if not existing:
         return []
-    bak_dir = grid_dir / ".deckinstall_art_bak" / str(shortcut_appid_u32)
-    if bak_dir.exists():
-        shutil.rmtree(bak_dir, ignore_errors=True)
-    bak_dir.mkdir(parents=True, exist_ok=True)
+    bak_root.mkdir(parents=True, exist_ok=True)
+    stage_dir = Path(tempfile.mkdtemp(prefix=f".bak_{shortcut_appid_u32}_", dir=str(bak_root)))
     copied: list[str] = []
-    for src in existing:
-        shutil.copy2(src, bak_dir / src.name)
-        copied.append(src.name)
+    try:
+        for src in existing:
+            shutil.copy2(src, stage_dir / src.name)
+            copied.append(src.name)
+        if bak_dir.exists():
+            shutil.rmtree(bak_dir, ignore_errors=True)
+        stage_dir.rename(bak_dir)
+    except Exception:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        raise
     return copied
 
 
@@ -157,7 +185,10 @@ def download_steam_artwork(
             for kind, (dest, urls) in targets.items()
         }
         for kind, fut in futs.items():
-            if fut.result():
-                saved[kind] = targets[kind][0]
+            try:
+                if fut.result():
+                    saved[kind] = targets[kind][0]
+            except Exception:
+                continue
 
     return ArtworkResult(steam_appid=steam_appid, saved_files=saved)
