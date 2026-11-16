@@ -2047,7 +2047,7 @@ def find_cleanup_candidates(
     home_dir: Path | None = None,
 ) -> list[CleanupCandidate]:
     """Find old external prefixes, orphan Steam compatdata/shadercache, backups, and optional system caches."""
-    from .standalone import list_standalone_games
+    from .standalone import get_games_dir, list_standalone_games
 
     candidates: list[CleanupCandidate] = []
     seen: set[Path] = set()
@@ -2071,7 +2071,17 @@ def find_cleanup_candidates(
             by_steam_appid.setdefault(f"umu-{sa}", entry)
 
     home = home_dir or Path.home()
-    games_dir = home / "Games"
+    data_home = (
+        (home / ".local" / "share")
+        if home_dir is not None
+        else Path(os.environ.get("XDG_DATA_HOME", "").strip() or (home / ".local" / "share")).expanduser()
+    )
+    cache_home = (
+        (home / ".cache")
+        if home_dir is not None
+        else Path(os.environ.get("XDG_CACHE_HOME", "").strip() or (home / ".cache")).expanduser()
+    )
+    games_dir = (home_dir / "Games") if home_dir is not None else get_games_dir()
     standalone_prefixes_dir = games_dir / ".prefixes"
     standalone_prefix_paths: set[Path] = set()
     for game in list_standalone_games(games_dir):
@@ -2277,7 +2287,7 @@ def find_cleanup_candidates(
                     )
                 )
 
-    apps_dir = home / ".local" / "share" / "applications"
+    apps_dir = data_home / "applications"
     if apps_dir.is_dir() and not apps_dir.is_symlink():
         for child in apps_dir.iterdir():
             if child.is_symlink() or not child.is_file():
@@ -2331,7 +2341,7 @@ def find_cleanup_candidates(
             )
 
     if include_system_caches:
-        trash_files = home / ".local" / "share" / "Trash" / "files"
+        trash_files = data_home / "Trash" / "files"
         if trash_files.is_dir() and not trash_files.is_symlink():
             sz = _dir_size_bytes(trash_files)
             if sz > 0:
@@ -2348,7 +2358,7 @@ def find_cleanup_candidates(
                     )
                 )
 
-        user_cache = home / ".cache"
+        user_cache = cache_home
         if user_cache.is_dir() and not user_cache.is_symlink():
             for child in user_cache.iterdir():
                 if child.is_symlink() or child.name in ("fontconfig", "dconf"):
@@ -2429,11 +2439,30 @@ def find_cleanup_candidates(
         compat_tools = (
             paths.steam_root / "compatibilitytools.d"
             if paths is not None
-            else home / ".local" / "share" / "Steam" / "compatibilitytools.d"
+            else data_home / "Steam" / "compatibilitytools.d"
         )
-        if compat_tools.is_dir():
-            preserved_ge11 = _newest_ge_proton11_paths(compat_tools)
-            for child in compat_tools.iterdir():
+        compat_dirs: list[Path] = [compat_tools]
+        raw_extra_compat = os.environ.get("STEAM_EXTRA_COMPAT_TOOLS_PATHS", "").strip()
+        if raw_extra_compat:
+            for part in raw_extra_compat.split(os.pathsep):
+                cleaned = part.strip()
+                if cleaned:
+                    compat_dirs.append(Path(cleaned).expanduser())
+
+        seen_compat_dirs: set[Path] = set()
+        for compat_dir in compat_dirs:
+            if not compat_dir.is_dir():
+                continue
+            try:
+                resolved_compat = compat_dir.resolve()
+            except OSError:
+                resolved_compat = compat_dir
+            if resolved_compat in seen_compat_dirs:
+                continue
+            seen_compat_dirs.add(resolved_compat)
+
+            preserved_ge11 = _newest_ge_proton11_paths(compat_dir)
+            for child in compat_dir.iterdir():
                 if child.is_symlink() or not child.is_dir():
                     continue
                 if child.name in active_tools:
@@ -2451,7 +2480,7 @@ def find_cleanup_candidates(
                         candidates.append(
                             CleanupCandidate(
                                 category="Old Proton/Runtime",
-                                label=f"compatibilitytools.d/{child.name}",
+                                label=f"{compat_dir.name}/{child.name}",
                                 path=child,
                                 size_bytes=sz,
                                 has_saves=False,
@@ -2461,7 +2490,7 @@ def find_cleanup_candidates(
                             )
                         )
 
-        umu_dir = home / ".local" / "share" / "umu"
+        umu_dir = data_home / "umu"
         steamrt3 = umu_dir / "steamrt3"
         if (
             not sniper_in_use
@@ -2971,6 +3000,7 @@ _PRESET_ENV_KEYS = (
     "PROTON_USE_WINED3D",
     "PROTON_NO_ESYNC",
     "PROTON_NO_FSYNC",
+    "PROTON_DLSS_UPGRADE",
     "WINEDLLOVERRIDES",
 )
 _HELIXSR_OPTISCALER_DLLS = frozenset(
@@ -3012,6 +3042,42 @@ def _format_winedlloverrides_token(winedlloverrides: str) -> str:
     if not any(ch in val for ch in ('"', "$", "`", "\\")):
         return f'WINEDLLOVERRIDES="{val}"'
     return f"WINEDLLOVERRIDES={shlex.quote(val)}"
+
+
+def install_mangohud_topbar_config(config_path: Path | None = None) -> Path:
+    """Write a Steam-Deck-style horizontal top-bar MangoHud.conf (backing up any existing file)."""
+    xdg_config_home = Path(
+        os.environ.get("XDG_CONFIG_HOME", "").strip() or (Path.home() / ".config")
+    ).expanduser()
+    target = config_path or (xdg_config_home / "MangoHud" / "MangoHud.conf")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    content = (
+        "# DeckInstall — Steam Deck style horizontal top-bar\n"
+        "legacy_layout=0\n"
+        "horizontal\n"
+        "position=top-left\n"
+        "hud_compact\n"
+        "background_alpha=0.35\n"
+        "font_size=19\n"
+        "fps\n"
+        "frametime\n"
+        "gpu_stats\n"
+        "gpu_temp\n"
+        "cpu_stats\n"
+        "cpu_temp\n"
+        "vram\n"
+        "ram\n"
+    )
+    if target.exists() and not target.is_symlink():
+        try:
+            if target.read_text(encoding="utf-8", errors="replace") != content:
+                backup = target.with_name(f"{target.name}.deckinstall.bak")
+                if not backup.exists():
+                    shutil.copy2(target, backup)
+        except OSError:
+            pass
+    _atomic_write_bytes(target, content.encode("utf-8"))
+    return target
 
 
 def detect_helixsr_lsfg_conflict(launch_options: str, winedlloverrides: str = "") -> bool:
@@ -3069,6 +3135,7 @@ def apply_launch_presets(
     no_esync: bool,
     no_fsync: bool,
     winedlloverrides: str = "",
+    dlss_upgrade: bool = False,
 ) -> str:
     """Toggle common SteamOS/Proton launch presets while preserving existing custom options."""
     _validate_launch_options(launch_options)
@@ -3107,6 +3174,8 @@ def apply_launch_presets(
         preset_envs.append("PROTON_NO_ESYNC=1")
     if no_fsync:
         preset_envs.append("PROTON_NO_FSYNC=1")
+    if dlss_upgrade:
+        preset_envs.append("PROTON_DLSS_UPGRADE=1")
     if winedlloverrides.strip():
         preset_envs.append(_format_winedlloverrides_token(winedlloverrides))
 

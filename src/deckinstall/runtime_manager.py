@@ -59,9 +59,45 @@ def get_versions_file() -> Path:
     return get_runtime_dir() / "versions.json"
 
 
+def _iter_extra_compat_tool_dirs() -> list[Path]:
+    """Return expanded paths from STEAM_EXTRA_COMPAT_TOOLS_PATHS."""
+    raw = os.environ.get("STEAM_EXTRA_COMPAT_TOOLS_PATHS", "").strip()
+    if not raw:
+        return []
+    out: list[Path] = []
+    for part in raw.split(os.pathsep):
+        cleaned = part.strip()
+        if cleaned:
+            out.append(Path(cleaned).expanduser())
+    return out
+
+
+def _is_writable_dir_candidate(path: Path) -> bool:
+    """Return True if path is a writable directory or can be created under a writable parent."""
+    if path.exists():
+        return path.is_dir() and os.access(path, os.W_OK | os.X_OK)
+    parent = path.parent
+    while parent != parent.parent and not parent.exists():
+        parent = parent.parent
+    return parent.is_dir() and os.access(parent, os.W_OK | os.X_OK)
+
+
 def get_compat_tools_dir() -> Path:
     """Return the Steam compatibilitytools.d directory for GE-Proton."""
-    return Path.home() / ".local" / "share" / "Steam" / "compatibilitytools.d"
+    for extra_dir in _iter_extra_compat_tool_dirs():
+        if _is_writable_dir_candidate(extra_dir):
+            return extra_dir
+
+    from .steam_paths import find_steam_root
+
+    steam_root = find_steam_root()
+    if steam_root is not None:
+        return steam_root / "compatibilitytools.d"
+
+    xdg_data_home = Path(
+        os.environ.get("XDG_DATA_HOME", "").strip() or (Path.home() / ".local" / "share")
+    ).expanduser()
+    return xdg_data_home / "Steam" / "compatibilitytools.d"
 
 
 def get_steamrt4_dir() -> Path:
@@ -99,23 +135,47 @@ def _parse_ge_proton_version(name: str) -> tuple[int, ...] | None:
 
 def list_ge_proton11_dirs() -> list[Path]:
     """List installed GE-Proton11+ directories sorted newest first."""
-    compat_dir = get_compat_tools_dir()
-    if not compat_dir.is_dir():
-        return []
+    from .steam_paths import _iter_compat_tool_dirs, find_steam_root
+
+    steam_root = find_steam_root()
+    candidate_dirs: list[Path] = [get_compat_tools_dir()]
+    if steam_root is not None:
+        candidate_dirs.extend(_iter_compat_tool_dirs(steam_root))
+    candidate_dirs.extend(_iter_extra_compat_tool_dirs())
+
+    seen_dirs: set[Path] = set()
+    seen_entries: set[Path] = set()
     found: list[tuple[tuple[int, ...], Path]] = []
-    try:
-        entries = list(compat_dir.iterdir())
-    except OSError:
-        return []
-    for entry in entries:
+
+    for compat_dir in candidate_dirs:
+        if not compat_dir.is_dir():
+            continue
         try:
-            if not entry.is_dir():
-                continue
+            resolved_dir = compat_dir.resolve()
+        except OSError:
+            resolved_dir = compat_dir
+        if resolved_dir in seen_dirs:
+            continue
+        seen_dirs.add(resolved_dir)
+
+        try:
+            entries = list(compat_dir.iterdir())
         except OSError:
             continue
-        version = _parse_ge_proton_version(entry.name)
-        if version is not None:
-            found.append((version, entry))
+        for entry in entries:
+            try:
+                if not entry.is_dir():
+                    continue
+                resolved_entry = entry.resolve()
+            except OSError:
+                continue
+            if resolved_entry in seen_entries:
+                continue
+            version = _parse_ge_proton_version(entry.name)
+            if version is not None:
+                seen_entries.add(resolved_entry)
+                found.append((version, entry))
+
     found.sort(key=lambda item: item[0], reverse=True)
     return [entry for _, entry in found]
 
@@ -354,6 +414,11 @@ def ensure_ge_proton11(
     tar_name = f"{tag}-{arch}.tar.gz"
     tar_asset = _find_release_asset(release, tar_name)
     if tar_asset is None:
+        if arch != "x86_64":
+            raise RuntimeError(
+                f"Upstream GE-Proton release {tag} did not publish an asset for {arch} "
+                f"(expected {tar_name})."
+            )
         raise RuntimeError(f"GE-Proton asset {tar_name} not found in release {tag}.")
 
     sha_asset = (
@@ -478,7 +543,7 @@ def validate_steamrt4_integrity() -> bool:
 
 
 def check_ubuntu_bwrap_userns() -> str | None:
-    """Check if Ubuntu AppArmor unprivileged userns restriction blocks bwrap."""
+    """Check if AppArmor unprivileged userns restriction (kernel.apparmor_restrict_unprivileged_userns=1) blocks bwrap."""
     sysctl_path = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
     if not sysctl_path.is_file():
         return None
@@ -503,17 +568,105 @@ def check_ubuntu_bwrap_userns() -> str | None:
         )
     except OSError:
         return (
-            "Ubuntu AppArmor restricts unprivileged user namespaces, blocking bubblewrap (bwrap).\n"
+            "AppArmor restricts unprivileged user namespaces "
+            "(kernel.apparmor_restrict_unprivileged_userns=1), blocking bubblewrap (bwrap).\n"
             "Fix with: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
         )
 
     if proc.returncode != 0:
         return (
-            "Ubuntu AppArmor restricts unprivileged user namespaces, blocking bubblewrap (bwrap) "
+            "AppArmor restricts unprivileged user namespaces "
+            "(kernel.apparmor_restrict_unprivileged_userns=1), blocking bubblewrap (bwrap) "
             "required by umu-run.\n"
             "Fix with: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
         )
     return None
+
+
+_SYSTEM_PACKAGE_MAP: dict[str, dict[str, list[str]]] = {
+    "gamemoderun": {
+        "apt-get": ["gamemode"],
+        "dnf": ["gamemode"],
+        "pacman": ["gamemode"],
+        "zypper": ["gamemode"],
+    },
+    "mangohud": {
+        "apt-get": ["mangohud"],
+        "dnf": ["mangohud"],
+        "pacman": ["mangohud"],
+        "zypper": ["mangohud"],
+    },
+}
+
+
+def get_system_package_install_cmd(bin_name: str) -> list[str] | None:
+    """Return an OS package-manager install command for bin_name, or None if unsupported."""
+    pkg_map = _SYSTEM_PACKAGE_MAP.get(bin_name)
+    if not pkg_map:
+        return None
+    if shutil.which("apt-get"):
+        return ["apt-get", "install", "-y", *pkg_map["apt-get"]]
+    if shutil.which("dnf"):
+        return ["dnf", "install", "-y", *pkg_map["dnf"]]
+    if shutil.which("pacman"):
+        return ["pacman", "-S", "--noconfirm", *pkg_map["pacman"]]
+    if shutil.which("zypper"):
+        return ["zypper", "--non-interactive", "install", *pkg_map["zypper"]]
+    return None
+
+
+def install_system_package(bin_name: str) -> tuple[bool, str]:
+    """Attempt to install the package providing bin_name via pkexec. Returns (ok, message)."""
+    cmd = get_system_package_install_cmd(bin_name)
+    if not cmd:
+        return (False, f"No supported package manager found for {bin_name}.")
+    pkexec = shutil.which("pkexec")
+    if not pkexec:
+        return (False, f"sudo {' '.join(cmd)}")
+    proc = subprocess.run(
+        [pkexec, *cmd],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+        return (False, err)
+    return (True, f"{bin_name} installed.")
+
+
+def fix_bwrap_userns() -> tuple[bool, str]:
+    """Install a persistent AppArmor userns profile for bwrap (or fallback sysctl) via pkexec."""
+    pkexec = shutil.which("pkexec")
+    if not pkexec:
+        return (False, "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0")
+    script = (
+        "set -e; "
+        "if [ -d /etc/apparmor.d ] && command -v apparmor_parser >/dev/null 2>&1; then "
+        "cat <<'EOF' >/etc/apparmor.d/bwrap\n"
+        "abi <abi/4.0>,\n"
+        "include <tunables/global>\n"
+        "profile bwrap /usr/bin/bwrap flags=(unconfined) {\n"
+        "  userns,\n"
+        "  include if exists <local/bwrap>\n"
+        "}\n"
+        "EOF\n"
+        "apparmor_parser -r /etc/apparmor.d/bwrap || true; "
+        "fi; "
+        "if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then "
+        "sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true; "
+        "fi"
+    )
+    proc = subprocess.run(
+        [pkexec, "sh", "-c", script],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+        return (False, err)
+    return (True, "OK")
 
 
 def build_umu_env(

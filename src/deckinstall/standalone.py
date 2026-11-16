@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 import shlex
 import shutil
@@ -30,11 +31,34 @@ from .steam_vdf import (
     sync_prefix_symlinks,
 )
 
-GAMES_DIR = Path.home() / "Games"
-PREFIXES_DIR = GAMES_DIR / ".prefixes"
+_DEFAULT_GAMES_DIR = Path.home() / "Games"
+_DEFAULT_PREFIXES_DIR = _DEFAULT_GAMES_DIR / ".prefixes"
+
+GAMES_DIR = _DEFAULT_GAMES_DIR
+PREFIXES_DIR = _DEFAULT_PREFIXES_DIR
 APPLICATIONS_DIR = Path.home() / ".local" / "share" / "applications"
 UMU_RUN_PATH = Path.home() / ".local" / "share" / "DeckInstall" / "runtime" / "umu" / "umu-run"
 STANDALONE_MANIFEST = ".deckinstall_standalone.json"
+
+
+def get_games_dir() -> Path:
+    """Return the standalone games directory (respecting DECKINSTALL_GAMES_DIR)."""
+    env_dir = os.environ.get("DECKINSTALL_GAMES_DIR", "").strip()
+    if env_dir:
+        return Path(env_dir).expanduser().resolve()
+    if GAMES_DIR != _DEFAULT_GAMES_DIR:
+        return GAMES_DIR
+    return Path.home() / "Games"
+
+
+def get_prefixes_dir() -> Path:
+    """Return the standalone Wine prefixes directory."""
+    env_dir = os.environ.get("DECKINSTALL_GAMES_DIR", "").strip()
+    if env_dir:
+        return get_games_dir() / ".prefixes"
+    if PREFIXES_DIR != _DEFAULT_PREFIXES_DIR:
+        return PREFIXES_DIR
+    return get_games_dir() / ".prefixes"
 
 _KNOWN_WRAPPERS = frozenset({"gamemoderun", "lsfg-vk", "mangohud", "gamescope"})
 
@@ -350,24 +374,26 @@ def install_standalone_game(
     _validate_launch_options(launch_options)
     _validate_launch_options(winedlloverrides)
 
+    games_dir = get_games_dir()
+    prefixes_dir = get_prefixes_dir()
     clean_name = game_name.strip() or game_dir.name
     safe_dir_name = _sanitize_dir_name(clean_name)
-    GAMES_DIR.mkdir(parents=True, exist_ok=True)
-    PREFIXES_DIR.mkdir(parents=True, exist_ok=True)
+    games_dir.mkdir(parents=True, exist_ok=True)
+    prefixes_dir.mkdir(parents=True, exist_ok=True)
 
     src_dir = game_dir.resolve()
     src_exe = exe_path.resolve()
 
-    if _is_under_dir(src_dir, GAMES_DIR) and src_dir != GAMES_DIR.resolve():
+    if _is_under_dir(src_dir, games_dir) and src_dir != games_dir.resolve():
         target_game_dir = game_dir
         target_exe_path = exe_path
     else:
-        target_game_dir = GAMES_DIR / safe_dir_name
+        target_game_dir = games_dir / safe_dir_name
         if target_game_dir.exists() and target_game_dir.resolve() != src_dir:
             idx = 2
-            while (GAMES_DIR / f"{safe_dir_name} ({idx})").exists():
+            while (games_dir / f"{safe_dir_name} ({idx})").exists():
                 idx += 1
-            target_game_dir = GAMES_DIR / f"{safe_dir_name} ({idx})"
+            target_game_dir = games_dir / f"{safe_dir_name} ({idx})"
         if target_game_dir.resolve() != src_dir:
             try:
                 rel_exe = src_exe.relative_to(src_dir)
@@ -378,7 +404,7 @@ def install_standalone_game(
         else:
             target_exe_path = exe_path
 
-    prefix_dir = PREFIXES_DIR / _sanitize_dir_name(target_game_dir.name)
+    prefix_dir = prefixes_dir / _sanitize_dir_name(target_game_dir.name)
     if prefix_dir.is_symlink():
         prefix_dir.unlink()
     prefix_dir.mkdir(parents=True, exist_ok=True)
@@ -459,7 +485,7 @@ def _load_manifest(manifest_path: Path) -> StandaloneGame | None:
 
 def list_standalone_games(games_dir: Path | None = None) -> list[StandaloneGame]:
     """Return all standalone games discovered under ~/Games/*/.deckinstall_standalone.json."""
-    root = games_dir if games_dir is not None else GAMES_DIR
+    root = games_dir if games_dir is not None else get_games_dir()
     if not root.is_dir():
         return []
     games: list[StandaloneGame] = []
@@ -533,10 +559,11 @@ def _unlink_prefix_symlinks_for_compat(
     compat_dir: Path,
     preferred_name: str,
 ) -> None:
-    """Remove any Shortix-style symlinks in PREFIXES_DIR pointing to compat_dir and update manifest."""
-    if not PREFIXES_DIR.is_dir():
+    """Remove any Shortix-style symlinks in prefixes_dir pointing to compat_dir and update manifest."""
+    prefixes_dir = get_prefixes_dir()
+    if not prefixes_dir.is_dir():
         return
-    manifest_file = PREFIXES_DIR / ".deckinstall_links.json"
+    manifest_file = prefixes_dir / ".deckinstall_links.json"
     managed: set[str] = set()
     if manifest_file.is_file():
         try:
@@ -552,9 +579,9 @@ def _unlink_prefix_symlinks_for_compat(
     except OSError:
         compat_resolved = compat_dir
 
-    candidates = [PREFIXES_DIR / preferred_name]
+    candidates = [prefixes_dir / preferred_name]
     try:
-        candidates.extend(PREFIXES_DIR.iterdir())
+        candidates.extend(prefixes_dir.iterdir())
     except OSError:
         pass
 

@@ -69,20 +69,33 @@ def can_replace_appimage(appimage_path: Path | None) -> tuple[bool, str]:
     return True, ""
 
 
+def _normalize_arch(machine: str | None = None) -> str:
+    """Normalize a machine architecture string (e.g. amd64 -> x86_64, arm64 -> aarch64)."""
+    raw = (machine if machine is not None else platform.machine()).strip().lower()
+    if raw in ("x86_64", "amd64"):
+        return "x86_64"
+    if raw in ("aarch64", "arm64"):
+        return "aarch64"
+    return raw
+
+
 def _select_appimage_asset(assets: list[dict], arch: str) -> dict | None:
-    """Pick the architecture-matching AppImage asset, falling back to any AppImage."""
+    """Pick the architecture-matching AppImage asset, or None if unavailable."""
+    normalized_arch = _normalize_arch(arch)
     arch_prefix = "DeckInstall-"
-    arch_suffix = f"-{arch}.AppImage"
-    fallback: dict | None = None
+    arch_suffix = f"-{normalized_arch}.AppImage"
 
     for asset in assets:
         name = str(asset.get("name") or "")
         if name.startswith(arch_prefix) and name.endswith(arch_suffix):
             return asset
-        if fallback is None and name.endswith(".AppImage"):
-            fallback = asset
 
-    return fallback
+    for asset in assets:
+        name = str(asset.get("name") or "")
+        if name.endswith(arch_suffix):
+            return asset
+
+    return None
 
 
 def _extract_sha256(asset: dict) -> str:
@@ -109,7 +122,7 @@ def check_app_update(timeout: float = 10.0) -> AppUpdateInfo:
     has_update = parse_semver(latest_version) > parse_semver(current_version)
 
     assets = data.get("assets") or []
-    asset = _select_appimage_asset(assets, platform.machine())
+    asset = _select_appimage_asset(assets, _normalize_arch())
     download_url = str(asset.get("browser_download_url") or "") if asset else ""
     asset_name = str(asset.get("name") or "") if asset else ""
     expected_sha256 = _extract_sha256(asset) if asset else ""

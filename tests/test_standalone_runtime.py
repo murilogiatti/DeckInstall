@@ -137,6 +137,33 @@ class RuntimeManagerTests(unittest.TestCase):
         self.assertEqual(env["WINEDLLOVERRIDES"], "dxgi=n,b")
         self.assertEqual(env["MANGOHUD"], "1")
 
+    def test_get_system_package_install_cmd_and_fix_bwrap(self) -> None:
+        with mock.patch("shutil.which", side_effect=lambda b: "/usr/bin/apt-get" if b == "apt-get" else None):
+            self.assertEqual(
+                runtime_manager.get_system_package_install_cmd("gamemoderun"),
+                ["apt-get", "install", "-y", "gamemode"],
+            )
+            self.assertEqual(
+                runtime_manager.get_system_package_install_cmd("mangohud"),
+                ["apt-get", "install", "-y", "mangohud"],
+            )
+        with mock.patch("shutil.which", side_effect=lambda b: "/usr/bin/pacman" if b == "pacman" else None):
+            self.assertEqual(
+                runtime_manager.get_system_package_install_cmd("mangohud"),
+                ["pacman", "-S", "--noconfirm", "mangohud"],
+            )
+        with mock.patch("shutil.which", return_value=None):
+            ok, msg = runtime_manager.fix_bwrap_userns()
+            self.assertFalse(ok)
+            self.assertIn("sysctl", msg)
+        with (
+            mock.patch("shutil.which", side_effect=lambda b: "/usr/bin/pkexec" if b == "pkexec" else None),
+            mock.patch("subprocess.run", return_value=mock.Mock(returncode=0, stdout="", stderr="")) as mrun,
+        ):
+            ok, _ = runtime_manager.fix_bwrap_userns()
+            self.assertTrue(ok)
+            self.assertEqual(mrun.call_args[0][0][0], "/usr/bin/pkexec")
+
     def test_check_ubuntu_bwrap_userns(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             fake_sysctl = Path(tmp) / "apparmor_restrict_unprivileged_userns"

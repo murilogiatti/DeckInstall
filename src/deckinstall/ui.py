@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import shlex
+import shutil
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -71,9 +72,12 @@ from .runtime_manager import (
     check_ubuntu_bwrap_userns,
     ensure_ge_proton11,
     ensure_umu_run,
+    fix_bwrap_userns,
     get_compat_tools_dir,
     get_steamrt4_dir,
+    get_system_package_install_cmd,
     get_umu_run_path,
+    install_system_package,
     list_ge_proton11_dirs,
     validate_steamrt4_integrity,
 )
@@ -111,6 +115,7 @@ from .steam_vdf import (
     get_shortcut_proton,
     import_external_prefix_saves,
     infer_game_root_from_exe,
+    install_mangohud_topbar_config,
     list_compat_tool_usage,
     load_shortcuts,
     migrate_shortcut_to_games,
@@ -1692,6 +1697,21 @@ class MainWindow(QMainWindow):
             tr("about.body", app=__app_name__, version=__version__),
         )
 
+    def _show_bwrap_warning_dialog(self, bwrap_warn: str) -> None:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(__app_name__)
+        box.setText(tr("runtime.bwrap_warning", msg=bwrap_warn))
+        fix_btn = box.addButton(tr("runtime.bwrap_fix_btn"), QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.exec()
+        if box.clickedButton() is fix_btn:
+            ok, out = fix_bwrap_userns()
+            if ok:
+                QMessageBox.information(self, __app_name__, tr("runtime.bwrap_fix_done"))
+            else:
+                QMessageBox.warning(self, __app_name__, tr("runtime.bwrap_fix_error", err=out))
+
     def _update_runtimes(self) -> None:
         self.btn_update_runtimes.setEnabled(False)
         self.status_label.setText(tr("runtime.checking"))
@@ -1705,7 +1725,7 @@ class MainWindow(QMainWindow):
             if self._closing_pending:
                 return
             if bwrap_warn:
-                QMessageBox.warning(self, __app_name__, tr("runtime.bwrap_warning", msg=bwrap_warn))
+                self._show_bwrap_warning_dialog(bwrap_warn)
             QMessageBox.information(self, __app_name__, msg)
 
         def _err(err: str) -> None:
@@ -2171,7 +2191,7 @@ class MainWindow(QMainWindow):
             if self._closing_pending:
                 return
             if bwrap_warn:
-                QMessageBox.warning(self, __app_name__, tr("runtime.bwrap_warning", msg=bwrap_warn))
+                self._show_bwrap_warning_dialog(bwrap_warn)
             QMessageBox.information(self, __app_name__, msg)
 
         def _err(err: str) -> None:
@@ -2697,13 +2717,30 @@ class MainWindow(QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle(tr("launch.title", name=title_name))
-        dlg.resize(540, 380)
+        dlg.resize(580, 500)
         lay = QVBoxLayout(dlg)
+
+        def _muted_hint(text: str) -> QLabel:
+            lbl = QLabel(text)
+            lbl.setObjectName("MutedText")
+            lbl.setWordWrap(True)
+            lbl.setContentsMargins(20, 0, 0, 4)
+            return lbl
 
         chk_gm = QCheckBox(tr("launch.gamemode"))
         chk_gm.setChecked("gamemoderun" in tokens_now)
         chk_mh = QCheckBox(tr("launch.mangohud"))
         chk_mh.setChecked("MANGOHUD=1" in tokens_now)
+        btn_mh_topbar = QPushButton(tr("launch.btn_mangohud_topbar"))
+        btn_mh_topbar.clicked.connect(
+            lambda: QMessageBox.information(
+                dlg,
+                __app_name__,
+                tr("launch.mangohud_topbar_done", path=str(install_mangohud_topbar_config())),
+            )
+        )
+        chk_dlss = QCheckBox(tr("launch.dlss_upgrade"))
+        chk_dlss.setChecked("PROTON_DLSS_UPGRADE=1" in tokens_now)
         chk_w3d = QCheckBox(tr("launch.wined3d"))
         chk_w3d.setChecked("PROTON_USE_WINED3D=1" in tokens_now)
         chk_esync = QCheckBox(tr("launch.no_esync"))
@@ -2749,6 +2786,7 @@ class MainWindow(QMainWindow):
                     no_esync=chk_esync.isChecked(),
                     no_fsync=chk_fsync.isChecked(),
                     winedlloverrides=dll_val,
+                    dlss_upgrade=chk_dlss.isChecked(),
                 )
                 raw_edit.setText(updated)
             except ValueError:
@@ -2766,11 +2804,70 @@ class MainWindow(QMainWindow):
                 parts = [p for p in parts if p.lower() != "dxgi=n,b"]
             winedll_edit.setText(";".join(parts))
 
-        for chk in (chk_gm, chk_mh, chk_w3d, chk_esync, chk_fsync):
+        def _add_tool_preset(chk: QCheckBox, hint_text: str, bin_name: str) -> None:
+            chk.toggled.connect(_sync_preview)
+            lay.addWidget(chk)
+            lay.addWidget(_muted_hint(hint_text))
+            if shutil.which(bin_name) is None:
+                warn_row = QWidget()
+                warn_lay = QHBoxLayout(warn_row)
+                warn_lay.setContentsMargins(20, 0, 0, 4)
+                warn_lay.setSpacing(8)
+                warn_lbl = QLabel(tr("launch.missing_bin_warn", bin=bin_name))
+                warn_lbl.setWordWrap(True)
+                warn_lbl.setStyleSheet("color: #ffd180;")
+                warn_lay.addWidget(warn_lbl, 1)
+
+                install_btn = QPushButton(tr("launch.btn_install_bin", bin=bin_name))
+
+                def _on_install_bin() -> None:
+                    cmd = get_system_package_install_cmd(bin_name)
+                    if not cmd:
+                        QMessageBox.information(
+                            dlg,
+                            __app_name__,
+                            tr("launch.install_bin_manual", cmd=f"<install {bin_name}>"),
+                        )
+                        return
+                    ans = QMessageBox.question(
+                        dlg,
+                        __app_name__,
+                        tr("launch.install_bin_confirm", bin=bin_name, cmd="sudo " + " ".join(cmd)),
+                    )
+                    if ans != QMessageBox.StandardButton.Yes:
+                        return
+                    install_btn.setEnabled(False)
+                    ok, out = install_system_package(bin_name)
+                    install_btn.setEnabled(True)
+                    if ok and shutil.which(bin_name):
+                        warn_row.setVisible(False)
+                        QMessageBox.information(dlg, __app_name__, tr("launch.install_bin_done", bin=bin_name))
+                    elif ok:
+                        warn_row.setVisible(False)
+                        QMessageBox.information(dlg, __app_name__, tr("launch.install_bin_done", bin=bin_name))
+                    else:
+                        QMessageBox.warning(
+                            dlg, __app_name__, tr("launch.install_bin_error", bin=bin_name, err=out)
+                        )
+
+                install_btn.clicked.connect(_on_install_bin)
+                warn_lay.addWidget(install_btn)
+                lay.addWidget(warn_row)
+
+        _add_tool_preset(chk_gm, tr("launch.gamemode_hint"), "gamemoderun")
+        _add_tool_preset(chk_mh, tr("launch.mangohud_hint"), "mangohud")
+        lay.addWidget(btn_mh_topbar)
+
+        chk_dlss.toggled.connect(_sync_preview)
+        lay.addWidget(chk_dlss)
+        lay.addWidget(_muted_hint(tr("launch.dlss_hint")))
+
+        for chk in (chk_w3d, chk_esync, chk_fsync):
             chk.toggled.connect(_sync_preview)
             lay.addWidget(chk)
         chk_helixsr.toggled.connect(_on_helixsr_toggled)
         lay.addWidget(chk_helixsr)
+        lay.addWidget(_muted_hint(tr("launch.helixsr_hint")))
         lay.addWidget(winedll_lbl)
         lay.addWidget(winedll_edit)
         lay.addWidget(conflict_warn)
