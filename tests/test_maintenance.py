@@ -334,6 +334,15 @@ class MaintenanceTests(unittest.TestCase):
             self.assertIn("hud_compact", text)
             self.assertIn("position=top-left", text)
 
+    def test_format_size_bytes_mb_and_gb(self) -> None:
+        try:
+            from deckinstall.ui import format_size_bytes
+        except Exception:
+            self.skipTest("PySide6 not installed in this environment")
+        self.assertEqual(format_size_bytes(500 * 1024 * 1024), "500.0 MB")
+        self.assertEqual(format_size_bytes(1024 * 1024 * 1024), "1.00 GB")
+        self.assertEqual(format_size_bytes(int(1.5 * 1024 * 1024 * 1024)), "1.50 GB")
+
 
 if __name__ == "__main__":
     unittest.main()

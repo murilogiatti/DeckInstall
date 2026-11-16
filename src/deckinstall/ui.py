@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSplitter,
     QStackedWidget,
     QTextEdit,
     QVBoxLayout,
@@ -93,6 +94,7 @@ from .standalone import (
 )
 from .steam_paths import (
     SteamPaths,
+    find_steam_root,
     is_gamescope_session,
     is_steam_running,
     list_installed_protons,
@@ -445,20 +447,32 @@ class RuntimeUpdateWorker(QThread):
             info = check_runtime_updates(force=True)
             umu_info = info.get("umu", {})
             ge_info = info.get("ge_proton", {})
-            any_updated = bool(
-                umu_info.get("update_available")
-                or ge_info.get("update_available")
-                or not umu_info.get("installed")
-                or not ge_info.get("installed")
-            )
-            umu_path = ensure_umu_run(
-                force_update=True,
-                progress_cb=lambda msg, _pct: self.status.emit(msg),
-            )
-            ge_path = ensure_ge_proton11(
-                force_update=True,
-                progress_cb=lambda msg, _pct: self.status.emit(msg),
-            )
+            umu_needs_update = bool(umu_info.get("update_available")) or not umu_info.get("installed")
+            ge_needs_update = bool(ge_info.get("update_available")) or not ge_info.get("installed")
+            any_updated = umu_needs_update or ge_needs_update
+
+            if umu_needs_update:
+                umu_path = ensure_umu_run(
+                    force_update=bool(umu_info.get("update_available")),
+                    progress_cb=lambda msg, _pct: self.status.emit(msg),
+                )
+            else:
+                umu_path = Path(str(umu_info["installed_path"])) if umu_info.get("installed_path") else ensure_umu_run(
+                    force_update=False,
+                    progress_cb=lambda msg, _pct: self.status.emit(msg),
+                )
+
+            if ge_needs_update:
+                ge_path = ensure_ge_proton11(
+                    force_update=bool(ge_info.get("update_available")),
+                    progress_cb=lambda msg, _pct: self.status.emit(msg),
+                )
+            else:
+                ge_path = Path(str(ge_info["installed_path"])) if ge_info.get("installed_path") else ensure_ge_proton11(
+                    force_update=False,
+                    progress_cb=lambda msg, _pct: self.status.emit(msg),
+                )
+
             bwrap_warn = check_ubuntu_bwrap_userns() or ""
             msg = (
                 tr("runtime.updated", umu=umu_path.name, proton=ge_path.name)
@@ -517,26 +531,53 @@ class StandaloneInstallWorker(QThread):
         app_name: str,
         exe_path: Path,
         steam_appid: int | None,
+        create_menu_shortcut: bool = True,
+        create_desktop_shortcut: bool = False,
+        icon_path: Path | None = None,
+        keep_in_place: bool = False,
     ) -> None:
         super().__init__()
         self.app_name = app_name
         self.exe_path = exe_path
         self.steam_appid = steam_appid
+        self.create_menu_shortcut = create_menu_shortcut
+        self.create_desktop_shortcut = create_desktop_shortcut
+        self.icon_path = icon_path
+        self.keep_in_place = keep_in_place
 
     def run(self) -> None:
         try:
-            self.status.emit(tr("add.preparing_runtime"))
-            ensure_umu_run(progress_cb=lambda msg, _pct: self.status.emit(msg))
-            ge_dir = ensure_ge_proton11(progress_cb=lambda msg, _pct: self.status.emit(msg))
-            game_dir = infer_game_root_from_exe(self.exe_path) or self.exe_path.parent
+            is_native = detect_exe_kind(self.exe_path) == "linux_elf"
+            if is_native:
+                proton_name = ""
+            else:
+                self.status.emit(tr("add.preparing_runtime"))
+                ensure_umu_run(progress_cb=lambda msg, _pct: self.status.emit(msg))
+                ge_dir = ensure_ge_proton11(progress_cb=lambda msg, _pct: self.status.emit(msg))
+                proton_name = ge_dir.name
+
+            single_exe_only = False
+            try:
+                game_dir = infer_game_root_from_exe(self.exe_path)
+            except ValueError:
+                game_dir = self.exe_path.parent
+                if not self.keep_in_place:
+                    single_exe_only = True
+
             game = install_standalone_game(
                 game_name=self.app_name,
                 exe_path=self.exe_path,
                 game_dir=game_dir,
-                proton_name=ge_dir.name,
+                proton_name=proton_name,
                 steam_appid=self.steam_appid,
+                icon_path=self.icon_path,
+                create_menu_shortcut=self.create_menu_shortcut,
+                create_desktop_shortcut=self.create_desktop_shortcut,
+                keep_in_place=self.keep_in_place,
+                native_linux=is_native,
+                single_exe_only=single_exe_only,
             )
-            bwrap_warn = check_ubuntu_bwrap_userns() or ""
+            bwrap_warn = "" if is_native else (check_ubuntu_bwrap_userns() or "")
             self.finished_ok.emit(game, bwrap_warn)
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -674,9 +715,17 @@ def _cleanup_candidate_auto_check(cand: CleanupCandidate) -> bool:
     return (not cand.has_saves) or cand.saves_verified_migrated
 
 
+def format_size_bytes(num_bytes: int | float) -> str:
+    """Format byte count as MB (< 1024 MB) or GB (>= 1024 MB)."""
+    size = max(0.0, float(num_bytes))
+    if size >= 1024 * 1024 * 1024:
+        return f"{size / (1024 ** 3):.2f} GB"
+    return f"{size / (1024 ** 2):.1f} MB"
+
+
 def _format_cleanup_candidate_label(cand: CleanupCandidate) -> str:
     """Format a human-readable list label for a CleanupCandidate."""
-    mb = cand.size_bytes / (1024 * 1024)
+    size_str = format_size_bytes(cand.size_bytes)
     if cand.saves_verified_migrated:
         save_tag = tr("cleanup.tag_verified", game=cand.matched_game)
     elif cand.has_saves:
@@ -709,7 +758,7 @@ def _format_cleanup_candidate_label(cand: CleanupCandidate) -> str:
     }
     cat_disp = cat_map.get(cand.category, cand.category)
     hint = f" ({cand.game_hint})" if cand.game_hint else ""
-    return f"[{cat_disp}] {cand.label}{hint} — {mb:.1f} MB{save_tag}"
+    return f"[{cat_disp}] {cand.label}{hint} — {size_str}{save_tag}"
 
 
 class FlowLayout(QLayout):
@@ -810,6 +859,9 @@ class MainWindow(QMainWindow):
         set_language(str(self.settings.value("language", "auto")))
         self.paths = resolve_steam_paths()
         self._detected_games: list[DetectedGame] = []
+        self._standalone_games: list[StandaloneGame] = []
+        self._steam_shortcuts: list[ShortcutEntry] = []
+        self._custom_icon_path: Path | None = None
         self._active_workers: set[QThread] = set()
         self._closing_pending = False
         self._vdf_corrupt = False
@@ -871,7 +923,9 @@ class MainWindow(QMainWindow):
         shell.setContentsMargins(0, 0, 0, 0)
         shell.setSpacing(0)
 
-        shell.addWidget(self._build_sidebar())
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_splitter.setChildrenCollapsible(False)
+        main_splitter.addWidget(self._build_sidebar())
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -896,13 +950,19 @@ class MainWindow(QMainWindow):
         self.status_label.setObjectName("MutedText")
         right_layout.addWidget(self.status_label)
 
-        shell.addWidget(right, 1)
+        main_splitter.addWidget(right)
+        main_splitter.setStretchFactor(0, 0)
+        main_splitter.setStretchFactor(1, 1)
+        main_splitter.setSizes([225, 755])
+        shell.addWidget(main_splitter)
         self.setCentralWidget(central)
+        self._update_steam_mode_ui()
 
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(225)
+        sidebar.setMinimumWidth(180)
+        sidebar.setMaximumWidth(360)
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(14, 20, 14, 16)
         layout.setSpacing(6)
@@ -948,13 +1008,14 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
-        steam_lbl = QLabel(
-            tr("status.steam_id", id=self.paths.user_id)
-            if self.paths
-            else tr("status.steam_not_detected")
-        )
-        steam_lbl.setObjectName("MutedText")
-        layout.addWidget(steam_lbl)
+        self.steam_status_lbl = QLabel(self._format_steam_status_text())
+        self.steam_status_lbl.setObjectName("MutedText")
+        self.steam_status_lbl.setWordWrap(True)
+        layout.addWidget(self.steam_status_lbl)
+
+        self.btn_redetect_steam = QPushButton(tr("sidebar.redetect_steam"))
+        self.btn_redetect_steam.clicked.connect(self._redetect_steam)
+        layout.addWidget(self.btn_redetect_steam)
 
         theme_lbl = QLabel(tr("header.theme"))
         theme_lbl.setObjectName("MutedText")
@@ -993,6 +1054,42 @@ class MainWindow(QMainWindow):
         btn_about.clicked.connect(self._show_about_dialog)
         layout.addWidget(btn_about)
         return sidebar
+
+    def _format_steam_status_text(self) -> str:
+        """Return localized sidebar status text for the current Steam detection state."""
+        if self.paths:
+            return tr("status.steam_id", id=self.paths.user_id)
+        if find_steam_root() is not None:
+            return tr("status.steam_needs_login")
+        return tr("status.steam_not_detected")
+
+    def _redetect_steam(self) -> None:
+        """Re-scan Steam paths and update all adaptive UI states."""
+        self.paths = resolve_steam_paths()
+        status_text = self._format_steam_status_text()
+        self.steam_status_lbl.setText(status_text)
+        self._update_steam_mode_ui()
+        self._refresh_shortcuts()
+        self.status_label.setText(status_text)
+
+    def _update_steam_mode_ui(self) -> None:
+        """Adapt Add/Extract/Maintenance controls for Steam vs Standalone-only mode."""
+        has_steam = self.paths is not None
+        self.add_no_steam_banner.setVisible(not has_steam)
+        self.btn_add_steam.setVisible(has_steam)
+        self.chk_proton.setVisible(has_steam)
+        self.chk_restart.setVisible(has_steam)
+        self.btn_add_steam.setObjectName("primaryBtn" if has_steam else "")
+        self.btn_add_standalone.setObjectName("" if has_steam else "primaryBtn")
+        for btn in (self.btn_add_steam, self.btn_add_standalone):
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+            btn.update()
+        self.btn_use_extracted.setText(
+            tr("install.btn_add_steam") if has_steam else tr("install.btn_continue_add")
+        )
+        if hasattr(self, "btn_maint_revalidate"):
+            self.btn_maint_revalidate.setEnabled(has_steam)
 
     def _build_extract_page(self) -> QWidget:
         page = QWidget()
@@ -1082,6 +1179,18 @@ class MainWindow(QMainWindow):
         layout.addWidget(title)
         layout.addWidget(sub)
 
+        self.add_no_steam_banner = QLabel(tr("add.no_steam_banner"))
+        self.add_no_steam_banner.setWordWrap(True)
+        self.add_no_steam_banner.setStyleSheet(
+            "background-color: rgba(61, 174, 233, 0.14); "
+            "border: 1px solid rgba(61, 174, 233, 0.55); border-radius: 6px; padding: 8px;"
+        )
+        self.add_no_steam_banner.setVisible(False)
+        layout.addWidget(self.add_no_steam_banner)
+
+        add_vsplit = QSplitter(Qt.Orientation.Vertical)
+        add_vsplit.setChildrenCollapsible(False)
+
         list_card, list_layout = _make_card()
         scan_row = QHBoxLayout()
         lbl_det = QLabel(tr("install.detected_title"))
@@ -1097,22 +1206,25 @@ class MainWindow(QMainWindow):
         list_layout.addLayout(scan_row)
 
         self.games_list = QListWidget()
-        self.games_list.setMaximumHeight(145)
+        self.games_list.setMinimumHeight(110)
         self.games_list.currentRowChanged.connect(self._on_game_selected)
-        list_layout.addWidget(self.games_list)
-        layout.addWidget(list_card)
+        list_layout.addWidget(self.games_list, 1)
+        add_vsplit.addWidget(list_card)
 
         cfg_card, cfg_layout = _make_card()
         prev_lbl = QLabel(tr("install.preview_title"))
         prev_lbl.setObjectName("SectionTitle")
         cfg_layout.addWidget(prev_lbl)
-        cfg_split = QHBoxLayout()
-        cfg_split.setSpacing(16)
+        cfg_split = QSplitter(Qt.Orientation.Horizontal)
+        cfg_split.setChildrenCollapsible(False)
 
-        form = QFormLayout()
+        form_widget = QWidget()
+        form = QFormLayout(form_widget)
+        form.setContentsMargins(0, 0, 8, 0)
         form.setSpacing(10)
         self.add_name = QLineEdit()
         self.add_name.setPlaceholderText(tr("install.game_name_placeholder"))
+        self.add_name.textChanged.connect(self._update_remove_existing_state)
         form.addRow(tr("install.folder_label"), self.add_name)
 
         self.add_exe_combo = QComboBox()
@@ -1121,6 +1233,7 @@ class MainWindow(QMainWindow):
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
         self.add_exe_combo.setMinimumContentsLength(24)
+        self.add_exe_combo.currentTextChanged.connect(self._on_exe_changed)
         form.addRow(tr("install.exe_label"), self.add_exe_combo)
 
         art_row = QHBoxLayout()
@@ -1149,26 +1262,72 @@ class MainWindow(QMainWindow):
         self.chk_restart.setChecked(True)
         form.addRow("", self.chk_restart)
 
-        cfg_split.addLayout(form, 1)
+        targets_row = QHBoxLayout()
+        self.chk_shortcut_menu = QCheckBox(tr("add.shortcut_menu"))
+        self.chk_shortcut_menu.setChecked(True)
+        self.chk_shortcut_desktop = QCheckBox(tr("add.shortcut_desktop"))
+        self.chk_shortcut_desktop.setChecked(False)
+        targets_row.addWidget(self.chk_shortcut_menu)
+        targets_row.addWidget(self.chk_shortcut_desktop)
+        targets_row.addStretch()
+        form.addRow(tr("add.standalone_targets"), targets_row)
 
+        self.chk_keep_in_place = QCheckBox(tr("add.keep_in_place"))
+        self.chk_keep_in_place.setChecked(False)
+        form.addRow("", self.chk_keep_in_place)
+
+        cfg_split.addWidget(form_widget)
+
+        preview_wrap = QWidget()
+        preview_lay = QVBoxLayout(preview_wrap)
+        preview_lay.setContentsMargins(8, 0, 0, 0)
         self.preview_label = QLabel(tr("install.art_preview_empty"))
         self.preview_label.setObjectName("PreviewBox")
         self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_label.setWordWrap(True)
-        self.preview_label.setFixedSize(230, 108)
-        cfg_split.addWidget(self.preview_label, 0, Qt.AlignmentFlag.AlignTop)
+        self.preview_label.setMinimumSize(180, 108)
+        preview_lay.addWidget(self.preview_label)
 
-        cfg_layout.addLayout(cfg_split)
+        icon_btn_row = QHBoxLayout()
+        icon_btn_row.setSpacing(6)
+        self.btn_pick_icon = QPushButton(tr("add.btn_pick_icon"))
+        self.btn_pick_icon.clicked.connect(self._pick_custom_icon)
+        icon_btn_row.addWidget(self.btn_pick_icon, 1)
+        self.btn_clear_icon = QPushButton(tr("add.btn_clear_icon"))
+        self.btn_clear_icon.clicked.connect(self._clear_custom_icon)
+        self.btn_clear_icon.setVisible(False)
+        icon_btn_row.addWidget(self.btn_clear_icon)
+        preview_lay.addLayout(icon_btn_row)
+        preview_lay.addStretch()
+        cfg_split.addWidget(preview_wrap)
+        cfg_split.setStretchFactor(0, 1)
+        cfg_split.setStretchFactor(1, 0)
+        cfg_split.setSizes([460, 240])
 
+        cfg_layout.addWidget(cfg_split, 1)
+
+        actions_row = QHBoxLayout()
+        actions_row.setSpacing(10)
         self.btn_add_steam = QPushButton(tr("install.btn_add_steam"))
         self.btn_add_steam.setObjectName("primaryBtn")
         self.btn_add_steam.clicked.connect(self._add_selected_to_steam)
-        cfg_layout.addWidget(self.btn_add_steam)
+        actions_row.addWidget(self.btn_add_steam, 1)
 
         self.btn_add_standalone = QPushButton(tr("install.btn_add_standalone"))
         self.btn_add_standalone.clicked.connect(self._add_selected_standalone)
-        cfg_layout.addWidget(self.btn_add_standalone)
-        layout.addWidget(cfg_card, 1)
+        actions_row.addWidget(self.btn_add_standalone, 1)
+
+        self.btn_remove_existing = QPushButton(tr("add.btn_remove_existing"))
+        self.btn_remove_existing.clicked.connect(self._remove_existing_from_add)
+        self.btn_remove_existing.setVisible(False)
+        actions_row.addWidget(self.btn_remove_existing)
+        cfg_layout.addLayout(actions_row)
+
+        add_vsplit.addWidget(cfg_card)
+        add_vsplit.setStretchFactor(0, 1)
+        add_vsplit.setStretchFactor(1, 2)
+        add_vsplit.setSizes([200, 420])
+        layout.addWidget(add_vsplit, 1)
         return page
 
     def _build_library_page(self) -> QWidget:
@@ -1429,14 +1588,19 @@ class MainWindow(QMainWindow):
         for extra_pfx_root in (Path.home() / "Games" / "Prefixes", Path.home() / "Prefixes"):
             if extra_pfx_root.is_dir():
                 prefix_dirs.append(extra_pfx_root)
-        prefixes_mb = sum(_dir_size_bytes(p) for p in prefix_dirs) / (1024 * 1024)
+        prefixes_bytes = sum(_dir_size_bytes(p) for p in prefix_dirs)
 
         runtime_dirs = [p for p in (umu_path.parent, get_compat_tools_dir()) if p.is_dir()]
-        runtimes_mb = sum(_dir_size_bytes(p) for p in runtime_dirs) / (1024 * 1024)
+        runtimes_bytes = sum(_dir_size_bytes(p) for p in runtime_dirs)
 
-        caches_mb = sum(c.size_bytes for c in self._maint_candidates) / (1024 * 1024)
+        caches_bytes = sum(c.size_bytes for c in self._maint_candidates)
         self.lbl_maint_disk.setText(
-            tr("maint.health_disk", prefixes=prefixes_mb, runtimes=runtimes_mb, caches=caches_mb)
+            tr(
+                "maint.health_disk",
+                prefixes=format_size_bytes(prefixes_bytes),
+                runtimes=format_size_bytes(runtimes_bytes),
+                caches=format_size_bytes(caches_bytes),
+            )
         )
 
     def _on_maint_filter_changed(self, key: str) -> None:
@@ -1468,14 +1632,14 @@ class MainWindow(QMainWindow):
     def _update_maint_summary(self) -> None:
         sel_items = [c for c in self._maint_candidates if self._maint_checked.get(c.path, False)]
         sel_count = len(sel_items)
-        sel_mb = sum(c.size_bytes for c in sel_items) / (1024 * 1024)
+        sel_size = format_size_bytes(sum(c.size_bytes for c in sel_items))
         safe_items = [c for c in self._maint_candidates if _cleanup_candidate_auto_check(c)]
-        safe_mb = sum(c.size_bytes for c in safe_items) / (1024 * 1024)
+        safe_size = format_size_bytes(sum(c.size_bytes for c in safe_items))
         self.lbl_maint_summary.setText(
-            tr("maint.summary", sel_mb=sel_mb, sel_count=sel_count, safe_mb=safe_mb)
+            tr("maint.summary", sel_size=sel_size, sel_count=sel_count, safe_size=safe_size)
         )
-        self.btn_maint_clean_safe.setText(tr("maint.btn_clean_safe", mb=safe_mb))
-        self.btn_maint_delete_selected.setText(tr("maint.btn_delete_selected", mb=sel_mb))
+        self.btn_maint_clean_safe.setText(tr("maint.btn_clean_safe", size=safe_size))
+        self.btn_maint_delete_selected.setText(tr("maint.btn_delete_selected", size=sel_size))
 
     def _apply_maint_scan_results(self, candidates: list[CleanupCandidate]) -> None:
         self._maint_candidates = candidates
@@ -1579,14 +1743,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, __app_name__, tr("cleanup.wine_running"))
             return
         safe_items = [c for c in self._maint_candidates if _cleanup_candidate_auto_check(c)]
-        safe_mb = sum(c.size_bytes for c in safe_items) / (1024 * 1024)
+        safe_size = format_size_bytes(sum(c.size_bytes for c in safe_items))
         if not safe_items:
             QMessageBox.information(self, __app_name__, tr("maint.safe_clean_empty"))
             return
         ans = QMessageBox.question(
             self,
             __app_name__,
-            tr("maint.confirm_safe_clean", count=len(safe_items), mb=safe_mb),
+            tr("maint.confirm_safe_clean", count=len(safe_items), size=safe_size),
         )
         if ans == QMessageBox.StandardButton.Yes:
             self._run_maint_delete(safe_items)
@@ -1598,11 +1762,11 @@ class MainWindow(QMainWindow):
         selected = [c for c in self._maint_candidates if self._maint_checked.get(c.path, False)]
         if not selected:
             return
-        sel_mb = sum(c.size_bytes for c in selected) / (1024 * 1024)
+        sel_size = format_size_bytes(sum(c.size_bytes for c in selected))
         ans = QMessageBox.question(
             self,
             __app_name__,
-            tr("maint.confirm_delete_selected", count=len(selected), mb=sel_mb),
+            tr("maint.confirm_delete_selected", count=len(selected), size=sel_size),
         )
         if ans == QMessageBox.StandardButton.Yes:
             self._run_maint_delete(selected)
@@ -1637,8 +1801,7 @@ class MainWindow(QMainWindow):
         ) -> None:
             self._set_steam_busy(False)
             self._apply_maint_scan_results(new_cands)
-            mb = freed / (1024 * 1024)
-            msg = tr("cleanup.deleted", deleted=deleted, mb=mb)
+            msg = tr("cleanup.deleted", deleted=deleted, size=format_size_bytes(freed))
             if errs:
                 msg += tr("cleanup.delete_warnings", errs="\n".join(errs[:10]))
             self.status_label.setText(msg.splitlines()[0])
@@ -1977,10 +2140,15 @@ class MainWindow(QMainWindow):
 
     def _populate_game_form(self, game: DetectedGame) -> None:
         self._search_req_id += 1
+        self._custom_icon_path = None
+        self.btn_clear_icon.setVisible(False)
         self.add_name.setText(game.name)
         self.add_exe_combo.clear()
         for exe in game.executables:
             self.add_exe_combo.addItem(str(exe))
+        self.chk_keep_in_place.setChecked(
+            str(game.primary_exe).startswith(("/run/media/", "/mnt/"))
+        )
         self.steam_search_input.setText(
             str(game.steam_appid) if game.steam_appid else game.name
         )
@@ -1989,17 +2157,23 @@ class MainWindow(QMainWindow):
             self.steam_match_combo.addItem(
                 tr("add.detected_appid", appid=game.steam_appid), game.steam_appid
             )
+        self._update_remove_existing_state()
 
     def _on_manual_exe_picked(self, path: str) -> None:
         if not path:
             return
         self._search_req_id += 1
+        self._custom_icon_path = None
+        self.btn_clear_icon.setVisible(False)
         exe = Path(path)
         game = scan_game_folder(exe.parent)
         name = game.name if game else exe.stem
         self.add_name.setText(name)
         self.add_exe_combo.clear()
         self.add_exe_combo.addItem(str(exe))
+        self.chk_keep_in_place.setChecked(
+            str(exe).startswith(("/run/media/", "/mnt/"))
+        )
         self.steam_search_input.setText(
             str(game.steam_appid) if (game and game.steam_appid) else name
         )
@@ -2010,6 +2184,56 @@ class MainWindow(QMainWindow):
             )
         else:
             self.preview_label.setText(tr("add.art_placeholder"))
+        self._update_remove_existing_state()
+
+    def _on_exe_changed(self, text: str) -> None:
+        """Update Proton default and Remove button visibility when the executable changes."""
+        cleaned = text.strip()
+        if cleaned:
+            exe_path = Path(cleaned)
+            if exe_path.is_file() and detect_exe_kind(exe_path) == "linux_elf":
+                self.chk_proton.setChecked(False)
+        self._update_remove_existing_state()
+
+    def _pick_custom_icon(self) -> None:
+        _pick_file_async(
+            self,
+            tr("add.pick_icon_title"),
+            Path.home(),
+            tr("add.pick_icon_filter"),
+            self._on_custom_icon_picked,
+        )
+
+    def _on_custom_icon_picked(self, path: str) -> None:
+        if not path:
+            return
+        icon_path = Path(path)
+        pix = QPixmap(str(icon_path))
+        self._custom_icon_path = icon_path
+        self.btn_clear_icon.setVisible(True)
+        if not pix.isNull():
+            self._display_preview_pixmap(pix)
+        else:
+            self.preview_label.setText(icon_path.name)
+
+    def _clear_custom_icon(self) -> None:
+        self._custom_icon_path = None
+        self.btn_clear_icon.setVisible(False)
+        self.preview_label.clear()
+        if self.steam_match_combo.count() > 0:
+            self._on_steam_match_changed()
+        else:
+            self.preview_label.setText(tr("add.art_placeholder"))
+
+    def _display_preview_pixmap(self, pix: QPixmap) -> None:
+        dpr = max(1.0, self.preview_label.devicePixelRatioF())
+        scaled = pix.scaled(
+            self.preview_label.size() * dpr,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        scaled.setDevicePixelRatio(dpr)
+        self.preview_label.setPixmap(scaled)
 
     def _pick_manual_exe(self) -> None:
         _pick_file_async(
@@ -2066,6 +2290,8 @@ class MainWindow(QMainWindow):
         )
 
     def _on_steam_match_changed(self) -> None:
+        if self._custom_icon_path is not None:
+            return
         appid = self.steam_match_combo.currentData()
         self._preview_req_id += 1
         if isinstance(appid, bool) or not isinstance(appid, int) or appid <= 0:
@@ -2081,23 +2307,16 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_preview_failed(self, req_id: int) -> None:
-        if req_id != self._preview_req_id:
+        if req_id != self._preview_req_id or self._custom_icon_path is not None:
             return
         self.preview_label.setText(tr("add.art_placeholder"))
 
     def _set_preview_bytes(self, req_id: int, raw: bytes) -> None:
-        if req_id != self._preview_req_id:
+        if req_id != self._preview_req_id or self._custom_icon_path is not None:
             return
         pix = QPixmap()
         if pix.loadFromData(raw):
-            dpr = max(1.0, self.preview_label.devicePixelRatioF())
-            scaled = pix.scaled(
-                self.preview_label.size() * dpr,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            scaled.setDevicePixelRatio(dpr)
-            self.preview_label.setPixmap(scaled)
+            self._display_preview_pixmap(pix)
         else:
             self.preview_label.setText(tr("add.art_placeholder"))
 
@@ -2171,6 +2390,11 @@ class MainWindow(QMainWindow):
         validated = self._validate_add_inputs()
         if validated is None:
             return
+        create_menu = self.chk_shortcut_menu.isChecked()
+        create_desktop = self.chk_shortcut_desktop.isChecked()
+        if not create_menu and not create_desktop:
+            QMessageBox.warning(self, __app_name__, tr("add.no_shortcut_selected"))
+            return
         app_name, exe_path = validated
         steam_appid = self._resolve_selected_steam_appid()
 
@@ -2179,6 +2403,10 @@ class MainWindow(QMainWindow):
             app_name=app_name,
             exe_path=exe_path,
             steam_appid=steam_appid,
+            create_menu_shortcut=create_menu,
+            create_desktop_shortcut=create_desktop,
+            icon_path=self._custom_icon_path,
+            keep_in_place=self.chk_keep_in_place.isChecked(),
         )
         self._track_worker(worker)
         worker.status.connect(self.status_label.setText)
@@ -2223,7 +2451,7 @@ class MainWindow(QMainWindow):
         if not self.paths:
             self._vdf_corrupt = False
             self.vdf_error_banner.hide()
-            self._set_vdf_write_enabled(True)
+            self._set_vdf_write_enabled(False)
         else:
             try:
                 entries = load_shortcuts(self.paths.shortcuts_vdf)
@@ -2237,6 +2465,9 @@ class MainWindow(QMainWindow):
                 self._set_vdf_write_enabled(False)
 
         standalone_games = list_standalone_games()
+        self._steam_shortcuts = entries
+        self._standalone_games = standalone_games
+        self._update_remove_existing_state()
         if not entries and not standalone_games:
             empty_item = QListWidgetItem(tr("library.no_shortcuts"))
             empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
@@ -2297,6 +2528,7 @@ class MainWindow(QMainWindow):
             self.act_launch_opts,
             self.act_backup_saves,
             self.act_restore_saves,
+            self.act_link_prefixes,
             self.act_import_steam,
             self.act_remove,
         ):
@@ -2312,7 +2544,6 @@ class MainWindow(QMainWindow):
             self.btn_tools_menu,
             self.act_art,
             self.act_revert_art,
-            self.act_link_prefixes,
             self.act_cleanup,
             self.act_export_standalone,
             self.btn_maint_scan,
@@ -2321,9 +2552,10 @@ class MainWindow(QMainWindow):
         ):
             w.setEnabled(enabled)
         self.btn_maint_revalidate.setEnabled(enabled and (self.paths is not None))
-        self._set_vdf_write_enabled(enabled and not self._vdf_corrupt)
+        self._set_vdf_write_enabled(enabled and bool(self.paths) and not self._vdf_corrupt)
         if enabled:
             self._update_library_action_states()
+        self._update_remove_existing_state()
 
     def _update_selected_shortcut_art(self) -> None:
         entry = self._selected_shortcut()
@@ -3146,39 +3378,106 @@ class MainWindow(QMainWindow):
         worker.failed.connect(_err)
         worker.start()
 
-    def _remove_selected_shortcut(self) -> None:
-        sel = self._selected_library_item()
-        if not sel:
-            return
-        kind, obj = sel
-        if kind == "standalone":
-            assert isinstance(obj, StandaloneGame)
-            ans = QMessageBox.question(
-                self,
-                __app_name__,
-                tr("library.standalone_remove_confirm", name=obj.name),
-            )
-            if ans != QMessageBox.StandardButton.Yes:
-                return
+    def _find_matching_installed(self) -> tuple[StandaloneGame | None, ShortcutEntry | None]:
+        """Match the current Add-tab game/exe against existing Standalone games and Steam shortcuts."""
+        exe_str = self.add_exe_combo.currentText().strip()
+        name_str = self.add_name.text().strip().lower()
+        exe_resolved: Path | None = None
+        if exe_str:
             try:
-                remove_standalone_game(obj, delete_files=False)
-            except Exception as exc:
-                QMessageBox.critical(self, __app_name__, str(exc))
-                return
-            self._refresh_shortcuts()
-            self.status_label.setText(tr("library.removed", name=obj.name))
-            return
+                exe_resolved = Path(exe_str).expanduser().resolve()
+            except OSError:
+                exe_resolved = Path(exe_str)
 
-        entry = obj
-        assert isinstance(entry, ShortcutEntry)
-        if not self.paths:
-            return
-        ans = QMessageBox.question(
-            self,
-            __app_name__,
-            tr("library.remove_confirm", name=entry.app_name),
+        matched_sa: StandaloneGame | None = None
+        for game in self._standalone_games:
+            try:
+                g_exe = game.exe_path.resolve()
+                g_dir = game.game_dir.resolve()
+            except OSError:
+                g_exe = game.exe_path
+                g_dir = game.game_dir
+            if exe_resolved is not None and (
+                exe_resolved == g_exe or exe_resolved.parent == g_dir or g_dir in exe_resolved.parents
+            ):
+                matched_sa = game
+                break
+            if name_str and game.name.strip().lower() == name_str:
+                matched_sa = game
+                break
+
+        matched_steam: ShortcutEntry | None = None
+        for entry in self._steam_shortcuts:
+            entry_exe = entry.exe.strip().strip('"')
+            if exe_resolved is not None and entry_exe:
+                try:
+                    if Path(entry_exe).resolve() == exe_resolved:
+                        matched_steam = entry
+                        break
+                except OSError:
+                    if entry_exe == exe_str:
+                        matched_steam = entry
+                        break
+            if name_str and entry.app_name.strip().lower() == name_str:
+                matched_steam = entry
+                break
+
+        return matched_sa, matched_steam
+
+    def _update_remove_existing_state(self) -> None:
+        """Show/enable the Add-tab Remove button when the current game is already installed."""
+        sa, steam_entry = self._find_matching_installed()
+        has_match = (sa is not None) or (
+            steam_entry is not None and bool(self.paths) and not self._vdf_corrupt
         )
-        if ans != QMessageBox.StandardButton.Yes:
+        self.btn_remove_existing.setVisible(has_match)
+        self.btn_remove_existing.setEnabled(has_match)
+
+    def _ask_standalone_remove_mode(
+        self, game_name: str, also_steam: bool = False
+    ) -> tuple[bool, bool] | None:
+        """Prompt user for 3-tier standalone removal: (delete_files, delete_prefix) or None."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(__app_name__)
+        msg = tr("remove.choose_mode", name=game_name)
+        if also_steam:
+            msg += "\n\n" + tr("remove.also_steam_note")
+        box.setText(msg)
+        btn_shortcut = box.addButton(
+            tr("remove.mode_shortcut_only"), QMessageBox.ButtonRole.AcceptRole
+        )
+        btn_prefix = box.addButton(
+            tr("remove.mode_shortcut_prefix"), QMessageBox.ButtonRole.AcceptRole
+        )
+        btn_all = box.addButton(
+            tr("remove.mode_all"), QMessageBox.ButtonRole.DestructiveRole
+        )
+        btn_cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(btn_cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == btn_shortcut:
+            return (False, False)
+        if clicked == btn_prefix:
+            return (False, True)
+        if clicked == btn_all:
+            if also_steam:
+                confirm = QMessageBox.question(
+                    self,
+                    __app_name__,
+                    tr("remove.confirm_all_with_steam", name=game_name),
+                )
+                if confirm != QMessageBox.StandardButton.Yes:
+                    return None
+            return (True, True)
+        return None
+
+    def _remove_steam_shortcut_async(
+        self, entry: ShortcutEntry, refresh_games: bool = False
+    ) -> None:
+        """Remove a Steam Non-Steam shortcut in a background thread."""
+        if not self.paths:
             return
         self._set_steam_busy(True)
         self.status_label.setText(tr("library.removing", name=entry.app_name))
@@ -3210,7 +3509,9 @@ class MainWindow(QMainWindow):
 
         def _on_removed(removed: bool) -> None:
             self._set_steam_busy(False)
-            if removed:
+            if refresh_games:
+                self._refresh_games()
+            if removed or refresh_games:
                 self._refresh_shortcuts()
                 self.status_label.setText(tr("library.removed", name=entry.app_name))
 
@@ -3222,6 +3523,79 @@ class MainWindow(QMainWindow):
         worker.done.connect(_on_removed)
         worker.failed.connect(_on_remove_err)
         worker.start()
+
+    def _remove_existing_from_add(self) -> None:
+        """Remove an existing Standalone game and/or Steam shortcut from the Add tab."""
+        sa, steam_entry = self._find_matching_installed()
+        if sa is None and steam_entry is None:
+            return
+        if sa is not None:
+            choice = self._ask_standalone_remove_mode(
+                sa.name, also_steam=steam_entry is not None
+            )
+            if choice is None:
+                return
+            delete_files, delete_prefix = choice
+            try:
+                remove_standalone_game(
+                    sa, delete_files=delete_files, delete_prefix=delete_prefix
+                )
+            except Exception as exc:
+                QMessageBox.critical(self, __app_name__, str(exc))
+                return
+            if steam_entry is not None and self.paths is not None:
+                self._remove_steam_shortcut_async(steam_entry, refresh_games=True)
+            else:
+                self._refresh_games()
+                self._refresh_shortcuts()
+                self.status_label.setText(tr("library.removed", name=sa.name))
+            return
+
+        if steam_entry is not None and self.paths is not None:
+            ans = QMessageBox.question(
+                self,
+                __app_name__,
+                tr("library.remove_confirm", name=steam_entry.app_name),
+            )
+            if ans == QMessageBox.StandardButton.Yes:
+                self._remove_steam_shortcut_async(steam_entry, refresh_games=True)
+
+    def _remove_selected_shortcut(self) -> None:
+        sel = self._selected_library_item()
+        if not sel:
+            return
+        kind, obj = sel
+        if kind == "standalone":
+            assert isinstance(obj, StandaloneGame)
+            choice = self._ask_standalone_remove_mode(obj.name, also_steam=False)
+            if choice is None:
+                return
+            delete_files, delete_prefix = choice
+            try:
+                remove_standalone_game(
+                    obj, delete_files=delete_files, delete_prefix=delete_prefix
+                )
+            except Exception as exc:
+                QMessageBox.critical(self, __app_name__, str(exc))
+                return
+            if delete_files:
+                self._refresh_games()
+            self._refresh_shortcuts()
+            self.status_label.setText(tr("library.removed", name=obj.name))
+            return
+
+        entry = obj
+        assert isinstance(entry, ShortcutEntry)
+        if not self.paths:
+            return
+        ans = QMessageBox.question(
+            self,
+            __app_name__,
+            tr("library.remove_confirm", name=entry.app_name),
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self._remove_steam_shortcut_async(entry)
 
     def _migrate_selected_shortcut(self) -> None:
         entry = self._selected_shortcut()
@@ -3425,7 +3799,7 @@ class MainWindow(QMainWindow):
                 if it.checkState() == Qt.CheckState.Checked:
                     c: CleanupCandidate = it.data(Qt.ItemDataRole.UserRole)
                     sel_bytes += c.size_bytes
-            total_lbl.setText(tr("cleanup.total", mb=sel_bytes / (1024 * 1024)))
+            total_lbl.setText(tr("cleanup.total", size=format_size_bytes(sel_bytes)))
 
         def _populate_list(items: list[CleanupCandidate]) -> None:
             lst.blockSignals(True)
@@ -3575,8 +3949,7 @@ class MainWindow(QMainWindow):
 
         def _on_deleted(deleted: int, freed: int, errs: list[str]) -> None:
             self._set_steam_busy(False)
-            mb = freed / (1024 * 1024)
-            msg = tr("cleanup.deleted", deleted=deleted, mb=mb)
+            msg = tr("cleanup.deleted", deleted=deleted, size=format_size_bytes(freed))
             if errs:
                 msg += tr("cleanup.delete_warnings", errs="\n".join(errs[:10]))
             self.status_label.setText(msg.splitlines()[0])

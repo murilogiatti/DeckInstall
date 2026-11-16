@@ -375,6 +375,155 @@ class StandaloneAndVdfTests(unittest.TestCase):
             self.assertNotIn(active_prefix.resolve(), candidate_paths)
             self.assertIn(orphan_prefix.resolve(), candidate_paths)
 
+    def test_standalone_desktop_shortcut_and_pe_icon_extraction(self) -> None:
+        import struct
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            games_dir = root / "Games"
+            prefixes_dir = games_dir / ".prefixes"
+            apps_dir = root / "applications"
+            desktop_dir = root / "Desktop"
+            src_game = root / "Downloads" / "IconGame"
+            src_game.mkdir(parents=True)
+            src_exe = src_game / "IconGame.exe"
+
+            # Build minimal valid PE32 with .rsrc containing RT_ICON(3) & RT_GROUP_ICON(14)
+            icon_png = b"\x89PNG\r\n\x1a\nFAKE_ICON_BYTES"
+            grp_blob = struct.pack("<HHH", 0, 1, 1) + struct.pack("<BBBBHHIH", 32, 32, 0, 0, 1, 32, len(icon_png), 1)
+
+            # Lay out .rsrc starting at file offset 0x200, RVA 0x2000
+            rsrc = bytearray(512)
+            # Level 1 (offset 0): 2 ID entries: type 3 -> subdir 0x28, type 14 -> subdir 0x60
+            struct.pack_into("<12xHH", rsrc, 0, 0, 2)
+            struct.pack_into("<II", rsrc, 16, 3, 0x80000028)
+            struct.pack_into("<II", rsrc, 24, 14, 0x80000060)
+
+            # Type 3 Level 2 (offset 0x28): 1 ID entry: id 1 -> subdir 0x40
+            struct.pack_into("<12xHH", rsrc, 0x28, 0, 1)
+            struct.pack_into("<II", rsrc, 0x38, 1, 0x80000040)
+            # Type 3 Level 3 (offset 0x40): 1 ID entry: lang 1033 -> data entry 0x58
+            struct.pack_into("<12xHH", rsrc, 0x40, 0, 1)
+            struct.pack_into("<II", rsrc, 0x50, 1033, 0x58)
+            # Data entry 0x58: RVA 0x2100, size len(icon_png)
+            struct.pack_into("<II", rsrc, 0x58, 0x2100, len(icon_png))
+
+            # Type 14 Level 2 (offset 0x60): 1 ID entry: id 1 -> subdir 0x78
+            struct.pack_into("<12xHH", rsrc, 0x60, 0, 1)
+            struct.pack_into("<II", rsrc, 0x70, 1, 0x80000078)
+            # Type 14 Level 3 (offset 0x78): 1 ID entry: lang 1033 -> data entry 0x90
+            struct.pack_into("<12xHH", rsrc, 0x78, 0, 1)
+            struct.pack_into("<II", rsrc, 0x88, 1033, 0x90)
+            # Data entry 0x90: RVA 0x2140, size len(grp_blob)
+            struct.pack_into("<II", rsrc, 0x90, 0x2140, len(grp_blob))
+
+            rsrc[0x100 : 0x100 + len(icon_png)] = icon_png
+            rsrc[0x140 : 0x140 + len(grp_blob)] = grp_blob
+
+            pe = bytearray(0x200)
+            pe[0:2] = b"MZ"
+            struct.pack_into("<I", pe, 0x3C, 0x80)
+            pe[0x80:0x84] = b"PE\x00\x00"
+            struct.pack_into("<H", pe, 0x86, 1)  # NumberOfSections
+            struct.pack_into("<H", pe, 0x94, 128)  # SizeOfOptionalHeader
+            opt = 0x98
+            struct.pack_into("<H", pe, opt, 0x10B)  # PE32
+            struct.pack_into("<II", pe, opt + 96 + 2 * 8, 0x2000, len(rsrc))
+            sec = opt + 128
+            pe[sec : sec + 5] = b".rsrc"
+            struct.pack_into("<IIII", pe, sec + 8, len(rsrc), 0x2000, len(rsrc), 0x200)
+            src_exe.write_bytes(bytes(pe) + bytes(rsrc))
+
+            # Non-PE file returns None safely
+            bad_exe = root / "bad.exe"
+            bad_exe.write_bytes(b"NOT_PE")
+            self.assertIsNone(standalone.extract_pe_icon(bad_exe, root / "bad.ico"))
+
+            with (
+                mock.patch.object(standalone, "GAMES_DIR", games_dir),
+                mock.patch.object(standalone, "PREFIXES_DIR", prefixes_dir),
+                mock.patch.object(standalone, "APPLICATIONS_DIR", apps_dir),
+                mock.patch.object(standalone, "get_desktop_dir", return_value=desktop_dir),
+            ):
+                installed = standalone.install_standalone_game(
+                    game_name="IconGame",
+                    exe_path=src_exe,
+                    game_dir=src_game,
+                    proton_name="GE-Proton11-12",
+                    create_menu_shortcut=False,
+                    create_desktop_shortcut=True,
+                )
+                self.assertFalse(installed.desktop_file.exists())
+                self.assertIsNotNone(installed.desktop_shortcut)
+                assert installed.desktop_shortcut is not None
+                self.assertTrue(installed.desktop_shortcut.is_file())
+                ico_path = installed.game_dir / ".deckinstall_icon.ico"
+                self.assertTrue(ico_path.is_file())
+                self.assertIn(f"Icon={ico_path}", installed.desktop_shortcut.read_text(encoding="utf-8"))
+                self.assertIn(icon_png, ico_path.read_bytes())
+
+                standalone.remove_standalone_game(installed, delete_files=False)
+                self.assertFalse(installed.desktop_shortcut.exists())
+
+    def test_standalone_keep_in_place_native_linux_nested_icon_and_prefix_only_remove(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            games_dir = root / "Games"
+            prefixes_dir = games_dir / ".prefixes"
+            apps_dir = root / "applications"
+
+            # 1) Keep-in-place + nested icon in Resources/ + prefix-only removal
+            sd_game = root / "sd_card" / "PixelQuest"
+            (sd_game / "Resources").mkdir(parents=True)
+            sd_exe = sd_game / "PixelQuest.exe"
+            sd_exe.write_bytes(b"MZ")
+            nested_ico = sd_game / "Resources" / "app.ico"
+            nested_ico.write_bytes(b"\x00\x00\x01\x00NESTED")
+
+            with (
+                mock.patch.object(standalone, "GAMES_DIR", games_dir),
+                mock.patch.object(standalone, "PREFIXES_DIR", prefixes_dir),
+                mock.patch.object(standalone, "APPLICATIONS_DIR", apps_dir),
+            ):
+                kept = standalone.install_standalone_game(
+                    game_name="PixelQuest",
+                    exe_path=sd_exe,
+                    game_dir=sd_game,
+                    proton_name="GE-Proton11-12",
+                    keep_in_place=True,
+                )
+                self.assertEqual(kept.game_dir, sd_game)
+                self.assertEqual(kept.exe_path, sd_exe)
+                self.assertTrue(kept.prefix_dir.is_dir())
+                self.assertIn(f"Icon={nested_ico}", kept.desktop_file.read_text(encoding="utf-8"))
+
+                # Remove shortcut + prefix only: game files stay, prefix is deleted
+                standalone.remove_standalone_game(kept, delete_files=False, delete_prefix=True)
+                self.assertFalse(kept.desktop_file.exists())
+                self.assertFalse(kept.prefix_dir.exists())
+                self.assertTrue(sd_exe.is_file())
+
+                # 2) Native Linux + single_exe_only from Downloads
+                dl_dir = root / "Downloads"
+                dl_dir.mkdir(parents=True)
+                elf_bin = dl_dir / "CelesteNative"
+                elf_bin.write_bytes(b"\x7fELF\x02\x01\x01\x00")
+                native = standalone.install_standalone_game(
+                    game_name="CelesteNative",
+                    exe_path=elf_bin,
+                    game_dir=dl_dir,
+                    native_linux=True,
+                    single_exe_only=True,
+                )
+                self.assertEqual(native.game_dir, games_dir / "CelesteNative")
+                self.assertTrue(native.exe_path.is_file())
+                self.assertFalse(elf_bin.exists())
+                self.assertTrue(native.native_linux)
+                launch_sh = native.launch_script.read_text(encoding="utf-8")
+                self.assertNotIn("umu-run", launch_sh)
+                self.assertNotIn("WINEPREFIX", launch_sh)
+                self.assertIn(str(native.exe_path), launch_sh)
+
 
 if __name__ == "__main__":
     unittest.main()
