@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -212,6 +213,60 @@ def _desktop_quote(path: Path) -> str:
     return f'"{s}"' if any(ch in s for ch in (" ", "\t", "'", '"')) else s
 
 
+def _desktop_points_to_game_dir(desktop_path: Path, target_game_dir: Path) -> bool:
+    """Return True if an existing .desktop file points to target_game_dir."""
+    try:
+        target_resolved = target_game_dir.resolve()
+        text = desktop_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    exec_line = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Path="):
+            path_val = stripped[5:].strip()
+            if path_val:
+                try:
+                    return Path(path_val).resolve() == target_resolved
+                except OSError:
+                    return False
+        elif stripped.startswith("Exec="):
+            exec_line = stripped[5:].strip()
+    if exec_line:
+        try:
+            tokens = shlex.split(exec_line)
+        except ValueError:
+            tokens = [exec_line.strip('"')]
+        if tokens:
+            try:
+                return Path(tokens[0]).parent.resolve() == target_resolved
+            except OSError:
+                return False
+    return False
+
+
+def _resolve_desktop_file_path(clean_name: str, target_game_dir: Path) -> Path:
+    """Return a unique .desktop path, disambiguating if slug collides with another game_dir."""
+    slug = _slugify(clean_name)
+    candidate = APPLICATIONS_DIR / f"deckinstall-{slug}.desktop"
+    if not candidate.exists() or _desktop_points_to_game_dir(candidate, target_game_dir):
+        return candidate
+    try:
+        key = str(target_game_dir.resolve())
+    except OSError:
+        key = str(target_game_dir)
+    short_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+    hashed = APPLICATIONS_DIR / f"deckinstall-{slug}-{short_hash}.desktop"
+    if not hashed.exists() or _desktop_points_to_game_dir(hashed, target_game_dir):
+        return hashed
+    idx = 2
+    while True:
+        numbered = APPLICATIONS_DIR / f"deckinstall-{slug}-{short_hash}-{idx}.desktop"
+        if not numbered.exists() or _desktop_points_to_game_dir(numbered, target_game_dir):
+            return numbered
+        idx += 1
+
+
 def _write_desktop_file(
     desktop_path: Path,
     game_name: str,
@@ -332,7 +387,7 @@ def install_standalone_game(
         steam_appid = detect_steam_appid(target_game_dir)
 
     launch_script = target_game_dir / "launch.sh"
-    desktop_file = APPLICATIONS_DIR / f"deckinstall-{_slugify(clean_name)}.desktop"
+    desktop_file = _resolve_desktop_file_path(clean_name, target_game_dir)
 
     game = StandaloneGame(
         name=clean_name,
@@ -402,13 +457,14 @@ def _load_manifest(manifest_path: Path) -> StandaloneGame | None:
         return None
 
 
-def list_standalone_games() -> list[StandaloneGame]:
+def list_standalone_games(games_dir: Path | None = None) -> list[StandaloneGame]:
     """Return all standalone games discovered under ~/Games/*/.deckinstall_standalone.json."""
-    if not GAMES_DIR.is_dir():
+    root = games_dir if games_dir is not None else GAMES_DIR
+    if not root.is_dir():
         return []
     games: list[StandaloneGame] = []
     try:
-        entries = list(GAMES_DIR.iterdir())
+        entries = list(root.iterdir())
     except OSError:
         return []
     for child in entries:

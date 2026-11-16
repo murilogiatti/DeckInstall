@@ -141,6 +141,17 @@ QPushButton#dangerBtn:disabled {
     border-color: #5b252b;
     color: #9b7377;
 }
+QPushButton#FilterPill {
+    padding: 5px 12px;
+    border-radius: 14px;
+    min-height: 16px;
+}
+QPushButton#FilterPill:checked {
+    background-color: #1d6fa5;
+    border-color: #3daee9;
+    color: #ffffff;
+    font-weight: 600;
+}
 QLineEdit:disabled, QComboBox:disabled {
     background-color: #151922;
     border-color: #232938;
@@ -287,6 +298,17 @@ QPushButton#dangerBtn:disabled {
     background-color: #dfb2b5;
     border-color: #d09fa3;
     color: #f9eff0;
+}
+QPushButton#FilterPill {
+    padding: 5px 12px;
+    border-radius: 14px;
+    min-height: 16px;
+}
+QPushButton#FilterPill:checked {
+    background-color: #1d6fa5;
+    border-color: #155885;
+    color: #ffffff;
+    font-weight: 600;
 }
 QLineEdit:disabled, QComboBox:disabled {
     background-color: #f1f4f9;

@@ -13,6 +13,7 @@ from PySide6.QtCore import QPoint, QRect, QSettings, QSize, Qt, QThread, Signal,
 from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -47,6 +48,7 @@ from .app_updater import (
     AppUpdateInfo,
     check_app_update,
     download_and_replace_appimage,
+    get_running_appimage,
     relaunch_appimage,
 )
 from .artwork import (
@@ -69,6 +71,11 @@ from .runtime_manager import (
     check_ubuntu_bwrap_userns,
     ensure_ge_proton11,
     ensure_umu_run,
+    get_compat_tools_dir,
+    get_steamrt4_dir,
+    get_umu_run_path,
+    list_ge_proton11_dirs,
+    validate_steamrt4_integrity,
 )
 from .scanner import DetectedGame, clean_game_name, detect_exe_kind, scan_all_games, scan_game_folder
 from .standalone import (
@@ -92,6 +99,7 @@ from .steam_vdf import (
     CompatMappingEntry,
     MigrationPlanItem,
     ShortcutEntry,
+    _dir_size_bytes,
     add_or_update_shortcut,
     adopt_installer_prefix,
     apply_launch_presets,
@@ -604,8 +612,19 @@ class BulkMigrateWorker(QThread):
                 start_steam()
 
 
+_WINE_PROC_NAMES = frozenset(
+    {
+        "umu-run",
+        "pressure-vessel-wrap",
+        "pv-bwrap",
+        "srt-bwrap",
+        "wineserver",
+    }
+)
+
+
 def _is_wine_game_running() -> bool:
-    """Return True if a Windows .exe process owned by the current user appears to be running."""
+    """Return True if a Windows .exe, umu/pressure-vessel wrapper, or wineserver is running."""
     proc = Path("/proc")
     if not proc.is_dir():
         return False
@@ -620,13 +639,72 @@ def _is_wine_game_running() -> bool:
             if not raw_cmd:
                 continue
             args = [a.decode("utf-8", errors="ignore").lower() for a in raw_cmd.split(b"\x00") if a]
-            if not args or any("wineserver" in a for a in args):
+            if not args:
                 continue
-            if any(a.endswith(".exe") for a in args):
+            if any(a.endswith(".exe") or Path(a).name in _WINE_PROC_NAMES for a in args):
                 return True
         except OSError:
             continue
     return False
+
+
+_MAINT_FILTER_CATEGORIES: dict[str, frozenset[str] | None] = {
+    "all": None,
+    "prefixes": frozenset(
+        {"Prefixo Externo", "external_prefix", "Compatdata Órfão", "orphan_compatdata"}
+    ),
+    "backups": frozenset({"Backup", "backup"}),
+    "caches": frozenset({"Steam Logs", "Trash", "App Cache", "Orphan Desktop"}),
+    "shaders": frozenset({"Orphan Shadercache", "GPU Shader Cache"}),
+    "runtimes": frozenset({"Old Proton/Runtime"}),
+}
+
+
+def _cleanup_candidate_auto_check(cand: CleanupCandidate) -> bool:
+    """Return True if a cleanup candidate is safe to auto-select for 1-click clean."""
+    if cand.category in ("GPU Shader Cache", "Old Proton/Runtime"):
+        return False
+    if cand.category in ("Prefixo Externo", "external_prefix"):
+        return bool(cand.matched_game) and ((not cand.has_saves) or cand.saves_verified_migrated)
+    return (not cand.has_saves) or cand.saves_verified_migrated
+
+
+def _format_cleanup_candidate_label(cand: CleanupCandidate) -> str:
+    """Format a human-readable list label for a CleanupCandidate."""
+    mb = cand.size_bytes / (1024 * 1024)
+    if cand.saves_verified_migrated:
+        save_tag = tr("cleanup.tag_verified", game=cand.matched_game)
+    elif cand.has_saves:
+        save_tag = tr("cleanup.tag_unverified")
+    elif cand.category in ("Prefixo Externo", "external_prefix") and not cand.matched_game:
+        save_tag = tr("cleanup.tag_no_steam")
+    elif cand.category in (
+        "Prefixo Externo",
+        "external_prefix",
+        "Compatdata Órfão",
+        "orphan_compatdata",
+    ):
+        save_tag = tr("cleanup.tag_no_saves")
+    else:
+        save_tag = ""
+    cat_map = {
+        "Prefixo Externo": tr("cleanup.cat_external"),
+        "external_prefix": tr("cleanup.cat_external"),
+        "Backup": tr("cleanup.cat_backup"),
+        "backup": tr("cleanup.cat_backup"),
+        "Compatdata Órfão": tr("cleanup.cat_orphan"),
+        "orphan_compatdata": tr("cleanup.cat_orphan"),
+        "Orphan Shadercache": tr("cleanup.cat_shadercache"),
+        "GPU Shader Cache": tr("maint.cat_gpu_shader"),
+        "Steam Logs": tr("cleanup.cat_logs"),
+        "Trash": tr("cleanup.cat_trash"),
+        "App Cache": tr("cleanup.cat_cache"),
+        "Old Proton/Runtime": tr("cleanup.cat_runtime"),
+        "Orphan Desktop": tr("maint.cat_orphan_desktop"),
+    }
+    cat_disp = cat_map.get(cand.category, cand.category)
+    hint = f" ({cand.game_hint})" if cand.game_hint else ""
+    return f"[{cat_disp}] {cand.label}{hint} — {mb:.1f} MB{save_tag}"
 
 
 class FlowLayout(QLayout):
@@ -806,6 +884,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(_wrap_scroll(self._build_extract_page()))
         self.stack.addWidget(_wrap_scroll(self._build_add_page()))
         self.stack.addWidget(_wrap_scroll(self._build_library_page()))
+        self.stack.addWidget(_wrap_scroll(self._build_maintenance_page()))
         right_layout.addWidget(self.stack)
 
         self.status_label = QLabel(tr("status.ready"))
@@ -851,6 +930,7 @@ class MainWindow(QMainWindow):
             tr("tabs.install"),
             tr("tabs.add"),
             tr("tabs.library"),
+            tr("tabs.maintenance"),
         ]
         for idx, label in enumerate(nav_items):
             btn = QPushButton(label)
@@ -1175,7 +1255,7 @@ class MainWindow(QMainWindow):
         self.act_link_prefixes = QAction(tr("library.btn_link_prefixes"), self)
         self.act_link_prefixes.triggered.connect(self._sync_prefix_links)
         self.act_cleanup = QAction(tr("library.btn_cleanup"), self)
-        self.act_cleanup.triggered.connect(self._cleanup_old_prefixes)
+        self.act_cleanup.triggered.connect(lambda: self._open_maintenance_page(auto_scan=True))
         for act in (self.act_backup_saves, self.act_restore_saves, self.act_link_prefixes):
             self._tools_menu.addAction(act)
         self._tools_menu.addSeparator()
@@ -1189,6 +1269,390 @@ class MainWindow(QMainWindow):
         lib_layout.addLayout(actions)
         layout.addWidget(lib_card, 1)
         return page
+
+    def _build_maintenance_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+
+        self._maint_candidates: list[CleanupCandidate] = []
+        self._maint_checked: dict[Path, bool] = {}
+        self._maint_active_filter = "all"
+
+        title = QLabel(tr("maint.page_title"))
+        title.setObjectName("PageTitle")
+        sub = QLabel(tr("maint.page_subtitle"))
+        sub.setObjectName("MutedText")
+        sub.setWordWrap(True)
+        layout.addWidget(title)
+        layout.addWidget(sub)
+
+        health_card, health_layout = _make_card()
+        health_top = QHBoxLayout()
+        health_lbl = QLabel(tr("maint.health_title"))
+        health_lbl.setObjectName("SectionTitle")
+        self.btn_maint_refresh_health = QPushButton(tr("maint.btn_refresh_health"))
+        self.btn_maint_refresh_health.clicked.connect(self._refresh_maintenance_health)
+        health_top.addWidget(health_lbl)
+        health_top.addStretch()
+        health_top.addWidget(self.btn_maint_refresh_health)
+        health_layout.addLayout(health_top)
+
+        self.lbl_maint_app = QLabel()
+        self.lbl_maint_umu = QLabel()
+        self.lbl_maint_proton = QLabel()
+        self.lbl_maint_steamrt4 = QLabel()
+        self.lbl_maint_disk = QLabel()
+        for lbl in (
+            self.lbl_maint_app,
+            self.lbl_maint_umu,
+            self.lbl_maint_proton,
+            self.lbl_maint_steamrt4,
+            self.lbl_maint_disk,
+        ):
+            lbl.setWordWrap(True)
+            health_layout.addWidget(lbl)
+        layout.addWidget(health_card)
+
+        clean_card, clean_layout = _make_card()
+        clean_top = QHBoxLayout()
+        clean_lbl = QLabel(tr("maint.cleanup_title"))
+        clean_lbl.setObjectName("SectionTitle")
+        self.btn_maint_scan = QPushButton(tr("maint.btn_scan"))
+        self.btn_maint_scan.clicked.connect(self._scan_maintenance_cleanup)
+        self.btn_maint_revalidate = QPushButton(tr("cleanup.btn_revalidate"))
+        self.btn_maint_revalidate.setEnabled(self.paths is not None)
+        self.btn_maint_revalidate.clicked.connect(self._revalidate_maintenance_cleanup)
+        clean_top.addWidget(clean_lbl)
+        clean_top.addStretch()
+        clean_top.addWidget(self.btn_maint_scan)
+        clean_top.addWidget(self.btn_maint_revalidate)
+        clean_layout.addLayout(clean_top)
+
+        pills_flow = FlowLayout(spacing=6)
+        self._maint_filter_group = QButtonGroup(self)
+        self._maint_filter_group.setExclusive(True)
+        filter_defs = (
+            ("all", tr("maint.filter_all")),
+            ("prefixes", tr("maint.filter_prefixes")),
+            ("backups", tr("maint.filter_backups")),
+            ("caches", tr("maint.filter_caches")),
+            ("shaders", tr("maint.filter_shaders")),
+            ("runtimes", tr("maint.filter_runtimes")),
+        )
+        for key, label in filter_defs:
+            pill = QPushButton(label)
+            pill.setObjectName("FilterPill")
+            pill.setCheckable(True)
+            if key == "all":
+                pill.setChecked(True)
+            pill.clicked.connect(lambda _=False, k=key: self._on_maint_filter_changed(k))
+            self._maint_filter_group.addButton(pill)
+            pills_flow.addWidget(pill)
+        clean_layout.addLayout(pills_flow)
+
+        self.maint_list = QListWidget()
+        self.maint_list.setMinimumHeight(220)
+        self.maint_list.itemChanged.connect(self._on_maint_item_changed)
+        clean_layout.addWidget(self.maint_list, 1)
+
+        footer = QHBoxLayout()
+        self.lbl_maint_summary = QLabel()
+        self.lbl_maint_summary.setWordWrap(True)
+        self.btn_maint_clean_safe = QPushButton()
+        self.btn_maint_clean_safe.setObjectName("primaryBtn")
+        self.btn_maint_clean_safe.clicked.connect(self._maint_clean_safe)
+        self.btn_maint_delete_selected = QPushButton()
+        self.btn_maint_delete_selected.setObjectName("dangerBtn")
+        self.btn_maint_delete_selected.clicked.connect(self._maint_delete_selected)
+        footer.addWidget(self.lbl_maint_summary, 1)
+        footer.addWidget(self.btn_maint_clean_safe)
+        footer.addWidget(self.btn_maint_delete_selected)
+        clean_layout.addLayout(footer)
+        layout.addWidget(clean_card, 1)
+
+        self._refresh_maintenance_health()
+        self._update_maint_summary()
+        return page
+
+    def _open_maintenance_page(self, *, auto_scan: bool = True) -> None:
+        self.stack.setCurrentIndex(3)
+        if len(self._nav_buttons) > 3:
+            self._nav_buttons[3].setChecked(True)
+        self._refresh_maintenance_health()
+        if auto_scan:
+            self._scan_maintenance_cleanup()
+
+    def _refresh_maintenance_health(self) -> None:
+        mode = "AppImage" if get_running_appimage() is not None else "Python"
+        self.lbl_maint_app.setText(
+            tr("maint.health_app", app=__app_name__, version=__version__, mode=mode)
+        )
+
+        umu_path = get_umu_run_path()
+        umu_status = f"OK ({umu_path})" if umu_path.is_file() else "Missing"
+        self.lbl_maint_umu.setText(tr("maint.health_umu", status=umu_status))
+
+        ge_dirs = list_ge_proton11_dirs()
+        proton_status = f"{len(ge_dirs)} ({ge_dirs[0].name})" if ge_dirs else "Missing"
+        self.lbl_maint_proton.setText(tr("maint.health_proton", status=proton_status))
+
+        steamrt4_dir = get_steamrt4_dir()
+        if not steamrt4_dir.is_dir():
+            rt4_status = "Missing"
+        elif validate_steamrt4_integrity():
+            rt4_status = "OK"
+        else:
+            rt4_status = "Corrupted (cleaned)"
+        self.lbl_maint_steamrt4.setText(tr("maint.health_steamrt4", status=rt4_status))
+
+        prefix_dirs: list[Path] = []
+        if self.paths is not None and self.paths.compatdata_dir.is_dir():
+            prefix_dirs.append(self.paths.compatdata_dir)
+        games_dir = Path.home() / "Games"
+        if games_dir.is_dir():
+            try:
+                for child in games_dir.iterdir():
+                    if child.is_dir():
+                        for sub_name in ("prefix", "pfx", "wineprefix"):
+                            sub = child / sub_name
+                            if sub.is_dir():
+                                prefix_dirs.append(sub)
+            except OSError:
+                pass
+        for extra_pfx_root in (Path.home() / "Games" / "Prefixes", Path.home() / "Prefixes"):
+            if extra_pfx_root.is_dir():
+                prefix_dirs.append(extra_pfx_root)
+        prefixes_mb = sum(_dir_size_bytes(p) for p in prefix_dirs) / (1024 * 1024)
+
+        runtime_dirs = [p for p in (umu_path.parent, get_compat_tools_dir()) if p.is_dir()]
+        runtimes_mb = sum(_dir_size_bytes(p) for p in runtime_dirs) / (1024 * 1024)
+
+        caches_mb = sum(c.size_bytes for c in self._maint_candidates) / (1024 * 1024)
+        self.lbl_maint_disk.setText(
+            tr("maint.health_disk", prefixes=prefixes_mb, runtimes=runtimes_mb, caches=caches_mb)
+        )
+
+    def _on_maint_filter_changed(self, key: str) -> None:
+        self._maint_active_filter = key
+        self._populate_maint_list()
+
+    def _on_maint_item_changed(self, item: QListWidgetItem) -> None:
+        cand = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(cand, CleanupCandidate):
+            self._maint_checked[cand.path] = item.checkState() == Qt.CheckState.Checked
+            self._update_maint_summary()
+
+    def _populate_maint_list(self) -> None:
+        allowed_cats = _MAINT_FILTER_CATEGORIES.get(self._maint_active_filter)
+        self.maint_list.blockSignals(True)
+        self.maint_list.clear()
+        for cand in self._maint_candidates:
+            if allowed_cats is not None and cand.category not in allowed_cats:
+                continue
+            item = QListWidgetItem(_format_cleanup_candidate_label(cand))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            checked = self._maint_checked.get(cand.path, _cleanup_candidate_auto_check(cand))
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, cand)
+            self.maint_list.addItem(item)
+        self.maint_list.blockSignals(False)
+        self._update_maint_summary()
+
+    def _update_maint_summary(self) -> None:
+        sel_items = [c for c in self._maint_candidates if self._maint_checked.get(c.path, False)]
+        sel_count = len(sel_items)
+        sel_mb = sum(c.size_bytes for c in sel_items) / (1024 * 1024)
+        safe_items = [c for c in self._maint_candidates if _cleanup_candidate_auto_check(c)]
+        safe_mb = sum(c.size_bytes for c in safe_items) / (1024 * 1024)
+        self.lbl_maint_summary.setText(
+            tr("maint.summary", sel_mb=sel_mb, sel_count=sel_count, safe_mb=safe_mb)
+        )
+        self.btn_maint_clean_safe.setText(tr("maint.btn_clean_safe", mb=safe_mb))
+        self.btn_maint_delete_selected.setText(tr("maint.btn_delete_selected", mb=sel_mb))
+
+    def _apply_maint_scan_results(self, candidates: list[CleanupCandidate]) -> None:
+        self._maint_candidates = candidates
+        self._maint_checked = {c.path: _cleanup_candidate_auto_check(c) for c in candidates}
+        self._populate_maint_list()
+        self._refresh_maintenance_health()
+
+    def _scan_maintenance_cleanup(self) -> None:
+        self._set_steam_busy(True)
+        self.status_label.setText(tr("cleanup.scanning"))
+
+        class _MaintScanWorker(QThread):
+            found = Signal(list)
+            failed = Signal(str)
+
+            def __init__(self, paths: SteamPaths | None) -> None:
+                super().__init__()
+                self._paths = paths
+
+            def run(self) -> None:
+                try:
+                    self.found.emit(find_cleanup_candidates(self._paths, include_system_caches=True))
+                except Exception as exc:
+                    self.failed.emit(str(exc))
+
+        def _on_found(candidates: list[CleanupCandidate]) -> None:
+            self._set_steam_busy(False)
+            self._apply_maint_scan_results(candidates)
+            self.status_label.setText(
+                tr("cleanup.none_found") if not candidates else tr("status.ready")
+            )
+
+        def _on_failed(err: str) -> None:
+            self._set_steam_busy(False)
+            msg = tr("cleanup.scan_error", err=err)
+            self.status_label.setText(msg)
+            QMessageBox.critical(self, __app_name__, msg)
+
+        worker = _MaintScanWorker(self.paths)
+        self._track_worker(worker)
+        worker.found.connect(_on_found)
+        worker.failed.connect(_on_failed)
+        worker.start()
+
+    def _revalidate_maintenance_cleanup(self) -> None:
+        if not self.paths:
+            return
+        if _is_wine_game_running():
+            QMessageBox.warning(self, __app_name__, tr("cleanup.wine_running"))
+            return
+        self._set_steam_busy(True)
+        self.status_label.setText(tr("cleanup.revalidating"))
+
+        class _MaintRevalWorker(QThread):
+            done = Signal(list, int, int, int)
+            failed = Signal(str)
+
+            def __init__(self, paths: SteamPaths) -> None:
+                super().__init__()
+                self._paths = paths
+
+            def run(self) -> None:
+                try:
+                    if _is_wine_game_running():
+                        raise RuntimeError(tr("cleanup.wine_running"))
+                    entries = load_shortcuts(self._paths.shortcuts_vdf)
+                    pending_plan = plan_bulk_migration(
+                        entries=entries,
+                        games_root=Path.home() / "Games",
+                        compatdata_dir=self._paths.compatdata_dir,
+                        config_vdf=self._paths.config_vdf,
+                    )
+                    checked, copied = sync_all_external_saves(self._paths)
+                    new_cands = find_cleanup_candidates(self._paths, include_system_caches=True)
+                    self.done.emit(new_cands, checked, copied, len(pending_plan))
+                except Exception as exc:
+                    self.failed.emit(str(exc))
+
+        def _on_done(
+            new_cands: list[CleanupCandidate], checked: int, copied: int, pending: int
+        ) -> None:
+            self._set_steam_busy(False)
+            self._apply_maint_scan_results(new_cands)
+            extra = tr("cleanup.reval_pending", pending=pending) if pending else ""
+            self.status_label.setText(tr("cleanup.reval_done", checked=checked, copied=copied) + extra)
+
+        def _on_failed(err: str) -> None:
+            self._set_steam_busy(False)
+            msg = tr("cleanup.reval_error", err=err)
+            self.status_label.setText(msg)
+            QMessageBox.critical(self, __app_name__, msg)
+
+        worker = _MaintRevalWorker(self.paths)
+        self._track_worker(worker)
+        worker.done.connect(_on_done)
+        worker.failed.connect(_on_failed)
+        worker.start()
+
+    def _maint_clean_safe(self) -> None:
+        if _is_wine_game_running():
+            QMessageBox.warning(self, __app_name__, tr("cleanup.wine_running"))
+            return
+        safe_items = [c for c in self._maint_candidates if _cleanup_candidate_auto_check(c)]
+        safe_mb = sum(c.size_bytes for c in safe_items) / (1024 * 1024)
+        if not safe_items:
+            QMessageBox.information(self, __app_name__, tr("maint.safe_clean_empty"))
+            return
+        ans = QMessageBox.question(
+            self,
+            __app_name__,
+            tr("maint.confirm_safe_clean", count=len(safe_items), mb=safe_mb),
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            self._run_maint_delete(safe_items)
+
+    def _maint_delete_selected(self) -> None:
+        if _is_wine_game_running():
+            QMessageBox.warning(self, __app_name__, tr("cleanup.wine_running"))
+            return
+        selected = [c for c in self._maint_candidates if self._maint_checked.get(c.path, False)]
+        if not selected:
+            return
+        sel_mb = sum(c.size_bytes for c in selected) / (1024 * 1024)
+        ans = QMessageBox.question(
+            self,
+            __app_name__,
+            tr("maint.confirm_delete_selected", count=len(selected), mb=sel_mb),
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            self._run_maint_delete(selected)
+
+    def _run_maint_delete(self, items: list[CleanupCandidate]) -> None:
+        self._set_steam_busy(True)
+        self.status_label.setText(tr("cleanup.deleting", count=len(items)))
+
+        class _MaintDeleteWorker(QThread):
+            done = Signal(int, int, list, list)
+            failed = Signal(str)
+
+            def __init__(self, paths: SteamPaths | None, target_items: list[CleanupCandidate]) -> None:
+                super().__init__()
+                self._paths = paths
+                self._items = target_items
+
+            def run(self) -> None:
+                try:
+                    if _is_wine_game_running():
+                        raise RuntimeError(tr("cleanup.wine_running"))
+                    deleted, freed, errs = delete_cleanup_candidates_checked(
+                        self._paths, self._items, include_system_caches=True
+                    )
+                    new_cands = find_cleanup_candidates(self._paths, include_system_caches=True)
+                    self.done.emit(deleted, freed, errs, new_cands)
+                except Exception as exc:
+                    self.failed.emit(str(exc))
+
+        def _on_deleted(
+            deleted: int, freed: int, errs: list[str], new_cands: list[CleanupCandidate]
+        ) -> None:
+            self._set_steam_busy(False)
+            self._apply_maint_scan_results(new_cands)
+            mb = freed / (1024 * 1024)
+            msg = tr("cleanup.deleted", deleted=deleted, mb=mb)
+            if errs:
+                msg += tr("cleanup.delete_warnings", errs="\n".join(errs[:10]))
+            self.status_label.setText(msg.splitlines()[0])
+            if errs:
+                QMessageBox.warning(self, __app_name__, msg)
+            else:
+                QMessageBox.information(self, __app_name__, msg)
+
+        def _on_failed(err: str) -> None:
+            self._set_steam_busy(False)
+            msg = tr("cleanup.delete_error", err=err)
+            self.status_label.setText(msg)
+            QMessageBox.critical(self, __app_name__, msg)
+
+        worker = _MaintDeleteWorker(self.paths, items)
+        self._track_worker(worker)
+        worker.done.connect(_on_deleted)
+        worker.failed.connect(_on_failed)
+        worker.start()
 
     def _show_shortcut_context_menu(self, pos: QPoint) -> None:
         item = self.shortcuts_list.itemAt(pos)
@@ -1831,8 +2295,12 @@ class MainWindow(QMainWindow):
             self.act_link_prefixes,
             self.act_cleanup,
             self.act_export_standalone,
+            self.btn_maint_scan,
+            self.btn_maint_clean_safe,
+            self.btn_maint_delete_selected,
         ):
             w.setEnabled(enabled)
+        self.btn_maint_revalidate.setEnabled(enabled and (self.paths is not None))
         self._set_vdf_write_enabled(enabled and not self._vdf_corrupt)
         if enabled:
             self._update_library_action_states()
@@ -2373,7 +2841,8 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _backup_all_saves(self) -> None:
-        if not self.paths:
+        if _is_wine_game_running():
+            QMessageBox.warning(self, __app_name__, tr("cleanup.wine_running"))
             return
         self._set_steam_busy(True)
         self.status_label.setText(tr("backup.running"))
@@ -2382,7 +2851,7 @@ class MainWindow(QMainWindow):
             done = Signal(str, int, int)
             failed = Signal(str)
 
-            def __init__(self, paths: SteamPaths) -> None:
+            def __init__(self, paths: SteamPaths | None) -> None:
                 super().__init__()
                 self._paths = paths
 
@@ -2865,47 +3334,9 @@ class MainWindow(QMainWindow):
             lst.blockSignals(True)
             lst.clear()
             for cand in items:
-                mb = cand.size_bytes / (1024 * 1024)
-                if cand.saves_verified_migrated:
-                    save_tag = tr("cleanup.tag_verified", game=cand.matched_game)
-                elif cand.has_saves:
-                    save_tag = tr("cleanup.tag_unverified")
-                elif cand.category in ("Prefixo Externo", "external_prefix") and not cand.matched_game:
-                    save_tag = tr("cleanup.tag_no_steam")
-                elif cand.category in (
-                    "Prefixo Externo",
-                    "external_prefix",
-                    "Compatdata Órfão",
-                    "orphan_compatdata",
-                ):
-                    save_tag = tr("cleanup.tag_no_saves")
-                else:
-                    save_tag = ""
-                cat_map = {
-                    "Prefixo Externo": tr("cleanup.cat_external"),
-                    "external_prefix": tr("cleanup.cat_external"),
-                    "Backup": tr("cleanup.cat_backup"),
-                    "backup": tr("cleanup.cat_backup"),
-                    "Compatdata Órfão": tr("cleanup.cat_orphan"),
-                    "orphan_compatdata": tr("cleanup.cat_orphan"),
-                    "Orphan Shadercache": tr("cleanup.cat_shadercache"),
-                    "Steam Logs": tr("cleanup.cat_logs"),
-                    "Trash": tr("cleanup.cat_trash"),
-                    "App Cache": tr("cleanup.cat_cache"),
-                    "Old Proton/Runtime": tr("cleanup.cat_runtime"),
-                }
-                cat_disp = cat_map.get(cand.category, cand.category)
-                hint = f" ({cand.game_hint})" if cand.game_hint else ""
-                item = QListWidgetItem(f"[{cat_disp}] {cand.label}{hint} — {mb:.1f} MB{save_tag}")
+                item = QListWidgetItem(_format_cleanup_candidate_label(cand))
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                if cand.category in ("Prefixo Externo", "external_prefix"):
-                    auto_check = bool(cand.matched_game) and (
-                        (not cand.has_saves) or cand.saves_verified_migrated
-                    )
-                elif cand.category == "Old Proton/Runtime":
-                    auto_check = False
-                else:
-                    auto_check = (not cand.has_saves) or cand.saves_verified_migrated
+                auto_check = _cleanup_candidate_auto_check(cand)
                 item.setCheckState(
                     Qt.CheckState.Checked if auto_check else Qt.CheckState.Unchecked
                 )

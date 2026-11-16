@@ -37,35 +37,42 @@ _THREAD_LOCAL = threading.local()
 
 
 @contextmanager
-def _steam_transaction_lock(anchor: Path):
-    """Acquire both intra-process RLock and cross-process flock per lockfile for Steam VDF mutations."""
-    lock_dir = anchor.parent if anchor.parent.exists() else Path(tempfile.gettempdir())
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = (lock_dir / ".deckinstall.vdf.lock").resolve()
+def _file_lock(lock_path: Path):
+    """Acquire both intra-process RLock and cross-process flock for a lockfile path."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved = lock_path.resolve()
     depths: dict[Path, int] = getattr(_THREAD_LOCAL, "flock_depths", None)
     if depths is None:
         depths = {}
         _THREAD_LOCAL.flock_depths = depths
-    depth = depths.get(lock_path, 0)
+    depth = depths.get(resolved, 0)
     with _STEAM_LOCK:
         if depth > 0:
-            depths[lock_path] = depth + 1
+            depths[resolved] = depth + 1
             try:
                 yield
             finally:
-                depths[lock_path] = depth
+                depths[resolved] = depth
             return
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        fd = os.open(str(resolved), os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            depths[lock_path] = 1
+            depths[resolved] = 1
             try:
                 yield
             finally:
-                depths.pop(lock_path, None)
+                depths.pop(resolved, None)
                 fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+
+@contextmanager
+def _steam_transaction_lock(anchor: Path):
+    """Acquire both intra-process RLock and cross-process flock per lockfile for Steam VDF mutations."""
+    lock_dir = anchor.parent if anchor.parent.exists() else Path(tempfile.gettempdir())
+    with _file_lock(lock_dir / ".deckinstall.vdf.lock"):
+        yield
 
 
 @dataclass(frozen=True)
@@ -1904,16 +1911,22 @@ def _active_compat_tools(config_vdf: Path, active_appids: set[int]) -> set[str]:
     return used
 
 
-def find_cleanup_candidates(
-    paths: SteamPaths,
-    extra_external_roots: list[Path] | None = None,
-    include_system_caches: bool = False,
-    home_dir: Path | None = None,
-) -> list[CleanupCandidate]:
-    """Find old external prefixes, orphan Steam compatdata/shadercache, backups, and optional system caches."""
-    candidates: list[CleanupCandidate] = []
-    seen: set[Path] = set()
+_GPU_SHADER_CACHE_NAMES = frozenset(
+    {"mesa_shader_cache", "mesa_shader_cache_db", "radv_builtin_shaders", "nvidia", "amd"}
+)
+_OLD_PROTON_PREFIXES = (
+    "proton_7",
+    "proton_8",
+    "proton_9",
+    "proton_10",
+    "proton_experimental",
+    "proton_hotfix",
+    "UMU-Proton",
+)
 
+
+def _all_user_shortcuts(paths: SteamPaths) -> tuple[list[ShortcutEntry], list[ShortcutEntry]]:
+    """Return (current_user_entries, deduplicated_all_user_entries) for Steam shortcuts."""
     current_entries = load_shortcuts(paths.shortcuts_vdf)
     all_users = list_steam_users(paths.steam_root)
     all_user_entries: list[ShortcutEntry] = list(current_entries)
@@ -1929,6 +1942,120 @@ def find_cleanup_candidates(
                 if key not in seen_entry_keys:
                     all_user_entries.append(e)
                     seen_entry_keys.add(key)
+    return current_entries, all_user_entries
+
+
+def collect_active_proton_tools(
+    paths: SteamPaths | None,
+    games_dir: Path | None = None,
+) -> set[str]:
+    """Return compatibility tool names in use by Steam games/shortcuts and standalone games."""
+    from .standalone import list_standalone_games
+
+    tools: set[str] = set()
+    if paths is not None:
+        _, all_user_entries = _all_user_shortcuts(paths)
+        active_shortcuts = {e.appid_u32 for e in all_user_entries}
+        installed_steam = _installed_steam_appids(paths.steam_root)
+        tools.update(_active_compat_tools(paths.config_vdf, active_shortcuts | installed_steam))
+    for game in list_standalone_games(games_dir):
+        if game.proton_name:
+            tools.add(game.proton_name)
+    return tools
+
+
+def _tool_uses_sniper_or_old_proton(tool_name: str) -> bool:
+    """Return True if a compatibility tool requires steamrt3/sniper or Proton <= 10."""
+    if tool_name.startswith(_OLD_PROTON_PREFIXES):
+        return True
+    if tool_name.startswith("GE-Proton"):
+        match = re.match(r"^GE-Proton(\d+)", tool_name)
+        if match is None:
+            return True
+        return int(match.group(1)) < 11
+    return False
+
+
+def _newest_ge_proton11_paths(compat_tools: Path) -> set[Path]:
+    """Return resolved paths for the newest installed GE-Proton11+ directory."""
+    from .runtime_manager import _parse_ge_proton_version, list_ge_proton11_dirs
+
+    preserved: set[Path] = set()
+    global_ge11 = list_ge_proton11_dirs()
+    if global_ge11:
+        try:
+            preserved.add(global_ge11[0].resolve())
+        except OSError:
+            pass
+    if compat_tools.is_dir():
+        found: list[tuple[tuple[int, ...], Path]] = []
+        try:
+            entries = list(compat_tools.iterdir())
+        except OSError:
+            entries = []
+        for entry in entries:
+            try:
+                if not entry.is_dir() or entry.is_symlink():
+                    continue
+            except OSError:
+                continue
+            ver = _parse_ge_proton_version(entry.name)
+            if ver is not None:
+                found.append((ver, entry))
+        if found:
+            found.sort(key=lambda item: item[0], reverse=True)
+            try:
+                preserved.add(found[0][1].resolve())
+            except OSError:
+                pass
+    return preserved
+
+
+def _is_orphan_desktop_file(desktop_path: Path) -> bool:
+    """Return True if a deckinstall-*.desktop file points to a missing Exec= or Path=."""
+    try:
+        text = desktop_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    exec_val = ""
+    path_val = ""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Exec=") and not exec_val:
+            exec_val = stripped[5:].strip()
+        elif stripped.startswith("Path=") and not path_val:
+            path_val = stripped[5:].strip()
+    if not exec_val:
+        return True
+    try:
+        tokens = shlex.split(exec_val)
+    except ValueError:
+        tokens = [exec_val.strip('"')]
+    if not tokens:
+        return True
+    if not Path(tokens[0]).exists():
+        return True
+    if path_val and not Path(path_val).exists():
+        return True
+    return False
+
+
+def find_cleanup_candidates(
+    paths: SteamPaths | None = None,
+    extra_external_roots: list[Path] | None = None,
+    include_system_caches: bool = False,
+    home_dir: Path | None = None,
+) -> list[CleanupCandidate]:
+    """Find old external prefixes, orphan Steam compatdata/shadercache, backups, and optional system caches."""
+    from .standalone import list_standalone_games
+
+    candidates: list[CleanupCandidate] = []
+    seen: set[Path] = set()
+
+    current_entries: list[ShortcutEntry] = []
+    all_user_entries: list[ShortcutEntry] = []
+    if paths is not None:
+        current_entries, all_user_entries = _all_user_shortcuts(paths)
 
     by_norm_key: dict[str, ShortcutEntry] = {}
     by_steam_appid: dict[str, ShortcutEntry] = {}
@@ -1947,6 +2074,11 @@ def find_cleanup_candidates(
     games_dir = home / "Games"
     standalone_prefixes_dir = games_dir / ".prefixes"
     standalone_prefix_paths: set[Path] = set()
+    for game in list_standalone_games(games_dir):
+        try:
+            standalone_prefix_paths.add(game.prefix_dir.resolve())
+        except OSError:
+            pass
     if games_dir.is_dir():
         try:
             for gdir in games_dir.iterdir():
@@ -1969,7 +2101,12 @@ def find_cleanup_candidates(
         except OSError:
             pass
 
-    for root in extra_external_roots or external_prefix_roots():
+    if extra_external_roots is not None:
+        roots = list(extra_external_roots)
+    else:
+        roots = list(external_prefix_roots()) + [standalone_prefixes_dir]
+
+    for root in roots:
         if not root.is_dir():
             continue
         try:
@@ -1985,7 +2122,7 @@ def find_cleanup_candidates(
         for child in children:
             if child.is_symlink() or not child.is_dir() or child.name.startswith("."):
                 continue
-            if _prefix_users_dir(child) is None:
+            if _prefix_users_dir(child) is None and not is_standalone_prefixes_root:
                 continue
             try:
                 resolved = child.resolve()
@@ -2003,10 +2140,13 @@ def find_cleanup_candidates(
                 continue
             if _is_prefix_referenced_by_shortcuts(resolved, all_user_entries):
                 continue
+            sz = _dir_size_bytes(child)
+            if is_standalone_prefixes_root and _prefix_users_dir(child) is None and sz == 0:
+                continue
             matched_entry = by_steam_appid.get(child.name) or by_norm_key.get(_norm_key(child.name))
             has_saves = _prefix_has_saves(child)
             saves_verified = False
-            if has_saves and matched_entry is not None:
+            if has_saves and matched_entry is not None and paths is not None:
                 dst_compat = paths.compatdata_dir / str(matched_entry.appid_u32)
                 saves_verified = _prefix_saves_verified_in_target(child, dst_compat)
             matched_name = matched_entry.app_name if matched_entry else ""
@@ -2015,7 +2155,7 @@ def find_cleanup_candidates(
                     category="Prefixo Externo",
                     label=f"{root.parent.name}/{root.name}/{child.name}",
                     path=child,
-                    size_bytes=_dir_size_bytes(child),
+                    size_bytes=sz,
                     has_saves=has_saves,
                     saves_verified_migrated=saves_verified,
                     matched_game=matched_name,
@@ -2023,93 +2163,136 @@ def find_cleanup_candidates(
                 )
             )
 
-    active_shortcuts = {e.appid_u32 for e in all_user_entries}
-    installed_steam = _installed_steam_appids(paths.steam_root)
-    if paths.compatdata_dir.is_dir():
-        for child in paths.compatdata_dir.iterdir():
-            if child.is_symlink() or not child.is_dir():
-                continue
-            if child.name.endswith(".deckinstall.bak"):
+    if paths is not None:
+        active_shortcuts = {e.appid_u32 for e in all_user_entries}
+        installed_steam = _installed_steam_appids(paths.steam_root)
+        if paths.compatdata_dir.is_dir():
+            for child in paths.compatdata_dir.iterdir():
+                if child.is_symlink() or not child.is_dir():
+                    continue
+                if child.name.endswith(".deckinstall.bak"):
+                    try:
+                        if _is_prefix_referenced_by_shortcuts(child.resolve(), all_user_entries):
+                            continue
+                    except OSError:
+                        continue
+                    prefix_id = child.name.split(".", 1)[0]
+                    matched_entry = (
+                        by_appid_u32.get(int(prefix_id))
+                        if (prefix_id.isascii() and prefix_id.isdigit())
+                        else None
+                    )
+                    has_saves = _prefix_has_saves(child)
+                    saves_verified = False
+                    if has_saves and matched_entry is not None:
+                        saves_verified = _prefix_saves_verified_in_target(
+                            child, paths.compatdata_dir / prefix_id
+                        )
+                    matched_name = matched_entry.app_name if matched_entry else ""
+                    candidates.append(
+                        CleanupCandidate(
+                            category="Backup",
+                            label=child.name,
+                            path=child,
+                            size_bytes=_dir_size_bytes(child),
+                            has_saves=has_saves,
+                            saves_verified_migrated=saves_verified,
+                            matched_game=matched_name,
+                            game_hint=matched_name or _infer_prefix_game_name(child),
+                        )
+                    )
+                    continue
+                if not (child.name.isascii() and child.name.isdigit()):
+                    continue
+                appid = int(child.name)
+                if appid in active_shortcuts or appid in installed_steam:
+                    continue
                 try:
                     if _is_prefix_referenced_by_shortcuts(child.resolve(), all_user_entries):
                         continue
                 except OSError:
                     continue
-                prefix_id = child.name.split(".", 1)[0]
-                matched_entry = (
-                    by_appid_u32.get(int(prefix_id))
-                    if (prefix_id.isascii() and prefix_id.isdigit())
-                    else None
-                )
                 has_saves = _prefix_has_saves(child)
                 saves_verified = False
-                if has_saves and matched_entry is not None:
-                    saves_verified = _prefix_saves_verified_in_target(
-                        child, paths.compatdata_dir / prefix_id
-                    )
-                matched_name = matched_entry.app_name if matched_entry else ""
+                matched_game = ""
+                if has_saves:
+                    for entry in current_entries:
+                        dst_compat = paths.compatdata_dir / str(entry.appid_u32)
+                        if dst_compat.is_dir() and _prefix_saves_verified_in_target(child, dst_compat):
+                            saves_verified = True
+                            matched_game = entry.app_name
+                            break
                 candidates.append(
                     CleanupCandidate(
-                        category="Backup",
-                        label=child.name,
+                        category="Compatdata Órfão",
+                        label=f"compatdata/{child.name}",
                         path=child,
                         size_bytes=_dir_size_bytes(child),
                         has_saves=has_saves,
                         saves_verified_migrated=saves_verified,
-                        matched_game=matched_name,
-                        game_hint=matched_name or _infer_prefix_game_name(child),
+                        matched_game=matched_game,
+                        game_hint=matched_game or _infer_prefix_game_name(child),
                     )
                 )
-                continue
-            if not (child.name.isascii() and child.name.isdigit()):
-                continue
-            appid = int(child.name)
-            if appid in active_shortcuts or appid in installed_steam:
-                continue
-            try:
-                if _is_prefix_referenced_by_shortcuts(child.resolve(), all_user_entries):
-                    continue
-            except OSError:
-                continue
-            has_saves = _prefix_has_saves(child)
-            saves_verified = False
-            matched_game = ""
-            if has_saves:
-                for entry in current_entries:
-                    dst_compat = paths.compatdata_dir / str(entry.appid_u32)
-                    if dst_compat.is_dir() and _prefix_saves_verified_in_target(child, dst_compat):
-                        saves_verified = True
-                        matched_game = entry.app_name
-                        break
-            candidates.append(
-                CleanupCandidate(
-                    category="Compatdata Órfão",
-                    label=f"compatdata/{child.name}",
-                    path=child,
-                    size_bytes=_dir_size_bytes(child),
-                    has_saves=has_saves,
-                    saves_verified_migrated=saves_verified,
-                    matched_game=matched_game,
-                    game_hint=matched_game or _infer_prefix_game_name(child),
-                )
-            )
 
-    shadercache_dir = paths.steam_root / "steamapps" / "shadercache"
-    if shadercache_dir.is_dir():
-        for child in shadercache_dir.iterdir():
-            if child.is_symlink() or not child.is_dir():
-                continue
-            if not (child.name.isascii() and child.name.isdigit()):
-                continue
-            appid = int(child.name)
-            if appid == 0 or appid in active_shortcuts or appid in installed_steam:
-                continue
-            sz = _dir_size_bytes(child)
-            if sz > 0:
+        shadercache_dir = paths.steam_root / "steamapps" / "shadercache"
+        if shadercache_dir.is_dir():
+            for child in shadercache_dir.iterdir():
+                if child.is_symlink() or not child.is_dir():
+                    continue
+                if not (child.name.isascii() and child.name.isdigit()):
+                    continue
+                appid = int(child.name)
+                if appid == 0 or appid in active_shortcuts or appid in installed_steam:
+                    continue
+                sz = _dir_size_bytes(child)
+                if sz > 0:
+                    candidates.append(
+                        CleanupCandidate(
+                            category="Orphan Shadercache",
+                            label=f"shadercache/{child.name}",
+                            path=child,
+                            size_bytes=sz,
+                            has_saves=False,
+                            saves_verified_migrated=False,
+                            matched_game="",
+                            game_hint="",
+                        )
+                    )
+
+        steam_logs_dir = paths.steam_root / "logs"
+        if steam_logs_dir.is_dir() and not steam_logs_dir.is_symlink():
+            sz = _dir_size_bytes(steam_logs_dir)
+            if sz >= 1024 * 1024:
                 candidates.append(
                     CleanupCandidate(
-                        category="Orphan Shadercache",
-                        label=f"shadercache/{child.name}",
+                        category="Steam Logs",
+                        label="Steam/logs",
+                        path=steam_logs_dir,
+                        size_bytes=sz,
+                        has_saves=False,
+                        saves_verified_migrated=False,
+                        matched_game="",
+                        game_hint="",
+                    )
+                )
+
+    apps_dir = home / ".local" / "share" / "applications"
+    if apps_dir.is_dir() and not apps_dir.is_symlink():
+        for child in apps_dir.iterdir():
+            if child.is_symlink() or not child.is_file():
+                continue
+            if not (child.name.startswith("deckinstall-") and child.name.endswith(".desktop")):
+                continue
+            if _is_orphan_desktop_file(child):
+                try:
+                    sz = child.stat().st_size
+                except OSError:
+                    continue
+                candidates.append(
+                    CleanupCandidate(
+                        category="Orphan Desktop",
+                        label=child.name,
                         path=child,
                         size_bytes=sz,
                         has_saves=False,
@@ -2119,15 +2302,26 @@ def find_cleanup_candidates(
                     )
                 )
 
-    steam_logs_dir = paths.steam_root / "logs"
-    if steam_logs_dir.is_dir() and not steam_logs_dir.is_symlink():
-        sz = _dir_size_bytes(steam_logs_dir)
-        if sz >= 1024 * 1024:
+    backups_dir = home / "Backups" / "DeckInstall"
+    if backups_dir.is_dir() and not backups_dir.is_symlink():
+        save_zips: list[tuple[float, str, Path, int]] = []
+        for child in backups_dir.iterdir():
+            if child.is_symlink() or not child.is_file():
+                continue
+            if not (child.name.startswith("saves-") and child.name.endswith(".zip")):
+                continue
+            try:
+                st = child.stat()
+            except OSError:
+                continue
+            save_zips.append((st.st_mtime, child.name, child, st.st_size))
+        save_zips.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        for _, _, old_zip, sz in save_zips[3:]:
             candidates.append(
                 CleanupCandidate(
-                    category="Steam Logs",
-                    label="Steam/logs",
-                    path=steam_logs_dir,
+                    category="Backup",
+                    label=old_zip.name,
+                    path=old_zip,
                     size_bytes=sz,
                     has_saves=False,
                     saves_verified_migrated=False,
@@ -2137,7 +2331,6 @@ def find_cleanup_candidates(
             )
 
     if include_system_caches:
-        home = home_dir or Path.home()
         trash_files = home / ".local" / "share" / "Trash" / "files"
         if trash_files.is_dir() and not trash_files.is_symlink():
             sz = _dir_size_bytes(trash_files)
@@ -2164,7 +2357,21 @@ def find_cleanup_candidates(
                     sz = _dir_size_bytes(child) if child.is_dir() else child.stat().st_size
                 except OSError:
                     continue
-                if sz >= 5 * 1024 * 1024:
+                if child.name in _GPU_SHADER_CACHE_NAMES:
+                    if sz > 0:
+                        candidates.append(
+                            CleanupCandidate(
+                                category="GPU Shader Cache",
+                                label=f".cache/{child.name}",
+                                path=child,
+                                size_bytes=sz,
+                                has_saves=False,
+                                saves_verified_migrated=False,
+                                matched_game="",
+                                game_hint="",
+                            )
+                        )
+                elif sz >= 5 * 1024 * 1024:
                     candidates.append(
                         CleanupCandidate(
                             category="App Cache",
@@ -2177,6 +2384,23 @@ def find_cleanup_candidates(
                             game_hint="",
                         )
                     )
+
+        nv_compute = home / ".nv" / "ComputeCache"
+        if nv_compute.is_dir() and not nv_compute.is_symlink():
+            sz = _dir_size_bytes(nv_compute)
+            if sz > 0:
+                candidates.append(
+                    CleanupCandidate(
+                        category="GPU Shader Cache",
+                        label=".nv/ComputeCache",
+                        path=nv_compute,
+                        size_bytes=sz,
+                        has_saves=False,
+                        saves_verified_migrated=False,
+                        matched_game="",
+                        game_hint="",
+                    )
+                )
 
         var_app = home / ".var" / "app"
         if var_app.is_dir() and not var_app.is_symlink():
@@ -2200,17 +2424,28 @@ def find_cleanup_candidates(
                             )
                         )
 
-        active_tools = _active_compat_tools(paths.config_vdf, active_shortcuts | installed_steam)
-        sniper_in_use = any(
-            t.startswith(("proton_8", "proton_9", "proton_10", "GE-Proton", "UMU-Proton"))
-            for t in active_tools
+        active_tools = collect_active_proton_tools(paths, games_dir=games_dir)
+        sniper_in_use = any(_tool_uses_sniper_or_old_proton(t) for t in active_tools)
+        compat_tools = (
+            paths.steam_root / "compatibilitytools.d"
+            if paths is not None
+            else home / ".local" / "share" / "Steam" / "compatibilitytools.d"
         )
-        compat_tools = paths.steam_root / "compatibilitytools.d"
         if compat_tools.is_dir():
+            preserved_ge11 = _newest_ge_proton11_paths(compat_tools)
             for child in compat_tools.iterdir():
                 if child.is_symlink() or not child.is_dir():
                     continue
-                if child.name.startswith("UMU-Proton-") and child.name not in active_tools:
+                if child.name in active_tools:
+                    continue
+                is_old_umu = child.name.startswith("UMU-Proton-")
+                is_old_ge = False
+                if child.name.startswith("GE-Proton"):
+                    try:
+                        is_old_ge = child.resolve() not in preserved_ge11
+                    except OSError:
+                        is_old_ge = False
+                if is_old_umu or is_old_ge:
                     sz = _dir_size_bytes(child)
                     if sz > 0:
                         candidates.append(
@@ -2226,49 +2461,73 @@ def find_cleanup_candidates(
                             )
                         )
 
-        common_dir = paths.steam_root / "steamapps" / "common"
-        if (
-            (common_dir / "Proton 11.0").is_dir()
-            and (common_dir / "Proton 10.0").is_dir()
-            and not any(t.startswith("proton_10") for t in active_tools)
-        ):
-            p10 = common_dir / "Proton 10.0"
-            if not p10.is_symlink():
-                sz = _dir_size_bytes(p10)
-                if sz > 0:
-                    candidates.append(
-                        CleanupCandidate(
-                            category="Old Proton/Runtime",
-                            label="common/Proton 10.0",
-                            path=p10,
-                            size_bytes=sz,
-                            has_saves=False,
-                            saves_verified_migrated=False,
-                            matched_game="",
-                            game_hint="",
-                        )
-                    )
+        umu_dir = home / ".local" / "share" / "umu"
+        steamrt3 = umu_dir / "steamrt3"
         if (
             not sniper_in_use
-            and (common_dir / "SteamLinuxRuntime_4").is_dir()
-            and (common_dir / "SteamLinuxRuntime_sniper").is_dir()
+            and (umu_dir / "steamrt4" / "toolmanifest.vdf").is_file()
+            and steamrt3.is_dir()
+            and not steamrt3.is_symlink()
         ):
-            sniper = common_dir / "SteamLinuxRuntime_sniper"
-            if not sniper.is_symlink():
-                sz = _dir_size_bytes(sniper)
-                if sz > 0:
-                    candidates.append(
-                        CleanupCandidate(
-                            category="Old Proton/Runtime",
-                            label="common/SteamLinuxRuntime_sniper",
-                            path=sniper,
-                            size_bytes=sz,
-                            has_saves=False,
-                            saves_verified_migrated=False,
-                            matched_game="",
-                            game_hint="",
-                        )
+            sz = _dir_size_bytes(steamrt3)
+            if sz > 0:
+                candidates.append(
+                    CleanupCandidate(
+                        category="Old Proton/Runtime",
+                        label="umu/steamrt3",
+                        path=steamrt3,
+                        size_bytes=sz,
+                        has_saves=False,
+                        saves_verified_migrated=False,
+                        matched_game="",
+                        game_hint="",
                     )
+                )
+
+        if paths is not None:
+            common_dir = paths.steam_root / "steamapps" / "common"
+            if (
+                (common_dir / "Proton 11.0").is_dir()
+                and (common_dir / "Proton 10.0").is_dir()
+                and not any(t.startswith("proton_10") for t in active_tools)
+            ):
+                p10 = common_dir / "Proton 10.0"
+                if not p10.is_symlink():
+                    sz = _dir_size_bytes(p10)
+                    if sz > 0:
+                        candidates.append(
+                            CleanupCandidate(
+                                category="Old Proton/Runtime",
+                                label="common/Proton 10.0",
+                                path=p10,
+                                size_bytes=sz,
+                                has_saves=False,
+                                saves_verified_migrated=False,
+                                matched_game="",
+                                game_hint="",
+                            )
+                        )
+            if (
+                not sniper_in_use
+                and (common_dir / "SteamLinuxRuntime_4").is_dir()
+                and (common_dir / "SteamLinuxRuntime_sniper").is_dir()
+            ):
+                sniper = common_dir / "SteamLinuxRuntime_sniper"
+                if not sniper.is_symlink():
+                    sz = _dir_size_bytes(sniper)
+                    if sz > 0:
+                        candidates.append(
+                            CleanupCandidate(
+                                category="Old Proton/Runtime",
+                                label="common/SteamLinuxRuntime_sniper",
+                                path=sniper,
+                                size_bytes=sz,
+                                has_saves=False,
+                                saves_verified_migrated=False,
+                                matched_game="",
+                                game_hint="",
+                            )
+                        )
 
     candidates.sort(key=lambda c: c.size_bytes, reverse=True)
     return candidates
@@ -2294,8 +2553,8 @@ def delete_cleanup_candidates(candidates: list[CleanupCandidate]) -> tuple[int, 
 
 
 def delete_cleanup_candidates_checked(
-    paths: SteamPaths,
-    candidates: list[CleanupCandidate],
+    paths: SteamPaths | None = None,
+    candidates: list[CleanupCandidate] | None = None,
     extra_external_roots: list[Path] | None = None,
     include_system_caches: bool = False,
     home_dir: Path | None = None,
@@ -2304,7 +2563,13 @@ def delete_cleanup_candidates_checked(
     deleted = 0
     freed = 0
     errors: list[str] = []
-    with _steam_transaction_lock(paths.shortcuts_vdf):
+    home = home_dir or Path.home()
+    lock_ctx = (
+        _steam_transaction_lock(paths.shortcuts_vdf)
+        if paths is not None
+        else _file_lock(home / ".local" / "share" / "DeckInstall" / "cleanup.lock")
+    )
+    with lock_ctx:
         fresh_by_path = {
             c.path.resolve(): c
             for c in find_cleanup_candidates(
@@ -2314,7 +2579,7 @@ def delete_cleanup_candidates_checked(
                 home_dir=home_dir,
             )
         }
-        for item in candidates:
+        for item in candidates or []:
             if not item.path.exists():
                 continue
             try:
@@ -2334,7 +2599,7 @@ def delete_cleanup_candidates_checked(
                     shutil.rmtree(item.path)
                 else:
                     item.path.unlink()
-                if item.label == "common/SteamLinuxRuntime_sniper":
+                if item.label == "common/SteamLinuxRuntime_sniper" and paths is not None:
                     acf = paths.steam_root / "steamapps" / "appmanifest_1628350.acf"
                     if acf.is_file() and not acf.is_symlink():
                         acf.unlink()
@@ -2369,16 +2634,68 @@ def _reserve_unique_backup_zip(out_dir: Path, stamp: str) -> Path:
     return cand
 
 
+def _write_prefix_saves_to_zip(
+    zf: zipfile.ZipFile,
+    prefix_dir: Path,
+    key_prefix: str,
+    files_backed: int,
+    total_uncompressed: int,
+) -> tuple[int, int, int]:
+    """Write saves from a single Wine/Proton prefix into zf; return (game_files, files_backed, total_uncompressed)."""
+    game_files = 0
+
+    def _add_save_pairs(pairs: list[tuple[Path, Path]], dummy_base: Path, subfolder: str) -> None:
+        nonlocal game_files, files_backed, total_uncompressed
+        for src_file, dst_rel in pairs:
+            fsize = src_file.stat().st_size
+            if fsize == 0:
+                continue
+            if files_backed + 1 >= _RESTORE_MAX_ENTRIES:
+                raise RuntimeError(f"Backup exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})")
+            if fsize > _RESTORE_MAX_FILE_BYTES or total_uncompressed + fsize > _RESTORE_MAX_TOTAL_BYTES:
+                raise RuntimeError(f"Backup size limit exceeded on {src_file.name}")
+            rel = dst_rel.relative_to(dummy_base)
+            arcname = f"{key_prefix}/{subfolder}/{rel.as_posix()}"
+            sfd = os.open(str(src_file), os.O_RDONLY | os.O_NOFOLLOW)
+            with os.fdopen(sfd, "rb") as sfh:
+                zf.writestr(arcname, sfh.read())
+            total_uncompressed += fsize
+            game_files += 1
+            files_backed += 1
+
+    src_users = _prefix_users_dir(prefix_dir)
+    if src_users is not None:
+        dummy_dst = prefix_dir / "__bak_rel__"
+        _add_save_pairs(
+            _iter_prefix_save_pairs(src_users, dummy_dst, preserve_user_dirs=True, raise_on_error=True),
+            dummy_dst,
+            "users",
+        )
+    src_progdata = _prefix_programdata_dir(prefix_dir)
+    if src_progdata is not None:
+        dummy_pd = prefix_dir / "__bak_pd_rel__"
+        _add_save_pairs(
+            _iter_programdata_save_pairs(src_progdata, dummy_pd, raise_on_error=True),
+            dummy_pd,
+            "ProgramData",
+        )
+    return game_files, files_backed, total_uncompressed
+
+
 def backup_all_saves(
-    paths: SteamPaths,
+    paths: SteamPaths | None = None,
     dest_root: Path | None = None,
+    games_dir: Path | None = None,
 ) -> tuple[Path, int, int]:
-    """Create a timestamped ZIP backup of saves for all active Non-Steam shortcuts."""
+    """Create a timestamped ZIP backup of saves for all active Non-Steam shortcuts and standalone games."""
+    from .standalone import list_standalone_games
+
     out_dir = dest_root or (Path.home() / "Backups" / "DeckInstall")
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     zip_path = _reserve_unique_backup_zip(out_dir, stamp)
-    entries = load_shortcuts(paths.shortcuts_vdf)
+    entries = load_shortcuts(paths.shortcuts_vdf) if paths is not None else []
+    standalone_games = list_standalone_games(games_dir)
     manifest: dict[str, str] = {}
     games_backed = 0
     files_backed = 0
@@ -2389,53 +2706,27 @@ def backup_all_saves(
     tmp_zip = Path(tmp_name)
     try:
         with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for entry in entries:
-                compat_dir = paths.compatdata_dir / str(entry.appid_u32)
-                game_files = 0
-                src_users = _prefix_users_dir(compat_dir)
-                if src_users is not None:
-                    dummy_dst = compat_dir / "__bak_rel__"
-                    for src_file, dst_rel in _iter_prefix_save_pairs(
-                        src_users, dummy_dst, preserve_user_dirs=True, raise_on_error=True
-                    ):
-                        fsize = src_file.stat().st_size
-                        if fsize == 0:
-                            continue
-                        if files_backed + 1 >= _RESTORE_MAX_ENTRIES:
-                            raise RuntimeError(f"Backup exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})")
-                        if fsize > _RESTORE_MAX_FILE_BYTES or total_uncompressed + fsize > _RESTORE_MAX_TOTAL_BYTES:
-                            raise RuntimeError(f"Limite de tamanho de backup excedido em {src_file.name}")
-                        rel = dst_rel.relative_to(dummy_dst)
-                        arcname = f"{entry.appid_u32}/users/{rel.as_posix()}"
-                        sfd = os.open(str(src_file), os.O_RDONLY | os.O_NOFOLLOW)
-                        with os.fdopen(sfd, "rb") as sfh:
-                            zf.writestr(arcname, sfh.read())
-                        total_uncompressed += fsize
-                        game_files += 1
-                        files_backed += 1
-                src_progdata = _prefix_programdata_dir(compat_dir)
-                if src_progdata is not None:
-                    dummy_pd = compat_dir / "__bak_pd_rel__"
-                    for src_file, dst_rel in _iter_programdata_save_pairs(
-                        src_progdata, dummy_pd, raise_on_error=True
-                    ):
-                        fsize = src_file.stat().st_size
-                        if fsize == 0:
-                            continue
-                        if files_backed + 1 >= _RESTORE_MAX_ENTRIES:
-                            raise RuntimeError(f"Backup exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})")
-                        if fsize > _RESTORE_MAX_FILE_BYTES or total_uncompressed + fsize > _RESTORE_MAX_TOTAL_BYTES:
-                            raise RuntimeError(f"Backup size limit exceeded on {src_file.name}")
-                        rel = dst_rel.relative_to(dummy_pd)
-                        arcname = f"{entry.appid_u32}/ProgramData/{rel.as_posix()}"
-                        sfd = os.open(str(src_file), os.O_RDONLY | os.O_NOFOLLOW)
-                        with os.fdopen(sfd, "rb") as sfh:
-                            zf.writestr(arcname, sfh.read())
-                        total_uncompressed += fsize
-                        game_files += 1
-                        files_backed += 1
+            if paths is not None:
+                for entry in entries:
+                    compat_dir = paths.compatdata_dir / str(entry.appid_u32)
+                    game_files, files_backed, total_uncompressed = _write_prefix_saves_to_zip(
+                        zf, compat_dir, str(entry.appid_u32), files_backed, total_uncompressed
+                    )
+                    if game_files > 0:
+                        manifest[str(entry.appid_u32)] = entry.app_name
+                        games_backed += 1
+            for game in standalone_games:
+                slug_base = re.sub(r"[^a-zA-Z0-9._-]+", "-", game.game_dir.name).strip("-") or "game"
+                key = f"standalone-{slug_base}"
+                idx = 2
+                while key in manifest:
+                    key = f"standalone-{slug_base}-{idx}"
+                    idx += 1
+                game_files, files_backed, total_uncompressed = _write_prefix_saves_to_zip(
+                    zf, game.prefix_dir, key, files_backed, total_uncompressed
+                )
                 if game_files > 0:
-                    manifest[str(entry.appid_u32)] = entry.app_name
+                    manifest[key] = game.name
                     games_backed += 1
             zf.writestr("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False))
         os.replace(tmp_zip, zip_path)
