@@ -524,6 +524,68 @@ class StandaloneAndVdfTests(unittest.TestCase):
                 self.assertNotIn("WINEPREFIX", launch_sh)
                 self.assertIn(str(native.exe_path), launch_sh)
 
+    def test_v090_gpu_profile_umu_gameid_winetricks_and_disk_space(self) -> None:
+        from deckinstall import extractor
+
+        # 1) resolve_umu_game_id
+        self.assertEqual(standalone.resolve_umu_game_id(1293170), ("umu-1293170", "steam"))
+        self.assertEqual(standalone.resolve_umu_game_id(None), ("umu-default", "none"))
+
+        # 2) detect_gpu_profile (mocked DRM vendor files)
+        with tempfile.TemporaryDirectory() as tmp:
+            drm = Path(tmp) / "drm"
+            (drm / "card0" / "device").mkdir(parents=True)
+            (drm / "card1" / "device").mkdir(parents=True)
+            (drm / "card0" / "device" / "vendor").write_text("0x8086\n", encoding="utf-8")
+            (drm / "card1" / "device" / "vendor").write_text("0x10de\n", encoding="utf-8")
+
+            orig_glob = Path.glob
+
+            def _fake_glob(self_p: Path, pattern: str):
+                if str(self_p) == "/sys/class/drm" and pattern == "card*/device/vendor":
+                    return drm.glob(pattern)
+                return orig_glob(self_p, pattern)
+
+            with (
+                mock.patch.object(Path, "glob", _fake_glob),
+                mock.patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-0"}, clear=False),
+            ):
+                prof = runtime_manager.detect_gpu_profile()
+                self.assertTrue(prof.has_nvidia)
+                self.assertTrue(prof.has_intel)
+                self.assertTrue(prof.is_hybrid)
+                self.assertTrue(prof.is_wayland)
+
+            # 3) check_disk_space & InsufficientSpaceError
+            with mock.patch("shutil.disk_usage", return_value=os.statvfs_result((4096, 4096, 1000, 100, 100, 0, 0, 0, 0, 255))):
+                pass
+            fake_usage = type("Usage", (), {"total": 1000, "used": 900, "free": 100})()
+            with mock.patch("shutil.disk_usage", return_value=fake_usage):
+                with self.assertRaises(extractor.InsufficientSpaceError):
+                    extractor.check_disk_space(Path(tmp), 500)
+
+            # 4) run_winetricks_verbs validation + Popen mock
+            with self.assertRaises(ValueError):
+                runtime_manager.run_winetricks_verbs(Path(tmp), ["vcrun2022;rm -rf /"])
+
+            r_fd, w_fd = os.pipe()
+            os.write(w_fd, b"Executing vcrun2022\n")
+            os.close(w_fd)
+            with (
+                mock.patch("shutil.which", side_effect=lambda b: "/usr/bin/winetricks" if b == "winetricks" else None),
+                mock.patch("subprocess.Popen") as mock_popen,
+                os.fdopen(r_fd, "r", encoding="utf-8") as stdout_reader,
+            ):
+                proc = mock.MagicMock()
+                proc.stdout = stdout_reader
+                proc.poll.return_value = 0
+                proc.wait.return_value = 0
+                proc.returncode = 0
+                mock_popen.return_value = proc
+                logs: list[str] = []
+                runtime_manager.run_winetricks_verbs(Path(tmp) / "pfx", ["vcrun2022"], on_log=logs.append)
+                self.assertTrue(any("vcrun2022" in line for line in logs))
+
 
 if __name__ == "__main__":
     unittest.main()

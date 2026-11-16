@@ -332,7 +332,7 @@ class MaintenanceTests(unittest.TestCase):
             text = cfg.read_text(encoding="utf-8")
             self.assertIn("horizontal", text)
             self.assertIn("hud_compact", text)
-            self.assertIn("position=top-left", text)
+            self.assertIn("position=top-center", text)
 
     def test_format_size_bytes_mb_and_gb(self) -> None:
         try:
@@ -343,7 +343,7 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(format_size_bytes(1024 * 1024 * 1024), "1.00 GB")
         self.assertEqual(format_size_bytes(int(1.5 * 1024 * 1024 * 1024)), "1.50 GB")
 
-    def test_mangohud_levels_and_gamescope_presets(self) -> None:
+    def test_mangohud_levels_and_system_package_cmds(self) -> None:
         opts = steam_vdf.apply_launch_presets(
             "",
             gamemode=True,
@@ -352,15 +352,13 @@ class MaintenanceTests(unittest.TestCase):
             no_esync=False,
             no_fsync=False,
             mangohud_level=2,
-            gamescope=True,
-            gamescope_mode="steamdeck",
         )
         self.assertIn("MANGOHUD=1", opts)
-        self.assertIn("MANGOHUD_CONFIG=preset=2", opts)
+        self.assertIn("position=top-center", opts)
+        self.assertIn("horizontal", opts)
         self.assertIn("gamemoderun", opts)
-        self.assertIn("gamescope -W 1280 -H 800 -f -- %command%", opts)
 
-        # Turning off MangoHud & Gamescope strips MANGOHUD_CONFIG and gamescope ... --
+        # Turning off MangoHud & GameMode strips MANGOHUD_CONFIG and gamemoderun
         stripped = steam_vdf.apply_launch_presets(
             opts,
             gamemode=False,
@@ -368,15 +366,139 @@ class MaintenanceTests(unittest.TestCase):
             wined3d=False,
             no_esync=False,
             no_fsync=False,
-            gamescope=False,
         )
         self.assertEqual(stripped, "")
 
+        # MangoHud position and FPS limit options
+        opts_l2 = steam_vdf.apply_launch_presets(
+            "",
+            gamemode=False,
+            mangohud=True,
+            wined3d=False,
+            no_esync=False,
+            no_fsync=False,
+            mangohud_level=2,
+            mangohud_position="bottom-right",
+            mangohud_fps_limit=60,
+        )
+        self.assertIn("MANGOHUD=1", opts_l2)
+        self.assertIn("position=bottom-right", opts_l2)
+        self.assertIn("fps_limit=60", opts_l2)
+        self.assertIn("horizontal", opts_l2)
+        self.assertNotIn("position=top-center", opts_l2)
+
+        opts_l1 = steam_vdf.apply_launch_presets(
+            opts_l2,
+            gamemode=False,
+            mangohud=True,
+            wined3d=False,
+            no_esync=False,
+            no_fsync=False,
+            mangohud_level=1,
+            mangohud_position="top-left",
+            mangohud_fps_limit=120,
+        )
+        self.assertIn("MANGOHUD_CONFIG=preset=1,position=top-left,fps_limit=120", opts_l1)
+
+        opts_default = steam_vdf.apply_launch_presets(
+            opts_l1,
+            gamemode=False,
+            mangohud=True,
+            wined3d=False,
+            no_esync=False,
+            no_fsync=False,
+            mangohud_level=None,
+            mangohud_position="top-right",
+            mangohud_fps_limit=40,
+        )
+        self.assertIn("MANGOHUD_CONFIG=position=top-right,fps_limit=40", opts_default)
+
+        opts_reset = steam_vdf.apply_launch_presets(
+            opts_default,
+            gamemode=False,
+            mangohud=True,
+            wined3d=False,
+            no_esync=False,
+            no_fsync=False,
+            mangohud_level=None,
+            mangohud_position="",
+            mangohud_fps_limit=0,
+        )
+        self.assertEqual(opts_reset, "MANGOHUD=1 %command%")
+
         with mock.patch("shutil.which", side_effect=lambda b: "/usr/bin/apt-get" if b == "apt-get" else None):
             self.assertEqual(
-                runtime_manager.get_system_package_install_cmd("gamescope"),
-                ["apt-get", "install", "-y", "gamescope"],
+                runtime_manager.get_system_package_install_cmd("mangohud"),
+                ["apt-get", "install", "-y", "mangohud"],
             )
+            self.assertIsNone(runtime_manager.get_system_package_install_cmd("gamescope"))
+
+    def test_gpu_presets_and_unverified_prefix_cleanup(self) -> None:
+        opts = steam_vdf.apply_launch_presets(
+            "",
+            gamemode=True,
+            mangohud=True,
+            wined3d=False,
+            no_esync=False,
+            no_fsync=False,
+            mangohud_level=2,
+            nvidia_nvapi=True,
+            prime_offload=True,
+            proton_wayland=True,
+        )
+        self.assertIn("MANGOHUD=1", opts)
+        self.assertIn("position=top-center", opts)
+        self.assertIn("horizontal", opts)
+        self.assertIn("PROTON_ENABLE_NVAPI=1", opts)
+        self.assertIn("DXVK_ENABLE_NVAPI=1", opts)
+        self.assertIn("__NV_PRIME_RENDER_OFFLOAD=1", opts)
+        self.assertIn("__GLX_VENDOR_LIBRARY_NAME=nvidia", opts)
+        self.assertIn("PROTON_ENABLE_WAYLAND=1", opts)
+
+        stripped = steam_vdf.apply_launch_presets(
+            opts,
+            gamemode=False,
+            mangohud=False,
+            wined3d=False,
+            no_esync=False,
+            no_fsync=False,
+        )
+        self.assertEqual(stripped, "")
+
+        # Unverified prefix cleanup: skipped when allow_unverified_saves=False, deleted when True, + backup ZIP
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            hydra_pfx = root / "hydra" / "OldHydraGame"
+            save_file = hydra_pfx / "drive_c" / "users" / "steamuser" / "Documents" / "save.dat"
+            save_file.parent.mkdir(parents=True)
+            save_file.write_bytes(b"HYDRA-SAVE")
+
+            with mock.patch.object(steam_vdf, "external_prefix_roots", return_value=[root / "hydra"]):
+                cands = steam_vdf.find_cleanup_candidates(
+                    None,
+                    home_dir=root / "home",
+                )
+                self.assertEqual(len(cands), 1)
+                self.assertTrue(cands[0].has_saves)
+                self.assertFalse(cands[0].saves_verified_migrated)
+
+                deleted, _freed, errs = steam_vdf.delete_cleanup_candidates_checked(
+                    None, cands, allow_unverified_saves=False
+                )
+                self.assertEqual(deleted, 0)
+                self.assertTrue(errs)
+                self.assertTrue(hydra_pfx.is_dir())
+
+                zpath, gcount, fcount = steam_vdf.backup_prefix_candidates_to_zip(cands, dest_root=root / "backups")
+                self.assertTrue(zpath.is_file())
+                self.assertEqual((gcount, fcount), (1, 1))
+
+                deleted2, _freed2, errs2 = steam_vdf.delete_cleanup_candidates_checked(
+                    None, cands, allow_unverified_saves=True
+                )
+                self.assertEqual(deleted2, 1)
+                self.assertEqual(errs2, [])
+                self.assertFalse(hydra_pfx.exists())
 
 
 if __name__ == "__main__":

@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import codecs
 import errno
 import os
 import re
-import select
 import shutil
-import signal
 import stat
 import subprocess
+import tarfile
 import tempfile
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -36,6 +35,58 @@ ARCHIVE_SUFFIXES = (
     ".rar",
     ".7z",
 )
+
+
+class InsufficientSpaceError(RuntimeError):
+    """Raised when the target filesystem lacks enough free space."""
+
+    def __init__(self, target_path: Path, required_bytes: int, available_bytes: int) -> None:
+        self.target_path = target_path
+        self.required_bytes = required_bytes
+        self.available_bytes = available_bytes
+        req_mb = required_bytes / (1024 * 1024)
+        avail_mb = available_bytes / (1024 * 1024)
+        super().__init__(
+            f"Insufficient disk space at {target_path}: "
+            f"need {req_mb:.1f} MiB, only {avail_mb:.1f} MiB available."
+        )
+
+
+def check_disk_space(
+    target_dir: Path,
+    required_bytes: int,
+    safety_margin: float = 1.1,
+) -> tuple[int, int]:
+    """Verify free space on target_dir's filesystem and return (required, available) bytes."""
+    probe = target_dir
+    while not probe.exists():
+        parent = probe.parent
+        if parent == probe:
+            break
+        probe = parent
+    usage = shutil.disk_usage(probe)
+    needed = int(required_bytes * safety_margin) if required_bytes > 0 else 0
+    if usage.free < needed:
+        raise InsufficientSpaceError(target_dir, needed, usage.free)
+    return (needed, usage.free)
+
+
+def estimate_archive_uncompressed_size(archive: Path) -> int:
+    """Estimate uncompressed byte size from zip/tar metadata, falling back to 2x file size."""
+    try:
+        if zipfile.is_zipfile(archive):
+            with zipfile.ZipFile(archive, "r") as zf:
+                total = sum(info.file_size for info in zf.infolist())
+                if total > 0:
+                    return total
+        elif tarfile.is_tarfile(archive):
+            with tarfile.open(archive, "r:*") as tf:
+                total = sum(member.size for member in tf.getmembers() if member.isfile())
+                if total > 0:
+                    return total
+    except (OSError, zipfile.BadZipFile, tarfile.TarError, EOFError, ValueError):
+        pass
+    return archive.stat().st_size * 2
 
 
 def is_archive(path: Path) -> bool:
@@ -64,6 +115,11 @@ def sanitize_folder_name(name: str) -> str:
     return cleaned
 
 
+def _find_7z_bin() -> str | None:
+    """Return the first available 7-Zip CLI binary (7z, 7zz, or 7za)."""
+    return shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
+
+
 def _select_extract_cmd(archive: Path, out_dir: Path) -> list[str]:
     arc = archive.resolve()
     low = arc.name.lower()
@@ -73,9 +129,68 @@ def _select_extract_cmd(archive: Path, out_dir: Path) -> list[str]:
         return ["unrar", "x", "-o+", "-y", "-p-", "--", str(arc), str(out_dir) + "/"]
     if low.endswith(".zip") and shutil.which("unzip"):
         return ["unzip", "-o", "--", str(arc), "-d", str(out_dir)]
-    if shutil.which("7z"):
-        return ["7z", "x", "-y", "-p-", f"-o{out_dir}", "--", str(arc)]
+    seven_z = _find_7z_bin()
+    if seven_z:
+        return [seven_z, "x", "-y", "-p-", f"-o{out_dir}", "--", str(arc)]
     raise RuntimeError(f"No extraction tool found for: {archive.name}")
+
+
+def _extract_zip_safe(archive: Path, dest_dir: Path) -> None:
+    """Extract a .zip archive using Python zipfile with strict path-traversal checks."""
+    dest_resolved = dest_dir.resolve()
+    with zipfile.ZipFile(archive, "r") as zf:
+        for info in zf.infolist():
+            member_name = info.filename.replace("\\", "/")
+            if not member_name:
+                continue
+            member_path = Path(member_name)
+            if member_path.is_absolute() or ".." in member_path.parts:
+                raise RuntimeError(f"Unsafe archive member path: {info.filename}")
+            if stat.S_ISLNK(info.external_attr >> 16):
+                continue
+            target_path = (dest_resolved / member_path).resolve()
+            if target_path != dest_resolved and dest_resolved not in target_path.parents:
+                raise RuntimeError(f"Archive member escapes destination: {info.filename}")
+            if info.is_dir():
+                target_path.mkdir(parents=True, exist_ok=True)
+            else:
+                target_path.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(info, "r") as src, open(target_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+
+def extract_archive_to_dir(archive: Path, dest_dir: Path) -> None:
+    """Extract a .zip or .7z (or other supported) archive directly into dest_dir."""
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    low = archive.name.lower()
+    if low.endswith(".zip"):
+        _extract_zip_safe(archive, dest_dir)
+        return
+    if low.endswith(".7z"):
+        seven_z = _find_7z_bin()
+        if not seven_z:
+            raise RuntimeError(
+                "No 7-Zip extraction tool found (tried 7z, 7zz, 7za). "
+                "Install 7zip/p7zip to extract .7z archives."
+            )
+        cmd = [seven_z, "x", "-y", "-p-", f"-o{dest_dir}", "--", str(archive)]
+    else:
+        cmd = _select_extract_cmd(archive, dest_dir)
+
+    proc = subprocess.run(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        raise RuntimeError(
+            f"Failed to extract {archive.name} (code {proc.returncode})"
+            + (f": {detail}" if detail else ".")
+        )
+    _strip_symlinks_and_specials(dest_dir)
 
 
 def _strip_symlinks_and_specials(root: Path) -> None:
@@ -168,13 +283,7 @@ def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
 
 def _kill_proc_group(proc: subprocess.Popen[bytes], sig: int) -> None:
     """Signal the subprocess group when start_new_session=True, falling back to proc."""
-    try:
-        os.killpg(proc.pid, sig)
-    except (ProcessLookupError, PermissionError, OSError):
-        if sig == signal.SIGKILL:
-            proc.kill()
-        else:
-            proc.terminate()
+    runtime_manager.kill_proc_group(proc, sig)
 
 
 def _drain_stream_lines(
@@ -184,59 +293,7 @@ def _drain_stream_lines(
     cancel_msg: str,
 ) -> int:
     """Read subprocess stdout non-blockingly so cancel_flag is checked every <=0.2s."""
-    assert proc.stdout is not None
-    fd = proc.stdout.fileno()
-    os.set_blocking(fd, False)
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    buf = ""
-    try:
-        while True:
-            if cancel_flag and cancel_flag():
-                _kill_proc_group(proc, signal.SIGTERM)
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    _kill_proc_group(proc, signal.SIGKILL)
-                    proc.wait(timeout=2)
-                raise RuntimeError(cancel_msg)
-            ready, _, _ = select.select([fd], [], [], 0.2)
-            if ready:
-                chunk = os.read(fd, 4096)
-                if not chunk:
-                    buf += decoder.decode(b"", final=True)
-                    if buf.strip():
-                        on_line(buf)
-                    break
-                buf += decoder.decode(chunk, final=False)
-                while True:
-                    idx_n = buf.find("\n")
-                    idx_r = buf.find("\r")
-                    if idx_n == -1 and idx_r == -1:
-                        break
-                    if idx_n == -1:
-                        sep = idx_r
-                    elif idx_r == -1:
-                        sep = idx_n
-                    else:
-                        sep = min(idx_n, idx_r)
-                    line = buf[:sep]
-                    buf = buf[sep + 1 :]
-                    if line.strip():
-                        on_line(line)
-            elif proc.poll() is not None:
-                buf += decoder.decode(b"", final=True)
-                if buf.strip():
-                    on_line(buf)
-                break
-        rc = proc.wait()
-        if cancel_flag and cancel_flag():
-            raise RuntimeError(cancel_msg)
-        return rc
-    finally:
-        try:
-            proc.stdout.close()
-        except OSError:
-            pass
+    return runtime_manager.drain_stream_lines(proc, cancel_flag, on_line, cancel_msg)
 
 
 def extract_archive(
@@ -247,6 +304,7 @@ def extract_archive(
     cancel_flag: Callable[[], bool] | None = None,
 ) -> Path:
     """Extract an archive into dest_root/<game_folder_name> and return the target path."""
+    check_disk_space(dest_root, estimate_archive_uncompressed_size(archive))
     folder_name = sanitize_folder_name(game_folder_name or suggest_target_name(archive))
     final_dir = dest_root / folder_name
     dest_root.mkdir(parents=True, exist_ok=True)
@@ -313,6 +371,7 @@ def run_windows_installer(
     cancel_flag: Callable[[], bool] | None = None,
 ) -> Path:
     """Run a Windows setup.exe using Steam's Proton or umu-run in a disposable prefix."""
+    check_disk_space(target_dir, max(installer_exe.stat().st_size * 2, 512 * 1024 * 1024))
     steam_root = find_steam_root()
     proton = find_proton_binary(steam_root) if steam_root is not None else None
     use_steam_proton = steam_root is not None and proton is not None
@@ -320,6 +379,10 @@ def run_windows_installer(
     target_dir.mkdir(parents=True, exist_ok=True)
     pre_existing = {p for p in target_dir.rglob("*") if p.is_file()}
     with tempfile.TemporaryDirectory(prefix="deckinstall_pfx_", dir=str(target_dir.parent)) as tmp_pfx:
+        def _handle_inst_line(line: str) -> None:
+            if on_log and line.strip():
+                on_log(line.strip()[:140])
+
         if use_steam_proton:
             env = os.environ.copy()
             env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_root)
@@ -329,40 +392,35 @@ def run_windows_installer(
                     f"Starting {installer_exe.name} via Proton.\n"
                     f"Tip: in the installer, set destination to Z:{target_dir}"
                 )
-            proc = subprocess.Popen(
-                [str(proton), "run", str(installer_exe)],
-                cwd=str(tmp_pfx),
-                env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-
-            def _handle_inst_line(line: str) -> None:
-                if on_log and line.strip():
-                    on_log(line.strip()[:140])
-
-            rc = _drain_stream_lines(proc, cancel_flag, _handle_inst_line, "Installer cancelled by user.")
-            if rc != 0:
-                raise RuntimeError(f"Installer exited with code {rc}.")
+            cmd = [str(proton), "run", str(installer_exe)]
             inst_pfx = Path(tmp_pfx) / "pfx"
         else:
             if cancel_flag and cancel_flag():
                 raise RuntimeError("Installer cancelled by user.")
+            umu_run = runtime_manager.ensure_umu_run()
+            resolved_proton = runtime_manager.ensure_ge_proton11()
+            runtime_manager.validate_steamrt4_integrity()
+            env = runtime_manager.build_umu_env(Path(tmp_pfx), resolved_proton)
             if on_log:
                 on_log(
                     f"Starting {installer_exe.name} via umu-run.\n"
                     f"Tip: in the installer, set destination to Z:{target_dir}"
                 )
-            res = runtime_manager.run_with_umu(
-                installer_exe,
-                Path(tmp_pfx),
-                cwd=Path(tmp_pfx),
-            )
-            if res.returncode != 0:
-                raise RuntimeError(f"Installer exited with code {res.returncode}.")
+            cmd = [str(umu_run), str(installer_exe)]
             inst_pfx = Path(tmp_pfx)
+
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(tmp_pfx),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        rc = _drain_stream_lines(proc, cancel_flag, _handle_inst_line, "Installer cancelled by user.")
+        if rc != 0:
+            raise RuntimeError(f"Installer exited with code {rc}.")
 
         has_installed = bool({p for p in target_dir.rglob("*") if p.is_file()} - pre_existing)
         if not has_installed:

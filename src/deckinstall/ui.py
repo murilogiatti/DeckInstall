@@ -10,10 +10,11 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QRect, QSettings, QSize, Qt, QThread, Signal, qInstallMessageHandler
+from PySide6.QtCore import QPoint, QRect, QSettings, QSize, Qt, QThread, QUrl, Signal, qInstallMessageHandler
 from PySide6.QtGui import (
     QAction,
     QCloseEvent,
+    QDesktopServices,
     QDragEnterEvent,
     QDragLeaveEvent,
     QDropEvent,
@@ -42,6 +43,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QProgressDialog,
     QPushButton,
@@ -72,6 +74,7 @@ from .artwork import (
 )
 from .i18n import available_languages, get_language, set_language, tr
 from .extractor import (
+    InsufficientSpaceError,
     extract_archive,
     is_archive,
     run_windows_installer,
@@ -79,8 +82,10 @@ from .extractor import (
     suggest_target_name,
 )
 from .runtime_manager import (
+    WINETRICKS_PRESETS,
     check_runtime_updates,
     check_ubuntu_bwrap_userns,
+    detect_gpu_profile,
     ensure_ge_proton11,
     ensure_umu_run,
     fix_bwrap_userns,
@@ -90,7 +95,19 @@ from .runtime_manager import (
     get_umu_run_path,
     install_system_package,
     list_ge_proton11_dirs,
+    resolve_game_prefix_and_proton,
+    run_winetricks_verbs,
     validate_steamrt4_integrity,
+)
+from .optiscaler import (
+    OPTISCALER_BACKENDS,
+    OPTISCALER_FG_MODES,
+    OPTISCALER_PROXY_DLLS,
+    OPTISCALER_SPOOF_MODES,
+    OptiScalerConflictError,
+    inspect_optiscaler_state,
+    install_optiscaler_for_game,
+    uninstall_optiscaler_for_game,
 )
 from .scanner import DetectedGame, clean_game_name, detect_exe_kind, scan_all_games, scan_game_folder
 from .standalone import (
@@ -104,6 +121,7 @@ from .standalone import (
 )
 from .steam_paths import (
     SteamPaths,
+    find_proton_binary,
     find_steam_root,
     is_gamescope_session,
     is_steam_running,
@@ -116,10 +134,13 @@ from .steam_vdf import (
     MigrationPlanItem,
     ShortcutEntry,
     _dir_size_bytes,
+    _format_winedlloverrides_token,
+    _strip_vdf_quotes,
     add_or_update_shortcut,
     adopt_installer_prefix,
     apply_launch_presets,
     backup_all_saves,
+    backup_prefix_candidates_to_zip,
     bulk_migrate_compat_tool,
     delete_cleanup_candidates_checked,
     detect_helixsr_lsfg_conflict,
@@ -127,13 +148,14 @@ from .steam_vdf import (
     get_shortcut_proton,
     import_external_prefix_saves,
     infer_game_root_from_exe,
-    install_mangohud_topbar_config,
     list_compat_tool_usage,
     load_shortcuts,
+    merge_winedlloverride,
     migrate_shortcut_to_games,
     plan_bulk_migration,
     remove_compat_tools,
     remove_shortcut,
+    remove_winedlloverride,
     restore_saves_backup,
     set_shortcut_proton,
     shutdown_steam,
@@ -276,7 +298,7 @@ class ExtractWorker(QThread):
             if self._cancelled or self.isInterruptionRequested():
                 self.cancelled.emit()
             else:
-                self.failed.emit(str(exc))
+                self.failed.emit(_format_worker_error(exc))
 
 
 class SteamSearchWorker(QThread):
@@ -337,7 +359,7 @@ class PkexecWorker(QThread):
             ok, out = self.fn()
             self.finished_result.emit(ok, out)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(_format_worker_error(exc))
 
 
 class SteamOpWorker(QThread):
@@ -373,7 +395,7 @@ class SteamOpWorker(QThread):
                 start_steam()
             self.finished_ok.emit(result)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(_format_worker_error(exc))
 
 
 class ScanWorker(QThread):
@@ -404,6 +426,8 @@ class AddToSteamWorker(QThread):
         steam_appid: int | None,
         enable_proton: bool,
         restart_steam: bool,
+        launch_options: str = "",
+        winedlloverrides: str = "",
     ) -> None:
         super().__init__()
         self.paths = paths
@@ -412,6 +436,8 @@ class AddToSteamWorker(QThread):
         self.steam_appid = steam_appid
         self.enable_proton = enable_proton
         self.restart_steam = restart_steam
+        self.launch_options = launch_options
+        self.winedlloverrides = winedlloverrides
 
     def run(self) -> None:
         was_running = False
@@ -424,11 +450,25 @@ class AddToSteamWorker(QThread):
                     raise RuntimeError(tr("add.close_steam_timeout"))
 
             self.status.emit(tr("add.writing_shortcut"))
+            effective_launch = self.launch_options.strip()
+            if self.winedlloverrides.strip():
+                dll_tok = _format_winedlloverrides_token(self.winedlloverrides)
+                if effective_launch:
+                    try:
+                        toks = shlex.split(effective_launch)
+                    except ValueError:
+                        toks = effective_launch.split()
+                    if not any(t.startswith("WINEDLLOVERRIDES=") for t in toks):
+                        effective_launch = f"{dll_tok} {effective_launch}"
+                else:
+                    effective_launch = f"{dll_tok} %command%"
+
             shortcut_id = add_or_update_shortcut(
                 self.paths,
                 app_name=self.app_name,
                 exe_path=self.exe_path,
                 start_dir=self.exe_path.parent,
+                launch_options=effective_launch or None,
                 enable_proton=self.enable_proton,
             )
             shortcut_written = True
@@ -461,7 +501,7 @@ class AddToSteamWorker(QThread):
                 tr("add.done", name=self.app_name, appid=shortcut_id, art=art_msg)
             )
         except Exception as exc:
-            self.failed.emit(str(exc), shortcut_written)
+            self.failed.emit(_format_worker_error(exc), shortcut_written)
         finally:
             if was_running and self.restart_steam:
                 try:
@@ -518,7 +558,7 @@ class RuntimeUpdateWorker(QThread):
             )
             self.finished_ok.emit(msg, bwrap_warn)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(_format_worker_error(exc))
 
 
 class AppUpdateCheckWorker(QThread):
@@ -531,7 +571,7 @@ class AppUpdateCheckWorker(QThread):
         try:
             self.checked.emit(check_app_update())
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(_format_worker_error(exc))
 
 
 class AppUpdateDownloadWorker(QThread):
@@ -553,7 +593,7 @@ class AppUpdateDownloadWorker(QThread):
             )
             self.finished_ok.emit(updated_path)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(_format_worker_error(exc))
 
 
 class StandaloneInstallWorker(QThread):
@@ -572,6 +612,8 @@ class StandaloneInstallWorker(QThread):
         create_desktop_shortcut: bool = False,
         icon_path: Path | None = None,
         keep_in_place: bool = False,
+        launch_options: str = "",
+        winedlloverrides: str = "",
     ) -> None:
         super().__init__()
         self.app_name = app_name
@@ -581,6 +623,8 @@ class StandaloneInstallWorker(QThread):
         self.create_desktop_shortcut = create_desktop_shortcut
         self.icon_path = icon_path
         self.keep_in_place = keep_in_place
+        self.launch_options = launch_options
+        self.winedlloverrides = winedlloverrides
 
     def run(self) -> None:
         try:
@@ -607,6 +651,8 @@ class StandaloneInstallWorker(QThread):
                 game_dir=game_dir,
                 proton_name=proton_name,
                 steam_appid=self.steam_appid,
+                winedlloverrides="" if is_native else self.winedlloverrides,
+                launch_options=self.launch_options,
                 icon_path=self.icon_path,
                 create_menu_shortcut=self.create_menu_shortcut,
                 create_desktop_shortcut=self.create_desktop_shortcut,
@@ -617,7 +663,7 @@ class StandaloneInstallWorker(QThread):
             bwrap_warn = "" if is_native else (check_ubuntu_bwrap_userns() or "")
             self.finished_ok.emit(game, bwrap_warn)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(_format_worker_error(exc))
 
 
 class BulkMigrateWorker(QThread):
@@ -668,7 +714,7 @@ class BulkMigrateWorker(QThread):
                         download_steam_artwork(steam_appid, new_appid, self.paths.grid_dir)
                     migrated.append(item.new_name)
                 except Exception as exc:
-                    errors.append(f"{item.entry.app_name}: {exc}")
+                    errors.append(f"{item.entry.app_name}: {_format_worker_error(exc)}")
 
             self.status.emit(tr("migrate.sync_all"))
             checked, copied = 0, 0
@@ -688,7 +734,7 @@ class BulkMigrateWorker(QThread):
                 summary += tr("migrate.errors_header", errs="\n".join(errors))
             self.finished_ok.emit(summary)
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(_format_worker_error(exc))
         finally:
             if was_running and not is_steam_running():
                 self.status.emit(tr("add.restarting_steam"))
@@ -758,6 +804,58 @@ def format_size_bytes(num_bytes: int | float) -> str:
     if size >= 1024 * 1024 * 1024:
         return f"{size / (1024 ** 3):.2f} GB"
     return f"{size / (1024 ** 2):.1f} MB"
+
+
+def _format_worker_error(exc: Exception) -> str:
+    """Format worker exceptions, localizing InsufficientSpaceError."""
+    if isinstance(exc, InsufficientSpaceError):
+        return tr(
+            "error.insufficient_space",
+            path=str(exc.target_path),
+            required=format_size_bytes(exc.required_bytes),
+            available=format_size_bytes(exc.available_bytes),
+        )
+    return str(exc)
+
+
+class WinetricksWorker(QThread):
+    """Background worker to install winetricks verbs into a game's Wine prefix."""
+
+    log = Signal(str)
+    finished_ok = Signal()
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        prefix_dir: Path,
+        verbs: list[str],
+        proton_dir: Path | None = None,
+    ) -> None:
+        super().__init__()
+        self.prefix_dir = prefix_dir
+        self.verbs = verbs
+        self.proton_dir = proton_dir
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        self.requestInterruption()
+
+    def run(self) -> None:
+        try:
+            run_winetricks_verbs(
+                self.prefix_dir,
+                self.verbs,
+                proton_dir=self.proton_dir,
+                on_log=lambda line: self.log.emit(line),
+                cancel_flag=lambda: self._cancelled or self.isInterruptionRequested(),
+            )
+            if self._cancelled or self.isInterruptionRequested():
+                self.failed.emit(tr("winetricks.cancelled"))
+                return
+            self.finished_ok.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 def _format_cleanup_candidate_label(cand: CleanupCandidate) -> str:
@@ -884,6 +982,83 @@ def _make_card() -> tuple[QFrame, QVBoxLayout]:
     layout.setContentsMargins(16, 14, 16, 14)
     layout.setSpacing(10)
     return card, layout
+
+
+def _parse_launch_preset_state(opts: str) -> dict[str, object]:
+    """Parse known launch preset flags and values from a LaunchOptions string."""
+    try:
+        tokens_list = shlex.split(opts) if opts.strip() else []
+    except ValueError:
+        tokens_list = opts.split()
+    tokens_now = set(tokens_list)
+
+    mh_level = 0
+    mh_position = ""
+    mh_fps_limit = 0
+    for tok in tokens_now:
+        if tok.startswith("MANGOHUD_CONFIG="):
+            val = tok.split("=", 1)[1]
+            if "horizontal" in val and ("hud_compact" in val or "position=top-center" in val):
+                mh_level = 2
+            else:
+                for lv in (1, 2, 3, 4):
+                    if f"preset={lv}" in val:
+                        mh_level = lv
+                        break
+            for part in val.split(","):
+                part_s = part.strip()
+                if part_s.startswith("position="):
+                    mh_position = part_s.split("=", 1)[1].strip()
+                elif part_s.startswith("fps_limit="):
+                    try:
+                        parsed_fps = int(part_s.split("=", 1)[1].strip())
+                        if parsed_fps > 0:
+                            mh_fps_limit = parsed_fps
+                    except ValueError:
+                        pass
+
+    winedll_from_tokens = ""
+    for tok in tokens_list:
+        if tok.startswith("WINEDLLOVERRIDES="):
+            winedll_from_tokens = tok.split("=", 1)[1]
+
+    return {
+        "tokens_list": tokens_list,
+        "tokens_now": tokens_now,
+        "gamemode": "gamemoderun" in tokens_now,
+        "mangohud": "MANGOHUD=1" in tokens_now,
+        "mh_level": mh_level,
+        "mh_position": mh_position,
+        "mh_fps_limit": mh_fps_limit,
+        "nvapi": "PROTON_ENABLE_NVAPI=1" in tokens_now or "DXVK_ENABLE_NVAPI=1" in tokens_now,
+        "prime": (
+            "__NV_PRIME_RENDER_OFFLOAD=1" in tokens_now
+            or "__GLX_VENDOR_LIBRARY_NAME=nvidia" in tokens_now
+        ),
+        "wayland": "PROTON_ENABLE_WAYLAND=1" in tokens_now,
+        "dlss_upgrade": "PROTON_DLSS_UPGRADE=1" in tokens_now,
+        "wined3d": "PROTON_USE_WINED3D=1" in tokens_now,
+        "no_esync": "PROTON_NO_ESYNC=1" in tokens_now,
+        "no_fsync": "PROTON_NO_FSYNC=1" in tokens_now,
+        "winedll": winedll_from_tokens,
+    }
+
+
+def _resolve_game_exe_path(kind: str, obj: object) -> Path | None:
+    """Resolve the executable Path for a standalone game or Steam shortcut entry."""
+    if kind == "standalone":
+        exe = getattr(obj, "exe_path", None)
+        return exe if isinstance(exe, Path) else (Path(str(exe)) if exe else None)
+    raw_exe = _strip_vdf_quotes(str(getattr(obj, "exe", "") or ""))
+    return Path(raw_exe) if raw_exe else None
+
+
+def _is_native_linux_game(kind: str, obj: object) -> bool:
+    """Return True if a standalone game or Steam shortcut targets a native Linux ELF binary."""
+    if kind == "standalone" and bool(getattr(obj, "native_linux", False)):
+        return True
+    exe_path = _resolve_game_exe_path(kind, obj)
+    return exe_path is not None and exe_path.is_file() and detect_exe_kind(exe_path) == "linux_elf"
 
 
 class MainWindow(QMainWindow):
@@ -1331,6 +1506,7 @@ class MainWindow(QMainWindow):
 
         self.chk_restart = QCheckBox(tr("add.reopen_steam"))
         self.chk_restart.setChecked(True)
+        self.chk_restart.setToolTip(tr("add.reopen_steam_tooltip"))
         form.addRow("", self.chk_restart)
 
         lbl_standalone_opts_group = QLabel(tr("add.group_standalone_opts"))
@@ -1351,6 +1527,37 @@ class MainWindow(QMainWindow):
         self.chk_keep_in_place = QCheckBox(tr("add.keep_in_place"))
         self.chk_keep_in_place.setChecked(False)
         form.addRow("", self.chk_keep_in_place)
+
+        self._add_launch_options = ""
+        self._add_winedlloverrides = ""
+        lbl_launch_opts_group = QLabel(tr("add.group_launch_opts"))
+        lbl_launch_opts_group.setObjectName("MutedText")
+        lbl_launch_opts_group.setStyleSheet("font-weight: 700; margin-top: 6px;")
+        form.addRow(lbl_launch_opts_group)
+
+        launch_opts_box = QVBoxLayout()
+        launch_opts_box.setSpacing(4)
+        launch_row1 = QHBoxLayout()
+        launch_row1.setSpacing(10)
+        self.chk_add_gamemode = QCheckBox(tr("launch.gamemode"))
+        self.chk_add_mangohud = QCheckBox(tr("launch.mangohud"))
+        launch_row1.addWidget(self.chk_add_gamemode)
+        launch_row1.addWidget(self.chk_add_mangohud)
+        launch_row1.addStretch()
+
+        launch_row2 = QHBoxLayout()
+        launch_row2.setSpacing(10)
+        self.chk_add_dlss = QCheckBox(tr("launch.dlss_upgrade"))
+        self.chk_add_dlss.setVisible(detect_gpu_profile().has_nvidia)
+        self.btn_add_launch_adv = QPushButton(tr("add.btn_launch_advanced"))
+        self.btn_add_launch_adv.clicked.connect(self._open_add_launch_advanced)
+        launch_row2.addWidget(self.chk_add_dlss)
+        launch_row2.addWidget(self.btn_add_launch_adv)
+        launch_row2.addStretch()
+
+        launch_opts_box.addLayout(launch_row1)
+        launch_opts_box.addLayout(launch_row2)
+        form.addRow("", launch_opts_box)
 
         cfg_split.addWidget(form_widget)
 
@@ -1483,6 +1690,10 @@ class MainWindow(QMainWindow):
         self.act_proton.triggered.connect(self._change_selected_proton)
         self.act_launch_opts = QAction(tr("library.btn_launch_opts"), self)
         self.act_launch_opts.triggered.connect(self._edit_launch_options_presets)
+        self.act_winetricks = QAction(tr("library.btn_winetricks"), self)
+        self.act_winetricks.triggered.connect(lambda: self._open_winetricks_dialog())
+        self.act_optiscaler = QAction(tr("library.btn_optiscaler"), self)
+        self.act_optiscaler.triggered.connect(lambda: self._open_optiscaler_dialog())
         self.act_export_standalone = QAction(tr("library.btn_export_standalone"), self)
         self.act_export_standalone.triggered.connect(self._export_selected_to_standalone)
         self.act_import_steam = QAction(tr("library.btn_import_steam"), self)
@@ -1495,6 +1706,8 @@ class MainWindow(QMainWindow):
             self.act_revert_art,
             self.act_proton,
             self.act_launch_opts,
+            self.act_winetricks,
+            self.act_optiscaler,
             self.act_export_standalone,
             self.act_import_steam,
         ):
@@ -1626,6 +1839,8 @@ class MainWindow(QMainWindow):
 
         self.maint_list = QListWidget()
         self.maint_list.setMinimumHeight(220)
+        self.maint_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.maint_list.customContextMenuRequested.connect(self._show_maint_context_menu)
         self.maint_list.itemChanged.connect(self._on_maint_item_changed)
         clean_layout.addWidget(self.maint_list, 1)
 
@@ -1662,23 +1877,29 @@ class MainWindow(QMainWindow):
             tr("maint.health_app", app=__app_name__, version=__version__, mode=mode)
         )
 
+        steam_root = find_steam_root()
+        has_steam_proton = steam_root is not None and find_proton_binary(steam_root) is not None
+        missing_status = (
+            tr("maint.status_optional_steam") if has_steam_proton else tr("maint.status_missing")
+        )
+
         umu_path = get_umu_run_path()
         umu_status = (
             f"{tr('maint.status_ok')} ({umu_path})"
             if umu_path.is_file()
-            else tr("maint.status_missing")
+            else missing_status
         )
         self.lbl_maint_umu.setText(tr("maint.health_umu", status=umu_status))
 
         ge_dirs = list_ge_proton11_dirs()
         proton_status = (
-            f"{len(ge_dirs)} ({ge_dirs[0].name})" if ge_dirs else tr("maint.status_missing")
+            f"{len(ge_dirs)} ({ge_dirs[0].name})" if ge_dirs else missing_status
         )
         self.lbl_maint_proton.setText(tr("maint.health_proton", status=proton_status))
 
         steamrt4_dir = get_steamrt4_dir()
         if not steamrt4_dir.is_dir():
-            rt4_status = tr("maint.status_missing")
+            rt4_status = missing_status
         elif validate_steamrt4_integrity():
             rt4_status = tr("maint.status_ok")
         else:
@@ -1920,6 +2141,41 @@ class MainWindow(QMainWindow):
         ]
         if not selected:
             return
+        unverified = [c for c in selected if c.has_saves and not c.saves_verified_migrated]
+        if unverified:
+            preview_lines = "\n".join(f"• {c.label}" for c in unverified[:5])
+            if len(unverified) > 5:
+                preview_lines += f"\n• ... (+{len(unverified) - 5})"
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle(__app_name__)
+            box.setText(
+                tr(
+                    "maint.confirm_delete_unverified",
+                    count=len(unverified),
+                    items=preview_lines,
+                )
+            )
+            btn_backup_del = box.addButton(
+                tr("maint.btn_backup_and_delete"), QMessageBox.ButtonRole.AcceptRole
+            )
+            btn_del_anyway = box.addButton(
+                tr("maint.btn_delete_anyway"), QMessageBox.ButtonRole.DestructiveRole
+            )
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(btn_backup_del)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is btn_backup_del:
+                self._run_maint_delete(
+                    selected, allow_unverified_saves=True, backup_unverified=True
+                )
+            elif clicked is btn_del_anyway:
+                self._run_maint_delete(
+                    selected, allow_unverified_saves=True, backup_unverified=False
+                )
+            return
+
         sel_size = format_size_bytes(sum(c.size_bytes for c in selected))
         ans = QMessageBox.question(
             self,
@@ -1929,37 +2185,73 @@ class MainWindow(QMainWindow):
         if ans == QMessageBox.StandardButton.Yes:
             self._run_maint_delete(selected)
 
-    def _run_maint_delete(self, items: list[CleanupCandidate]) -> None:
+    def _run_maint_delete(
+        self,
+        items: list[CleanupCandidate],
+        *,
+        allow_unverified_saves: bool = False,
+        backup_unverified: bool = False,
+    ) -> None:
         self._set_steam_busy(True)
         self.status_label.setText(tr("cleanup.deleting", count=len(items)))
 
         class _MaintDeleteWorker(QThread):
-            done = Signal(int, int, list, list)
+            done = Signal(int, int, list, list, str)
             failed = Signal(str)
 
-            def __init__(self, paths: SteamPaths | None, target_items: list[CleanupCandidate]) -> None:
+            def __init__(
+                self,
+                paths: SteamPaths | None,
+                target_items: list[CleanupCandidate],
+                allow_unverified: bool,
+                do_backup_unverified: bool,
+            ) -> None:
                 super().__init__()
                 self._paths = paths
                 self._items = target_items
+                self._allow_unverified = allow_unverified
+                self._backup_unverified = do_backup_unverified
 
             def run(self) -> None:
                 try:
                     if _is_wine_game_running():
                         raise RuntimeError(tr("cleanup.wine_running"))
+                    backup_zip_str = ""
+                    if self._backup_unverified:
+                        unverified_items = [
+                            c
+                            for c in self._items
+                            if c.has_saves and not c.saves_verified_migrated
+                        ]
+                        if unverified_items:
+                            zip_path, _games, files_backed = backup_prefix_candidates_to_zip(
+                                unverified_items
+                            )
+                            if files_backed > 0:
+                                backup_zip_str = str(zip_path)
                     deleted, freed, errs = delete_cleanup_candidates_checked(
-                        self._paths, self._items, include_system_caches=True
+                        self._paths,
+                        self._items,
+                        include_system_caches=True,
+                        allow_unverified_saves=self._allow_unverified,
                     )
                     new_cands = find_cleanup_candidates(self._paths, include_system_caches=True)
-                    self.done.emit(deleted, freed, errs, new_cands)
+                    self.done.emit(deleted, freed, errs, new_cands, backup_zip_str)
                 except Exception as exc:
                     self.failed.emit(str(exc))
 
         def _on_deleted(
-            deleted: int, freed: int, errs: list[str], new_cands: list[CleanupCandidate]
+            deleted: int,
+            freed: int,
+            errs: list[str],
+            new_cands: list[CleanupCandidate],
+            backup_zip_str: str,
         ) -> None:
             self._set_steam_busy(False)
             self._apply_maint_scan_results(new_cands)
             msg = tr("cleanup.deleted", deleted=deleted, size=format_size_bytes(freed))
+            if backup_zip_str:
+                msg += "\n" + tr("maint.backup_created_note", path=backup_zip_str)
             if errs:
                 msg += tr("cleanup.delete_warnings", errs="\n".join(errs[:10]))
             self.status_label.setText(msg.splitlines()[0])
@@ -1974,11 +2266,58 @@ class MainWindow(QMainWindow):
             self.status_label.setText(msg)
             QMessageBox.critical(self, __app_name__, msg)
 
-        worker = _MaintDeleteWorker(self.paths, items)
+        worker = _MaintDeleteWorker(
+            self.paths, items, allow_unverified_saves, backup_unverified
+        )
         self._track_worker(worker)
         worker.done.connect(_on_deleted)
         worker.failed.connect(_on_failed)
         worker.start()
+
+    def _show_maint_context_menu(self, pos: QPoint) -> None:
+        item = self.maint_list.itemAt(pos)
+        if item is None:
+            return
+        cand = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(cand, CleanupCandidate):
+            return
+
+        menu = QMenu(self)
+        act_open = menu.addAction(tr("maint.ctx_open_folder"))
+        act_backup: QAction | None = None
+        if cand.path.is_dir() and cand.category in (
+            "Prefixo Externo",
+            "external_prefix",
+            "Compatdata Órfão",
+            "orphan_compatdata",
+        ):
+            act_backup = menu.addAction(tr("maint.ctx_backup_saves"))
+
+        chosen = menu.exec(self.maint_list.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
+        if chosen is act_open:
+            target = cand.path if cand.path.is_dir() else cand.path.parent
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+        elif act_backup is not None and chosen is act_backup:
+            try:
+                zip_path, _games, files_backed = backup_prefix_candidates_to_zip([cand])
+                if files_backed > 0:
+                    QMessageBox.information(
+                        self,
+                        __app_name__,
+                        tr("maint.backup_done", path=str(zip_path), files=files_backed),
+                    )
+                else:
+                    try:
+                        zip_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    QMessageBox.information(self, __app_name__, tr("maint.backup_empty"))
+            except Exception as exc:
+                QMessageBox.critical(
+                    self, __app_name__, tr("maint.backup_error", err=str(exc))
+                )
 
     def _show_shortcut_context_menu(self, pos: QPoint) -> None:
         item = self.shortcuts_list.itemAt(pos)
@@ -2050,6 +2389,19 @@ class MainWindow(QMainWindow):
             worker.start()
 
     def _update_runtimes(self) -> None:
+        steam_root = find_steam_root()
+        has_steam_proton = steam_root is not None and find_proton_binary(steam_root) is not None
+        if has_steam_proton and (
+            not get_umu_run_path().is_file() or not list_ge_proton11_dirs()
+        ):
+            ans = QMessageBox.question(
+                self,
+                __app_name__,
+                tr("runtime.confirm_optional_steamos"),
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+
         self.btn_update_runtimes.setEnabled(False)
         self.status_label.setText(tr("runtime.checking"))
         worker = RuntimeUpdateWorker()
@@ -2312,10 +2664,71 @@ class MainWindow(QMainWindow):
         if 0 <= row < len(self._detected_games):
             self._populate_game_form(self._detected_games[row])
 
+    def _reset_add_launch_options(self) -> None:
+        self._add_launch_options = ""
+        self._add_winedlloverrides = ""
+        self.chk_add_gamemode.setChecked(False)
+        self.chk_add_mangohud.setChecked(False)
+        self.chk_add_dlss.setChecked(False)
+
+    def _is_add_exe_native(self) -> bool:
+        exe_text = self.add_exe_combo.currentText().strip()
+        if not exe_text:
+            return False
+        exe_path = Path(exe_text)
+        return exe_path.is_file() and detect_exe_kind(exe_path) == "linux_elf"
+
+    def _resolve_add_launch_options(self) -> tuple[str, str]:
+        is_native = self._is_add_exe_native()
+        st = _parse_launch_preset_state(self._add_launch_options)
+        try:
+            merged_opts = apply_launch_presets(
+                self._add_launch_options,
+                gamemode=self.chk_add_gamemode.isChecked(),
+                mangohud=self.chk_add_mangohud.isChecked(),
+                wined3d=bool(st["wined3d"]),
+                no_esync=bool(st["no_esync"]),
+                no_fsync=bool(st["no_fsync"]),
+                winedlloverrides="",
+                dlss_upgrade=False if is_native else self.chk_add_dlss.isChecked(),
+                mangohud_level=st["mh_level"] if st["mh_level"] in (1, 2, 3, 4) else None,
+                nvidia_nvapi=bool(st["nvapi"]),
+                prime_offload=bool(st["prime"]),
+                proton_wayland=bool(st["wayland"]),
+                mangohud_position=str(st.get("mh_position") or ""),
+                mangohud_fps_limit=int(st.get("mh_fps_limit") or 0) or None,
+            )
+        except ValueError:
+            merged_opts = self._add_launch_options.strip()
+        winedll = "" if is_native else self._add_winedlloverrides.strip()
+        return merged_opts, winedll
+
+    def _open_add_launch_advanced(self) -> None:
+        cur_opts, cur_winedll = self._resolve_add_launch_options()
+        title = self.add_name.text().strip() or tr("add.page_title")
+        res = self._open_launch_presets_dialog(
+            title=title,
+            kind="standalone",
+            initial_opts=cur_opts,
+            initial_winedll=cur_winedll,
+            game_obj=None,
+            is_native_linux=self._is_add_exe_native(),
+        )
+        if res is None:
+            return
+        new_opts, new_winedll = res
+        self._add_launch_options = new_opts
+        self._add_winedlloverrides = new_winedll
+        st = _parse_launch_preset_state(new_opts)
+        self.chk_add_gamemode.setChecked(bool(st["gamemode"]))
+        self.chk_add_mangohud.setChecked(bool(st["mangohud"]))
+        self.chk_add_dlss.setChecked(bool(st["dlss_upgrade"]))
+
     def _populate_game_form(self, game: DetectedGame) -> None:
         self._search_req_id += 1
         self._custom_icon_path = None
         self.btn_clear_icon.setVisible(False)
+        self._reset_add_launch_options()
         self.add_name.setText(game.name)
         self.add_exe_combo.clear()
         for exe in game.executables:
@@ -2339,6 +2752,7 @@ class MainWindow(QMainWindow):
         self._search_req_id += 1
         self._custom_icon_path = None
         self.btn_clear_icon.setVisible(False)
+        self._reset_add_launch_options()
         exe = Path(path)
         game = scan_game_folder(exe.parent)
         name = game.name if game else exe.stem
@@ -2363,10 +2777,18 @@ class MainWindow(QMainWindow):
     def _on_exe_changed(self, text: str) -> None:
         """Update Proton default and Remove button visibility when the executable changes."""
         cleaned = text.strip()
+        is_elf = False
         if cleaned:
             exe_path = Path(cleaned)
-            if exe_path.is_file() and detect_exe_kind(exe_path) == "linux_elf":
-                self.chk_proton.setChecked(False)
+            is_elf = exe_path.is_file() and detect_exe_kind(exe_path) == "linux_elf"
+        if is_elf:
+            self.chk_proton.setChecked(False)
+            self.chk_proton.setEnabled(False)
+            self.chk_add_dlss.setChecked(False)
+            self.chk_add_dlss.setEnabled(False)
+        else:
+            self.chk_proton.setEnabled(True)
+            self.chk_add_dlss.setEnabled(True)
         self._update_remove_existing_state()
 
     def _pick_custom_icon(self) -> None:
@@ -2544,6 +2966,7 @@ class MainWindow(QMainWindow):
                 return
 
         steam_appid = self._resolve_selected_steam_appid()
+        launch_opts, winedll = self._resolve_add_launch_options()
 
         self._set_steam_busy(True)
         self._add_worker = AddToSteamWorker(
@@ -2553,6 +2976,8 @@ class MainWindow(QMainWindow):
             steam_appid=steam_appid,
             enable_proton=self.chk_proton.isChecked(),
             restart_steam=self.chk_restart.isChecked(),
+            launch_options=launch_opts,
+            winedlloverrides=winedll,
         )
         self._track_worker(self._add_worker)
         self._add_worker.status.connect(self.status_label.setText)
@@ -2571,6 +2996,7 @@ class MainWindow(QMainWindow):
             return
         app_name, exe_path = validated
         steam_appid = self._resolve_selected_steam_appid()
+        launch_opts, winedll = self._resolve_add_launch_options()
 
         self._set_steam_busy(True)
         worker = StandaloneInstallWorker(
@@ -2581,6 +3007,8 @@ class MainWindow(QMainWindow):
             create_desktop_shortcut=create_desktop,
             icon_path=self._custom_icon_path,
             keep_in_place=self.chk_keep_in_place.isChecked(),
+            launch_options=launch_opts,
+            winedlloverrides=winedll,
         )
         self._track_worker(worker)
         worker.status.connect(self.status_label.setText)
@@ -2718,6 +3146,9 @@ class MainWindow(QMainWindow):
             act.setVisible(not is_standalone)
         self.act_import_steam.setVisible(is_standalone)
         self.act_launch_opts.setVisible(True)
+        is_native = sel is not None and _is_native_linux_game(sel[0], sel[1])
+        self.act_winetricks.setVisible(not is_native)
+        self.act_optiscaler.setVisible(not is_native)
         self.act_remove.setVisible(True)
 
         self.act_migrate.setEnabled(is_steam and can_write_vdf)
@@ -2727,6 +3158,10 @@ class MainWindow(QMainWindow):
         self.act_export_standalone.setEnabled(is_steam and bool(self.paths))
         self.act_import_steam.setEnabled(is_standalone and can_write_vdf)
         self.act_launch_opts.setEnabled((is_steam and can_write_vdf) or is_standalone)
+        self.act_winetricks.setEnabled((is_steam and bool(self.paths)) or (is_standalone and not is_native))
+        self.act_optiscaler.setEnabled(
+            sel is not None and not is_native and ((is_steam and bool(self.paths)) or is_standalone)
+        )
         self.act_remove.setEnabled((is_steam and can_write_vdf) or is_standalone)
 
     def _set_vdf_write_enabled(self, enabled: bool) -> None:
@@ -3137,32 +3572,28 @@ class MainWindow(QMainWindow):
         )
         worker.start()
 
-    def _edit_launch_options_presets(self) -> None:
-        sel = self._selected_library_item()
-        if not sel:
-            return
-        kind, obj = sel
-        if kind == "steam" and not self.paths:
-            return
-
-        title_name = obj.app_name if kind == "steam" else obj.name
-        opts_now = (obj.launch_options or "") if kind == "steam" else (obj.launch_options or "")
-        try:
-            tokens_list = shlex.split(opts_now)
-        except ValueError:
-            tokens_list = opts_now.split()
-        tokens_now = set(tokens_list)
-
-        if kind == "standalone":
-            winedll_now = obj.winedlloverrides or ""
-        else:
-            winedll_now = ""
-            for tok in tokens_list:
-                if tok.startswith("WINEDLLOVERRIDES="):
-                    winedll_now = tok.split("=", 1)[1]
+    def _open_launch_presets_dialog(
+        self,
+        title: str,
+        kind: str,
+        initial_opts: str,
+        initial_winedll: str,
+        game_obj: object | None = None,
+        is_native_linux: bool = False,
+    ) -> tuple[str, str] | None:
+        is_native_linux = bool(
+            is_native_linux or (game_obj is not None and _is_native_linux_game(kind, game_obj))
+        )
+        opts_now = initial_opts or ""
+        winedll_now = initial_winedll or ""
+        st = _parse_launch_preset_state(opts_now)
+        if kind == "standalone" and not winedll_now.strip():
+            extracted_dll = str(st.get("winedll") or "").strip()
+            if extracted_dll:
+                winedll_now = extracted_dll
 
         dlg = QDialog(self)
-        dlg.setWindowTitle(tr("launch.title", name=title_name))
+        dlg.setWindowTitle(tr("launch.title", name=title))
         dlg.resize(580, 500)
         dlg_lay = QVBoxLayout(dlg)
 
@@ -3181,9 +3612,9 @@ class MainWindow(QMainWindow):
             return lbl
 
         chk_gm = QCheckBox(tr("launch.gamemode"))
-        chk_gm.setChecked("gamemoderun" in tokens_now)
+        chk_gm.setChecked(bool(st["gamemode"]))
         chk_mh = QCheckBox(tr("launch.mangohud"))
-        chk_mh.setChecked("MANGOHUD=1" in tokens_now)
+        chk_mh.setChecked(bool(st["mangohud"]))
 
         mh_level_row = QHBoxLayout()
         mh_level_row.setContentsMargins(20, 0, 0, 4)
@@ -3194,65 +3625,72 @@ class MainWindow(QMainWindow):
         mh_level_combo.addItem(tr("launch.mangohud_level_2"), 2)
         mh_level_combo.addItem(tr("launch.mangohud_level_3"), 3)
         mh_level_combo.addItem(tr("launch.mangohud_level_4"), 4)
-        cur_mh_level = 0
-        for tok in tokens_now:
-            if tok.startswith("MANGOHUD_CONFIG="):
-                val = tok.split("=", 1)[1]
-                for lv in (1, 2, 3, 4):
-                    if f"preset={lv}" in val:
-                        cur_mh_level = lv
-                        break
-        mh_idx = mh_level_combo.findData(cur_mh_level)
+        mh_idx = mh_level_combo.findData(st["mh_level"])
         if mh_idx >= 0:
             mh_level_combo.setCurrentIndex(mh_idx)
         mh_level_combo.setEnabled(chk_mh.isChecked())
         mh_level_row.addWidget(mh_level_lbl)
         mh_level_row.addWidget(mh_level_combo, 1)
 
-        btn_mh_topbar = QPushButton(tr("launch.btn_mangohud_topbar"))
-        btn_mh_topbar.clicked.connect(
-            lambda: QMessageBox.information(
-                dlg,
-                __app_name__,
-                tr("launch.mangohud_topbar_done", path=str(install_mangohud_topbar_config())),
-            )
-        )
+        mh_extra_row = QHBoxLayout()
+        mh_extra_row.setContentsMargins(20, 0, 0, 4)
+        mh_pos_lbl = QLabel(tr("launch.mangohud_position_label"))
+        mh_pos_combo = QComboBox()
+        mh_pos_combo.addItem(tr("launch.mangohud_pos_auto"), "")
+        mh_pos_combo.addItem(tr("launch.mangohud_pos_top_center"), "top-center")
+        mh_pos_combo.addItem(tr("launch.mangohud_pos_top_left"), "top-left")
+        mh_pos_combo.addItem(tr("launch.mangohud_pos_top_right"), "top-right")
+        mh_pos_combo.addItem(tr("launch.mangohud_pos_bottom_left"), "bottom-left")
+        mh_pos_combo.addItem(tr("launch.mangohud_pos_bottom_right"), "bottom-right")
+        pos_idx = mh_pos_combo.findData(st.get("mh_position", ""))
+        if pos_idx >= 0:
+            mh_pos_combo.setCurrentIndex(pos_idx)
+        mh_pos_combo.setEnabled(chk_mh.isChecked())
 
-        chk_gs = QCheckBox(tr("launch.gamescope"))
-        chk_gs.setChecked("gamescope" in tokens_now)
-        gs_mode_row = QHBoxLayout()
-        gs_mode_row.setContentsMargins(20, 0, 0, 4)
-        gs_mode_lbl = QLabel(tr("launch.gamescope_mode_label"))
-        gs_mode_combo = QComboBox()
-        gs_mode_combo.addItem(tr("launch.gamescope_mode_fullscreen"), "fullscreen")
-        gs_mode_combo.addItem(tr("launch.gamescope_mode_deck"), "steamdeck")
-        gs_mode_combo.addItem(tr("launch.gamescope_mode_720p"), "720p")
-        gs_mode_combo.addItem(tr("launch.gamescope_mode_1080p"), "1080p")
-        cur_gs_mode = "fullscreen"
-        if "1280" in tokens_now and "800" in tokens_now:
-            cur_gs_mode = "steamdeck"
-        elif "1280" in tokens_now and "720" in tokens_now:
-            cur_gs_mode = "720p"
-        elif "1920" in tokens_now and "1080" in tokens_now:
-            cur_gs_mode = "1080p"
-        gs_idx = gs_mode_combo.findData(cur_gs_mode)
-        if gs_idx >= 0:
-            gs_mode_combo.setCurrentIndex(gs_idx)
-        gs_mode_combo.setEnabled(chk_gs.isChecked())
-        gs_mode_row.addWidget(gs_mode_lbl)
-        gs_mode_row.addWidget(gs_mode_combo, 1)
+        mh_fps_lbl = QLabel(tr("launch.mangohud_fps_limit_label"))
+        mh_fps_combo = QComboBox()
+        mh_fps_combo.addItem(tr("launch.mangohud_fps_unlimited"), 0)
+        for fps_val in (30, 40, 60, 90, 120, 144):
+            mh_fps_combo.addItem(f"{fps_val} FPS", fps_val)
+        fps_idx = mh_fps_combo.findData(st.get("mh_fps_limit", 0))
+        if fps_idx >= 0:
+            mh_fps_combo.setCurrentIndex(fps_idx)
+        mh_fps_combo.setEnabled(chk_mh.isChecked())
+
+        mh_extra_row.addWidget(mh_pos_lbl)
+        mh_extra_row.addWidget(mh_pos_combo, 1)
+        mh_extra_row.addSpacing(8)
+        mh_extra_row.addWidget(mh_fps_lbl)
+        mh_extra_row.addWidget(mh_fps_combo)
+
+        mh_opts_col = QVBoxLayout()
+        mh_opts_col.setContentsMargins(0, 0, 0, 0)
+        mh_opts_col.setSpacing(2)
+        mh_opts_col.addLayout(mh_level_row)
+        mh_opts_col.addLayout(mh_extra_row)
+
+        gpu = detect_gpu_profile()
+        nvapi_active = bool(st["nvapi"])
+        prime_active = bool(st["prime"])
+        wayland_active = bool(st["wayland"])
+
+        chk_nvapi = QCheckBox(tr("launch.nvidia_nvapi"))
+        chk_nvapi.setChecked(nvapi_active)
+        chk_prime = QCheckBox(tr("launch.prime_offload"))
+        chk_prime.setChecked(prime_active)
+        chk_wayland = QCheckBox(tr("launch.proton_wayland"))
+        chk_wayland.setChecked(wayland_active)
+
         chk_dlss = QCheckBox(tr("launch.dlss_upgrade"))
-        chk_dlss.setChecked("PROTON_DLSS_UPGRADE=1" in tokens_now)
+        chk_dlss.setChecked(bool(st["dlss_upgrade"]))
         chk_w3d = QCheckBox(tr("launch.wined3d"))
-        chk_w3d.setChecked("PROTON_USE_WINED3D=1" in tokens_now)
+        chk_w3d.setChecked(bool(st["wined3d"]))
         chk_esync = QCheckBox(tr("launch.no_esync"))
-        chk_esync.setChecked("PROTON_NO_ESYNC=1" in tokens_now)
+        chk_esync.setChecked(bool(st["no_esync"]))
         chk_fsync = QCheckBox(tr("launch.no_fsync"))
-        chk_fsync.setChecked("PROTON_NO_FSYNC=1" in tokens_now)
+        chk_fsync.setChecked(bool(st["no_fsync"]))
         chk_helixsr = QCheckBox(tr("launch.helixsr_preset"))
-        chk_helixsr.setChecked(
-            any(p.strip().lower() == "dxgi=n,b" for p in winedll_now.split(";") if p.strip())
-        )
+        chk_helixsr.setChecked(remove_winedlloverride(winedll_now, "dxgi") != winedll_now)
 
         winedll_lbl = QLabel(tr("launch.winedlloverrides_label"))
         winedll_edit = QLineEdit(winedll_now)
@@ -3265,37 +3703,88 @@ class MainWindow(QMainWindow):
         )
         conflict_warn.setVisible(False)
 
+        wined3d_warn = QLabel(tr("launch.wined3d_vulkan_warn"))
+        wined3d_warn.setWordWrap(True)
+        wined3d_warn.setStyleSheet(
+            "color: #ffd180; background-color: rgba(180, 110, 20, 0.22); "
+            "border: 1px solid #c77c1a; border-radius: 6px; padding: 6px;"
+        )
+        wined3d_warn.setVisible(False)
+
         raw_lbl = QLabel(tr("launch.raw_label"))
         raw_edit = QLineEdit(opts_now)
 
         syncing = {"active": False}
 
         def _update_conflict_warning() -> None:
-            has_conflict = detect_helixsr_lsfg_conflict(raw_edit.text(), winedll_edit.text())
+            has_conflict = (not is_native_linux) and detect_helixsr_lsfg_conflict(
+                raw_edit.text(), winedll_edit.text()
+            )
             conflict_warn.setVisible(has_conflict)
 
+        def _update_wined3d_warning() -> None:
+            if is_native_linux or not chk_w3d.isChecked():
+                wined3d_warn.setVisible(False)
+                return
+            raw_low = raw_edit.text().lower()
+            has_lsfg = "lsfg-vk" in raw_low or "enable_lsfg" in raw_low
+            has_vulkan_feat = (
+                chk_dlss.isChecked()
+                or chk_nvapi.isChecked()
+                or chk_helixsr.isChecked()
+                or has_lsfg
+            )
+            wined3d_warn.setVisible(has_vulkan_feat)
+
+        def _update_optiscaler_dxgi_guard() -> None:
+            if is_native_linux or game_obj is None:
+                return
+            exe_p = _resolve_game_exe_path(kind, game_obj)
+            opt_st = (
+                inspect_optiscaler_state(exe_p)
+                if exe_p is not None and exe_p.parent.is_dir()
+                else None
+            )
+            if opt_st is not None and opt_st.proxy_dll == "dxgi":
+                chk_helixsr.setChecked(True)
+                chk_helixsr.setEnabled(False)
+                chk_helixsr.setToolTip(tr("launch.helixsr_optiscaler_locked"))
+            else:
+                chk_helixsr.setEnabled(True)
+                chk_helixsr.setToolTip("")
+
         def _sync_preview() -> None:
-            mh_level_combo.setEnabled(chk_mh.isChecked())
-            gs_mode_combo.setEnabled(chk_gs.isChecked())
+            mh_enabled = chk_mh.isChecked()
+            mh_level_combo.setEnabled(mh_enabled)
+            mh_pos_combo.setEnabled(mh_enabled)
+            mh_fps_combo.setEnabled(mh_enabled)
             if syncing["active"]:
                 return
             syncing["active"] = True
             try:
-                dll_val = winedll_edit.text().strip() if kind == "steam" else ""
+                dll_val = (
+                    winedll_edit.text().strip()
+                    if (kind == "steam" and not is_native_linux)
+                    else ""
+                )
                 mh_lvl = mh_level_combo.currentData()
-                gs_mode = str(gs_mode_combo.currentData() or "fullscreen")
+                mh_pos = str(mh_pos_combo.currentData() or "")
+                mh_fps = mh_fps_combo.currentData()
                 updated = apply_launch_presets(
                     raw_edit.text(),
                     gamemode=chk_gm.isChecked(),
-                    mangohud=chk_mh.isChecked(),
-                    wined3d=chk_w3d.isChecked(),
-                    no_esync=chk_esync.isChecked(),
-                    no_fsync=chk_fsync.isChecked(),
+                    mangohud=mh_enabled,
+                    wined3d=False if is_native_linux else chk_w3d.isChecked(),
+                    no_esync=False if is_native_linux else chk_esync.isChecked(),
+                    no_fsync=False if is_native_linux else chk_fsync.isChecked(),
                     winedlloverrides=dll_val,
-                    dlss_upgrade=chk_dlss.isChecked(),
+                    dlss_upgrade=False if is_native_linux else chk_dlss.isChecked(),
                     mangohud_level=int(mh_lvl) if isinstance(mh_lvl, int) and mh_lvl in (1, 2, 3, 4) else None,
-                    gamescope=chk_gs.isChecked(),
-                    gamescope_mode=gs_mode,
+                    nvidia_nvapi=False if is_native_linux else chk_nvapi.isChecked(),
+                    prime_offload=chk_prime.isChecked(),
+                    proton_wayland=False if is_native_linux else chk_wayland.isChecked(),
+                    mangohud_position=mh_pos,
+                    mangohud_fps_limit=int(mh_fps) if isinstance(mh_fps, int) and mh_fps > 0 else None,
                 )
                 raw_edit.setText(updated)
             except ValueError:
@@ -3303,15 +3792,33 @@ class MainWindow(QMainWindow):
             finally:
                 syncing["active"] = False
             _update_conflict_warning()
+            _update_wined3d_warning()
 
         def _on_helixsr_toggled(checked: bool) -> None:
-            parts = [p.strip() for p in winedll_edit.text().split(";") if p.strip()]
-            if checked:
-                if not any(p.lower().startswith("dxgi=") for p in parts):
-                    parts.append("dxgi=n,b")
-            else:
-                parts = [p for p in parts if p.lower() != "dxgi=n,b"]
-            winedll_edit.setText(";".join(parts))
+            if syncing["active"]:
+                return
+            cur_dll = winedll_edit.text()
+            new_dll = (
+                merge_winedlloverride(cur_dll, "dxgi", "n,b")
+                if checked
+                else remove_winedlloverride(cur_dll, "dxgi")
+            )
+            winedll_edit.setText(new_dll)
+
+        def _on_winedll_text_changed(text: str) -> None:
+            if not syncing["active"]:
+                has_dxgi = remove_winedlloverride(text, "dxgi") != text
+                if chk_helixsr.isChecked() != has_dxgi:
+                    syncing["active"] = True
+                    try:
+                        chk_helixsr.setChecked(has_dxgi)
+                    finally:
+                        syncing["active"] = False
+            _sync_preview()
+
+        def _on_raw_text_changed() -> None:
+            _update_conflict_warning()
+            _update_wined3d_warning()
 
         dlg_alive = {"open": True}
         dlg.finished.connect(lambda _r: dlg_alive.__setitem__("open", False))
@@ -3396,31 +3903,119 @@ class MainWindow(QMainWindow):
                 lay.addWidget(warn_row)
 
         _add_tool_preset(chk_gm, tr("launch.gamemode_hint"), "gamemoderun")
-        _add_tool_preset(chk_mh, tr("launch.mangohud_hint"), "mangohud", extra_row=mh_level_row)
+        _add_tool_preset(chk_mh, tr("launch.mangohud_hint"), "mangohud", extra_row=mh_opts_col)
         mh_level_combo.currentIndexChanged.connect(_sync_preview)
-        lay.addWidget(btn_mh_topbar)
-        _add_tool_preset(chk_gs, tr("launch.gamescope_hint"), "gamescope", extra_row=gs_mode_row)
-        gs_mode_combo.currentIndexChanged.connect(_sync_preview)
+        mh_pos_combo.currentIndexChanged.connect(_sync_preview)
+        mh_fps_combo.currentIndexChanged.connect(_sync_preview)
 
-        chk_dlss.toggled.connect(_sync_preview)
-        lay.addWidget(chk_dlss)
-        lay.addWidget(_muted_hint(tr("launch.dlss_hint")))
+        if (not is_native_linux) and (gpu.has_nvidia or nvapi_active):
+            chk_nvapi.toggled.connect(_sync_preview)
+            lay.addWidget(chk_nvapi)
+            lay.addWidget(_muted_hint(tr("launch.nvidia_nvapi_hint")))
+        else:
+            chk_nvapi.setVisible(False)
+            chk_nvapi.setEnabled(False)
+        if gpu.is_hybrid or prime_active:
+            chk_prime.toggled.connect(_sync_preview)
+            lay.addWidget(chk_prime)
+            lay.addWidget(_muted_hint(tr("launch.prime_offload_hint")))
+        if (not is_native_linux) and (gpu.is_wayland or wayland_active):
+            chk_wayland.toggled.connect(_sync_preview)
+            lay.addWidget(chk_wayland)
+            lay.addWidget(_muted_hint(tr("launch.proton_wayland_hint")))
+        else:
+            chk_wayland.setVisible(False)
+            chk_wayland.setEnabled(False)
 
-        for chk in (chk_w3d, chk_esync, chk_fsync):
-            chk.toggled.connect(_sync_preview)
-            lay.addWidget(chk)
-        chk_helixsr.toggled.connect(_on_helixsr_toggled)
-        lay.addWidget(chk_helixsr)
-        lay.addWidget(_muted_hint(tr("launch.helixsr_hint")))
-        lay.addWidget(winedll_lbl)
-        lay.addWidget(winedll_edit)
+        if (not is_native_linux) and (gpu.has_nvidia or bool(st["dlss_upgrade"])):
+            chk_dlss.toggled.connect(_sync_preview)
+            lay.addWidget(chk_dlss)
+            lay.addWidget(_muted_hint(tr("launch.dlss_hint")))
+        else:
+            chk_dlss.setVisible(False)
+            chk_dlss.setEnabled(False)
+
+        if not is_native_linux:
+            for chk in (chk_w3d, chk_esync, chk_fsync):
+                chk.toggled.connect(_sync_preview)
+                lay.addWidget(chk)
+            chk_helixsr.toggled.connect(_on_helixsr_toggled)
+            lay.addWidget(chk_helixsr)
+            lay.addWidget(_muted_hint(tr("launch.helixsr_hint")))
+        else:
+            for chk in (chk_w3d, chk_esync, chk_fsync, chk_helixsr):
+                chk.setVisible(False)
+                chk.setEnabled(False)
+
+        if game_obj is not None and not is_native_linux:
+            btn_winetricks = QPushButton(tr("launch.btn_winetricks"))
+            btn_winetricks.clicked.connect(lambda: self._open_winetricks_dialog(kind, game_obj))
+            lay.addWidget(btn_winetricks)
+            btn_optiscaler = QPushButton(tr("launch.btn_optiscaler"))
+
+            def _on_optiscaler_clicked() -> None:
+                self._open_optiscaler_dialog(kind, game_obj)
+                if not dlg_alive["open"]:
+                    return
+                new_opts_after = raw_edit.text()
+                new_dll_after = winedll_edit.text()
+                if kind == "standalone":
+                    new_dll_after = str(getattr(game_obj, "winedlloverrides", "") or "")
+                    new_opts_after = str(getattr(game_obj, "launch_options", "") or "")
+                elif kind == "steam" and self.paths is not None:
+                    target_appid = getattr(game_obj, "appid_u32", None)
+                    try:
+                        shortcuts = load_shortcuts(self.paths.shortcuts_vdf)
+                    except Exception:
+                        shortcuts = []
+                    matched = next(
+                        (sc for sc in shortcuts if sc.appid_u32 == target_appid),
+                        None,
+                    )
+                    if matched is not None:
+                        new_opts_after = matched.launch_options or ""
+                    else:
+                        new_opts_after = str(getattr(game_obj, "launch_options", "") or "")
+                    new_dll_after = str(_parse_launch_preset_state(new_opts_after)["winedll"])
+                syncing["active"] = True
+                try:
+                    raw_edit.setText(new_opts_after)
+                    winedll_edit.setText(new_dll_after)
+                    chk_helixsr.setChecked(
+                        remove_winedlloverride(new_dll_after, "dxgi") != new_dll_after
+                    )
+                finally:
+                    syncing["active"] = False
+                _update_optiscaler_dxgi_guard()
+                _update_conflict_warning()
+                _update_wined3d_warning()
+
+            btn_optiscaler.clicked.connect(_on_optiscaler_clicked)
+            lay.addWidget(btn_optiscaler)
+
+        if not is_native_linux:
+            lay.addWidget(winedll_lbl)
+            lay.addWidget(winedll_edit)
+            if kind == "standalone":
+                winedll_note = QLabel(tr("launch.winedll_standalone_note"))
+                winedll_note.setObjectName("MutedText")
+                winedll_note.setWordWrap(True)
+                lay.addWidget(winedll_note)
+        else:
+            winedll_lbl.setVisible(False)
+            winedll_edit.setVisible(False)
+            winedll_edit.setEnabled(False)
+
         lay.addWidget(conflict_warn)
+        lay.addWidget(wined3d_warn)
         lay.addWidget(raw_lbl)
         lay.addWidget(raw_edit)
 
-        winedll_edit.textChanged.connect(_sync_preview)
-        raw_edit.textChanged.connect(_update_conflict_warning)
+        winedll_edit.textChanged.connect(_on_winedll_text_changed)
+        raw_edit.textChanged.connect(_on_raw_text_changed)
+        _update_optiscaler_dxgi_guard()
         _update_conflict_warning()
+        _update_wined3d_warning()
 
         scroll.setWidget(body)
         dlg_lay.addWidget(scroll, 1)
@@ -3433,10 +4028,36 @@ class MainWindow(QMainWindow):
         dlg_lay.addWidget(btns)
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+
+        return raw_edit.text().strip(), winedll_edit.text().strip()
+
+    def _edit_launch_options_presets(self) -> None:
+        sel = self._selected_library_item()
+        if not sel:
+            return
+        kind, obj = sel
+        if kind == "steam" and not self.paths:
             return
 
-        new_opts = raw_edit.text().strip()
-        new_dll = winedll_edit.text().strip()
+        title_name = obj.app_name if kind == "steam" else obj.name
+        opts_now = obj.launch_options or ""
+        if kind == "standalone":
+            winedll_now = obj.winedlloverrides or ""
+        else:
+            winedll_now = str(_parse_launch_preset_state(opts_now)["winedll"])
+
+        res = self._open_launch_presets_dialog(
+            title=title_name,
+            kind=kind,
+            initial_opts=opts_now,
+            initial_winedll=winedll_now,
+            game_obj=obj,
+            is_native_linux=_is_native_linux_game(kind, obj),
+        )
+        if res is None:
+            return
+        new_opts, new_dll = res
 
         if kind == "standalone":
             try:
@@ -3483,6 +4104,594 @@ class MainWindow(QMainWindow):
         worker.finished_ok.connect(_ok)
         worker.failed.connect(_err)
         worker.start()
+
+    def _open_winetricks_dialog(
+        self, kind: str | None = None, obj: object | None = None
+    ) -> None:
+        if kind is None or obj is None:
+            sel = self._selected_library_item()
+            if not sel:
+                return
+            kind, obj = sel
+        if kind == "standalone" and bool(getattr(obj, "native_linux", False)):
+            return
+        if kind == "steam" and not self.paths:
+            return
+
+        try:
+            prefix_dir, proton_dir = resolve_game_prefix_and_proton(kind, obj, self.paths)
+        except Exception as exc:
+            QMessageBox.critical(self, __app_name__, str(exc))
+            return
+
+        title_name = obj.app_name if kind == "steam" else obj.name
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("winetricks.title", name=title_name))
+        dlg.resize(560, 480)
+        lay = QVBoxLayout(dlg)
+
+        lbl_prefix = QLabel(tr("winetricks.prefix_label", path=str(prefix_dir)))
+        lbl_prefix.setObjectName("MutedText")
+        lbl_prefix.setWordWrap(True)
+        lay.addWidget(lbl_prefix)
+
+        dlg_alive = {"open": True}
+        active_worker: dict[str, WinetricksWorker | None] = {"w": None}
+
+        def _on_dlg_finished(_r: int) -> None:
+            dlg_alive["open"] = False
+            w = active_worker["w"]
+            if w is not None and w.isRunning():
+                w.cancel()
+
+        dlg.finished.connect(_on_dlg_finished)
+
+        warn_row = QWidget()
+        warn_lay = QHBoxLayout(warn_row)
+        warn_lay.setContentsMargins(0, 0, 0, 4)
+        warn_lay.setSpacing(8)
+        warn_lbl = QLabel(tr("winetricks.missing_warn"))
+        warn_lbl.setWordWrap(True)
+        warn_lbl.setStyleSheet("color: #ffd180;")
+        warn_lay.addWidget(warn_lbl, 1)
+        btn_install_wt = QPushButton(tr("launch.btn_install_bin", bin="winetricks"))
+        warn_lay.addWidget(btn_install_wt)
+        has_winetricks = shutil.which("winetricks") is not None
+        warn_row.setVisible(not has_winetricks)
+        lay.addWidget(warn_row)
+
+        lay.addWidget(QLabel(tr("winetricks.presets_label")))
+        preset_checks: dict[str, QCheckBox] = {}
+        for verb, desc in WINETRICKS_PRESETS.items():
+            chk = QCheckBox(f"{verb} — {desc}")
+            preset_checks[verb] = chk
+            lay.addWidget(chk)
+
+        lay.addWidget(QLabel(tr("winetricks.custom_label")))
+        custom_edit = QLineEdit()
+        custom_edit.setPlaceholderText(tr("winetricks.custom_placeholder"))
+        lay.addWidget(custom_edit)
+
+        log_edit = QPlainTextEdit()
+        log_edit.setReadOnly(True)
+        log_edit.setMaximumBlockCount(500)
+        lay.addWidget(log_edit, 1)
+
+        btn_row = QHBoxLayout()
+        btn_install = QPushButton(tr("winetricks.btn_install"))
+        btn_install.setObjectName("primaryBtn")
+        btn_install.setEnabled(has_winetricks)
+        btn_cancel = QPushButton(tr("winetricks.btn_cancel"))
+        btn_cancel.setEnabled(False)
+        btn_close = QPushButton(tr("winetricks.btn_close"))
+        btn_close.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_install)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_close)
+        lay.addLayout(btn_row)
+
+        def _on_install_wt_pkg() -> None:
+            cmd = get_system_package_install_cmd("winetricks")
+            if not cmd:
+                QMessageBox.information(
+                    dlg,
+                    __app_name__,
+                    tr("launch.install_bin_manual", cmd="<install winetricks>"),
+                )
+                return
+            ans = QMessageBox.question(
+                dlg,
+                __app_name__,
+                tr("launch.install_bin_confirm", bin="winetricks", cmd="sudo " + " ".join(cmd)),
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            btn_install_wt.setEnabled(False)
+            btn_install_wt.setText(tr("launch.installing_bin", bin="winetricks"))
+            worker = PkexecWorker(lambda: install_system_package("winetricks"))
+            self._track_worker(worker)
+
+            def _pkg_ok(ok: bool, out: str) -> None:
+                if dlg_alive["open"]:
+                    btn_install_wt.setEnabled(True)
+                    btn_install_wt.setText(tr("launch.btn_install_bin", bin="winetricks"))
+                parent_win = dlg if dlg_alive["open"] else self
+                if self._closing_pending:
+                    return
+                if ok:
+                    if dlg_alive["open"]:
+                        warn_row.setVisible(False)
+                        btn_install.setEnabled(True)
+                    QMessageBox.information(
+                        parent_win, __app_name__, tr("launch.install_bin_done", bin="winetricks")
+                    )
+                else:
+                    QMessageBox.warning(
+                        parent_win,
+                        __app_name__,
+                        tr("launch.install_bin_error", bin="winetricks", err=out),
+                    )
+
+            def _pkg_err(err: str) -> None:
+                if dlg_alive["open"]:
+                    btn_install_wt.setEnabled(True)
+                    btn_install_wt.setText(tr("launch.btn_install_bin", bin="winetricks"))
+                if not self._closing_pending:
+                    QMessageBox.warning(
+                        dlg if dlg_alive["open"] else self,
+                        __app_name__,
+                        tr("launch.install_bin_error", bin="winetricks", err=err),
+                    )
+
+            worker.finished_result.connect(_pkg_ok)
+            worker.failed.connect(_pkg_err)
+            worker.start()
+
+        btn_install_wt.clicked.connect(_on_install_wt_pkg)
+
+        def _set_running(running: bool) -> None:
+            if not dlg_alive["open"]:
+                return
+            for chk in preset_checks.values():
+                chk.setEnabled(not running)
+            custom_edit.setEnabled(not running)
+            btn_install.setEnabled((not running) and (shutil.which("winetricks") is not None))
+            btn_cancel.setEnabled(running)
+            btn_close.setEnabled(not running)
+
+        def _on_run() -> None:
+            verbs = [v for v, chk in preset_checks.items() if chk.isChecked()]
+            raw_custom = custom_edit.text().replace(",", " ").strip()
+            if raw_custom:
+                for tok in raw_custom.split():
+                    if tok not in verbs:
+                        verbs.append(tok)
+            if not verbs:
+                QMessageBox.information(dlg, __app_name__, tr("winetricks.no_verbs"))
+                return
+
+            log_edit.clear()
+            log_edit.appendPlainText(tr("winetricks.running"))
+            _set_running(True)
+
+            worker = WinetricksWorker(prefix_dir, verbs, proton_dir=proton_dir)
+            active_worker["w"] = worker
+            self._track_worker(worker)
+
+            def _on_log(line: str) -> None:
+                if dlg_alive["open"]:
+                    log_edit.appendPlainText(line)
+
+            def _on_ok() -> None:
+                active_worker["w"] = None
+                _set_running(False)
+                if dlg_alive["open"]:
+                    log_edit.appendPlainText(tr("winetricks.done"))
+                    if not self._closing_pending:
+                        QMessageBox.information(dlg, __app_name__, tr("winetricks.done"))
+
+            def _on_err(err: str) -> None:
+                active_worker["w"] = None
+                _set_running(False)
+                if dlg_alive["open"]:
+                    msg = tr("winetricks.error", err=err)
+                    log_edit.appendPlainText(msg)
+                    if not self._closing_pending:
+                        QMessageBox.warning(dlg, __app_name__, msg)
+
+            worker.log.connect(_on_log)
+            worker.finished_ok.connect(_on_ok)
+            worker.failed.connect(_on_err)
+            worker.start()
+
+        def _on_cancel() -> None:
+            w = active_worker["w"]
+            if w is not None and w.isRunning():
+                btn_cancel.setEnabled(False)
+                w.cancel()
+
+        btn_install.clicked.connect(_on_run)
+        btn_cancel.clicked.connect(_on_cancel)
+        dlg.exec()
+
+    def _open_optiscaler_dialog(
+        self, kind: str | None = None, obj: object | None = None
+    ) -> None:
+        if kind is None or obj is None:
+            sel = self._selected_library_item()
+            if not sel:
+                return
+            kind, obj = sel
+        if _is_native_linux_game(kind, obj):
+            return
+        if kind == "steam" and not self.paths:
+            return
+
+        exe_path = _resolve_game_exe_path(kind, obj)
+        if exe_path is None or not str(exe_path).strip() or not exe_path.parent.is_dir():
+            QMessageBox.warning(
+                self,
+                __app_name__,
+                tr("optiscaler.invalid_exe_dir", path=str(exe_path.parent) if exe_path else ""),
+            )
+            return
+
+        title_name = obj.app_name if kind == "steam" else obj.name
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("optiscaler.title", name=title_name))
+        dlg.resize(520, 360)
+        lay = QVBoxLayout(dlg)
+
+        dlg_alive = {"open": True}
+        dlg.finished.connect(lambda _r: dlg_alive.__setitem__("open", False))
+
+        lbl_dir = QLabel(tr("optiscaler.exe_dir_label", path=str(exe_path.parent)))
+        lbl_dir.setObjectName("MutedText")
+        lbl_dir.setWordWrap(True)
+        lay.addWidget(lbl_dir)
+
+        lbl_state = QLabel()
+        lbl_state.setWordWrap(True)
+        lay.addWidget(lbl_state)
+
+        form = QFormLayout()
+        combo_backend = QComboBox()
+        backend_labels = {
+            "auto": tr("optiscaler.backend_auto"),
+            "fsr3": tr("optiscaler.backend_fsr3"),
+            "fsr22": tr("optiscaler.backend_fsr22"),
+            "fsr21": tr("optiscaler.backend_fsr21"),
+            "xess": tr("optiscaler.backend_xess"),
+            "dlss": tr("optiscaler.backend_dlss"),
+        }
+        for b in OPTISCALER_BACKENDS:
+            combo_backend.addItem(backend_labels.get(b, b), b)
+        form.addRow(tr("optiscaler.backend_label"), combo_backend)
+
+        combo_proxy = QComboBox()
+        for dll in OPTISCALER_PROXY_DLLS:
+            label = tr("optiscaler.proxy_dxgi") if dll == "dxgi" else f"{dll}.dll"
+            combo_proxy.addItem(label, dll)
+        form.addRow(tr("optiscaler.proxy_label"), combo_proxy)
+
+        fg_combo = QComboBox()
+        fg_labels = {
+            "auto": tr("optiscaler.fg_auto"),
+            "nofg": tr("optiscaler.fg_nofg"),
+            "optifg": tr("optiscaler.fg_optifg"),
+            "nukems": tr("optiscaler.fg_nukems"),
+        }
+        for fg in OPTISCALER_FG_MODES:
+            fg_combo.addItem(fg_labels.get(fg, fg), fg)
+        form.addRow(tr("optiscaler.fg_label"), fg_combo)
+
+        spoof_combo = QComboBox()
+        spoof_labels = {
+            "auto": tr("optiscaler.spoof_auto"),
+            "true": tr("optiscaler.spoof_true"),
+            "false": tr("optiscaler.spoof_false"),
+        }
+        for sp in OPTISCALER_SPOOF_MODES:
+            spoof_combo.addItem(spoof_labels.get(sp, sp), sp)
+        form.addRow(tr("optiscaler.spoof_label"), spoof_combo)
+
+        chk_overlay_menu = QCheckBox(tr("optiscaler.overlay_menu_label"))
+        chk_overlay_menu.setChecked(True)
+        form.addRow("", chk_overlay_menu)
+        lay.addLayout(form)
+
+        lbl_note = QLabel(tr("optiscaler.note_overlay"))
+        lbl_note.setObjectName("MutedText")
+        lbl_note.setWordWrap(True)
+        lay.addWidget(lbl_note)
+
+        lbl_progress = QLabel("")
+        lbl_progress.setObjectName("MutedText")
+        lbl_progress.setWordWrap(True)
+        lbl_progress.setVisible(False)
+        lay.addWidget(lbl_progress)
+        lay.addStretch(1)
+
+        btn_row = QHBoxLayout()
+        btn_install = QPushButton(tr("optiscaler.btn_install"))
+        btn_install.setObjectName("primaryBtn")
+        btn_remove = QPushButton(tr("optiscaler.btn_remove"))
+        btn_close = QPushButton(tr("optiscaler.btn_close"))
+        btn_close.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_install)
+        btn_row.addWidget(btn_remove)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_close)
+        lay.addLayout(btn_row)
+
+        def _refresh_state_ui() -> None:
+            st_now = inspect_optiscaler_state(exe_path)
+            if st_now is not None:
+                lbl_state.setText(
+                    tr(
+                        "optiscaler.state_installed",
+                        proxy=f"{st_now.proxy_dll}.dll",
+                        backend=st_now.backend,
+                        version=st_now.version or "-",
+                    )
+                )
+                b_idx = combo_backend.findData(st_now.backend)
+                if b_idx >= 0:
+                    combo_backend.setCurrentIndex(b_idx)
+                p_idx = combo_proxy.findData(st_now.proxy_dll)
+                if p_idx >= 0:
+                    combo_proxy.setCurrentIndex(p_idx)
+                fg_raw = getattr(st_now, "fg_mode", "auto") or "auto"
+                fg_norm = "auto" if fg_raw == "default" else fg_raw
+                fg_idx = fg_combo.findData(fg_norm)
+                if fg_idx >= 0:
+                    fg_combo.setCurrentIndex(fg_idx)
+                sp_idx = spoof_combo.findData(getattr(st_now, "spoof_mode", "auto") or "auto")
+                if sp_idx >= 0:
+                    spoof_combo.setCurrentIndex(sp_idx)
+                chk_overlay_menu.setChecked(bool(getattr(st_now, "overlay_menu", True)))
+                btn_remove.setEnabled(True)
+            else:
+                lbl_state.setText(tr("optiscaler.state_not_installed"))
+                btn_remove.setEnabled(False)
+
+        def _set_busy(busy: bool, status_text: str = "") -> None:
+            if not dlg_alive["open"]:
+                return
+            combo_backend.setEnabled(not busy)
+            combo_proxy.setEnabled(not busy)
+            fg_combo.setEnabled(not busy)
+            spoof_combo.setEnabled(not busy)
+            chk_overlay_menu.setEnabled(not busy)
+            btn_install.setEnabled(not busy)
+            btn_close.setEnabled(not busy)
+            if busy:
+                btn_remove.setEnabled(False)
+                lbl_progress.setText(status_text)
+                lbl_progress.setVisible(True)
+            else:
+                lbl_progress.setVisible(False)
+                _refresh_state_ui()
+
+        def _current_winedll() -> str:
+            if kind == "standalone":
+                return str(getattr(obj, "winedlloverrides", "") or "")
+            return str(_parse_launch_preset_state(str(getattr(obj, "launch_options", "") or ""))["winedll"])
+
+        def _apply_winedll_update(
+            new_winedll: str,
+            done_msg: str,
+            *,
+            check_conflict: bool,
+        ) -> None:
+            parent_win = dlg if dlg_alive["open"] else self
+            if kind == "standalone":
+                cur_opts = str(getattr(obj, "launch_options", "") or "")
+                try:
+                    updated = update_standalone_launch_options(
+                        obj.game_dir,
+                        winedlloverrides=new_winedll,
+                        launch_options=cur_opts,
+                    )
+                except Exception as exc:
+                    _set_busy(False)
+                    if not self._closing_pending:
+                        QMessageBox.critical(parent_win, __app_name__, tr("optiscaler.error", err=str(exc)))
+                    return
+                obj.winedlloverrides = updated.winedlloverrides
+                self._refresh_shortcuts()
+                _set_busy(False)
+                self.status_label.setText(done_msg)
+                if not self._closing_pending:
+                    if check_conflict and detect_helixsr_lsfg_conflict(cur_opts, new_winedll):
+                        QMessageBox.warning(parent_win, __app_name__, tr("optiscaler.helixsr_lsfg_warn"))
+                    QMessageBox.information(parent_win, __app_name__, done_msg)
+                return
+
+            if not self._confirm_close_steam_if_running():
+                _set_busy(False)
+                return
+            paths = self.paths
+            assert paths is not None
+            cur_opts = str(getattr(obj, "launch_options", "") or "")
+            st = _parse_launch_preset_state(cur_opts)
+            mh_lvl = st["mh_level"]
+            new_opts = apply_launch_presets(
+                cur_opts,
+                gamemode=bool(st["gamemode"]),
+                mangohud=bool(st["mangohud"]),
+                wined3d=bool(st["wined3d"]),
+                no_esync=bool(st["no_esync"]),
+                no_fsync=bool(st["no_fsync"]),
+                winedlloverrides=new_winedll,
+                dlss_upgrade=bool(st["dlss_upgrade"]),
+                mangohud_level=int(mh_lvl) if isinstance(mh_lvl, int) and mh_lvl in (1, 2, 3, 4) else None,
+                nvidia_nvapi=bool(st["nvapi"]),
+                prime_offload=bool(st["prime"]),
+                proton_wayland=bool(st["wayland"]),
+                mangohud_position=str(st.get("mh_position") or ""),
+                mangohud_fps_limit=int(st.get("mh_fps_limit") or 0) or None,
+            )
+            self._set_steam_busy(True)
+            steam_worker = SteamOpWorker(
+                lambda: update_shortcut_launch_options(paths, obj.appid_u32, new_opts),
+                need_steam_closed=True,
+            )
+            self._track_worker(steam_worker)
+            steam_worker.status.connect(self.status_label.setText)
+
+            def _steam_ok(_res: object) -> None:
+                self._set_steam_busy(False)
+                obj.launch_options = new_opts
+                self._refresh_shortcuts()
+                _set_busy(False)
+                self.status_label.setText(done_msg)
+                p_win = dlg if dlg_alive["open"] else self
+                if not self._closing_pending:
+                    if check_conflict and detect_helixsr_lsfg_conflict(new_opts, new_winedll):
+                        QMessageBox.warning(p_win, __app_name__, tr("optiscaler.helixsr_lsfg_warn"))
+                    QMessageBox.information(p_win, __app_name__, done_msg)
+
+            def _steam_err(err: str) -> None:
+                self._set_steam_busy(False)
+                _set_busy(False)
+                if not self._closing_pending:
+                    QMessageBox.critical(
+                        dlg if dlg_alive["open"] else self,
+                        __app_name__,
+                        tr("optiscaler.error", err=err),
+                    )
+
+            steam_worker.finished_ok.connect(_steam_ok)
+            steam_worker.failed.connect(_steam_err)
+            steam_worker.start()
+
+        class _OptiScalerOpWorker(QThread):
+            status = Signal(str)
+            finished_ok = Signal(object)
+            conflict = Signal(str)
+            failed = Signal(str)
+
+            def __init__(self, fn: Callable[[Callable[[str, int | None], None]], object]) -> None:
+                super().__init__()
+                self._fn = fn
+
+            def run(self) -> None:
+                try:
+                    res = self._fn(lambda msg, _pct=None: self.status.emit(msg))
+                    self.finished_ok.emit(res)
+                except OptiScalerConflictError as exc:
+                    self.conflict.emit(str(exc.existing_path))
+                except Exception as exc:
+                    self.failed.emit(_format_worker_error(exc))
+
+        def _start_install(overwrite_existing: bool) -> None:
+            proxy_dll = str(combo_proxy.currentData() or "dxgi")
+            backend = str(combo_backend.currentData() or "auto")
+            fg_mode = str(fg_combo.currentData() or "auto")
+            spoof_mode = str(spoof_combo.currentData() or "auto")
+            overlay_menu = chk_overlay_menu.isChecked()
+            prev_state = inspect_optiscaler_state(exe_path)
+            _set_busy(True, tr("optiscaler.installing"))
+            self.status_label.setText(tr("optiscaler.installing"))
+
+            worker = _OptiScalerOpWorker(
+                lambda cb: install_optiscaler_for_game(
+                    exe_path,
+                    proxy_dll=proxy_dll,
+                    backend=backend,
+                    fg_mode=fg_mode,
+                    spoof_mode=spoof_mode,
+                    overlay_menu=overlay_menu,
+                    overwrite_existing=overwrite_existing,
+                    progress_cb=cb,
+                )
+            )
+            self._track_worker(worker)
+
+            def _on_status(msg: str) -> None:
+                self.status_label.setText(msg)
+                if dlg_alive["open"]:
+                    lbl_progress.setText(msg)
+
+            def _on_conflict(existing_path: str) -> None:
+                self.status_label.setText(tr("status.ready"))
+                _set_busy(False)
+                if self._closing_pending:
+                    return
+                ans = QMessageBox.question(
+                    dlg if dlg_alive["open"] else self,
+                    __app_name__,
+                    tr("optiscaler.conflict_confirm", path=existing_path),
+                )
+                if ans == QMessageBox.StandardButton.Yes and dlg_alive["open"]:
+                    _start_install(True)
+
+            def _on_ok(state: object) -> None:
+                self.status_label.setText(tr("status.ready"))
+                cur_winedll = _current_winedll()
+                if prev_state is not None and prev_state.proxy_dll and prev_state.proxy_dll != state.proxy_dll:
+                    cur_winedll = remove_winedlloverride(cur_winedll, prev_state.proxy_dll)
+                new_winedll = merge_winedlloverride(cur_winedll, state.proxy_dll, "n,b")
+                done_msg = tr(
+                    "optiscaler.install_done",
+                    proxy=f"{state.proxy_dll}.dll",
+                    backend=state.backend,
+                )
+                _apply_winedll_update(new_winedll, done_msg, check_conflict=True)
+
+            def _on_err(err: str) -> None:
+                self.status_label.setText(tr("status.ready"))
+                _set_busy(False)
+                if not self._closing_pending:
+                    QMessageBox.critical(
+                        dlg if dlg_alive["open"] else self,
+                        __app_name__,
+                        tr("optiscaler.error", err=err),
+                    )
+
+            worker.status.connect(_on_status)
+            worker.conflict.connect(_on_conflict)
+            worker.finished_ok.connect(_on_ok)
+            worker.failed.connect(_on_err)
+            worker.start()
+
+        def _on_remove() -> None:
+            _set_busy(True, tr("optiscaler.removing"))
+            self.status_label.setText(tr("optiscaler.removing"))
+            worker = _OptiScalerOpWorker(lambda _cb: uninstall_optiscaler_for_game(exe_path))
+            self._track_worker(worker)
+
+            def _on_ok(res: object) -> None:
+                self.status_label.setText(tr("status.ready"))
+                cur_winedll = _current_winedll()
+                state = getattr(res, "state", None)
+                new_winedll = (
+                    remove_winedlloverride(cur_winedll, state.proxy_dll)
+                    if state is not None and state.proxy_dll
+                    else cur_winedll
+                )
+                _apply_winedll_update(new_winedll, tr("optiscaler.remove_done"), check_conflict=False)
+
+            def _on_err(err: str) -> None:
+                self.status_label.setText(tr("status.ready"))
+                _set_busy(False)
+                if not self._closing_pending:
+                    QMessageBox.critical(
+                        dlg if dlg_alive["open"] else self,
+                        __app_name__,
+                        tr("optiscaler.error", err=err),
+                    )
+
+            worker.finished_ok.connect(_on_ok)
+            worker.failed.connect(_on_err)
+            worker.start()
+
+        btn_install.clicked.connect(lambda: _start_install(False))
+        btn_remove.clicked.connect(_on_remove)
+        _refresh_state_ui()
+        dlg.exec()
 
     def _backup_all_saves(self) -> None:
         if _is_wine_game_running():

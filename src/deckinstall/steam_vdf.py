@@ -2587,6 +2587,7 @@ def delete_cleanup_candidates_checked(
     extra_external_roots: list[Path] | None = None,
     include_system_caches: bool = False,
     home_dir: Path | None = None,
+    allow_unverified_saves: bool = False,
 ) -> tuple[int, int, list[str]]:
     """Revalidate each candidate immediately before deleting it and return (deleted, freed, errors)."""
     deleted = 0
@@ -2620,7 +2621,7 @@ def delete_cleanup_candidates_checked(
             if fresh is None:
                 errors.append(f"{item.label}: skipped for safety (no longer orphan/safe).")
                 continue
-            if fresh.has_saves and not fresh.saves_verified_migrated:
+            if fresh.has_saves and not fresh.saves_verified_migrated and not allow_unverified_saves:
                 errors.append(f"{item.label}: skipped for safety (unvalidated saves).")
                 continue
             try:
@@ -2772,6 +2773,56 @@ def backup_all_saves(
             pass
         raise
     return zip_path, games_backed, files_backed
+
+
+def backup_prefix_candidates_to_zip(
+    candidates: list[CleanupCandidate],
+    dest_root: Path | None = None,
+) -> tuple[Path, int, int]:
+    """Create a ZIP backup of saves found inside the given cleanup prefix candidates."""
+    root = dest_root or (Path.home() / "Backups" / "DeckInstall")
+    root.mkdir(parents=True, exist_ok=True)
+    zip_path = _reserve_unique_backup_zip(root, "prefix-cleanup-backup")
+    manifest: dict[str, str] = {}
+    games_count = 0
+    files_count = 0
+    total_uncompressed = 0
+
+    fd, tmp_name = tempfile.mkstemp(prefix=".saves-", suffix=".zip.tmp", dir=str(root))
+    os.close(fd)
+    tmp_zip = Path(tmp_name)
+    try:
+        with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for cand in candidates:
+                if not cand.path.is_dir():
+                    continue
+                slug_base = re.sub(r"[^a-zA-Z0-9._-]+", "-", cand.label).strip("-") or "prefix"
+                key = slug_base
+                idx = 2
+                while key in manifest:
+                    key = f"{slug_base}-{idx}"
+                    idx += 1
+                game_files, files_count, total_uncompressed = _write_prefix_saves_to_zip(
+                    zf, cand.path, key, files_count, total_uncompressed
+                )
+                if game_files > 0:
+                    manifest[key] = cand.label
+                    games_count += 1
+            zf.writestr("manifest.json", json.dumps(manifest, indent=2, ensure_ascii=False))
+        os.replace(tmp_zip, zip_path)
+    except Exception:
+        for p in (tmp_zip, zip_path):
+            try:
+                if p.exists() and p.stat().st_size == 0:
+                    p.unlink()
+            except OSError:
+                pass
+        try:
+            tmp_zip.unlink()
+        except OSError:
+            pass
+        raise
+    return zip_path, games_count, files_count
 
 
 def _safe_parents_within(base_dir: Path, base_resolved: Path, rel_parts: tuple[str, ...]) -> bool:
@@ -3002,16 +3053,15 @@ _PRESET_ENV_KEYS = (
     "PROTON_NO_ESYNC",
     "PROTON_NO_FSYNC",
     "PROTON_DLSS_UPGRADE",
+    "PROTON_ENABLE_NVAPI",
+    "DXVK_ENABLE_NVAPI",
+    "__NV_PRIME_RENDER_OFFLOAD",
+    "__GLX_VENDOR_LIBRARY_NAME",
+    "PROTON_ENABLE_WAYLAND",
     "WINEDLLOVERRIDES",
 )
-_GAMESCOPE_MODES: dict[str, list[str]] = {
-    "fullscreen": ["-f"],
-    "steamdeck": ["-W", "1280", "-H", "800", "-f"],
-    "720p": ["-W", "1280", "-H", "720", "-f"],
-    "1080p": ["-W", "1920", "-H", "1080", "-f"],
-}
 _HELIXSR_OPTISCALER_DLLS = frozenset(
-    {"dxgi", "amd_fidelityfx_dx12", "amd_fidelityfx_vk", "winmm", "version"}
+    {"dxgi", "amd_fidelityfx_dx12", "amd_fidelityfx_vk", "winmm", "version", "dbghelp"}
 )
 _SHELL_OPS = {"&&", "||", ";", "|", ">", ">>", "<", "2>&1", "1>&2", "%command%"}
 _SAFE_UNQUOTED_DOLLAR_RE = re.compile(r"^[\w./:=+-]*\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})[\w./:=+-]*$")
@@ -3051,6 +3101,56 @@ def _format_winedlloverrides_token(winedlloverrides: str) -> str:
     return f"WINEDLLOVERRIDES={shlex.quote(val)}"
 
 
+def _normalize_dll_name(dll_name: str) -> str:
+    norm = dll_name.strip().lstrip("*").lower()
+    if norm.endswith(".dll"):
+        norm = norm[:-4]
+    return norm
+
+
+def _strip_dll_from_overrides(existing: str, target_norm: str) -> list[str]:
+    kept_entries: list[str] = []
+    for raw_entry in existing.split(";"):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        if "=" in entry:
+            names_part, mode_part = entry.split("=", 1)
+            mode_str: str | None = mode_part.strip()
+        else:
+            names_part = entry
+            mode_str = None
+        remaining_names = [
+            name.strip()
+            for name in names_part.split(",")
+            if name.strip() and _normalize_dll_name(name) != target_norm
+        ]
+        if not remaining_names:
+            continue
+        names_joined = ",".join(remaining_names)
+        kept_entries.append(f"{names_joined}={mode_str}" if mode_str is not None else names_joined)
+    return kept_entries
+
+
+def merge_winedlloverride(existing: str, dll_name: str, mode: str = "n,b") -> str:
+    """Merge a DLL override into a WINEDLLOVERRIDES string without clobbering other DLLs."""
+    norm = _normalize_dll_name(dll_name)
+    if not norm:
+        return existing.strip()
+    entries = _strip_dll_from_overrides(existing, norm)
+    clean_mode = mode.strip()
+    entries.append(f"{norm}={clean_mode}" if clean_mode else norm)
+    return ";".join(entries)
+
+
+def remove_winedlloverride(existing: str, dll_name: str) -> str:
+    """Remove a DLL override from a WINEDLLOVERRIDES string without clobbering sibling DLLs."""
+    norm = _normalize_dll_name(dll_name)
+    if not norm:
+        return existing.strip()
+    return ";".join(_strip_dll_from_overrides(existing, norm))
+
+
 def install_mangohud_topbar_config(config_path: Path | None = None) -> Path:
     """Write a Steam-Deck-style horizontal top-bar MangoHud.conf (backing up any existing file)."""
     xdg_config_home = Path(
@@ -3062,7 +3162,7 @@ def install_mangohud_topbar_config(config_path: Path | None = None) -> Path:
         "# DeckInstall — Steam Deck style horizontal top-bar\n"
         "legacy_layout=0\n"
         "horizontal\n"
-        "position=top-left\n"
+        "position=top-center\n"
         "hud_compact\n"
         "background_alpha=0.35\n"
         "font_size=19\n"
@@ -3134,6 +3234,50 @@ def detect_helixsr_lsfg_conflict(launch_options: str, winedlloverrides: str = ""
     return False
 
 
+def _is_managed_mangohud_config(value: str) -> bool:
+    cleaned = value.strip("\"'").strip()
+    if "preset=" in cleaned or (
+        "legacy_layout=0" in cleaned and "horizontal" in cleaned and "hud_compact" in cleaned
+    ):
+        return True
+    parts = [p.strip() for p in cleaned.split(",") if p.strip()]
+    return bool(parts) and all(p.startswith(("position=", "fps_limit=")) for p in parts)
+
+
+def _build_mangohud_config_parts(
+    mangohud_level: int | None,
+    mangohud_position: str,
+    mangohud_fps_limit: int | None,
+) -> list[str]:
+    """Build managed MANGOHUD_CONFIG key-value parts from level, position, and FPS limit."""
+    pos = mangohud_position.strip()
+    if mangohud_level == 2:
+        parts = [
+            "legacy_layout=0",
+            "horizontal",
+            "hud_compact",
+            f"position={pos or 'top-center'}",
+            "fps",
+            "frametime",
+            "gpu_stats",
+            "gpu_temp",
+            "cpu_stats",
+            "cpu_temp",
+            "vram",
+            "ram",
+        ]
+    elif mangohud_level in (1, 3, 4):
+        parts = [f"preset={mangohud_level}"]
+        if pos:
+            parts.append(f"position={pos}")
+    else:
+        parts = [f"position={pos}"] if pos else []
+
+    if mangohud_fps_limit and mangohud_fps_limit > 0:
+        parts.append(f"fps_limit={mangohud_fps_limit}")
+    return parts
+
+
 def apply_launch_presets(
     launch_options: str,
     gamemode: bool,
@@ -3144,8 +3288,11 @@ def apply_launch_presets(
     winedlloverrides: str = "",
     dlss_upgrade: bool = False,
     mangohud_level: int | None = None,
-    gamescope: bool = False,
-    gamescope_mode: str = "fullscreen",
+    nvidia_nvapi: bool = False,
+    prime_offload: bool = False,
+    proton_wayland: bool = False,
+    mangohud_position: str = "",
+    mangohud_fps_limit: int | None = None,
 ) -> str:
     """Toggle common SteamOS/Proton launch presets while preserving existing custom options."""
     _validate_launch_options(launch_options)
@@ -3155,26 +3302,30 @@ def apply_launch_presets(
     except ValueError:
         tokens = launch_options.split()
 
-    # Strip existing managed presets (including any existing gamescope wrapper up to '--')
+    mh_parts = (
+        _build_mangohud_config_parts(mangohud_level, mangohud_position, mangohud_fps_limit)
+        if mangohud
+        else []
+    )
+
+    # Strip existing managed presets
     filtered: list[str] = []
-    skip_gamescope = False
     for tok in tokens:
-        if skip_gamescope:
-            if tok == "--":
-                skip_gamescope = False
-                continue
-            if tok == "%command%":
-                skip_gamescope = False
-                filtered.append(tok)
-                continue
-            continue
-        if tok == "gamescope":
-            skip_gamescope = True
-            continue
         if tok == "gamemoderun":
             continue
-        if _is_env_assignment(tok) and tok.split("=", 1)[0] in _PRESET_ENV_KEYS:
+        if mangohud and tok == "mangohud":
             continue
+        if _is_env_assignment(tok):
+            env_key, env_val = tok.split("=", 1)
+            if env_key == "MANGOHUD_CONFIG":
+                if (
+                    not mangohud
+                    or bool(mh_parts)
+                    or _is_managed_mangohud_config(env_val)
+                ):
+                    continue
+            elif env_key in _PRESET_ENV_KEYS:
+                continue
         filtered.append(tok)
 
     if "%command%" in filtered:
@@ -3191,8 +3342,8 @@ def apply_launch_presets(
     preset_envs: list[str] = []
     if mangohud:
         preset_envs.append("MANGOHUD=1")
-        if mangohud_level in (1, 2, 3, 4):
-            preset_envs.append(f"MANGOHUD_CONFIG=preset={mangohud_level}")
+        if mh_parts:
+            preset_envs.append(f"MANGOHUD_CONFIG={','.join(mh_parts)}")
     if wined3d:
         preset_envs.append("PROTON_USE_WINED3D=1")
     if no_esync:
@@ -3201,6 +3352,14 @@ def apply_launch_presets(
         preset_envs.append("PROTON_NO_FSYNC=1")
     if dlss_upgrade:
         preset_envs.append("PROTON_DLSS_UPGRADE=1")
+    if nvidia_nvapi:
+        preset_envs.append("PROTON_ENABLE_NVAPI=1")
+        preset_envs.append("DXVK_ENABLE_NVAPI=1")
+    if prime_offload:
+        preset_envs.append("__NV_PRIME_RENDER_OFFLOAD=1")
+        preset_envs.append("__GLX_VENDOR_LIBRARY_NAME=nvidia")
+    if proton_wayland:
+        preset_envs.append("PROTON_ENABLE_WAYLAND=1")
     if winedlloverrides.strip():
         preset_envs.append(_format_winedlloverrides_token(winedlloverrides))
 
@@ -3208,9 +3367,6 @@ def apply_launch_presets(
     if gamemode:
         wrappers_out.append("gamemoderun")
     wrappers_out.extend(wrappers_before)
-    if gamescope:
-        flags = _GAMESCOPE_MODES.get(gamescope_mode, _GAMESCOPE_MODES["fullscreen"])
-        wrappers_out.extend(["gamescope", *flags, "--"])
 
     if not env_before and not preset_envs and not wrappers_out and not after_cmd:
         return ""

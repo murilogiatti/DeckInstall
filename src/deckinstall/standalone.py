@@ -14,6 +14,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .extractor import check_disk_space
 from .scanner import detect_steam_appid
 from .steam_paths import SteamPaths, _iter_compat_tool_dirs, _list_steam_library_roots, _read_compat_tool_id, find_steam_root, list_steam_users
 from .steam_vdf import (
@@ -62,7 +63,7 @@ def get_prefixes_dir() -> Path:
         return PREFIXES_DIR
     return get_games_dir() / ".prefixes"
 
-_KNOWN_WRAPPERS = frozenset({"gamemoderun", "lsfg-vk", "mangohud", "gamescope"})
+_KNOWN_WRAPPERS = frozenset({"gamemoderun", "lsfg-vk", "mangohud"})
 
 
 @dataclass
@@ -152,6 +153,38 @@ def _resolve_proton_path(proton_name: str) -> str:
     return name
 
 
+def resolve_umu_game_id(steam_appid: int | None, store: str = "") -> tuple[str, str]:
+    """Return (GAMEID, STORE) for umu-run given an optional Steam AppID and store name."""
+    cleaned_store = store.strip()
+    if isinstance(steam_appid, int) and not isinstance(steam_appid, bool) and steam_appid > 0:
+        return f"umu-{steam_appid}", cleaned_store or "steam"
+    return "umu-default", cleaned_store or "none"
+
+
+def estimate_dir_size(path: Path) -> int:
+    """Return total byte size of regular files under *path*, skipping symlinks."""
+    if path.is_symlink() or not path.exists():
+        return 0
+    if path.is_file():
+        try:
+            return path.lstat().st_size
+        except OSError:
+            return 0
+    total = 0
+    for root, dirs, files in os.walk(path, followlinks=False):
+        root_path = Path(root)
+        dirs[:] = [d for d in dirs if not (root_path / d).is_symlink()]
+        for fname in files:
+            fpath = root_path / fname
+            if fpath.is_symlink():
+                continue
+            try:
+                total += fpath.lstat().st_size
+            except OSError:
+                continue
+    return total
+
+
 def _parse_launch_tokens(
     launch_options: str,
     winedlloverrides: str = "",
@@ -169,8 +202,16 @@ def _parse_launch_tokens(
         before = tokens[:idx]
         after = tokens[idx + 1 :]
     else:
-        before = [t for t in tokens if _is_env_assignment(t) or t.strip("\"'") in _KNOWN_WRAPPERS]
-        after = [t for t in tokens if not (_is_env_assignment(t) or t.strip("\"'") in _KNOWN_WRAPPERS)]
+        before = [
+            t
+            for t in tokens
+            if _is_env_assignment(t) or t.strip("\"'") in _KNOWN_WRAPPERS
+        ]
+        after = [
+            t
+            for t in tokens
+            if not (_is_env_assignment(t) or t.strip("\"'") in _KNOWN_WRAPPERS)
+        ]
 
     env_pairs: list[tuple[str, str]] = []
     wrappers: list[str] = []
@@ -200,6 +241,7 @@ def _write_launch_script(
     winedlloverrides: str,
     launch_options: str,
     native_linux: bool = False,
+    steam_appid: int | None = None,
 ) -> None:
     """Generate an executable launch.sh script invoking umu-run or a native Linux binary."""
     env_pairs, wrappers, game_args, effective_dll = _parse_launch_tokens(
@@ -214,11 +256,12 @@ def _write_launch_script(
 
     if not native_linux:
         proton_path = _resolve_proton_path(proton_name)
+        game_id, store = resolve_umu_game_id(steam_appid)
         lines.extend([
             f"export WINEPREFIX={shlex.quote(str(prefix_dir))}",
             f"export PROTONPATH={shlex.quote(proton_path)}",
-            "export GAMEID=umu-default",
-            "export STORE=none",
+            f"export GAMEID={shlex.quote(game_id)}",
+            f"export STORE={shlex.quote(store)}",
         ])
         if effective_dll:
             lines.append(f"export WINEDLLOVERRIDES={shlex.quote(effective_dll)}")
@@ -296,6 +339,20 @@ def _resolve_desktop_file_path(clean_name: str, target_game_dir: Path) -> Path:
     idx = 2
     while True:
         numbered = APPLICATIONS_DIR / f"deckinstall-{slug}-{short_hash}-{idx}.desktop"
+        if not numbered.exists() or _desktop_points_to_game_dir(numbered, target_game_dir):
+            return numbered
+        idx += 1
+
+
+def _resolve_desktop_shortcut_path(safe_dir_name: str, target_game_dir: Path) -> Path:
+    """Return a clean Desktop .desktop path, disambiguating with (N) only on collision."""
+    desktop_dir = get_desktop_dir()
+    candidate = desktop_dir / f"{safe_dir_name}.desktop"
+    if not candidate.exists() or _desktop_points_to_game_dir(candidate, target_game_dir):
+        return candidate
+    idx = 2
+    while True:
+        numbered = desktop_dir / f"{safe_dir_name} ({idx}).desktop"
         if not numbered.exists() or _desktop_points_to_game_dir(numbered, target_game_dir):
             return numbered
         idx += 1
@@ -619,6 +676,16 @@ def _write_desktop_file(
             desktop_path.chmod(0o755)
         except OSError:
             pass
+        if shutil.which("gio"):
+            try:
+                subprocess.run(
+                    ["gio", "set", str(desktop_path), "metadata::trusted", "true"],
+                    capture_output=True,
+                    timeout=3,
+                    check=False,
+                )
+            except Exception:
+                pass
 
 
 def _write_manifest(game: StandaloneGame) -> None:
@@ -720,6 +787,8 @@ def install_standalone_game(
                     rel_exe = src_exe.relative_to(src_dir)
                 except ValueError:
                     rel_exe = Path(src_exe.name)
+                if src_dir.stat().st_dev != games_dir.stat().st_dev:
+                    check_disk_space(games_dir, estimate_dir_size(src_dir))
                 shutil.move(str(game_dir), str(target_game_dir))
                 target_exe_path = target_game_dir / rel_exe
             else:
@@ -738,7 +807,9 @@ def install_standalone_game(
     launch_script = target_game_dir / "launch.sh"
     desktop_file = _resolve_desktop_file_path(clean_name, target_game_dir)
     desktop_shortcut = (
-        get_desktop_dir() / desktop_file.name if create_desktop_shortcut else None
+        _resolve_desktop_shortcut_path(safe_dir_name, target_game_dir)
+        if create_desktop_shortcut
+        else None
     )
     resolved_icon = resolve_game_icon(
         target_exe_path,
@@ -770,6 +841,7 @@ def install_standalone_game(
         game.winedlloverrides,
         game.launch_options,
         native_linux=game.native_linux,
+        steam_appid=game.steam_appid,
     )
     if create_menu_shortcut:
         _write_desktop_file(
@@ -882,6 +954,7 @@ def update_standalone_launch_options(
         game.winedlloverrides,
         game.launch_options,
         native_linux=game.native_linux,
+        steam_appid=game.steam_appid,
     )
     _write_manifest(game)
     return game
@@ -912,7 +985,30 @@ def remove_standalone_game(
             logging.warning("Failed to remove %s: %s", fpath, exc)
 
     if delete_files:
-        _remove_path_or_tree(game.game_dir)
+        protected_dirs: set[Path] = set()
+        for candidate in (
+            Path.home(),
+            Path.home() / "Downloads",
+            get_desktop_dir(),
+            Path.home() / "Documents",
+            get_games_dir(),
+            Path("/"),
+        ):
+            try:
+                protected_dirs.add(candidate.resolve())
+            except OSError:
+                protected_dirs.add(candidate)
+        try:
+            resolved_game_dir = game.game_dir.resolve()
+        except OSError:
+            resolved_game_dir = game.game_dir
+        if resolved_game_dir in protected_dirs:
+            logging.warning(
+                "Refusing to delete protected directory as game_dir: %s",
+                game.game_dir,
+            )
+        else:
+            _remove_path_or_tree(game.game_dir)
         _remove_path_or_tree(game.prefix_dir)
     elif delete_prefix:
         _remove_path_or_tree(game.prefix_dir)
@@ -1072,11 +1168,11 @@ def import_standalone_to_steam(
         exe_path=game.exe_path,
         start_dir=game.exe_path.parent,
         launch_options=steam_launch or None,
-        enable_proton=True,
+        enable_proton=not game.native_linux,
     )
 
     target_tool = compat_tool.strip() or game.proton_name.strip()
-    if target_tool:
+    if target_tool and not game.native_linux:
         set_shortcut_proton(paths.config_vdf, appid_u32, target_tool)
 
     target_compat = paths.compatdata_dir / str(appid_u32)

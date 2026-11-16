@@ -2,24 +2,31 @@
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import json
 import os
 import platform
 import re
+import select
 import shutil
+import signal
 import stat
 import subprocess
 import tarfile
 import tempfile
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import requests
 
 from . import __version__
+
+if TYPE_CHECKING:
+    from .steam_paths import SteamPaths
 
 UMU_RELEASES_LATEST_URL = (
     "https://api.github.com/repos/Open-Wine-Components/umu-launcher/releases/latest"
@@ -30,13 +37,102 @@ GE_PROTON_RELEASES_LATEST_URL = (
 GE_PROTON_RELEASES_URL = (
     "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases"
 )
+OPTISCALER_RELEASES_API = (
+    "https://api.github.com/repos/optiscaler/OptiScaler/releases/latest"
+)
 
 UPDATE_CACHE_TTL_SECONDS = 24 * 60 * 60
 USER_AGENT = f"DeckInstall/{__version__}"
 _GE_PROTON_TAG_RE = re.compile(r"^GE-Proton(\d+)(.*)$")
 _SHA512_RE = re.compile(r"\b([0-9a-fA-F]{128})\b")
+_WINETRICKS_VERB_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+WINETRICKS_PRESETS: dict[str, str] = {
+    "vcrun2022": "Visual C++ 2015-2022 Redistributable",
+    "d3dcompiler_47": "Direct3D Shader Compiler (d3dcompiler_47)",
+    "corefonts": "Microsoft Core Fonts (Arial, Times, etc.)",
+    "d3dx9": "DirectX 9 Runtime (d3dx9)",
+}
 
 ProgressCallback = Callable[[str, int], None]
+ProgressCb = ProgressCallback
+
+
+@dataclass(frozen=True)
+class GpuProfile:
+    """Detected GPU hardware, driver, and display-session capabilities."""
+
+    has_nvidia: bool
+    has_amd: bool
+    has_intel: bool
+    is_hybrid: bool
+    is_wayland: bool
+    nvidia_driver_present: bool
+
+
+def detect_gpu_profile() -> GpuProfile:
+    """Inspect DRM sysfs vendor IDs (with lspci fallback) and session environment."""
+    has_nvidia = False
+    has_amd = False
+    has_intel = False
+    found_vendor_file = False
+
+    drm_root = Path("/sys/class/drm")
+    if drm_root.is_dir():
+        for vendor_file in drm_root.glob("card*/device/vendor"):
+            try:
+                vendor_id = vendor_file.read_text(encoding="utf-8").strip().lower()
+            except OSError:
+                continue
+            if not vendor_id:
+                continue
+            found_vendor_file = True
+            if vendor_id == "0x10de":
+                has_nvidia = True
+            elif vendor_id == "0x1002":
+                has_amd = True
+            elif vendor_id == "0x8086":
+                has_intel = True
+
+    if not found_vendor_file:
+        try:
+            proc = subprocess.run(
+                ["lspci", "-nn"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            if proc.returncode == 0:
+                for line in proc.stdout.splitlines():
+                    low = line.lower()
+                    if not any(tok in low for tok in ("vga", "3d", "display")):
+                        continue
+                    if "[10de:" in low or "nvidia" in low:
+                        has_nvidia = True
+                    if "[1002:" in low or "amd" in low or "ati" in low or "radeon" in low:
+                        has_amd = True
+                    if "[8086:" in low or "intel" in low:
+                        has_intel = True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    is_hybrid = sum((has_nvidia, has_amd, has_intel)) >= 2
+    nvidia_driver_present = (
+        Path("/proc/driver/nvidia/version").exists()
+        or shutil.which("nvidia-smi") is not None
+    )
+    is_wayland = bool(os.environ.get("WAYLAND_DISPLAY")) or (
+        os.environ.get("XDG_SESSION_TYPE", "").strip().lower() == "wayland"
+    )
+    return GpuProfile(
+        has_nvidia=has_nvidia,
+        has_amd=has_amd,
+        has_intel=has_intel,
+        is_hybrid=is_hybrid,
+        is_wayland=is_wayland,
+        nvidia_driver_present=nvidia_driver_present,
+    )
 
 
 def get_runtime_dir() -> Path:
@@ -57,6 +153,11 @@ def get_umu_run_path() -> Path:
 def get_versions_file() -> Path:
     """Return the path to the runtime version/cache metadata JSON file."""
     return get_runtime_dir() / "versions.json"
+
+
+def get_optiscaler_dir() -> Path:
+    """Return the directory containing the cached OptiScaler runtime payload."""
+    return get_runtime_dir() / "optiscaler" / "current"
 
 
 def _iter_extra_compat_tool_dirs() -> list[Path]:
@@ -395,6 +496,117 @@ def ensure_umu_run(
     return umu_run
 
 
+def _has_optiscaler_dll(directory: Path) -> bool:
+    if not directory.is_dir():
+        return False
+    return any(
+        p.is_file() and not p.is_symlink() and p.name.lower() == "optiscaler.dll"
+        for p in directory.iterdir()
+    )
+
+
+def _pick_optiscaler_asset(release: dict[str, Any]) -> dict[str, Any]:
+    assets = release.get("assets", [])
+    if not isinstance(assets, list):
+        raise RuntimeError("OptiScaler release response is missing assets list.")
+    zip_asset: dict[str, Any] | None = None
+    seven_z_asset: dict[str, Any] | None = None
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name", "")).lower()
+        url = str(asset.get("browser_download_url", "")).strip()
+        if not url:
+            continue
+        if name.endswith(".zip") and zip_asset is None:
+            zip_asset = asset
+        elif name.endswith(".7z") and seven_z_asset is None:
+            seven_z_asset = asset
+    chosen = zip_asset or seven_z_asset
+    if chosen is None:
+        raise RuntimeError("Could not find a .zip or .7z asset in latest OptiScaler release.")
+    return chosen
+
+
+def _swap_directory_atomic(src_dir: Path, target_dir: Path) -> None:
+    """Copy src_dir into a staging sibling and atomically swap it into target_dir."""
+    parent = target_dir.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    staged_dir = Path(tempfile.mkdtemp(prefix=f".{target_dir.name}_stage_", dir=str(parent)))
+    backup_dir: Path | None = None
+    try:
+        shutil.copytree(src_dir, staged_dir, dirs_exist_ok=True, symlinks=False)
+        if target_dir.exists() or target_dir.is_symlink():
+            backup_dir = Path(tempfile.mkdtemp(prefix=f".{target_dir.name}_old_", dir=str(parent)))
+            backup_dir.rmdir()
+            os.replace(target_dir, backup_dir)
+        os.replace(staged_dir, target_dir)
+    except Exception:
+        if backup_dir is not None and backup_dir.exists() and not target_dir.exists():
+            try:
+                os.replace(backup_dir, target_dir)
+            except OSError:
+                pass
+        shutil.rmtree(staged_dir, ignore_errors=True)
+        raise
+    if backup_dir is not None:
+        shutil.rmtree(backup_dir, ignore_errors=True)
+
+
+def ensure_optiscaler(
+    force_update: bool = False,
+    progress_cb: ProgressCb | None = None,
+) -> Path:
+    """Ensure OptiScaler payload is cached under runtime/optiscaler/current."""
+    opti_dir = get_optiscaler_dir()
+    if not force_update and _has_optiscaler_dll(opti_dir):
+        return opti_dir
+
+    from .extractor import extract_archive_to_dir
+
+    _emit_progress(progress_cb, "Checking latest OptiScaler release...", 0)
+    release = _fetch_json(OPTISCALER_RELEASES_API)
+    if not isinstance(release, dict):
+        raise RuntimeError("Unexpected GitHub release response for OptiScaler.")
+
+    tag = str(release.get("tag_name", "")).strip()
+    asset = _pick_optiscaler_asset(release)
+    download_url = str(asset.get("browser_download_url", "")).strip()
+    asset_name = str(asset.get("name", "OptiScaler.zip"))
+
+    opti_parent = opti_dir.parent
+    opti_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="deckinstall_optiscaler_", dir=str(opti_parent)) as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        archive_path = tmp_path / asset_name
+        _download_file(download_url, archive_path, asset_name, progress_cb=progress_cb)
+
+        _emit_progress(progress_cb, "Extracting OptiScaler...", 90)
+        extract_dir = tmp_path / "extract"
+        extract_archive_to_dir(archive_path, extract_dir)
+
+        dll_candidates = [
+            p
+            for p in extract_dir.rglob("*")
+            if p.is_file() and not p.is_symlink() and p.name.lower() == "optiscaler.dll"
+        ]
+        if not dll_candidates:
+            raise RuntimeError("OptiScaler.dll not found inside downloaded OptiScaler archive.")
+        payload_src = min(dll_candidates, key=lambda p: len(p.parts)).parent
+
+        _emit_progress(progress_cb, "Installing OptiScaler runtime...", 96)
+        _swap_directory_atomic(payload_src, opti_dir)
+
+    versions = _load_versions()
+    if tag:
+        versions["optiscaler_installed_version"] = tag
+        versions["optiscaler_latest_version"] = tag
+    versions["optiscaler_last_check"] = int(time.time())
+    _save_versions(versions)
+    _emit_progress(progress_cb, "OptiScaler ready.", 100)
+    return opti_dir
+
+
 def ensure_ge_proton11(
     force_update: bool = False,
     progress_cb: ProgressCallback | None = None,
@@ -596,11 +808,11 @@ _SYSTEM_PACKAGE_MAP: dict[str, dict[str, list[str]]] = {
         "pacman": ["mangohud"],
         "zypper": ["mangohud"],
     },
-    "gamescope": {
-        "apt-get": ["gamescope"],
-        "dnf": ["gamescope"],
-        "pacman": ["gamescope"],
-        "zypper": ["gamescope"],
+    "winetricks": {
+        "apt-get": ["winetricks"],
+        "dnf": ["winetricks"],
+        "pacman": ["winetricks"],
+        "zypper": ["winetricks"],
     },
 }
 
@@ -675,17 +887,200 @@ def fix_bwrap_userns() -> tuple[bool, str]:
     return (True, "OK")
 
 
+def kill_proc_group(proc: subprocess.Popen[bytes], sig: int) -> None:
+    """Signal the subprocess group when start_new_session=True, falling back to proc."""
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        if sig == signal.SIGKILL:
+            proc.kill()
+        else:
+            proc.terminate()
+
+
+def drain_stream_lines(
+    proc: subprocess.Popen[bytes],
+    cancel_flag: Callable[[], bool] | None,
+    on_line: Callable[[str], None],
+    cancel_msg: str,
+) -> int:
+    """Read subprocess stdout non-blockingly so cancel_flag is checked every <=0.2s."""
+    assert proc.stdout is not None
+    fd = proc.stdout.fileno()
+    os.set_blocking(fd, False)
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    buf = ""
+    try:
+        while True:
+            if cancel_flag and cancel_flag():
+                kill_proc_group(proc, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    kill_proc_group(proc, signal.SIGKILL)
+                    proc.wait(timeout=2)
+                raise RuntimeError(cancel_msg)
+            ready, _, _ = select.select([fd], [], [], 0.2)
+            if ready:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    buf += decoder.decode(b"", final=True)
+                    if buf.strip():
+                        on_line(buf)
+                    break
+                buf += decoder.decode(chunk, final=False)
+                while True:
+                    idx_n = buf.find("\n")
+                    idx_r = buf.find("\r")
+                    if idx_n == -1 and idx_r == -1:
+                        break
+                    if idx_n == -1:
+                        sep = idx_r
+                    elif idx_r == -1:
+                        sep = idx_n
+                    else:
+                        sep = min(idx_n, idx_r)
+                    line = buf[:sep]
+                    buf = buf[sep + 1 :]
+                    if line.strip():
+                        on_line(line)
+            elif proc.poll() is not None:
+                buf += decoder.decode(b"", final=True)
+                if buf.strip():
+                    on_line(buf)
+                break
+        rc = proc.wait()
+        if cancel_flag and cancel_flag():
+            raise RuntimeError(cancel_msg)
+        return rc
+    finally:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+
+
+def resolve_game_prefix(
+    kind: str,
+    obj: object,
+    paths: SteamPaths | None,
+) -> tuple[Path, Path | None]:
+    """Resolve (prefix_dir, proton_dir) for a Steam shortcut or standalone game."""
+    kind_norm = kind.strip().lower()
+    if kind_norm == "steam":
+        if paths is None:
+            raise ValueError("SteamPaths is required to resolve a Steam game prefix.")
+        appid = getattr(obj, "appid_u32", obj)
+        if not isinstance(appid, int):
+            raise ValueError(f"Expected integer appid or ShortcutEntry, got {type(obj).__name__}.")
+        prefix_dir = paths.compatdata_dir / str(appid) / "pfx"
+        from .steam_paths import find_proton_binary
+
+        proton_bin = find_proton_binary(paths.steam_root)
+        proton_dir = proton_bin.parent if proton_bin is not None else None
+        return (prefix_dir, proton_dir)
+
+    if kind_norm == "standalone":
+        raw_prefix = getattr(obj, "prefix_dir", None)
+        if raw_prefix is None:
+            raise ValueError("Standalone game object has no prefix_dir attribute.")
+        prefix_dir = Path(raw_prefix)
+        if (prefix_dir / "pfx").is_dir() and not (prefix_dir / "drive_c").is_dir():
+            prefix_dir = prefix_dir / "pfx"
+
+        proton_dir: Path | None = None
+        proton_name = str(getattr(obj, "proton_name", "") or "").strip()
+        if proton_name:
+            as_path = Path(proton_name)
+            if as_path.is_dir() and (as_path / "proton").is_file():
+                proton_dir = as_path
+            else:
+                for cand in list_ge_proton11_dirs():
+                    if cand.name == proton_name:
+                        proton_dir = cand
+                        break
+                if proton_dir is None:
+                    compat_cand = get_compat_tools_dir() / proton_name
+                    if compat_cand.is_dir() and (compat_cand / "proton").is_file():
+                        proton_dir = compat_cand
+        if proton_dir is None:
+            ge_dirs = list_ge_proton11_dirs()
+            if ge_dirs:
+                proton_dir = ge_dirs[0]
+        return (prefix_dir, proton_dir)
+
+    raise ValueError(f"Unsupported game kind: {kind!r}")
+
+
+def run_winetricks_verbs(
+    prefix_dir: Path,
+    verbs: list[str],
+    proton_dir: Path | None = None,
+    on_log: Callable[[str], None] | None = None,
+    cancel_flag: Callable[[], bool] | None = None,
+) -> None:
+    """Install one or more winetricks verbs silently into prefix_dir."""
+    if not verbs:
+        raise ValueError("At least one winetricks verb is required.")
+    for verb in verbs:
+        if not _WINETRICKS_VERB_RE.fullmatch(verb):
+            raise ValueError(f"Invalid winetricks verb: {verb!r}")
+
+    winetricks = shutil.which("winetricks")
+    if winetricks is None:
+        raise RuntimeError("winetricks is not installed or not found in PATH.")
+
+    prefix_dir.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env["WINEPREFIX"] = str(prefix_dir)
+    if proton_dir is not None:
+        for rel in ("files/bin/wine", "dist/bin/wine"):
+            wine_bin = proton_dir / rel
+            if wine_bin.is_file():
+                env["WINE"] = str(wine_bin)
+                wineserver = wine_bin.parent / "wineserver"
+                if wineserver.is_file():
+                    env["WINESERVER"] = str(wineserver)
+                break
+
+    if cancel_flag and cancel_flag():
+        raise RuntimeError("Winetricks cancelled by user.")
+
+    cmd = [winetricks, "-q", *verbs]
+    if on_log:
+        on_log(f"Running winetricks ({', '.join(verbs)}) in {prefix_dir}...")
+
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    def _handle_line(line: str) -> None:
+        if on_log and line.strip():
+            on_log(line.strip()[:160])
+
+    rc = drain_stream_lines(proc, cancel_flag, _handle_line, "Winetricks cancelled by user.")
+    if rc != 0:
+        raise RuntimeError(f"winetricks exited with code {rc} for verbs: {', '.join(verbs)}")
+
+
 def build_umu_env(
     prefix_dir: Path,
     proton_dir: Path,
     extra_env: dict[str, str] | None = None,
+    game_id: str = "umu-default",
+    store: str = "none",
 ) -> dict[str, str]:
     """Build environment variables for executing a Windows binary via umu-run."""
     env = os.environ.copy()
     env["WINEPREFIX"] = str(prefix_dir)
     env["PROTONPATH"] = str(proton_dir)
-    env["GAMEID"] = "umu-default"
-    env["STORE"] = "none"
+    env["GAMEID"] = game_id or "umu-default"
+    env["STORE"] = store or "none"
     if extra_env:
         env.update(extra_env)
     return env
