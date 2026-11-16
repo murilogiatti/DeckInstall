@@ -95,7 +95,7 @@ from .runtime_manager import (
     get_umu_run_path,
     install_system_package,
     list_ge_proton11_dirs,
-    resolve_game_prefix_and_proton,
+    resolve_game_prefix,
     run_winetricks_verbs,
     validate_steamrt4_integrity,
 )
@@ -4119,7 +4119,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            prefix_dir, proton_dir = resolve_game_prefix_and_proton(kind, obj, self.paths)
+            prefix_dir, proton_dir = resolve_game_prefix(kind, obj, self.paths)
         except Exception as exc:
             QMessageBox.critical(self, __app_name__, str(exc))
             return
