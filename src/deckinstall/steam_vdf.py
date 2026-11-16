@@ -882,6 +882,8 @@ def _dir_has_game_exe(directory: Path, max_depth: int = 3) -> bool:
 
 def _looks_like_multi_game_container(directory: Path) -> bool:
     """Return True if directory is a Syncthing root or contains multiple game subfolders."""
+    if directory == directory.parent:
+        return False
     try:
         if (directory / ".stfolder").exists() or (directory / ".stfolder").is_symlink():
             return True
@@ -942,12 +944,20 @@ def infer_game_root_from_exe(exe_path: Path) -> Path:
     tmp_containers = {Path("/tmp").resolve(), Path("/var/tmp").resolve()}
     candidate = resolved.parent
     for parent in resolved.parents:
+        if parent in known_containers or parent == parent.parent:
+            break
         if parent.parent in tmp_containers:
             rel_parts = resolved.relative_to(parent).parts
             if len(rel_parts) == 1 or rel_parts[0].lower() in _SUBDIR_NAMES:
                 candidate = parent
                 break
-            continue
+            while (
+                candidate.name.lower() in _SUBDIR_NAMES
+                and candidate.parent != candidate
+                and candidate.parent != parent
+            ):
+                candidate = candidate.parent
+            break
         if parent.parent in known_containers or _looks_like_multi_game_container(parent.parent):
             candidate = parent
             break
