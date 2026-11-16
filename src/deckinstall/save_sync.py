@@ -98,11 +98,12 @@ def _atomic_write_bytes(target: Path, data: bytes) -> None:
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
     )
-    os.close(fd)
     tmp_path = Path(tmp_name)
     try:
-        with tmp_path.open("wb") as fh:
+        with os.fdopen(fd, "wb") as fh:
             fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp_path, target)
     except Exception:
         try:
@@ -303,6 +304,17 @@ def pull_game_saves(
     latest_zip = sync_root / slug / "latest.zip"
     if not latest_zip.is_file():
         return 0, None
+
+    meta = _read_sync_meta(sync_root / slug / "meta.json")
+    if meta is not None:
+        expected_sha = meta.get("sha256")
+        if isinstance(expected_sha, str) and expected_sha.strip():
+            actual_sha = _sha256_file(latest_zip)
+            if actual_sha.lower() != expected_sha.strip().lower():
+                raise RuntimeError(
+                    f"Sync archive checksum mismatch for {game_name}: "
+                    f"expected {expected_sha}, got {actual_sha}"
+                )
 
     snap_path = snapshot_prefix_saves(
         prefix_dir,

@@ -729,7 +729,9 @@ class CoreTests(unittest.TestCase):
             )
             entry = ShortcutEntry("0", appid, "TestGame", '"/g/t.exe"', '"/g"', "", "")
             with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[entry]):
-                zpath, games, files = backup_all_saves(paths, dest_root=root / "Backups")
+                zpath, games, files = backup_all_saves(
+                    paths, dest_root=root / "Backups", games_dir=root / "Games"
+                )
                 self.assertEqual((games, files), (1, 1))
                 self.assertTrue(zpath.is_file())
 
@@ -835,7 +837,9 @@ class CoreTests(unittest.TestCase):
             old_entry = ShortcutEntry("0", old_id, "Cool Game", '"/g/a.exe"', '"/g"', "", "")
             new_entry = ShortcutEntry("0", new_id, "Cool Game", '"/Games/Cool Game/a.exe"', '"/Games/Cool Game"', "", "")
             with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[old_entry]):
-                zpath, games, files = backup_all_saves(paths, dest_root=root / "Backups")
+                zpath, games, files = backup_all_saves(
+                    paths, dest_root=root / "Backups", games_dir=root / "Games"
+                )
                 self.assertEqual((games, files), (1, 3))
             with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[new_entry]):
                 rgames, rfiles = restore_saves_backup(paths, zpath)
@@ -1052,8 +1056,8 @@ class CoreTests(unittest.TestCase):
             fake_entry = ShortcutEntry("0", 999, "Game999", '"/g/a.exe"', '"/g"', "", "")
             out_dir = root / "backups"
             with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[fake_entry]):
-                z1, g1, f1 = backup_all_saves(paths, out_dir)
-                z2, g2, f2 = backup_all_saves(paths, out_dir)
+                z1, g1, f1 = backup_all_saves(paths, out_dir, games_dir=root / "Games")
+                z2, g2, f2 = backup_all_saves(paths, out_dir, games_dir=root / "Games")
             self.assertNotEqual(z1, z2)
             self.assertEqual((g1, f1), (1, 1))
             self.assertEqual((g2, f2), (1, 1))
@@ -1678,6 +1682,9 @@ class CoreTests(unittest.TestCase):
                         mock.patch("deckinstall.ui.load_shortcuts", side_effect=ValueError("bad vdf")),
                     ):
                         win = MainWindow(app)
+                        for w in list(win._active_workers):
+                            w.wait(2000)
+                        app.processEvents()
                         self.assertTrue(win._vdf_corrupt)
                         self.assertFalse(win.vdf_error_banner.isHidden())
                         self.assertFalse(win.btn_add_steam.isEnabled())

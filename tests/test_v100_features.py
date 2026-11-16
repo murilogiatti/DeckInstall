@@ -93,10 +93,17 @@ class SaveSyncTests(unittest.TestCase):
             self.assertTrue(pushed_zip.is_file())
             self.assertTrue((pushed_zip.parent / "meta.json").is_file())
 
-            # Inject malicious path-traversal and symlink entries into the sync archive.
+            # Inject malicious path-traversal and symlink entries into the sync archive,
+            # and update meta.json sha256 so pull reaches archive extraction traversal checks.
             with zipfile.ZipFile(pushed_zip, "a") as zf:
                 zf.writestr("save/users/../../escaped.txt", b"pwned")
                 zf.writestr("save/other_section/bad.txt", b"ignored")
+
+            import hashlib
+            meta_file = pushed_zip.parent / "meta.json"
+            meta_data = json.loads(meta_file.read_text(encoding="utf-8"))
+            meta_data["sha256"] = hashlib.sha256(pushed_zip.read_bytes()).hexdigest()
+            meta_file.write_text(json.dumps(meta_data), encoding="utf-8")
 
             restored, snap_path = pull_game_saves(
                 "Cool Game",

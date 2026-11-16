@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import codecs
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -13,9 +15,12 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
+import threading
 import time
+import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,9 +48,19 @@ OPTISCALER_RELEASES_API = (
 
 UPDATE_CACHE_TTL_SECONDS = 24 * 60 * 60
 USER_AGENT = f"DeckInstall/{__version__}"
-_GE_PROTON_TAG_RE = re.compile(r"^GE-Proton(\d+)(.*)$")
+_GE_PROTON_TAG_RE = re.compile(r"^GE-Proton(\d+)([A-Za-z0-9._-]*)$")
 _SHA512_RE = re.compile(r"\b([0-9a-fA-F]{128})\b")
 _WINETRICKS_VERB_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_ALLOWED_URL_HOSTS = frozenset(
+    {
+        "api.github.com",
+        "github.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+        "github-releases.githubusercontent.com",
+    }
+)
+_VERSIONS_LOCK = threading.Lock()
 
 WINETRICKS_PRESETS: dict[str, str] = {
     "vcrun2022": "Visual C++ 2015-2022 Redistributable",
@@ -270,20 +285,26 @@ def _get_arch() -> str:
     return machine
 
 
-def _parse_ge_proton_version(name: str) -> tuple[int, ...] | None:
-    """Parse GE-Proton11+ folder/tag names; return None for Proton 10 and older."""
+def _parse_ge_proton_version(
+    name: str, min_major: int = 11, max_major: int | None = None
+) -> tuple[int, ...] | None:
+    """Parse GE-Proton folder/tag names within [min_major, max_major]."""
     match = _GE_PROTON_TAG_RE.match(name)
     if not match:
         return None
     major = int(match.group(1))
-    if major < 11:
+    if major < min_major:
+        return None
+    if max_major is not None and major > max_major:
         return None
     rest = [int(part) for part in re.findall(r"\d+", match.group(2))]
     return (major, *rest)
 
 
-def list_ge_proton11_dirs() -> list[Path]:
-    """List installed GE-Proton11+ directories sorted newest first."""
+def list_ge_proton_dirs(
+    min_major: int = 11, max_major: int | None = None
+) -> list[Path]:
+    """List installed GE-Proton directories within [min_major, max_major] sorted newest first."""
     from .steam_paths import _iter_compat_tool_dirs, find_steam_root
 
     steam_root = find_steam_root()
@@ -320,7 +341,9 @@ def list_ge_proton11_dirs() -> list[Path]:
                 continue
             if resolved_entry in seen_entries:
                 continue
-            version = _parse_ge_proton_version(entry.name)
+            version = _parse_ge_proton_version(
+                entry.name, min_major=min_major, max_major=max_major
+            )
             if version is not None:
                 seen_entries.add(resolved_entry)
                 found.append((version, entry))
@@ -329,36 +352,84 @@ def list_ge_proton11_dirs() -> list[Path]:
     return [entry for _, entry in found]
 
 
+def list_ge_proton11_dirs() -> list[Path]:
+    """List installed GE-Proton11+ directories sorted newest first."""
+    return list_ge_proton_dirs(min_major=11)
+
+
+def list_ge_proton10_dirs() -> list[Path]:
+    """List installed GE-Proton10 directories sorted newest first."""
+    return list_ge_proton_dirs(min_major=10, max_major=10)
+
+
+@contextlib.contextmanager
+def _versions_lock():
+    """Serialize read/write access to versions.json across threads and processes."""
+    lock_path = get_versions_file().with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with _VERSIONS_LOCK:
+        with open(lock_path, "a+", encoding="utf-8") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
 def _load_versions() -> dict[str, Any]:
-    path = get_versions_file()
-    if not path.is_file():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    with _versions_lock():
+        path = get_versions_file()
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
 
 
 def _save_versions(data: dict[str, Any]) -> None:
-    path = get_versions_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=".versions_", suffix=".json", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, sort_keys=True)
-        os.replace(tmp_name, path)
-    except Exception:
+    with _versions_lock():
+        path = get_versions_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(prefix=".versions_", suffix=".json", dir=str(path.parent))
         try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=2, sort_keys=True)
+            os.replace(tmp_name, path)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
+
+def _validate_github_url(url: str) -> str:
+    """Validate that url uses HTTPS and points to an allowlisted GitHub/CDN host."""
+    cleaned = url.strip()
+    parsed = urllib.parse.urlparse(cleaned)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme.lower() != "https" or host not in _ALLOWED_URL_HOSTS:
+        raise ValueError(f"Disallowed URL (must be HTTPS on GitHub): {url!r}")
+    return cleaned
+
+
+def _sanitize_asset_name(name: str) -> str:
+    """Ensure a release asset filename is a single safe basename."""
+    raw = name.strip()
+    if not raw or "/" in raw or "\\" in raw:
+        raise ValueError(f"Unsafe asset filename: {name!r}")
+    cleaned = Path(raw).name
+    if not cleaned or cleaned in (".", ".."):
+        raise ValueError(f"Unsafe asset filename: {name!r}")
+    return cleaned
 
 
 def _fetch_json(url: str, timeout: int = 20) -> Any:
+    validated_url = _validate_github_url(url)
     resp = requests.get(
-        url,
+        validated_url,
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "application/vnd.github+json",
@@ -376,9 +447,10 @@ def _download_file(
     progress_cb: ProgressCallback | None = None,
     timeout: int = 60,
 ) -> None:
+    validated_url = _validate_github_url(url)
     dest.parent.mkdir(parents=True, exist_ok=True)
     with requests.get(
-        url,
+        validated_url,
         headers={"User-Agent": USER_AGENT},
         stream=True,
         timeout=timeout,
@@ -404,7 +476,7 @@ def _download_file(
 
 
 def _safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:
-    """Safely extract a tar/tar.gz archive preventing path traversal."""
+    """Safely extract a tar/tar.gz archive preventing path traversal and special files."""
     dest_resolved = dest_dir.resolve()
     with tarfile.open(tar_path, "r:*") as tf:
         members = tf.getmembers()
@@ -412,6 +484,8 @@ def _safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:
             member_path = Path(member.name)
             if member_path.is_absolute() or ".." in member_path.parts:
                 raise RuntimeError(f"Unsafe archive member path: {member.name}")
+            if member.isdev() or member.isfifo() or member.ischr() or member.isblk():
+                raise RuntimeError(f"Unsafe archive special file: {member.name}")
             target_path = (dest_resolved / member_path).resolve()
             if target_path != dest_resolved and dest_resolved not in target_path.parents:
                 raise RuntimeError(f"Archive member escapes destination: {member.name}")
@@ -423,7 +497,10 @@ def _safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:
                 resolved_link = (base / link_target).resolve()
                 if resolved_link != dest_resolved and dest_resolved not in resolved_link.parents:
                     raise RuntimeError(f"Unsafe archive link target: {member.linkname}")
-        tf.extractall(dest_dir, members=members)
+        if sys.version_info >= (3, 12):
+            tf.extractall(dest_dir, members=members, filter="data")
+        else:
+            tf.extractall(dest_dir, members=members)
 
 
 def _fetch_latest_ge_proton11_release() -> dict[str, Any]:
@@ -456,10 +533,34 @@ def _find_release_asset(release: dict[str, Any], name: str) -> dict[str, Any] | 
 
 
 def _verify_sha512(file_path: Path, checksum_text: str) -> None:
-    match = _SHA512_RE.search(checksum_text)
-    if not match:
+    entries: list[tuple[str, str]] = []
+    for raw_line in checksum_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        match = re.match(r"^([0-9a-fA-F]{128})(?:\s+[* ]?(.+))?$", line)
+        if match:
+            digest_hex = match.group(1).lower()
+            entry_name = Path((match.group(2) or "").strip()).name
+            entries.append((digest_hex, entry_name))
+
+    if not entries:
         raise RuntimeError("Invalid .sha512sum file format.")
-    expected = match.group(1).lower()
+
+    expected: str | None = None
+    for digest_hex, entry_name in entries:
+        if entry_name == file_path.name:
+            expected = digest_hex
+            break
+
+    if expected is None:
+        if len(entries) == 1:
+            expected = entries[0][0]
+        else:
+            raise RuntimeError(
+                f"No SHA-512 entry matching {file_path.name!r} in .sha512sum."
+            )
+
     digest = hashlib.sha512()
     with open(file_path, "rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -501,7 +602,7 @@ def ensure_umu_run(
         raise RuntimeError("Could not find umu-launcher-*-zipapp.tar in latest release.")
 
     download_url = str(zipapp_asset.get("browser_download_url", ""))
-    asset_name = str(zipapp_asset.get("name", "umu-launcher-zipapp.tar"))
+    asset_name = _sanitize_asset_name(str(zipapp_asset.get("name", "umu-launcher-zipapp.tar")))
     if not download_url:
         raise RuntimeError("umu-launcher zipapp asset is missing download URL.")
 
@@ -620,7 +721,7 @@ def ensure_optiscaler(
     tag = str(release.get("tag_name", "")).strip()
     asset = _pick_optiscaler_asset(release)
     download_url = str(asset.get("browser_download_url", "")).strip()
-    asset_name = str(asset.get("name", "OptiScaler.zip"))
+    asset_name = _sanitize_asset_name(str(asset.get("name", "OptiScaler.zip")))
 
     opti_parent = opti_dir.parent
     opti_parent.mkdir(parents=True, exist_ok=True)
@@ -669,9 +770,11 @@ def ensure_ge_proton11(
     tag = str(release.get("tag_name", "")).strip()
     if not tag:
         raise RuntimeError("GE-Proton release is missing tag_name.")
+    if _parse_ge_proton_version(tag) is None or ".." in tag:
+        raise RuntimeError(f"Unsafe GE-Proton tag name: {tag!r}")
 
     arch = _get_arch()
-    tar_name = f"{tag}-{arch}.tar.gz"
+    tar_name = _sanitize_asset_name(f"{tag}-{arch}.tar.gz")
     tar_asset = _find_release_asset(release, tar_name)
     if tar_asset is None:
         if arch != "x86_64":
@@ -696,11 +799,14 @@ def ensure_ge_proton11(
     compat_dir = get_compat_tools_dir()
     compat_dir.mkdir(parents=True, exist_ok=True)
     target_dir = compat_dir / tag
+    if target_dir.resolve().parent != compat_dir.resolve():
+        raise RuntimeError(f"Unsafe GE-Proton target directory: {target_dir}")
 
     with tempfile.TemporaryDirectory(prefix="deckinstall_ge_", dir=str(compat_dir)) as tmp_dir:
         tmp_path = Path(tmp_dir)
         tar_path = tmp_path / tar_name
-        sha_path = tmp_path / str(sha_asset.get("name", f"{tag}-{arch}.sha512sum"))
+        sha_name = _sanitize_asset_name(str(sha_asset.get("name", f"{tag}-{arch}.sha512sum")))
+        sha_path = tmp_path / sha_name
 
         _download_file(sha_url, sha_path, sha_path.name)
         _download_file(tar_url, tar_path, tar_name, progress_cb=progress_cb, timeout=120)
@@ -718,15 +824,54 @@ def ensure_ge_proton11(
             subdirs = [p for p in extract_dir.iterdir() if p.is_dir()]
             extracted_root = subdirs[0] if len(subdirs) == 1 else extract_dir
 
-        if target_dir.exists():
-            shutil.rmtree(target_dir)
-        shutil.move(str(extracted_root), str(target_dir))
+        backup_dir: Path | None = None
+        try:
+            if target_dir.exists() or target_dir.is_symlink():
+                backup_dir = Path(
+                    tempfile.mkdtemp(prefix=f".{tag}_old_", dir=str(compat_dir))
+                )
+                backup_dir.rmdir()
+                os.replace(target_dir, backup_dir)
+            os.replace(extracted_root, target_dir)
+        except Exception:
+            if backup_dir is not None and backup_dir.exists() and not target_dir.exists():
+                try:
+                    os.replace(backup_dir, target_dir)
+                except OSError:
+                    pass
+            raise
+        if backup_dir is not None:
+            shutil.rmtree(backup_dir, ignore_errors=True)
 
     versions = _load_versions()
     versions["ge_proton_latest_version"] = tag
     _save_versions(versions)
     _emit_progress(progress_cb, f"{tag} ready.", 100)
     return target_dir
+
+
+def ensure_ge_proton10(
+    force_update: bool = False,
+    progress_cb: ProgressCallback | None = None,
+) -> Path:
+    """Ensure a GE-Proton10 directory is installed in Steam compatibilitytools.d."""
+    existing = list_ge_proton10_dirs()
+    if existing and not force_update:
+        return existing[0]
+
+    _emit_progress(progress_cb, "Checking latest GE-Proton10 release...", 0)
+    releases = fetch_available_proton_releases("ge-proton", limit=50)
+    release: ProtonRelease | None = None
+    for rel in releases:
+        if rel.prerelease:
+            continue
+        if _parse_ge_proton_version(rel.tag_name, min_major=10, max_major=10) is not None:
+            release = rel
+            break
+    if release is None:
+        raise RuntimeError("No GE-Proton10 release found.")
+
+    return install_compat_tool(release, progress_cb=progress_cb)
 
 
 def _dir_size_bytes(path: Path) -> int:
@@ -932,7 +1077,8 @@ def install_compat_tool(
 
     compat_dir = get_compat_tools_dir()
     compat_dir.mkdir(parents=True, exist_ok=True)
-    tar_name = release.asset_name or Path(release.download_url.split("?", 1)[0]).name
+    raw_tar_name = release.asset_name or Path(release.download_url.split("?", 1)[0]).name
+    tar_name = _sanitize_asset_name(raw_tar_name)
 
     with tempfile.TemporaryDirectory(
         prefix="deckinstall_proton_", dir=str(compat_dir)
@@ -974,10 +1120,12 @@ def install_compat_tool(
             extracted_root = extract_dir
             folder_name = _strip_tar_suffix(tar_name) or release.tag_name
 
-        if not folder_name or folder_name in (".", "..") or "/" in folder_name:
+        if not folder_name or folder_name in (".", "..") or "/" in folder_name or "\\" in folder_name:
             raise RuntimeError(f"Unsafe compatibility tool folder name: {folder_name!r}")
 
         target_dir = compat_dir / folder_name
+        if ".." in folder_name or target_dir.resolve().parent != compat_dir.resolve():
+            raise RuntimeError(f"Unsafe compatibility tool target directory: {target_dir}")
         backup_dir: Path | None = None
         try:
             if target_dir.exists() or target_dir.is_symlink():
@@ -1463,3 +1611,61 @@ def run_with_umu(
         env=env,
         check=False,
     )
+
+
+def is_win32_prefix(prefix_dir: Path) -> bool:
+    """Return True if prefix_dir/system.reg declares a 32-bit (#arch=win32) Wine prefix."""
+    reg_file = prefix_dir / "system.reg"
+    try:
+        with reg_file.open("r", encoding="utf-8", errors="ignore") as fh:
+            has_win32 = False
+            has_win64 = False
+            for idx, line in enumerate(fh):
+                if idx >= 64:
+                    break
+                if "#arch=win32" in line:
+                    has_win32 = True
+                if "#arch=win64" in line:
+                    has_win64 = True
+            return has_win32 and not has_win64
+    except OSError:
+        return False
+
+
+def run_exe_in_prefix(
+    exe_path: Path,
+    prefix_dir: Path,
+    proton_path: Path | None = None,
+    game_id: str = "umu-default",
+    wait: bool = True,
+) -> int:
+    """Run an arbitrary Windows executable inside an existing Wine prefix via umu-run."""
+    resolved_proton = proton_path
+    if resolved_proton is None:
+        candidates = list_ge_proton11_dirs() or list_ge_proton10_dirs()
+        if not candidates:
+            raise RuntimeError(
+                "No GE-Proton11+ or GE-Proton10 installation found. Install GE-Proton first."
+            )
+        resolved_proton = candidates[0]
+
+    umu_run = ensure_umu_run()
+    prefix_dir.mkdir(parents=True, exist_ok=True)
+    env = build_umu_env(prefix_dir, resolved_proton, game_id=game_id)
+    cmd = [str(umu_run), str(exe_path)]
+    cwd = str(exe_path.parent) if exe_path.parent.is_dir() else None
+
+    if wait:
+        proc = subprocess.run(cmd, cwd=cwd, env=env, check=False)
+        return proc.returncode
+
+    subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return 0

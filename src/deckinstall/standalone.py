@@ -103,6 +103,70 @@ def _is_under_dir(path: Path, parent: Path) -> bool:
         return False
 
 
+def _is_strictly_under_dir(path: Path, parent: Path) -> bool:
+    """Return True if path resolves strictly inside parent (and is not a symlink)."""
+    if path.is_symlink():
+        return False
+    try:
+        resolved_path = path.resolve()
+        resolved_parent = parent.resolve()
+        resolved_path.relative_to(resolved_parent)
+        return resolved_path != resolved_parent
+    except (OSError, ValueError):
+        return False
+
+
+def _strip_control_chars(value: str) -> str:
+    """Remove CR, LF, and ASCII control characters from a string."""
+    return "".join(ch for ch in value if ord(ch) >= 32 and ord(ch) != 127)
+
+
+def _get_protected_dirs() -> set[Path]:
+    """Return resolved paths of system/user directories that must never be moved or deleted."""
+    home = Path.home()
+    candidates = (
+        home,
+        home / "Downloads",
+        home / "Desktop",
+        get_desktop_dir(),
+        home / "Documents",
+        home / "Music",
+        home / "Pictures",
+        home / "Videos",
+        home / "Public",
+        home / "Templates",
+        home / "Games",
+        get_games_dir(),
+        home / "Syncthing",
+        Path("/"),
+        Path("/tmp"),
+        Path("/var/tmp"),
+        Path("/mnt"),
+        Path("/media"),
+    )
+    protected: set[Path] = set()
+    for candidate in candidates:
+        try:
+            protected.add(candidate.resolve())
+        except OSError:
+            protected.add(candidate)
+    return protected
+
+
+def _is_protected_dir(path: Path) -> bool:
+    """Return True if path is a protected directory or a Syncthing folder root."""
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    if resolved in _get_protected_dirs():
+        return True
+    try:
+        return (resolved / ".stfolder").exists()
+    except OSError:
+        return False
+
+
 def _resolve_proton_path(proton_name: str) -> str:
     """Resolve a Proton/GE-Proton tool name to a filesystem path for PROTONPATH when possible."""
     name = proton_name.strip()
@@ -151,6 +215,23 @@ def _resolve_proton_path(proton_name: str) -> str:
                         return str(cand)
 
     return name
+
+
+def resolve_standalone_proton_fallback(game: StandaloneGame) -> tuple[Path | None, str | None]:
+    """Resolve game.proton_name or fall back to the newest installed GE-Proton11+/10 tool."""
+    from .runtime_manager import list_ge_proton10_dirs, list_ge_proton11_dirs
+
+    if game.proton_name.strip():
+        resolved_str = _resolve_proton_path(game.proton_name)
+        resolved_path = Path(resolved_str)
+        if resolved_path.is_dir() and (resolved_path / "proton").is_file():
+            return (resolved_path, None)
+
+    candidates = list_ge_proton11_dirs() or list_ge_proton10_dirs()
+    if candidates:
+        fallback_dir = candidates[0]
+        return (fallback_dir, fallback_dir.name)
+    return (None, None)
 
 
 def resolve_umu_game_id(steam_appid: int | None, store: str = "") -> tuple[str, str]:
@@ -659,21 +740,25 @@ def _write_desktop_file(
 ) -> None:
     """Create or update a .desktop launcher file."""
     desktop_path.parent.mkdir(parents=True, exist_ok=True)
+    clean_name = _strip_control_chars(game_name)
+    clean_game_dir = _strip_control_chars(str(game_dir))
     lines = [
         "[Desktop Entry]",
         "Type=Application",
-        f"Name={game_name}",
+        f"Name={clean_name}",
         f"Exec={_desktop_quote(launch_script)}",
-        f"Path={game_dir}",
+        f"Path={clean_game_dir}",
         "Terminal=false",
         "Categories=Game;",
         "StartupNotify=true",
     ]
-    clean_wm_class = startup_wm_class.strip()
+    clean_wm_class = _strip_control_chars(startup_wm_class.strip())
     if clean_wm_class:
         lines.append(f"StartupWMClass={clean_wm_class}")
     if icon_path is not None and icon_path.is_file():
-        lines.append(f"Icon={icon_path}")
+        clean_icon = _strip_control_chars(str(icon_path))
+        if clean_icon:
+            lines.append(f"Icon={clean_icon}")
     _atomic_write_text(desktop_path, "\n".join(lines) + "\n")
     if executable:
         try:
@@ -727,7 +812,8 @@ def _copy_or_move_dir_contents(src_dir: Path, dst_dir: Path, move: bool) -> None
                         item.rmdir()
                     except OSError:
                         pass
-                continue
+                    continue
+                _remove_path_or_tree(target)
             shutil.move(str(item), str(target))
         else:
             if item.is_symlink():
@@ -787,6 +873,10 @@ def install_standalone_game(
                 if src_exe != target_exe_path.resolve():
                     shutil.move(str(exe_path), str(target_exe_path))
             elif target_game_dir.resolve() != src_dir:
+                if _is_protected_dir(src_dir):
+                    raise ValueError(
+                        f"Refusing to move protected or Syncthing directory: {src_dir}"
+                    )
                 try:
                     rel_exe = src_exe.relative_to(src_dir)
                 except ValueError:
@@ -883,7 +973,7 @@ def _load_manifest(manifest_path: Path) -> StandaloneGame | None:
         raw = json.loads(manifest_path.read_text(encoding="utf-8", errors="replace"))
         if not isinstance(raw, dict):
             return None
-        game_dir = Path(str(raw.get("game_dir") or manifest_path.parent))
+        game_dir = manifest_path.parent.resolve()
         name = str(raw.get("name") or game_dir.name)
         exe_path = Path(str(raw["exe_path"]))
         prefix_dir = Path(str(raw["prefix_dir"]))
@@ -981,50 +1071,61 @@ def _remove_path_or_tree(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _safe_remove_prefix_dir(prefix_dir: Path) -> None:
+    """Remove prefix_dir only if it is a non-symlink strictly inside get_prefixes_dir()."""
+    if not _is_strictly_under_dir(prefix_dir, get_prefixes_dir()):
+        logging.warning(
+            "Refusing to remove prefix_dir outside prefixes directory: %s",
+            prefix_dir,
+        )
+        return
+    _remove_path_or_tree(prefix_dir)
+
+
 def remove_standalone_game(
     game: StandaloneGame,
     delete_files: bool = False,
     delete_prefix: bool = False,
 ) -> None:
     """Remove standalone integration files and optionally delete game & prefix directories."""
-    targets: list[Path] = [game.desktop_file, game.launch_script, game.game_dir / STANDALONE_MANIFEST]
+    try:
+        resolved_game_dir = game.game_dir.resolve()
+    except OSError:
+        resolved_game_dir = game.game_dir
+
+    validated_targets: list[tuple[Path, Path]] = [
+        (game.desktop_file, APPLICATIONS_DIR),
+        (game.launch_script, resolved_game_dir),
+        (game.game_dir / STANDALONE_MANIFEST, resolved_game_dir),
+    ]
     if game.desktop_shortcut is not None:
-        targets.append(game.desktop_shortcut)
-    for fpath in targets:
+        validated_targets.append((game.desktop_shortcut, get_desktop_dir()))
+
+    for fpath, allowed_parent in validated_targets:
+        if not _is_strictly_under_dir(fpath, allowed_parent):
+            logging.warning(
+                "Skipping out-of-bounds or symlink integration file %s (expected inside %s)",
+                fpath,
+                allowed_parent,
+            )
+            continue
         try:
-            if fpath.exists() or fpath.is_symlink():
+            if fpath.exists():
                 fpath.unlink()
         except OSError as exc:
             logging.warning("Failed to remove %s: %s", fpath, exc)
 
     if delete_files:
-        protected_dirs: set[Path] = set()
-        for candidate in (
-            Path.home(),
-            Path.home() / "Downloads",
-            get_desktop_dir(),
-            Path.home() / "Documents",
-            get_games_dir(),
-            Path("/"),
-        ):
-            try:
-                protected_dirs.add(candidate.resolve())
-            except OSError:
-                protected_dirs.add(candidate)
-        try:
-            resolved_game_dir = game.game_dir.resolve()
-        except OSError:
-            resolved_game_dir = game.game_dir
-        if resolved_game_dir in protected_dirs:
+        if game.game_dir.is_symlink() or _is_protected_dir(resolved_game_dir):
             logging.warning(
-                "Refusing to delete protected directory as game_dir: %s",
+                "Refusing to delete protected or symlinked directory as game_dir: %s",
                 game.game_dir,
             )
         else:
             _remove_path_or_tree(game.game_dir)
-        _remove_path_or_tree(game.prefix_dir)
+        _safe_remove_prefix_dir(game.prefix_dir)
     elif delete_prefix:
-        _remove_path_or_tree(game.prefix_dir)
+        _safe_remove_prefix_dir(game.prefix_dir)
 
 
 def _unlink_prefix_symlinks_for_compat(
@@ -1103,10 +1204,21 @@ def export_steam_to_standalone(
     exe_str = _strip_vdf_quotes(shortcut.exe)
     exe_path = Path(exe_str)
     start_str = _strip_vdf_quotes(shortcut.start_dir)
-    if start_str and Path(start_str).is_dir():
+    try:
+        inferred_dir: Path | None = infer_game_root_from_exe(exe_path)
+    except ValueError:
+        inferred_dir = None
+
+    if inferred_dir is not None and inferred_dir.is_dir() and not _is_protected_dir(inferred_dir):
+        game_dir = inferred_dir
+    elif start_str and Path(start_str).is_dir() and not _is_protected_dir(Path(start_str)):
         game_dir = Path(start_str)
+    elif inferred_dir is not None:
+        game_dir = inferred_dir
     else:
-        game_dir = infer_game_root_from_exe(exe_path)
+        raise ValueError(
+            f"Cannot determine a safe game directory for {exe_path} (StartDir={start_str!r})."
+        )
 
     game_name = shortcut.app_name.strip() or game_dir.name or f"Game {shortcut.appid_u32}"
     safe_name = _sanitize_dir_name(game_name)
@@ -1144,13 +1256,24 @@ def export_steam_to_standalone(
         icon_path=icon_path,
     )
 
+    moved_prefix = False
     if src_pfx.is_dir() and not src_pfx.is_symlink():
         _copy_or_move_dir_contents(src_pfx, game.prefix_dir, move=not should_copy)
-        if not should_copy:
-            shutil.rmtree(src_compat, ignore_errors=True)
+        moved_prefix = not should_copy
 
     if remove_from_steam:
-        remove_shortcut(paths, shortcut.appid_u32)
+        try:
+            removed = remove_shortcut(paths, shortcut.appid_u32)
+            if not removed:
+                raise RuntimeError(f"Shortcut {shortcut.appid_u32} could not be removed from Steam.")
+        except Exception:
+            if moved_prefix and game.prefix_dir.is_dir() and not game.prefix_dir.is_symlink():
+                _copy_or_move_dir_contents(game.prefix_dir, src_pfx, move=True)
+            raise
+        if moved_prefix:
+            shutil.rmtree(src_compat, ignore_errors=True)
+    elif moved_prefix:
+        shutil.rmtree(src_compat, ignore_errors=True)
 
     return game
 
@@ -1173,6 +1296,22 @@ def import_standalone_to_steam(
         no_esync=env_map.get("PROTON_NO_ESYNC") == "1",
         no_fsync=env_map.get("PROTON_NO_FSYNC") == "1",
         winedlloverrides=game.winedlloverrides,
+        dlss_upgrade=env_map.get("PROTON_DLSS_UPGRADE") == "1",
+        nvidia_nvapi=(
+            env_map.get("PROTON_ENABLE_NVAPI") == "1"
+            or env_map.get("DXVK_ENABLE_NVAPI") == "1"
+        ),
+        prime_offload=(
+            env_map.get("__NV_PRIME_RENDER_OFFLOAD") == "1"
+            or env_map.get("__GLX_VENDOR_LIBRARY_NAME") == "nvidia"
+        ),
+        proton_wayland=env_map.get("PROTON_ENABLE_WAYLAND") == "1",
+    )
+
+    resolved_icon = resolve_game_icon(
+        game.game_dir,
+        game.exe_path,
+        steam_appid=game.steam_appid,
     )
 
     appid_u32 = add_or_update_shortcut(
@@ -1180,6 +1319,7 @@ def import_standalone_to_steam(
         app_name=game.name,
         exe_path=game.exe_path,
         start_dir=game.exe_path.parent,
+        icon_path=resolved_icon,
         launch_options=steam_launch or None,
         enable_proton=not game.native_linux,
     )

@@ -4,25 +4,28 @@
 
 Non-Steam game installer, Proton prefix migrator, save validator, and official Steam artwork manager for **Steam Deck / SteamOS** (KDE Plasma + Qt6).
 
-**Current version:** `0.7.7`
+**Current version:** `0.11.0`
 
 ## Features
-- **Extract & Install**: Extracts `.zip`, `.rar`, `.7z`, and `.tar.*` into `~/Games/<Game>` (automatically unwrapping nested single root folders and merging without wiping existing files), or runs Windows `setup.exe` installers via Proton and automatically adopts the resulting `.deckinstall_installer_pfx` prefix into Steam `compatdata`.
-- **Smart Game Detection**: Scans `~/Games`, `~/Downloads`, `~/Syncthing`, and SD cards (`/run/media/*`), skipping helper/redistributable binaries to highlight the real game executable while reading validated `steam_appid.txt` (`1..4294967295`) and emulator metadata.
-- **Transactional Steam Shortcuts & Proton Control**: Safely manages `shortcuts.vdf` and `config.vdf` under file locking (`flock`), preserves existing `LaunchOptions`, `icon`, and Proton tool mappings, migrates `compatdata`/grid assets when paths change, and disables VDF writes with a warning banner if `shortcuts.vdf` is corrupted.
-- **Bulk Migration & Multi-Launcher Save Sync**: Moves games from `~/Downloads` into `~/Games` across Steam users with multi-user rollback, imports newer/missing saves from **Hydra**, **Heroic**, **Lutris**, **Bottles**, and **UMU** prefixes (with symlink-escape guards), and supports full ZIP save backup & restore.
-- **Verified Prefix Cleanup**: Lists external prefixes, `.deckinstall.bak` backups, and orphan `compatdata` folders with inferred game names, verifying file integrity (`SHA-256`, size, mtime, and unconventional `drive_c` save scan) and protecting active Steam shortcuts before deletion.
+- **Unified 3-Tab UI (Games & Library, Maintenance, Settings)**: Combines game installation, library management, and per-game configuration into a streamlined 3-tab interface with a unified **Configure Game** dialog.
+- **Standalone & Steam Modes**: Install and launch Windows games via **Standalone mode** (`umu-run` + `GE-Proton11+`, with `GE-Proton10` fallback and automatic runtime fallback, no Steam required) or add them directly as transactional Non-Steam Steam shortcuts.
+- **Extract, Install & In-Place Defaults**: Extracts `.zip`, `.rar`, `.7z`, and `.tar.*` into `~/Games/<Game>` (automatically unwrapping nested single root folders and merging without wiping existing files), defaults local `.exe` files to in-place installation, or runs Windows `setup.exe` installers via Proton and automatically adopts the resulting `.deckinstall_installer_pfx` prefix into Steam `compatdata`.
+- **Smart Game Detection & Dynamic Scan Folders**: Scans configurable scan folders (`~/Games`, `~/Downloads`, `~/Syncthing`, SD cards `/run/media/*`, and user-added paths), skipping helper/redistributable binaries to highlight the real game executable while reading validated `steam_appid.txt` (`1..4294967295`) and emulator metadata.
+- **Transactional Steam Shortcuts, Prefix Guard & Multi-Proton Manager**: Safely manages `shortcuts.vdf` and `config.vdf` under file locking (`flock`), preserves existing `LaunchOptions`, `icon`, and Proton tool mappings, migrates `compatdata`/grid assets when paths change, enforces a `win32` prefix guard, disables VDF writes with a warning banner if `shortcuts.vdf` is corrupted, and lets you inspect or remove installed Proton/GE-Proton versions.
+- **Run `.exe` in Prefix, OptiScaler & Winetricks**: Run arbitrary `.exe` tools (patches, trainers, modders) inside any game's Wine/Proton prefix, inject/roll back OptiScaler DLSS/FSR/XeSS per game, and install Winetricks verbs/DLLs directly.
+- **Bulk Migration, Save Sync & Snapshots**: Moves games from `~/Downloads` into `~/Games` across Steam users with multi-user rollback, imports newer/missing saves from **Hydra**, **Heroic**, **Lutris**, **Bottles**, and **UMU** prefixes (with symlink-escape guards and security/stability hardening), supports folder-based Save Sync, and creates/restores ZIP save snapshots.
+- **Maintenance Tab & Verified Prefix Cleanup**: Dedicated Maintenance view with storage health metrics, external/orphan prefix and `.deckinstall.bak` cleanup with file integrity verification (`SHA-256`, size, mtime, and unconventional `drive_c` save scan) protecting active shortcuts before deletion.
 - **Launch Presets & Official Steam Artwork**: One-click toggles for `gamemoderun`, `mangohud`, `PROTON_USE_WINED3D`, `PROTON_NO_ESYNC`, and `PROTON_NO_FSYNC`; Steam Store search and direct AppID lookup (with Flatpak/native warning); and `.deckinstall_art_bak/` backup for one-click **Revert Artwork**.
-- **Themes & Internationalization (i18n)**: Supports **Auto**, **Dark**, and **Light** themes, with JSON-based localization (`src/deckinstall/locales/en.json` and `pt_BR.json`).
+- **AppImage Auto-Updater, Themes & Internationalization (i18n)**: Built-in AppImage auto-updater via GitHub Releases, **Auto**, **Dark**, and **Light** themes, and JSON-based localization (`src/deckinstall/locales/en.json` and `pt_BR.json`).
 
 ## Quick Start (AppImage)
 Download `DeckInstall-<version>-x86_64.AppImage` from [GitHub Releases](https://github.com/murilogiatti/DeckInstall/releases):
 
 ```bash
-chmod +x DeckInstall-0.7.7-x86_64.AppImage
-./DeckInstall-0.7.7-x86_64.AppImage --version
-QT_QPA_PLATFORM=offscreen ./DeckInstall-0.7.7-x86_64.AppImage --smoke-test
-./DeckInstall-0.7.7-x86_64.AppImage
+chmod +x DeckInstall-0.11.0-x86_64.AppImage
+./DeckInstall-0.11.0-x86_64.AppImage --version
+QT_QPA_PLATFORM=offscreen ./DeckInstall-0.11.0-x86_64.AppImage --smoke-test
+./DeckInstall-0.11.0-x86_64.AppImage
 ```
 
 ## Translating DeckInstall
@@ -45,7 +48,7 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -W error::ResourceWarning -m un
 ```
 
 ## Build AppImage (GitHub Actions)
-Push a semantic tag matching `VERSION` (e.g. `v0.7.7`) to automatically run the test suite, compile a standalone binary with Nuitka, smoke-test the packaged `AppDir`, build `DeckInstall-<version>-x86_64.AppImage`, and attach it to the GitHub Release.
+Push a semantic tag matching `VERSION` (e.g. `v0.11.0`) to automatically run the test suite, compile a standalone binary with Nuitka, smoke-test the packaged `AppDir`, build `DeckInstall-<version>-x86_64.AppImage`, and attach it to the GitHub Release.
 
 ## License
 Distributed under the [MIT License](LICENSE).

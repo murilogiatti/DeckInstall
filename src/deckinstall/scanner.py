@@ -241,6 +241,12 @@ def default_scan_roots() -> list[Path]:
         for child in media_children:
             if not _safe_is_dir(child):
                 continue
+            if (
+                not child.is_symlink()
+                and not child.name.startswith(".")
+                and child.name not in {"steamapps", "lost+found", "System Volume Information"}
+            ):
+                roots.append(child)
             games_sub = child / "Games"
             if _safe_is_dir(games_sub):
                 roots.append(games_sub)
@@ -258,14 +264,26 @@ def default_scan_roots() -> list[Path]:
                     continue
                 sub_games = sub / "Games"
                 roots.append(sub_games if _safe_is_dir(sub_games) else sub)
-    return [r for r in roots if _safe_is_dir(r)]
+    deduped: list[Path] = []
+    seen_roots: set[Path] = set()
+    for r in roots:
+        if not _safe_is_dir(r):
+            continue
+        try:
+            res = r.resolve()
+        except OSError:
+            res = r
+        if res not in seen_roots:
+            seen_roots.add(res)
+            deduped.append(r)
+    return deduped
 
 
 def scan_all_games(roots: list[Path] | None = None) -> list[DetectedGame]:
     """Scan top-level folders in all roots for installed/extracted games."""
     seen: set[Path] = set()
     results: list[DetectedGame] = []
-    for root in roots or default_scan_roots():
+    for root in (roots if roots is not None else default_scan_roots()):
         try:
             children = sorted(root.iterdir())
         except OSError:

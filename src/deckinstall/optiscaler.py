@@ -93,9 +93,30 @@ def _atomic_write_text(path: Path, content: str) -> None:
         raise
 
 
-def _resolve_manifest_path(exe_dir: Path, raw: str) -> Path:
-    p = Path(raw)
-    return p if p.is_absolute() else (exe_dir / p)
+def _resolve_manifest_path(exe_dir: Path, raw: str) -> Path | None:
+    """Resolve a manifest-relative path strictly inside exe_dir, rejecting symlinks and escapes."""
+    raw_str = raw.strip()
+    if not raw_str:
+        return None
+    p = Path(raw_str)
+    if p.is_absolute():
+        return None
+    try:
+        base = exe_dir.resolve()
+        cur = exe_dir
+        for part in p.parts:
+            if part in ("", "."):
+                continue
+            cur = cur / part
+            if cur.is_symlink():
+                return None
+        resolved = (exe_dir / p).resolve()
+        resolved.relative_to(base)
+        if resolved == base:
+            return None
+        return resolved
+    except (OSError, ValueError):
+        return None
 
 
 def _serialize_manifest_path(exe_dir: Path, path: Path) -> str:
@@ -107,7 +128,7 @@ def _serialize_manifest_path(exe_dir: Path, path: Path) -> str:
 
 def inspect_optiscaler_state(exe_path: Path) -> OptiScalerState | None:
     """Inspect the game directory for an OptiScaler installation manifest."""
-    exe_dir = exe_path.parent
+    exe_dir = exe_path.parent.resolve()
     manifest_path = exe_dir / OPTISCALER_MANIFEST
     if not manifest_path.is_file() or manifest_path.is_symlink():
         return None
@@ -121,17 +142,23 @@ def inspect_optiscaler_state(exe_path: Path) -> OptiScalerState | None:
     proxy_dll = str(data.get("proxy_dll", "")).strip()
     backend = str(data.get("backend", "auto")).strip()
     version = str(data.get("version", "")).strip()
-    raw_exe_dir = data.get("exe_dir")
-    resolved_exe_dir = Path(raw_exe_dir) if isinstance(raw_exe_dir, str) and raw_exe_dir else exe_dir
     installed_raw = data.get("installed_files", [])
     backed_raw = data.get("backed_up_files", [])
     installed_files = (
-        [_resolve_manifest_path(resolved_exe_dir, str(p)) for p in installed_raw if str(p)]
+        [
+            resolved
+            for p in installed_raw
+            if str(p) and (resolved := _resolve_manifest_path(exe_dir, str(p))) is not None
+        ]
         if isinstance(installed_raw, list)
         else []
     )
     backed_up_files = (
-        [_resolve_manifest_path(resolved_exe_dir, str(p)) for p in backed_raw if str(p)]
+        [
+            resolved
+            for p in backed_raw
+            if str(p) and (resolved := _resolve_manifest_path(exe_dir, str(p))) is not None
+        ]
         if isinstance(backed_raw, list)
         else []
     )
@@ -149,7 +176,7 @@ def inspect_optiscaler_state(exe_path: Path) -> OptiScalerState | None:
         proxy_dll=proxy_dll,
         backend=backend,
         version=version,
-        exe_dir=resolved_exe_dir,
+        exe_dir=exe_dir,
         installed_files=installed_files,
         backed_up_files=backed_up_files,
         added_override=added_override,
@@ -313,7 +340,7 @@ def install_optiscaler_for_game(
     if detect_exe_kind(exe_path) == "linux_elf":
         raise ValueError(f"OptiScaler cannot be installed for native Linux executable: {exe_path}")
 
-    exe_dir = exe_path.parent
+    exe_dir = exe_path.parent.resolve()
     if not exe_dir.is_dir():
         raise FileNotFoundError(f"Game directory does not exist: {exe_dir}")
 
@@ -377,6 +404,8 @@ def install_optiscaler_for_game(
             if is_payload_root and low_name == "optiscaler.dll":
                 dst_file = target_proxy_path
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
+                if dst_file.is_symlink():
+                    dst_file.unlink()
                 shutil.copy2(src_file, dst_file)
                 installed_files.append(dst_file)
                 continue
@@ -392,17 +421,26 @@ def install_optiscaler_for_game(
                     overlay_menu=overlay_menu,
                 )
                 dst_ini = exe_dir / "OptiScaler.ini"
+                _backup_if_needed(dst_ini, managed_paths, backed_up_files)
+                if dst_ini.is_symlink():
+                    dst_ini.unlink()
                 _atomic_write_text(dst_ini, patched_ini)
                 installed_files.append(dst_ini)
                 continue
 
             dst_file = exe_dir / rel_dir / fname
             dst_file.parent.mkdir(parents=True, exist_ok=True)
+            _backup_if_needed(dst_file, managed_paths, backed_up_files)
+            if dst_file.is_symlink():
+                dst_file.unlink()
             shutil.copy2(src_file, dst_file)
             installed_files.append(dst_file)
 
     if not saw_ini:
         dst_ini = exe_dir / "OptiScaler.ini"
+        _backup_if_needed(dst_ini, managed_paths, backed_up_files)
+        if dst_ini.is_symlink():
+            dst_ini.unlink()
         _atomic_write_text(
             dst_ini,
             patch_optiscaler_ini(
@@ -468,7 +506,7 @@ def uninstall_optiscaler_for_game(exe_path: Path) -> OptiScalerResult:
     restored_count = 0
     for orig in state.backed_up_files:
         backup = orig.with_name(f"{orig.name}.deckinstall.bak")
-        if backup.is_file() and not backup.is_symlink():
+        if backup.is_file() and not backup.is_symlink() and not orig.is_symlink():
             orig.parent.mkdir(parents=True, exist_ok=True)
             os.replace(backup, orig)
             restored_count += 1

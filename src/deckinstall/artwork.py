@@ -107,8 +107,8 @@ def fetch_header_preview(steam_appid: int) -> bytes | None:
     appid = _validate_appid(steam_appid)
     url = f"{STEAM_CDN_BASE}/{appid}/header.jpg"
     try:
-        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10, stream=True)
-        return _read_bounded_image(resp)
+        with requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10, stream=True) as resp:
+            return _read_bounded_image(resp)
     except requests.RequestException:
         return None
 
@@ -116,8 +116,10 @@ def fetch_header_preview(steam_appid: int) -> bytes | None:
 def _download_first(urls: list[str], dest: Path, alt_remove: list[Path] | None = None) -> bool:
     for url in urls:
         try:
-            resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=15, stream=True)
-            data = _read_bounded_image(resp)
+            with requests.get(
+                url, headers={"User-Agent": USER_AGENT}, timeout=15, stream=True
+            ) as resp:
+                data = _read_bounded_image(resp)
             if data is not None:
                 fd, tmp_name = tempfile.mkstemp(
                     prefix=f".{dest.name}.", suffix=".tmp", dir=str(dest.parent)

@@ -57,6 +57,8 @@ class AppUpdaterTests(unittest.TestCase):
             self.assertEqual(app_updater.can_replace_appimage(target), (True, ""))
 
     def test_check_app_update_finds_x86_64_asset_and_digest(self) -> None:
+        valid_x64_sha = "a" * 64
+        valid_arm_sha = "1" * 64
         release_payload = {
             "tag_name": "v0.9.0",
             "body": "Release notes for 0.9.0",
@@ -64,13 +66,13 @@ class AppUpdaterTests(unittest.TestCase):
             "assets": [
                 {
                     "name": "DeckInstall-0.9.0-aarch64.AppImage",
-                    "browser_download_url": "https://example.invalid/aarch64.AppImage",
-                    "digest": "sha256:1111111111111111",
+                    "browser_download_url": "https://github.com/murilogiatti/DeckInstall/releases/download/v0.9.0/aarch64.AppImage",
+                    "digest": f"sha256:{valid_arm_sha}",
                 },
                 {
                     "name": "DeckInstall-0.9.0-x86_64.AppImage",
-                    "browser_download_url": "https://example.invalid/DeckInstall-0.9.0-x86_64.AppImage",
-                    "digest": "sha256:abcdef0123456789",
+                    "browser_download_url": "https://objects.githubusercontent.com/DeckInstall-0.9.0-x86_64.AppImage",
+                    "digest": f"sha256:{valid_x64_sha}",
                 },
             ],
         }
@@ -97,9 +99,9 @@ class AppUpdaterTests(unittest.TestCase):
         self.assertEqual(info.asset_name, "DeckInstall-0.9.0-x86_64.AppImage")
         self.assertEqual(
             info.download_url,
-            "https://example.invalid/DeckInstall-0.9.0-x86_64.AppImage",
+            "https://objects.githubusercontent.com/DeckInstall-0.9.0-x86_64.AppImage",
         )
-        self.assertEqual(info.expected_sha256, "abcdef0123456789")
+        self.assertEqual(info.expected_sha256, valid_x64_sha)
         self.assertEqual(info.release_notes, "Release notes for 0.9.0")
         self.assertEqual(
             info.html_url,
@@ -126,7 +128,7 @@ class AppUpdaterTests(unittest.TestCase):
                 current_version="0.8.0",
                 latest_version="0.9.0",
                 has_update=True,
-                download_url="https://example.invalid/DeckInstall-0.9.0-x86_64.AppImage",
+                download_url="https://github.com/murilogiatti/DeckInstall/releases/download/v0.9.0/DeckInstall-0.9.0-x86_64.AppImage",
                 asset_name="DeckInstall-0.9.0-x86_64.AppImage",
                 expected_sha256=expected_sha,
                 release_notes="",
@@ -157,7 +159,7 @@ class AppUpdaterTests(unittest.TestCase):
                 current_version="0.8.0",
                 latest_version="0.9.0",
                 has_update=True,
-                download_url="https://example.invalid/DeckInstall-0.9.0-x86_64.AppImage",
+                download_url="https://github.com/murilogiatti/DeckInstall/releases/download/v0.9.0/DeckInstall-0.9.0-x86_64.AppImage",
                 asset_name="DeckInstall-0.9.0-x86_64.AppImage",
                 expected_sha256="0" * 64,
                 release_notes="",
@@ -174,6 +176,30 @@ class AppUpdaterTests(unittest.TestCase):
 
             self.assertEqual(target.read_bytes(), old_bytes)
             self.assertFalse(any(p.name.endswith(".tmp") for p in tmp_dir.iterdir()))
+
+    def test_download_and_replace_appimage_fails_closed_when_sha256_empty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "DeckInstall.AppImage"
+            target.write_bytes(b"existing-appimage")
+            info = app_updater.AppUpdateInfo(
+                current_version="0.8.0",
+                latest_version="0.9.0",
+                has_update=True,
+                download_url="https://github.com/murilogiatti/DeckInstall/releases/download/v0.9.0/DeckInstall-0.9.0-x86_64.AppImage",
+                asset_name="DeckInstall-0.9.0-x86_64.AppImage",
+                expected_sha256="",
+                release_notes="",
+                html_url=app_updater.GITHUB_RELEASES_URL,
+                is_appimage=True,
+                appimage_path=target,
+                can_self_update=True,
+                cannot_update_reason="",
+            )
+            with mock.patch("deckinstall.app_updater.requests.get") as mock_get:
+                with self.assertRaises(RuntimeError):
+                    app_updater.download_and_replace_appimage(info)
+            mock_get.assert_not_called()
+            self.assertEqual(target.read_bytes(), b"existing-appimage")
 
     def test_build_clean_relaunch_env_strips_appimage_vars_and_mount_paths(self) -> None:
         fake_env = {

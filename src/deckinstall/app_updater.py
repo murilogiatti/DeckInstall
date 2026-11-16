@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -24,6 +25,26 @@ GITHUB_RELEASES_URL = "https://github.com/murilogiatti/DeckInstall/releases"
 _CHUNK_SIZE = 65536
 _APPIMAGE_ENV_KEYS = ("APPIMAGE", "APPDIR", "ARGV0", "OWD")
 _PATH_ENV_KEYS = ("PATH", "LD_LIBRARY_PATH", "QT_PLUGIN_PATH")
+_ALLOWED_URL_HOSTS = frozenset(
+    {
+        "api.github.com",
+        "github.com",
+        "objects.githubusercontent.com",
+        "release-assets.githubusercontent.com",
+        "github-releases.githubusercontent.com",
+    }
+)
+_SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _validate_github_url(url: str) -> str:
+    """Validate that url uses HTTPS and points to an allowlisted GitHub/CDN host."""
+    cleaned = url.strip()
+    parsed = urllib.parse.urlparse(cleaned)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme.lower() != "https" or host not in _ALLOWED_URL_HOSTS:
+        raise ValueError(f"Disallowed update URL (must be HTTPS on GitHub): {url!r}")
+    return cleaned
 
 
 @dataclass(frozen=True)
@@ -57,7 +78,14 @@ def get_running_appimage() -> Path | None:
     if not val:
         return None
     path = Path(val)
-    return path if path.is_file() else None
+    if (
+        not path.is_absolute()
+        or path.is_symlink()
+        or path.suffix.lower() != ".appimage"
+        or not path.is_file()
+    ):
+        return None
+    return path
 
 
 def can_replace_appimage(appimage_path: Path | None) -> tuple[bool, str]:
@@ -102,8 +130,12 @@ def _extract_sha256(asset: dict) -> str:
     """Extract a normalized SHA-256 hex digest from a GitHub release asset."""
     digest = str(asset.get("digest") or "").strip()
     if digest.lower().startswith("sha256:"):
-        return digest.split(":", 1)[1].strip()
-    return digest
+        digest = digest.split(":", 1)[1].strip()
+    if not digest:
+        return ""
+    if not _SHA256_HEX_RE.match(digest):
+        raise ValueError(f"Invalid SHA-256 digest format: {digest!r}")
+    return digest.lower()
 
 
 def check_app_update(timeout: float = 10.0) -> AppUpdateInfo:
@@ -113,7 +145,8 @@ def check_app_update(timeout: float = 10.0) -> AppUpdateInfo:
         "Accept": "application/vnd.github+json",
         "User-Agent": f"DeckInstall/{current_version}",
     }
-    response = requests.get(GITHUB_RELEASES_API, headers=headers, timeout=timeout)
+    api_url = _validate_github_url(GITHUB_RELEASES_API)
+    response = requests.get(api_url, headers=headers, timeout=timeout)
     response.raise_for_status()
     data = response.json()
 
@@ -124,6 +157,8 @@ def check_app_update(timeout: float = 10.0) -> AppUpdateInfo:
     assets = data.get("assets") or []
     asset = _select_appimage_asset(assets, _normalize_arch())
     download_url = str(asset.get("browser_download_url") or "") if asset else ""
+    if download_url:
+        download_url = _validate_github_url(download_url)
     asset_name = str(asset.get("name") or "") if asset else ""
     expected_sha256 = _extract_sha256(asset) if asset else ""
 
@@ -167,13 +202,18 @@ def download_and_replace_appimage(
     """Download the new AppImage, verify its SHA-256, and atomically replace the current one."""
     if not info.can_self_update or not info.download_url or info.appimage_path is None:
         raise ValueError("Self-update is not available for the provided AppUpdateInfo.")
+    if not info.expected_sha256:
+        raise RuntimeError("Missing expected SHA-256 digest")
+    if not _SHA256_HEX_RE.match(info.expected_sha256):
+        raise RuntimeError("Invalid expected SHA-256 digest")
+    download_url = _validate_github_url(info.download_url)
 
     target_path = info.appimage_path
     tmp_path: Path | None = None
 
     try:
         headers = {"User-Agent": f"DeckInstall/{info.current_version}"}
-        with requests.get(info.download_url, headers=headers, stream=True, timeout=60.0) as resp:
+        with requests.get(download_url, headers=headers, stream=True, timeout=60.0) as resp:
             resp.raise_for_status()
             total_size = int(resp.headers.get("Content-Length") or 0)
             downloaded = 0
@@ -206,7 +246,7 @@ def download_and_replace_appimage(
             progress_cb(100)
 
         actual_sha256 = hasher.hexdigest()
-        if info.expected_sha256 and actual_sha256.lower() != info.expected_sha256.lower():
+        if actual_sha256.lower() != info.expected_sha256.lower():
             raise RuntimeError("SHA256 mismatch")
 
         try:

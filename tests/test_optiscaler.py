@@ -293,8 +293,10 @@ class LaunchPresetsAndStandaloneGuardTests(unittest.TestCase):
             marker = protected_games_dir / "keep.txt"
             marker.write_text("do not delete", encoding="utf-8")
 
-            desktop_file = root / "game.desktop"
-            launch_script = root / "launch.sh"
+            apps_dir = root / "applications"
+            apps_dir.mkdir()
+            desktop_file = apps_dir / "game.desktop"
+            launch_script = protected_games_dir / "launch.sh"
             desktop_file.write_text("[Desktop Entry]\n", encoding="utf-8")
             launch_script.write_text("#!/bin/sh\n", encoding="utf-8")
 
@@ -310,7 +312,10 @@ class LaunchPresetsAndStandaloneGuardTests(unittest.TestCase):
                 launch_script=launch_script,
                 desktop_file=desktop_file,
             )
-            with patch("deckinstall.standalone.get_games_dir", return_value=protected_games_dir):
+            with (
+                patch("deckinstall.standalone.get_games_dir", return_value=protected_games_dir),
+                patch("deckinstall.standalone.APPLICATIONS_DIR", apps_dir),
+            ):
                 remove_standalone_game(game, delete_files=True, delete_prefix=False)
 
             self.assertTrue(protected_games_dir.exists())

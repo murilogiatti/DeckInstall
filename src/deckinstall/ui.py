@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shlex
@@ -101,10 +102,12 @@ from .runtime_manager import (
     get_umu_run_path,
     install_compat_tool,
     install_system_package,
+    is_win32_prefix,
     list_ge_proton11_dirs,
     list_installed_compat_tools,
     remove_compat_tool,
     resolve_game_prefix,
+    run_exe_in_prefix,
     run_winetricks_verbs,
     validate_steamrt4_integrity,
 )
@@ -127,18 +130,28 @@ from .optiscaler import (
     install_optiscaler_for_game,
     uninstall_optiscaler_for_game,
 )
-from .scanner import DetectedGame, clean_game_name, detect_exe_kind, scan_all_games, scan_game_folder
+from .scanner import (
+    DetectedGame,
+    clean_game_name,
+    default_scan_roots,
+    detect_exe_kind,
+    scan_all_games,
+    scan_game_folder,
+)
 from .standalone import (
     StandaloneGame,
     export_steam_to_standalone,
+    get_games_dir,
     import_standalone_to_steam,
     install_standalone_game,
     list_standalone_games,
     remove_standalone_game,
+    resolve_standalone_proton_fallback,
     update_standalone_launch_options,
 )
 from .steam_paths import (
     SteamPaths,
+    _read_compat_tool_id,
     find_proton_binary,
     find_steam_root,
     is_gamescope_session,
@@ -334,7 +347,7 @@ class SteamSearchWorker(QThread):
         try:
             self.results.emit(self.req_id, search_steam_games(self.query))
         except Exception as exc:
-            self.failed.emit(self.req_id, str(exc))
+            self.failed.emit(self.req_id, _format_worker_error(exc))
 
 
 class PreviewWorker(QThread):
@@ -421,12 +434,63 @@ class ScanWorker(QThread):
 
     finished_scan = Signal(list)
 
+    def __init__(self, roots: list[Path] | None = None) -> None:
+        super().__init__()
+        self.roots = roots
+
     def run(self) -> None:
         try:
-            self.finished_scan.emit(scan_all_games())
+            self.finished_scan.emit(scan_all_games(roots=self.roots))
         except Exception:
             logging.exception("ScanWorker failed")
             self.finished_scan.emit([])
+
+
+class FallbackProton10Worker(QThread):
+    """Background worker to resolve/download GE-Proton 10 and apply it to a game."""
+
+    status = Signal(str)
+    finished_ok = Signal(str)
+    failed = Signal(str, bool)
+
+    def __init__(
+        self,
+        fn_apply: Callable[[str], None],
+        need_steam_closed: bool = False,
+    ) -> None:
+        super().__init__()
+        self.fn_apply = fn_apply
+        self.need_steam_closed = need_steam_closed
+
+    def run(self) -> None:
+        from .runtime_manager import ensure_ge_proton10, list_ge_proton10_dirs
+
+        try:
+            ge10_dirs = list_ge_proton10_dirs()
+            if ge10_dirs:
+                ge10_dir = ge10_dirs[0]
+            else:
+                self.status.emit(tr("proton10.downloading"))
+                try:
+                    ge10_dir = ensure_ge_proton10(
+                        progress_cb=lambda msg, _pct: self.status.emit(msg)
+                    )
+                except Exception as exc:
+                    self.failed.emit(_format_worker_error(exc), True)
+                    return
+
+            tool_id = _read_compat_tool_id(
+                ge10_dir / "compatibilitytool.vdf", ge10_dir.name
+            )
+            if self.need_steam_closed and is_steam_running():
+                self.status.emit(tr("add.closing_steam"))
+                if not shutdown_steam():
+                    raise RuntimeError(tr("add.close_steam_timeout"))
+
+            self.fn_apply(tool_id)
+            self.finished_ok.emit(tool_id)
+        except Exception as exc:
+            self.failed.emit(_format_worker_error(exc), False)
 
 
 class AddToSteamWorker(QThread):
@@ -632,6 +696,8 @@ class StandaloneInstallWorker(QThread):
         keep_in_place: bool = False,
         launch_options: str = "",
         winedlloverrides: str = "",
+        game_dir: Path | None = None,
+        single_exe_only: bool = False,
     ) -> None:
         super().__init__()
         self.app_name = app_name
@@ -643,6 +709,8 @@ class StandaloneInstallWorker(QThread):
         self.keep_in_place = keep_in_place
         self.launch_options = launch_options
         self.winedlloverrides = winedlloverrides
+        self.game_dir = game_dir
+        self.single_exe_only = single_exe_only
 
     def run(self) -> None:
         try:
@@ -655,13 +723,17 @@ class StandaloneInstallWorker(QThread):
                 ge_dir = ensure_ge_proton11(progress_cb=lambda msg, _pct: self.status.emit(msg))
                 proton_name = ge_dir.name
 
-            single_exe_only = False
-            try:
-                game_dir = infer_game_root_from_exe(self.exe_path)
-            except ValueError:
-                game_dir = self.exe_path.parent
-                if not self.keep_in_place:
-                    single_exe_only = True
+            if self.game_dir is not None:
+                game_dir = self.game_dir
+                single_exe_only = self.single_exe_only
+            else:
+                single_exe_only = False
+                try:
+                    game_dir = infer_game_root_from_exe(self.exe_path)
+                except ValueError:
+                    game_dir = self.exe_path.parent
+                    if not self.keep_in_place:
+                        single_exe_only = True
 
             game = install_standalone_game(
                 game_name=self.app_name,
@@ -738,11 +810,17 @@ class BulkMigrateWorker(QThread):
                         new_name=item.new_name,
                     )
                     if steam_appid is None:
-                        matches = search_steam_games(item.new_name, limit=1)
-                        if matches:
-                            steam_appid = matches[0].appid
+                        try:
+                            matches = search_steam_games(item.new_name, limit=1)
+                            if matches:
+                                steam_appid = matches[0].appid
+                        except Exception:
+                            pass
                     if steam_appid:
-                        download_steam_artwork(steam_appid, new_appid, self.paths.grid_dir)
+                        try:
+                            download_steam_artwork(steam_appid, new_appid, self.paths.grid_dir)
+                        except Exception:
+                            pass
                     migrated.append(item.new_name)
                 except Exception as exc:
                     errors.append(f"{item.entry.app_name}: {_format_worker_error(exc)}")
@@ -897,7 +975,38 @@ class WinetricksWorker(QThread):
                 return
             self.finished_ok.emit()
         except Exception as exc:
-            self.failed.emit(str(exc))
+            self.failed.emit(_format_worker_error(exc))
+
+
+class RunExeInPrefixWorker(QThread):
+    """Background worker to execute an .exe/.msi inside a Wine/Proton prefix."""
+
+    status = Signal(str)
+    finished_ok = Signal()
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        prefix_dir: Path,
+        exe_path: Path,
+        proton_dir: Path | None = None,
+    ) -> None:
+        super().__init__()
+        self.prefix_dir = prefix_dir
+        self.exe_path = exe_path
+        self.proton_dir = proton_dir
+
+    def run(self) -> None:
+        try:
+            self.status.emit(tr("run_exe.running", exe=self.exe_path.name))
+            run_exe_in_prefix(
+                self.prefix_dir,
+                self.exe_path,
+                proton_dir=self.proton_dir,
+            )
+            self.finished_ok.emit()
+        except Exception as exc:
+            self.failed.emit(_format_worker_error(exc))
 
 
 def _format_cleanup_candidate_label(cand: CleanupCandidate) -> str:
@@ -1124,6 +1233,9 @@ class MainWindow(QMainWindow):
         self._vdf_corrupt = False
         self._search_req_id = 0
         self._preview_req_id = 0
+        self._maint_health_req_id = 0
+        self._shortcuts_req_id = 0
+        self._launched_procs: list[subprocess.Popen] = []
         self._extract_worker: ExtractWorker | None = None
         self._search_worker: SteamSearchWorker | None = None
         self._preview_worker: PreviewWorker | None = None
@@ -1163,7 +1275,11 @@ class MainWindow(QMainWindow):
 
         worker.finished.connect(_cleanup)
 
+    def _prune_launched_procs(self) -> None:
+        self._launched_procs = [p for p in self._launched_procs if p.poll() is None]
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        self._prune_launched_procs()
         if self._extract_worker and self._extract_worker.isRunning():
             self._extract_worker.cancel()
         if any(w.isRunning() for w in self._active_workers):
@@ -1198,7 +1314,6 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self.stack.addWidget(_wrap_scroll(self._build_extract_page()))
-        self.stack.addWidget(_wrap_scroll(self._build_add_page()))
         self.stack.addWidget(_wrap_scroll(self._build_library_page()))
         self.stack.addWidget(_wrap_scroll(self._build_maintenance_page()))
         self.stack.currentChanged.connect(self._on_stack_tab_changed)
@@ -1252,7 +1367,6 @@ class MainWindow(QMainWindow):
         self._nav_buttons: list[QPushButton] = []
         nav_items = [
             tr("tabs.install"),
-            tr("tabs.add"),
             tr("tabs.library"),
             tr("tabs.maintenance"),
         ]
@@ -1336,7 +1450,7 @@ class MainWindow(QMainWindow):
 
     def _on_stack_tab_changed(self, idx: int) -> None:
         """Refresh Maintenance health metrics when switching to the Maintenance tab."""
-        if idx == 3:
+        if idx == 2:
             self._refresh_maintenance_health()
 
     def _format_steam_status_text(self) -> str:
@@ -1483,10 +1597,17 @@ class MainWindow(QMainWindow):
         lbl_det.setObjectName("SectionTitle")
         self.btn_scan = QPushButton(tr("install.btn_rescan"))
         self.btn_scan.clicked.connect(self._refresh_games)
+        self.btn_scan_folders = QPushButton(tr("scan_folders.btn"))
+        self.btn_scan_folders.clicked.connect(self._open_scan_folders_dialog)
+        self.lbl_scan_folders_count = QLabel()
+        self.lbl_scan_folders_count.setObjectName("MutedText")
+        self._update_scan_folders_label()
         btn_browse_exe = QPushButton(tr("install.browse"))
         btn_browse_exe.clicked.connect(self._pick_manual_exe)
         scan_row.addWidget(lbl_det)
         scan_row.addStretch()
+        scan_row.addWidget(self.lbl_scan_folders_count)
+        scan_row.addWidget(self.btn_scan_folders)
         scan_row.addWidget(self.btn_scan)
         scan_row.addWidget(btn_browse_exe)
         list_layout.addLayout(scan_row)
@@ -1664,28 +1785,62 @@ class MainWindow(QMainWindow):
         layout.addWidget(add_vsplit, 1)
         return page
 
+    def _switch_library_subview(self, idx: int) -> None:
+        """Switch between 'My Library' (0) and 'Scan & Add Game' (1) sub-views."""
+        self.library_sub_stack.setCurrentIndex(idx)
+        self.btn_lib_sub_my.setChecked(idx == 0)
+        self.btn_lib_sub_add.setChecked(idx == 1)
+
     def _build_library_page(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(14)
+        layout.setSpacing(12)
+
+        sub_nav_row = QHBoxLayout()
+        sub_nav_row.setSpacing(8)
+        self.btn_lib_sub_my = QPushButton(tr("library.subtab_my"))
+        self.btn_lib_sub_my.setCheckable(True)
+        self.btn_lib_sub_my.setChecked(True)
+        self.btn_lib_sub_add = QPushButton(tr("library.subtab_add"))
+        self.btn_lib_sub_add.setCheckable(True)
+        sub_group = QButtonGroup(page)
+        sub_group.setExclusive(True)
+        sub_group.addButton(self.btn_lib_sub_my, 0)
+        sub_group.addButton(self.btn_lib_sub_add, 1)
+        self.btn_lib_sub_my.clicked.connect(lambda: self._switch_library_subview(0))
+        self.btn_lib_sub_add.clicked.connect(lambda: self._switch_library_subview(1))
+        sub_nav_row.addWidget(self.btn_lib_sub_my)
+        sub_nav_row.addWidget(self.btn_lib_sub_add)
+        sub_nav_row.addStretch()
+        layout.addLayout(sub_nav_row)
+
+        self.library_sub_stack = QStackedWidget()
+
+        my_lib_page = QWidget()
+        my_lib_layout = QVBoxLayout(my_lib_page)
+        my_lib_layout.setContentsMargins(0, 0, 0, 0)
+        my_lib_layout.setSpacing(14)
 
         title = QLabel(tr("library.page_title"))
         title.setObjectName("PageTitle")
         sub = QLabel(tr("library.page_subtitle"))
         sub.setObjectName("MutedText")
         sub.setWordWrap(True)
-        layout.addWidget(title)
-        layout.addWidget(sub)
+        my_lib_layout.addWidget(title)
+        my_lib_layout.addWidget(sub)
 
         lib_card, lib_layout = _make_card()
         top = QHBoxLayout()
         lbl = QLabel(tr("library.shortcuts_title"))
         lbl.setObjectName("SectionTitle")
+        self.btn_goto_add_subview = QPushButton(tr("library.btn_add_scan_games"))
+        self.btn_goto_add_subview.clicked.connect(lambda: self._switch_library_subview(1))
         self.btn_reload = QPushButton(tr("install.btn_rescan"))
         self.btn_reload.clicked.connect(self._refresh_shortcuts)
         top.addWidget(lbl)
         top.addStretch()
+        top.addWidget(self.btn_goto_add_subview)
         top.addWidget(self.btn_reload)
         lib_layout.addLayout(top)
 
@@ -1731,6 +1886,8 @@ class MainWindow(QMainWindow):
         self._game_actions_menu = QMenu(self)
         self.act_play = QAction(tr("library.btn_play"), self)
         self.act_play.triggered.connect(self._play_selected_game)
+        self.act_configure_game = QAction(tr("library.btn_configure_game"), self)
+        self.act_configure_game.triggered.connect(self._open_configure_game_dialog)
         self.act_migrate = QAction(tr("library.btn_migrate_one"), self)
         self.act_migrate.triggered.connect(self._migrate_selected_shortcut)
         self.act_art = QAction(tr("library.btn_update_art"), self)
@@ -1739,12 +1896,16 @@ class MainWindow(QMainWindow):
         self.act_revert_art.triggered.connect(self._revert_selected_shortcut_art)
         self.act_proton = QAction(tr("library.btn_proton"), self)
         self.act_proton.triggered.connect(self._change_selected_proton)
+        self.act_fallback_proton10 = QAction(tr("library.btn_fallback_proton10"), self)
+        self.act_fallback_proton10.triggered.connect(self._fallback_selected_proton10)
         self.act_launch_opts = QAction(tr("library.btn_launch_opts"), self)
         self.act_launch_opts.triggered.connect(self._edit_launch_options_presets)
         self.act_winetricks = QAction(tr("library.btn_winetricks"), self)
         self.act_winetricks.triggered.connect(lambda: self._open_winetricks_dialog())
         self.act_optiscaler = QAction(tr("library.btn_optiscaler"), self)
         self.act_optiscaler.triggered.connect(lambda: self._open_optiscaler_dialog())
+        self.act_run_exe_in_prefix = QAction(tr("library.btn_run_exe_in_prefix"), self)
+        self.act_run_exe_in_prefix.triggered.connect(lambda: self._run_exe_in_prefix_dialog())
         self.act_export_standalone = QAction(tr("library.btn_export_standalone"), self)
         self.act_export_standalone.triggered.connect(self._export_selected_to_standalone)
         self.act_import_steam = QAction(tr("library.btn_import_steam"), self)
@@ -1753,13 +1914,16 @@ class MainWindow(QMainWindow):
         self.act_remove.triggered.connect(self._remove_selected_shortcut)
         for act in (
             self.act_play,
+            self.act_configure_game,
             self.act_migrate,
             self.act_art,
             self.act_revert_art,
             self.act_proton,
+            self.act_fallback_proton10,
             self.act_launch_opts,
             self.act_winetricks,
             self.act_optiscaler,
+            self.act_run_exe_in_prefix,
             self.act_export_standalone,
             self.act_import_steam,
         ):
@@ -1808,7 +1972,11 @@ class MainWindow(QMainWindow):
         ):
             actions.addWidget(b)
         lib_layout.addLayout(actions)
-        layout.addWidget(lib_card, 1)
+        my_lib_layout.addWidget(lib_card, 1)
+
+        self.library_sub_stack.addWidget(my_lib_page)
+        self.library_sub_stack.addWidget(self._build_add_page())
+        layout.addWidget(self.library_sub_stack, 1)
         return page
 
     def _build_maintenance_page(self) -> QWidget:
@@ -1930,79 +2098,127 @@ class MainWindow(QMainWindow):
         return page
 
     def _open_maintenance_page(self, *, auto_scan: bool = True) -> None:
-        self.stack.setCurrentIndex(3)
-        if len(self._nav_buttons) > 3:
-            self._nav_buttons[3].setChecked(True)
+        self.stack.setCurrentIndex(2)
+        if len(self._nav_buttons) > 2:
+            self._nav_buttons[2].setChecked(True)
         self._refresh_maintenance_health()
         if auto_scan:
             self._scan_maintenance_cleanup()
 
     def _refresh_maintenance_health(self) -> None:
-        mode = "AppImage" if get_running_appimage() is not None else "Python"
+        mode = (
+            tr("maint.mode_appimage")
+            if get_running_appimage() is not None
+            else tr("maint.mode_python")
+        )
         self.lbl_maint_app.setText(
             tr("maint.health_app", app=__app_name__, version=__version__, mode=mode)
         )
-
-        steam_root = find_steam_root()
-        has_steam_proton = steam_root is not None and find_proton_binary(steam_root) is not None
-        missing_status = (
-            tr("maint.status_optional_steam") if has_steam_proton else tr("maint.status_missing")
-        )
-
-        umu_path = get_umu_run_path()
-        umu_status = (
-            f"{tr('maint.status_ok')} ({umu_path})"
-            if umu_path.is_file()
-            else missing_status
-        )
-        self.lbl_maint_umu.setText(tr("maint.health_umu", status=umu_status))
-
-        ge_dirs = list_ge_proton11_dirs()
-        proton_status = (
-            f"{len(ge_dirs)} ({ge_dirs[0].name})" if ge_dirs else missing_status
-        )
-        self.lbl_maint_proton.setText(tr("maint.health_proton", status=proton_status))
-
-        steamrt4_dir = get_steamrt4_dir()
-        if not steamrt4_dir.is_dir():
-            rt4_status = missing_status
-        elif validate_steamrt4_integrity():
-            rt4_status = tr("maint.status_ok")
-        else:
-            rt4_status = tr("maint.status_corrupted")
-        self.lbl_maint_steamrt4.setText(tr("maint.health_steamrt4", status=rt4_status))
-
-        prefix_dirs: list[Path] = []
-        if self.paths is not None and self.paths.compatdata_dir.is_dir():
-            prefix_dirs.append(self.paths.compatdata_dir)
-        games_dir = Path.home() / "Games"
-        if games_dir.is_dir():
-            try:
-                for child in games_dir.iterdir():
-                    if child.is_dir():
-                        for sub_name in ("prefix", "pfx", "wineprefix"):
-                            sub = child / sub_name
-                            if sub.is_dir():
-                                prefix_dirs.append(sub)
-            except OSError:
-                pass
-        for extra_pfx_root in (Path.home() / "Games" / "Prefixes", Path.home() / "Prefixes"):
-            if extra_pfx_root.is_dir():
-                prefix_dirs.append(extra_pfx_root)
-        prefixes_bytes = sum(_dir_size_bytes(p) for p in prefix_dirs)
-
-        runtime_dirs = [p for p in (umu_path.parent, get_compat_tools_dir()) if p.is_dir()]
-        runtimes_bytes = sum(_dir_size_bytes(p) for p in runtime_dirs)
-
+        self._maint_health_req_id += 1
+        req_id = self._maint_health_req_id
+        paths_snapshot = self.paths
         caches_bytes = sum(c.size_bytes for c in self._maint_candidates)
-        self.lbl_maint_disk.setText(
-            tr(
-                "maint.health_disk",
-                prefixes=format_size_bytes(prefixes_bytes),
-                runtimes=format_size_bytes(runtimes_bytes),
-                caches=format_size_bytes(caches_bytes),
+
+        class _MaintHealthWorker(QThread):
+            ready = Signal(int, dict)
+
+            def __init__(self, r_id: int, paths: SteamPaths | None, cached_bytes: int) -> None:
+                super().__init__()
+                self._req_id = r_id
+                self._paths = paths
+                self._cached_bytes = cached_bytes
+
+            def run(self) -> None:
+                steam_root = find_steam_root()
+                has_steam_proton = (
+                    steam_root is not None and find_proton_binary(steam_root) is not None
+                )
+                missing_status = (
+                    tr("maint.status_optional_steam")
+                    if has_steam_proton
+                    else tr("maint.status_missing")
+                )
+
+                umu_path = get_umu_run_path()
+                umu_status = (
+                    f"{tr('maint.status_ok')} ({umu_path})"
+                    if umu_path.is_file()
+                    else missing_status
+                )
+
+                ge_dirs = list_ge_proton11_dirs()
+                proton_status = (
+                    f"{len(ge_dirs)} ({ge_dirs[0].name})" if ge_dirs else missing_status
+                )
+
+                steamrt4_dir = get_steamrt4_dir()
+                if not steamrt4_dir.is_dir():
+                    rt4_status = missing_status
+                elif validate_steamrt4_integrity():
+                    rt4_status = tr("maint.status_ok")
+                else:
+                    rt4_status = tr("maint.status_corrupted")
+
+                prefix_dirs: list[Path] = []
+                if self._paths is not None and self._paths.compatdata_dir.is_dir():
+                    prefix_dirs.append(self._paths.compatdata_dir)
+                games_dir = Path.home() / "Games"
+                if games_dir.is_dir():
+                    try:
+                        for child in games_dir.iterdir():
+                            if child.is_dir():
+                                for sub_name in ("prefix", "pfx", "wineprefix"):
+                                    sub = child / sub_name
+                                    if sub.is_dir():
+                                        prefix_dirs.append(sub)
+                    except OSError:
+                        pass
+                for extra_pfx_root in (
+                    Path.home() / "Games" / "Prefixes",
+                    Path.home() / "Prefixes",
+                ):
+                    if extra_pfx_root.is_dir():
+                        prefix_dirs.append(extra_pfx_root)
+                prefixes_bytes = sum(_dir_size_bytes(p) for p in prefix_dirs)
+
+                runtime_dirs = [
+                    p for p in (umu_path.parent, get_compat_tools_dir()) if p.is_dir()
+                ]
+                runtimes_bytes = sum(_dir_size_bytes(p) for p in runtime_dirs)
+
+                self.ready.emit(
+                    self._req_id,
+                    {
+                        "umu_status": umu_status,
+                        "proton_status": proton_status,
+                        "rt4_status": rt4_status,
+                        "prefixes_bytes": prefixes_bytes,
+                        "runtimes_bytes": runtimes_bytes,
+                        "caches_bytes": self._cached_bytes,
+                    },
+                )
+
+        def _on_health_ready(r_id: int, data: dict) -> None:
+            if self._closing_pending or r_id != self._maint_health_req_id:
+                return
+            self.lbl_maint_umu.setText(tr("maint.health_umu", status=data["umu_status"]))
+            self.lbl_maint_proton.setText(tr("maint.health_proton", status=data["proton_status"]))
+            self.lbl_maint_steamrt4.setText(
+                tr("maint.health_steamrt4", status=data["rt4_status"])
             )
-        )
+            self.lbl_maint_disk.setText(
+                tr(
+                    "maint.health_disk",
+                    prefixes=format_size_bytes(data["prefixes_bytes"]),
+                    runtimes=format_size_bytes(data["runtimes_bytes"]),
+                    caches=format_size_bytes(data["caches_bytes"]),
+                )
+            )
+
+        worker = _MaintHealthWorker(req_id, paths_snapshot, caches_bytes)
+        self._track_worker(worker)
+        worker.ready.connect(_on_health_ready)
+        worker.start()
 
     def _on_maint_filter_changed(self, key: str) -> None:
         self._maint_active_filter = key
@@ -2106,10 +2322,12 @@ class MainWindow(QMainWindow):
                 try:
                     self.found.emit(find_cleanup_candidates(self._paths, include_system_caches=True))
                 except Exception as exc:
-                    self.failed.emit(str(exc))
+                    self.failed.emit(_format_worker_error(exc))
 
         def _on_found(candidates: list[CleanupCandidate]) -> None:
             self._set_steam_busy(False)
+            if self._closing_pending:
+                return
             self._apply_maint_scan_results(candidates)
             self.status_label.setText(
                 tr("cleanup.none_found") if not candidates else tr("status.ready")
@@ -2117,6 +2335,8 @@ class MainWindow(QMainWindow):
 
         def _on_failed(err: str) -> None:
             self._set_steam_busy(False)
+            if self._closing_pending:
+                return
             msg = tr("cleanup.scan_error", err=err)
             self.status_label.setText(msg)
             QMessageBox.critical(self, __app_name__, msg)
@@ -2159,18 +2379,22 @@ class MainWindow(QMainWindow):
                     new_cands = find_cleanup_candidates(self._paths, include_system_caches=True)
                     self.done.emit(new_cands, checked, copied, len(pending_plan))
                 except Exception as exc:
-                    self.failed.emit(str(exc))
+                    self.failed.emit(_format_worker_error(exc))
 
         def _on_done(
             new_cands: list[CleanupCandidate], checked: int, copied: int, pending: int
         ) -> None:
             self._set_steam_busy(False)
+            if self._closing_pending:
+                return
             self._apply_maint_scan_results(new_cands)
             extra = tr("cleanup.reval_pending", pending=pending) if pending else ""
             self.status_label.setText(tr("cleanup.reval_done", checked=checked, copied=copied) + extra)
 
         def _on_failed(err: str) -> None:
             self._set_steam_busy(False)
+            if self._closing_pending:
+                return
             msg = tr("cleanup.reval_error", err=err)
             self.status_label.setText(msg)
             QMessageBox.critical(self, __app_name__, msg)
@@ -2304,7 +2528,7 @@ class MainWindow(QMainWindow):
                     new_cands = find_cleanup_candidates(self._paths, include_system_caches=True)
                     self.done.emit(deleted, freed, errs, new_cands, backup_zip_str)
                 except Exception as exc:
-                    self.failed.emit(str(exc))
+                    self.failed.emit(_format_worker_error(exc))
 
         def _on_deleted(
             deleted: int,
@@ -2314,6 +2538,8 @@ class MainWindow(QMainWindow):
             backup_zip_str: str,
         ) -> None:
             self._set_steam_busy(False)
+            if self._closing_pending:
+                return
             self._apply_maint_scan_results(new_cands)
             msg = tr("cleanup.deleted", deleted=deleted, size=format_size_bytes(freed))
             if backup_zip_str:
@@ -2328,6 +2554,8 @@ class MainWindow(QMainWindow):
 
         def _on_failed(err: str) -> None:
             self._set_steam_busy(False)
+            if self._closing_pending:
+                return
             msg = tr("cleanup.delete_error", err=err)
             self.status_label.setText(msg)
             QMessageBox.critical(self, __app_name__, msg)
@@ -2366,24 +2594,59 @@ class MainWindow(QMainWindow):
             target = cand.path if cand.path.is_dir() else cand.path.parent
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
         elif act_backup is not None and chosen is act_backup:
-            try:
-                zip_path, _games, files_backed = backup_prefix_candidates_to_zip([cand])
+            self._set_steam_busy(True)
+            self.status_label.setText(tr("maint.backup_running"))
+
+            class _MaintBackupWorker(QThread):
+                done = Signal(str, int)
+                failed = Signal(str)
+
+                def __init__(self, target_cand: CleanupCandidate) -> None:
+                    super().__init__()
+                    self._cand = target_cand
+
+                def run(self) -> None:
+                    try:
+                        zip_path, _games, files_backed = backup_prefix_candidates_to_zip(
+                            [self._cand]
+                        )
+                        if files_backed <= 0:
+                            try:
+                                zip_path.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                        self.done.emit(str(zip_path), files_backed)
+                    except Exception as exc:
+                        self.failed.emit(_format_worker_error(exc))
+
+            def _on_backup_done(zip_str: str, files_backed: int) -> None:
+                self._set_steam_busy(False)
+                self.status_label.setText(tr("status.ready"))
+                if self._closing_pending:
+                    return
                 if files_backed > 0:
                     QMessageBox.information(
                         self,
                         __app_name__,
-                        tr("maint.backup_done", path=str(zip_path), files=files_backed),
+                        tr("maint.backup_done", path=zip_str, files=files_backed),
                     )
                 else:
-                    try:
-                        zip_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
                     QMessageBox.information(self, __app_name__, tr("maint.backup_empty"))
-            except Exception as exc:
+
+            def _on_backup_failed(err: str) -> None:
+                self._set_steam_busy(False)
+                self.status_label.setText(tr("status.ready"))
+                if self._closing_pending:
+                    return
                 QMessageBox.critical(
-                    self, __app_name__, tr("maint.backup_error", err=str(exc))
+                    self, __app_name__, tr("maint.backup_error", err=err)
                 )
+
+            worker = _MaintBackupWorker(cand)
+            self._track_worker(worker)
+            worker.done.connect(_on_backup_done)
+            worker.failed.connect(_on_backup_failed)
+            worker.start()
 
     def _show_shortcut_context_menu(self, pos: QPoint) -> None:
         item = self.shortcuts_list.itemAt(pos)
@@ -2697,13 +2960,208 @@ class MainWindow(QMainWindow):
         if isinstance(target, Path) and target.is_dir():
             game = scan_game_folder(target)
             if game:
-                self._populate_game_form(game)
+                self._populate_game_form(game, from_extract=True)
         self._nav_buttons[1].setChecked(True)
         self.stack.setCurrentIndex(1)
+        self._switch_library_subview(1)
+
+    def _load_scan_folders(self) -> tuple[list[tuple[Path, bool]], list[dict[str, object]]]:
+        """Return (default_entries, custom_entries) from QSettings."""
+        raw_disabled = self.settings.value("scan_folders/disabled_defaults", "[]")
+        if isinstance(raw_disabled, str):
+            try:
+                disabled_list = json.loads(raw_disabled)
+            except Exception:
+                disabled_list = []
+        elif isinstance(raw_disabled, (list, tuple)):
+            disabled_list = list(raw_disabled)
+        else:
+            disabled_list = []
+        disabled_set = {str(p) for p in disabled_list if p}
+
+        raw_custom = self.settings.value("scan_folders/custom", "[]")
+        if isinstance(raw_custom, str):
+            try:
+                custom_parsed = json.loads(raw_custom)
+            except Exception:
+                custom_parsed = []
+        elif isinstance(raw_custom, (list, tuple)):
+            custom_parsed = list(raw_custom)
+        else:
+            custom_parsed = []
+
+        custom_entries: list[dict[str, object]] = []
+        seen_custom: set[str] = set()
+        for item in custom_parsed:
+            if isinstance(item, dict) and item.get("path"):
+                p_str = str(item["path"])
+                if p_str not in seen_custom:
+                    seen_custom.add(p_str)
+                    custom_entries.append(
+                        {"path": p_str, "enabled": bool(item.get("enabled", True))}
+                    )
+
+        defaults = [(p, str(p) not in disabled_set) for p in default_scan_roots()]
+        return defaults, custom_entries
+
+    def _save_scan_folders(
+        self, disabled_defaults: list[str], custom_entries: list[dict[str, object]]
+    ) -> None:
+        """Persist scan folder configuration to QSettings and refresh label."""
+        self.settings.setValue("scan_folders/disabled_defaults", json.dumps(disabled_defaults))
+        self.settings.setValue("scan_folders/custom", json.dumps(custom_entries))
+        self._update_scan_folders_label()
+
+    def _enabled_scan_roots(self) -> list[Path]:
+        """Return deduplicated list of enabled scan root Paths."""
+        defaults, custom_entries = self._load_scan_folders()
+        roots: list[Path] = []
+        seen: set[Path] = set()
+        candidates: list[Path] = [p for p, enabled in defaults if enabled]
+        for entry in custom_entries:
+            if entry.get("enabled", True):
+                p = Path(str(entry["path"])).expanduser()
+                if p.is_dir():
+                    candidates.append(p)
+        for p in candidates:
+            try:
+                res = p.resolve()
+            except OSError:
+                res = p
+            if res not in seen:
+                seen.add(res)
+                roots.append(p)
+        return roots
+
+    def _update_scan_folders_label(self) -> None:
+        """Update the muted active scan folder count label."""
+        if hasattr(self, "lbl_scan_folders_count"):
+            count = len(self._enabled_scan_roots())
+            self.lbl_scan_folders_count.setText(
+                tr("scan_folders.active_count", count=count)
+            )
+
+    def _open_scan_folders_dialog(self) -> None:
+        """Open a dialog to enable/disable default scan roots and manage custom folders."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("scan_folders.title"))
+        dlg.resize(560, 420)
+        lay = QVBoxLayout(dlg)
+
+        sub = QLabel(tr("scan_folders.subtitle"))
+        sub.setObjectName("MutedText")
+        sub.setWordWrap(True)
+        lay.addWidget(sub)
+
+        folder_list = QListWidget()
+        defaults, custom_entries = self._load_scan_folders()
+        tag_default = tr("scan_folders.tag_default")
+        tag_custom = tr("scan_folders.tag_custom")
+
+        def _add_entry(kind: str, path_str: str, enabled: bool) -> QListWidgetItem:
+            tag = tag_default if kind == "default" else tag_custom
+            item = QListWidgetItem(f"[{tag}] {path_str}")
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            item.setCheckState(
+                Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked
+            )
+            item.setData(Qt.ItemDataRole.UserRole, (kind, path_str))
+            folder_list.addItem(item)
+            return item
+
+        for p, enabled in defaults:
+            _add_entry("default", str(p), enabled)
+        for entry in custom_entries:
+            _add_entry("custom", str(entry["path"]), bool(entry.get("enabled", True)))
+
+        lay.addWidget(folder_list, 1)
+
+        ctrl_row = QHBoxLayout()
+        btn_add = QPushButton(tr("scan_folders.btn_add"))
+        btn_remove = QPushButton(tr("scan_folders.btn_remove"))
+        btn_remove.setEnabled(False)
+        ctrl_row.addWidget(btn_add)
+        ctrl_row.addWidget(btn_remove)
+        ctrl_row.addStretch()
+        lay.addLayout(ctrl_row)
+
+        def _update_remove_state() -> None:
+            cur = folder_list.currentItem()
+            data = cur.data(Qt.ItemDataRole.UserRole) if cur is not None else None
+            btn_remove.setEnabled(
+                isinstance(data, tuple) and len(data) == 2 and data[0] == "custom"
+            )
+
+        folder_list.currentItemChanged.connect(lambda _c, _p: _update_remove_state())
+
+        def _on_add_folder() -> None:
+            chosen = QFileDialog.getExistingDirectory(
+                dlg, tr("scan_folders.pick_title"), str(Path.home())
+            )
+            if not chosen:
+                return
+            chosen_str = str(Path(chosen))
+            for i in range(folder_list.count()):
+                data = folder_list.item(i).data(Qt.ItemDataRole.UserRole)
+                if isinstance(data, tuple) and data[1] == chosen_str:
+                    folder_list.setCurrentRow(i)
+                    return
+            item = _add_entry("custom", chosen_str, True)
+            folder_list.setCurrentItem(item)
+
+        def _on_remove_folder() -> None:
+            row = folder_list.currentRow()
+            if row < 0:
+                return
+            cur = folder_list.item(row)
+            data = cur.data(Qt.ItemDataRole.UserRole) if cur is not None else None
+            if isinstance(data, tuple) and data[0] == "custom":
+                folder_list.takeItem(row)
+
+        btn_add.clicked.connect(_on_add_folder)
+        btn_remove.clicked.connect(_on_remove_folder)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Apply
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+
+        def _apply() -> None:
+            new_disabled: list[str] = []
+            new_custom: list[dict[str, object]] = []
+            for i in range(folder_list.count()):
+                it = folder_list.item(i)
+                data = it.data(Qt.ItemDataRole.UserRole)
+                if not (isinstance(data, tuple) and len(data) == 2):
+                    continue
+                kind, p_str = data
+                checked = it.checkState() == Qt.CheckState.Checked
+                if kind == "default":
+                    if not checked:
+                        new_disabled.append(str(p_str))
+                elif kind == "custom":
+                    new_custom.append({"path": str(p_str), "enabled": checked})
+            self._save_scan_folders(new_disabled, new_custom)
+            self._refresh_games()
+
+        apply_btn = buttons.button(QDialogButtonBox.StandardButton.Apply)
+        if apply_btn is not None:
+            apply_btn.clicked.connect(_apply)
+        buttons.accepted.connect(lambda: (_apply(), dlg.accept()))
+        buttons.rejected.connect(dlg.reject)
+        lay.addWidget(buttons)
+
+        dlg.exec()
 
     def _refresh_games(self) -> None:
         self.btn_scan.setEnabled(False)
-        worker = ScanWorker()
+        self._update_scan_folders_label()
+        worker = ScanWorker(roots=self._enabled_scan_roots())
         self._scan_worker = worker
         self._track_worker(worker)
         worker.finished_scan.connect(
@@ -2838,7 +3296,7 @@ class MainWindow(QMainWindow):
         self.chk_add_mangohud.setChecked(bool(st["mangohud"]))
         self.chk_add_dlss.setChecked(bool(st["dlss_upgrade"]))
 
-    def _populate_game_form(self, game: DetectedGame) -> None:
+    def _populate_game_form(self, game: DetectedGame, from_extract: bool = False) -> None:
         self._search_req_id += 1
         self._custom_icon_path = None
         self.btn_clear_icon.setVisible(False)
@@ -2847,9 +3305,7 @@ class MainWindow(QMainWindow):
         self.add_exe_combo.clear()
         for exe in game.executables:
             self.add_exe_combo.addItem(str(exe))
-        self.chk_keep_in_place.setChecked(
-            str(game.primary_exe).startswith(("/run/media/", "/mnt/"))
-        )
+        self.chk_keep_in_place.setChecked(not from_extract)
         self.steam_search_input.setText(
             str(game.steam_appid) if game.steam_appid else game.name
         )
@@ -2873,9 +3329,7 @@ class MainWindow(QMainWindow):
         self.add_name.setText(name)
         self.add_exe_combo.clear()
         self.add_exe_combo.addItem(str(exe))
-        self.chk_keep_in_place.setChecked(
-            str(exe).startswith(("/run/media/", "/mnt/"))
-        )
+        self.chk_keep_in_place.setChecked(True)
         self.steam_search_input.setText(
             str(game.steam_appid) if (game and game.steam_appid) else name
         )
@@ -3114,6 +3568,77 @@ class MainWindow(QMainWindow):
         launch_opts, winedll = self._resolve_add_launch_options()
         self._save_last_launch_prefs(launch_opts, winedll)
 
+        keep_in_place = self.chk_keep_in_place.isChecked()
+        single_exe_only = False
+        inferred_container = False
+        try:
+            game_dir = infer_game_root_from_exe(exe_path)
+        except ValueError:
+            game_dir = exe_path.parent
+            inferred_container = True
+            if not keep_in_place:
+                single_exe_only = True
+
+        games_dir = get_games_dir()
+        try:
+            game_dir.resolve().relative_to(games_dir.resolve())
+            inside_games_dir = True
+        except ValueError:
+            inside_games_dir = False
+
+        if not keep_in_place and not inside_games_dir:
+            try:
+                item_count = sum(1 for _ in game_dir.iterdir())
+            except OSError:
+                item_count = 0
+            try:
+                total_bytes = (
+                    exe_path.stat().st_size
+                    if inferred_container
+                    else _dir_size_bytes(game_dir)
+                )
+            except OSError:
+                total_bytes = 0
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle(__app_name__)
+            box.setText(
+                tr(
+                    "add.confirm_move_folder",
+                    games_dir=str(games_dir),
+                    src=str(game_dir),
+                    dst=str(games_dir / app_name),
+                    count=item_count,
+                    size=format_size_bytes(total_bytes),
+                )
+            )
+            btn_move_folder = box.addButton(
+                tr("add.btn_move_folder"), QMessageBox.ButtonRole.AcceptRole
+            )
+            btn_keep = box.addButton(
+                tr("add.btn_keep_in_place"), QMessageBox.ButtonRole.ActionRole
+            )
+            btn_move_exe = None
+            if single_exe_only or inferred_container:
+                btn_move_exe = box.addButton(
+                    tr("add.btn_move_exe_only"), QMessageBox.ButtonRole.ActionRole
+                )
+            btn_cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(btn_cancel)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked == btn_cancel or clicked is None:
+                return
+            if clicked == btn_keep:
+                keep_in_place = True
+                single_exe_only = False
+            elif btn_move_exe is not None and clicked == btn_move_exe:
+                keep_in_place = False
+                single_exe_only = True
+            else:
+                keep_in_place = False
+                single_exe_only = False
+
         self._set_steam_busy(True)
         worker = StandaloneInstallWorker(
             app_name=app_name,
@@ -3122,9 +3647,11 @@ class MainWindow(QMainWindow):
             create_menu_shortcut=create_menu,
             create_desktop_shortcut=create_desktop,
             icon_path=self._custom_icon_path,
-            keep_in_place=self.chk_keep_in_place.isChecked(),
+            keep_in_place=keep_in_place,
             launch_options=launch_opts,
             winedlloverrides=winedll,
+            game_dir=game_dir,
+            single_exe_only=single_exe_only,
         )
         self._track_worker(worker)
         worker.status.connect(self.status_label.setText)
@@ -3164,56 +3691,91 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, __app_name__, err)
 
     def _refresh_shortcuts(self) -> None:
-        self.shortcuts_list.clear()
-        entries: list[ShortcutEntry] = []
-        if not self.paths:
-            self._vdf_corrupt = False
-            self.vdf_error_banner.hide()
-            self._set_vdf_write_enabled(False)
-        else:
-            try:
-                entries = load_shortcuts(self.paths.shortcuts_vdf)
+        self._shortcuts_req_id += 1
+        req_id = self._shortcuts_req_id
+        paths_snapshot = self.paths
+
+        class _ShortcutsRefreshWorker(QThread):
+            ready = Signal(int, list, list, list, str)
+
+            def __init__(self, r_id: int, paths: SteamPaths | None) -> None:
+                super().__init__()
+                self._req_id = r_id
+                self._paths = paths
+
+            def run(self) -> None:
+                entries: list[ShortcutEntry] = []
+                vdf_err = ""
+                if self._paths is not None:
+                    try:
+                        entries = load_shortcuts(self._paths.shortcuts_vdf)
+                    except Exception as exc:
+                        vdf_err = str(exc)
+                standalone_games = list_standalone_games()
+                external_games = scan_external_launcher_games()
+                self.ready.emit(
+                    self._req_id, entries, standalone_games, external_games, vdf_err
+                )
+
+        def _on_loaded(
+            r_id: int,
+            entries: list[ShortcutEntry],
+            standalone_games: list[StandaloneGame],
+            external_games: list[ExternalLauncherGame],
+            vdf_err: str,
+        ) -> None:
+            if self._closing_pending or r_id != self._shortcuts_req_id:
+                return
+            self.shortcuts_list.clear()
+            if not paths_snapshot:
+                self._vdf_corrupt = False
+                self.vdf_error_banner.hide()
+                self._set_vdf_write_enabled(False)
+            elif vdf_err:
+                self._vdf_corrupt = True
+                self.vdf_error_banner.setText(tr("library.vdf_error", err=vdf_err))
+                self.vdf_error_banner.show()
+                self._set_vdf_write_enabled(False)
+            else:
                 self._vdf_corrupt = False
                 self.vdf_error_banner.hide()
                 self._set_vdf_write_enabled(True)
-            except Exception as exc:
-                self._vdf_corrupt = True
-                self.vdf_error_banner.setText(tr("library.vdf_error", err=exc))
-                self.vdf_error_banner.show()
-                self._set_vdf_write_enabled(False)
 
-        standalone_games = list_standalone_games()
-        external_games = scan_external_launcher_games()
-        self._steam_shortcuts = entries
-        self._standalone_games = standalone_games
-        self._external_games = external_games
-        self._update_remove_existing_state()
-        if not entries and not standalone_games and not external_games:
-            empty_item = QListWidgetItem(tr("library.no_shortcuts"))
-            empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
-            self.shortcuts_list.addItem(empty_item)
+            self._steam_shortcuts = entries
+            self._standalone_games = standalone_games
+            self._external_games = external_games
+            self._update_remove_existing_state()
+            if not entries and not standalone_games and not external_games:
+                empty_item = QListWidgetItem(tr("library.no_shortcuts"))
+                empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
+                self.shortcuts_list.addItem(empty_item)
+                self._filter_library_list()
+                self._update_library_action_states()
+                return
+
+            for entry in entries:
+                item = QListWidgetItem(f"{entry.app_name}  ({entry.appid_u32})  —  {entry.exe}")
+                item.setData(Qt.ItemDataRole.UserRole, ("steam", entry))
+                self.shortcuts_list.addItem(item)
+
+            standalone_tag = tr("library.tag_standalone")
+            for game in standalone_games:
+                item = QListWidgetItem(f"{standalone_tag} {game.name}  —  {game.exe_path}")
+                item.setData(Qt.ItemDataRole.UserRole, ("standalone", game))
+                self.shortcuts_list.addItem(item)
+
+            for ext in external_games:
+                item = QListWidgetItem(f"[{ext.source.title()}] {ext.name} — {ext.exe_path}")
+                item.setData(Qt.ItemDataRole.UserRole, ("external", ext))
+                self.shortcuts_list.addItem(item)
+
             self._filter_library_list()
             self._update_library_action_states()
-            return
 
-        for entry in entries:
-            item = QListWidgetItem(f"{entry.app_name}  ({entry.appid_u32})  —  {entry.exe}")
-            item.setData(Qt.ItemDataRole.UserRole, ("steam", entry))
-            self.shortcuts_list.addItem(item)
-
-        standalone_tag = tr("library.tag_standalone")
-        for game in standalone_games:
-            item = QListWidgetItem(f"{standalone_tag} {game.name}  —  {game.exe_path}")
-            item.setData(Qt.ItemDataRole.UserRole, ("standalone", game))
-            self.shortcuts_list.addItem(item)
-
-        for ext in external_games:
-            item = QListWidgetItem(f"[{ext.source.title()}] {ext.name} — {ext.exe_path}")
-            item.setData(Qt.ItemDataRole.UserRole, ("external", ext))
-            self.shortcuts_list.addItem(item)
-
-        self._filter_library_list()
-        self._update_library_action_states()
+        worker = _ShortcutsRefreshWorker(req_id, paths_snapshot)
+        self._track_worker(worker)
+        worker.ready.connect(_on_loaded)
+        worker.start()
 
     def _filter_library_list(self) -> None:
         """Filter Steam, Standalone, and External library items live and update the count label."""
@@ -3268,6 +3830,8 @@ class MainWindow(QMainWindow):
         self.btn_game_actions.setEnabled(sel is not None)
         self.act_play.setVisible(True)
         self.act_play.setEnabled(sel is not None)
+        self.act_configure_game.setVisible(sel is not None)
+        self.act_configure_game.setEnabled(sel is not None)
         self.act_remove.setText(
             tr("library.btn_remove_standalone") if is_standalone else tr("library.btn_remove")
         )
@@ -3277,13 +3841,14 @@ class MainWindow(QMainWindow):
             self.act_migrate,
             self.act_art,
             self.act_revert_art,
-            self.act_proton,
             self.act_export_standalone,
         ):
             act.setVisible(is_steam)
         self.act_import_steam.setVisible(is_standalone)
         self.act_launch_opts.setVisible(not is_external)
         is_native = sel is not None and _is_native_linux_game(sel[0], sel[1])
+        self.act_proton.setVisible((is_steam or is_standalone) and not is_native)
+        self.act_fallback_proton10.setVisible((is_steam or is_standalone) and not is_native)
         ext_prefix = getattr(sel[1], "prefix_dir", None) if is_external and sel is not None else None
         has_ext_prefix = (
             is_external
@@ -3292,12 +3857,16 @@ class MainWindow(QMainWindow):
         )
         self.act_winetricks.setVisible((not is_native) and (not is_external or has_ext_prefix))
         self.act_optiscaler.setVisible(not is_native)
+        self.act_run_exe_in_prefix.setVisible((is_steam or is_standalone) and not is_native)
         self.act_remove.setVisible(not is_external)
 
         self.act_migrate.setEnabled(is_steam and can_write_vdf)
         self.act_art.setEnabled(is_steam and bool(self.paths))
         self.act_revert_art.setEnabled(is_steam and bool(self.paths))
-        self.act_proton.setEnabled(is_steam and can_write_vdf)
+        self.act_proton.setEnabled(((is_steam and can_write_vdf) or is_standalone) and not is_native)
+        self.act_fallback_proton10.setEnabled(
+            ((is_steam and can_write_vdf) or is_standalone) and not is_native
+        )
         self.act_export_standalone.setEnabled(is_steam and bool(self.paths))
         self.act_import_steam.setEnabled(is_standalone and can_write_vdf)
         self.act_launch_opts.setEnabled((is_steam and can_write_vdf) or is_standalone)
@@ -3310,6 +3879,9 @@ class MainWindow(QMainWindow):
             sel is not None
             and not is_native
             and ((is_steam and bool(self.paths)) or is_standalone or is_external)
+        )
+        self.act_run_exe_in_prefix.setEnabled(
+            ((is_steam and bool(self.paths)) or is_standalone) and not is_native
         )
         self.act_remove.setEnabled((is_steam and can_write_vdf) or is_standalone)
 
@@ -3342,6 +3914,227 @@ class MainWindow(QMainWindow):
             )
             return None
 
+    def _warn_if_win32_prefix(self, prefix_dir: Path | None) -> bool:
+        """Warn and return True if prefix_dir is an unsupported 32-bit Wine prefix."""
+        if prefix_dir is not None and is_win32_prefix(prefix_dir):
+            QMessageBox.warning(
+                self,
+                __app_name__,
+                tr("prefix.win32_unsupported", path=str(prefix_dir)),
+            )
+            return True
+        return False
+
+    def _run_exe_in_prefix_dialog(
+        self, kind: str | None = None, obj: object | None = None
+    ) -> None:
+        """Prompt for an .exe/.msi and run it inside the selected game's Wine prefix."""
+        if kind is None or obj is None:
+            sel = self._selected_library_item()
+            if not sel:
+                return
+            kind, obj = sel
+        if kind not in ("steam", "standalone") or _is_native_linux_game(kind, obj):
+            return
+        if kind == "steam" and not self.paths:
+            return
+
+        self._prune_launched_procs()
+        if self._launched_procs:
+            QMessageBox.warning(self, __app_name__, tr("run_exe.game_running"))
+            return
+
+        try:
+            prefix_dir, proton_dir = resolve_game_prefix(kind, obj, self.paths)
+        except Exception as exc:
+            QMessageBox.critical(self, __app_name__, str(exc))
+            return
+
+        if self._warn_if_win32_prefix(prefix_dir):
+            return
+
+        start_dir = str(obj.game_dir) if isinstance(obj, StandaloneGame) else str(Path.home())
+        exe_path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            tr("run_exe.pick_title"),
+            start_dir,
+            tr("run_exe.filter"),
+        )
+        if not exe_path_str:
+            return
+
+        exe_path = Path(exe_path_str)
+        worker = RunExeInPrefixWorker(prefix_dir, exe_path, proton_dir=proton_dir)
+        self._track_worker(worker)
+        worker.status.connect(self.status_label.setText)
+
+        def _ok() -> None:
+            msg = tr("run_exe.done", exe=exe_path.name)
+            self.status_label.setText(msg)
+            if not self._closing_pending:
+                QMessageBox.information(self, __app_name__, msg)
+
+        def _err(err: str) -> None:
+            if not self._closing_pending:
+                QMessageBox.critical(self, __app_name__, tr("run_exe.error", err=err))
+
+        worker.finished_ok.connect(_ok)
+        worker.failed.connect(_err)
+        worker.start()
+
+    def _open_configure_game_dialog(self) -> None:
+        """Open a unified 3-tab configuration dialog for the selected game."""
+        sel = self._selected_library_item()
+        if not sel:
+            return
+        kind, obj = sel
+        is_steam = kind == "steam" and isinstance(obj, ShortcutEntry)
+        is_standalone = kind == "standalone" and isinstance(obj, StandaloneGame)
+        is_native = _is_native_linux_game(kind, obj)
+        title_name = obj.app_name if is_steam else obj.name
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("configure.title", name=title_name))
+        dlg.resize(580, 440)
+        root_lay = QVBoxLayout(dlg)
+
+        tabs = QTabWidget(dlg)
+        root_lay.addWidget(tabs, 1)
+
+        # --- Tab 1: Game & Executable ---
+        tab_game = QWidget()
+        game_form = QFormLayout(tab_game)
+        exe_str = str(obj.exe if is_steam else obj.exe_path)
+        dir_str = str(obj.start_dir if is_steam else obj.game_dir)
+        game_form.addRow(tr("configure.lbl_name"), QLabel(title_name))
+        game_form.addRow(tr("configure.lbl_type"), QLabel(kind))
+        lbl_exe = QLabel(exe_str)
+        lbl_exe.setWordWrap(True)
+        lbl_dir = QLabel(dir_str)
+        lbl_dir.setWordWrap(True)
+        game_form.addRow(tr("configure.lbl_exe"), lbl_exe)
+        game_form.addRow(tr("configure.lbl_dir"), lbl_dir)
+
+        opts_edit = QLineEdit(str(getattr(obj, "launch_options", "") or ""))
+        opts_edit.setReadOnly(True)
+        game_form.addRow(tr("configure.lbl_launch_opts"), opts_edit)
+
+        btn_edit_opts = QPushButton(tr("configure.btn_edit_launch_opts"))
+        btn_edit_opts.setEnabled(is_steam or is_standalone)
+
+        def _on_edit_opts() -> None:
+            self._edit_launch_options_presets()
+            cur = self._selected_library_item()
+            if cur is not None:
+                opts_edit.setText(str(getattr(cur[1], "launch_options", "") or ""))
+
+        btn_edit_opts.clicked.connect(_on_edit_opts)
+        game_form.addRow("", btn_edit_opts)
+        tabs.addTab(tab_game, tr("configure.tab_game"))
+
+        # --- Tab 2: Runner & Proton ---
+        tab_runner = QWidget()
+        runner_lay = QVBoxLayout(tab_runner)
+        if is_native:
+            lbl_native = QLabel(tr("configure.native_no_proton"))
+            lbl_native.setWordWrap(True)
+            runner_lay.addWidget(lbl_native)
+            runner_lay.addStretch()
+        else:
+            def _current_proton_text() -> str:
+                if is_steam and self.paths:
+                    return get_shortcut_proton(self.paths.config_vdf, obj.appid_u32) or tr("proton.default_label")
+                if is_standalone:
+                    return obj.proton_name or tr("proton.default_label")
+                return str(getattr(obj, "runner", "") or tr("proton.default_label"))
+
+            lbl_cur_proton = QLabel(_current_proton_text())
+            runner_form = QFormLayout()
+            runner_form.addRow(tr("configure.lbl_current_proton"), lbl_cur_proton)
+            runner_lay.addLayout(runner_form)
+
+            btn_change_proton = QPushButton(tr("library.btn_proton"))
+            btn_change_proton.setEnabled((is_steam and bool(self.paths)) or is_standalone)
+
+            def _on_change_proton() -> None:
+                self._change_selected_proton()
+                lbl_cur_proton.setText(_current_proton_text())
+
+            btn_change_proton.clicked.connect(_on_change_proton)
+            runner_lay.addWidget(btn_change_proton)
+
+            btn_fallback10 = QPushButton(tr("library.btn_fallback_proton10"))
+            btn_fallback10.setEnabled((is_steam and bool(self.paths)) or is_standalone)
+            btn_fallback10.clicked.connect(self._fallback_selected_proton10)
+            runner_lay.addWidget(btn_fallback10)
+            runner_lay.addStretch()
+        tabs.addTab(tab_runner, tr("configure.tab_runner"))
+
+        # --- Tab 3: Prefix & Tools ---
+        tab_prefix = QWidget()
+        prefix_lay = QVBoxLayout(tab_prefix)
+        if is_native:
+            lbl_no_pfx = QLabel(tr("configure.native_no_prefix"))
+            lbl_no_pfx.setWordWrap(True)
+            prefix_lay.addWidget(lbl_no_pfx)
+            prefix_lay.addStretch()
+        else:
+            resolved_pfx: Path | None = None
+            try:
+                resolved_pfx, _ = resolve_game_prefix(kind, obj, self.paths)
+            except Exception:
+                resolved_pfx = getattr(obj, "prefix_dir", None)
+
+            pfx_label = QLabel(str(resolved_pfx) if resolved_pfx else "-")
+            pfx_label.setWordWrap(True)
+            pfx_form = QFormLayout()
+            pfx_form.addRow(tr("configure.lbl_prefix_path"), pfx_label)
+            prefix_lay.addLayout(pfx_form)
+
+            if resolved_pfx is not None and is_win32_prefix(resolved_pfx):
+                win32_warn = QLabel(tr("prefix.win32_unsupported", path=str(resolved_pfx)))
+                win32_warn.setWordWrap(True)
+                win32_warn.setStyleSheet("color: #ffd180;")
+                prefix_lay.addWidget(win32_warn)
+
+            btn_wt = QPushButton(tr("library.btn_winetricks"))
+            btn_wt.setEnabled(
+                (is_steam and bool(self.paths))
+                or is_standalone
+                or (resolved_pfx is not None and resolved_pfx.is_dir())
+            )
+            btn_wt.clicked.connect(lambda: self._open_winetricks_dialog(kind, obj))
+            prefix_lay.addWidget(btn_wt)
+
+            btn_opti = QPushButton(tr("library.btn_optiscaler"))
+            btn_opti.setEnabled((is_steam and bool(self.paths)) or is_standalone or kind == "external")
+            btn_opti.clicked.connect(lambda: self._open_optiscaler_dialog(kind, obj))
+            prefix_lay.addWidget(btn_opti)
+
+            btn_run_exe = QPushButton(tr("library.btn_run_exe_in_prefix"))
+            btn_run_exe.setEnabled((is_steam and bool(self.paths)) or is_standalone)
+            btn_run_exe.clicked.connect(lambda: self._run_exe_in_prefix_dialog(kind, obj))
+            prefix_lay.addWidget(btn_run_exe)
+
+            btn_open_pfx = QPushButton(tr("configure.btn_open_prefix"))
+            btn_open_pfx.setEnabled(resolved_pfx is not None and resolved_pfx.is_dir())
+            if resolved_pfx is not None:
+                btn_open_pfx.clicked.connect(
+                    lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(resolved_pfx)))
+                )
+            prefix_lay.addWidget(btn_open_pfx)
+            prefix_lay.addStretch()
+        tabs.addTab(tab_prefix, tr("configure.tab_prefix"))
+
+        btn_close = QPushButton(tr("configure.btn_close"))
+        btn_close.clicked.connect(dlg.accept)
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        close_row.addWidget(btn_close)
+        root_lay.addLayout(close_row)
+
+        dlg.exec()
+
     def _play_selected_game(self) -> None:
         """Launch the selected Steam, Standalone, or External game."""
         sel = self._selected_library_item()
@@ -3350,12 +4143,30 @@ class MainWindow(QMainWindow):
         kind, obj = sel
         title_name = obj.app_name if kind == "steam" else obj.name
         try:
+            self._prune_launched_procs()
             if kind == "standalone":
                 assert isinstance(obj, StandaloneGame)
-                subprocess.Popen(
-                    ["bash", str(obj.launch_script)],
-                    cwd=str(obj.game_dir),
-                    start_new_session=True,
+                if not obj.native_linux:
+                    if self._warn_if_win32_prefix(obj.prefix_dir):
+                        return
+                    fallback_name = resolve_standalone_proton_fallback(obj)
+                    if fallback_name:
+                        update_standalone_launch_options(
+                            obj.game_dir,
+                            winedlloverrides=obj.winedlloverrides,
+                            launch_options=obj.launch_options,
+                            proton_name=fallback_name,
+                        )
+                        obj.proton_name = fallback_name
+                        msg = tr("play.proton_fallback", name=obj.name, proton=fallback_name)
+                        self.status_label.setText(msg)
+                        QMessageBox.information(self, __app_name__, msg)
+                self._launched_procs.append(
+                    subprocess.Popen(
+                        ["bash", str(obj.launch_script)],
+                        cwd=str(obj.game_dir),
+                        start_new_session=True,
+                    )
                 )
             elif kind == "steam":
                 assert isinstance(obj, ShortcutEntry)
@@ -3364,12 +4175,16 @@ class MainWindow(QMainWindow):
             elif kind == "external":
                 assert isinstance(obj, ExternalLauncherGame)
                 if obj.launch_cmd:
-                    subprocess.Popen(obj.launch_cmd, start_new_session=True)
+                    self._launched_procs.append(
+                        subprocess.Popen(obj.launch_cmd, start_new_session=True)
+                    )
                 elif obj.runner == "linux":
-                    subprocess.Popen(
-                        [str(obj.exe_path)],
-                        cwd=str(obj.game_dir),
-                        start_new_session=True,
+                    self._launched_procs.append(
+                        subprocess.Popen(
+                            [str(obj.exe_path)],
+                            cwd=str(obj.game_dir),
+                            start_new_session=True,
+                        )
                     )
                 else:
                     umu_run = get_umu_run_path()
@@ -3398,11 +4213,13 @@ class MainWindow(QMainWindow):
                     )
                     prefix_dir.mkdir(parents=True, exist_ok=True)
                     env = build_umu_env(prefix_dir, proton_dir)
-                    subprocess.Popen(
-                        [str(umu_run), str(obj.exe_path)],
-                        cwd=str(obj.game_dir),
-                        env=env,
-                        start_new_session=True,
+                    self._launched_procs.append(
+                        subprocess.Popen(
+                            [str(umu_run), str(obj.exe_path)],
+                            cwd=str(obj.game_dir),
+                            env=env,
+                            start_new_session=True,
+                        )
                     )
             self.status_label.setText(tr("play.launched", name=title_name))
         except Exception as exc:
@@ -3487,7 +4304,7 @@ class MainWindow(QMainWindow):
                 try:
                     self.found.emit(search_steam_games(self._app_name, limit=5))
                 except Exception as exc:
-                    self.failed.emit(str(exc))
+                    self.failed.emit(_format_worker_error(exc))
 
         def _on_search_found(matches: list[SteamMatch]) -> None:
             if self._closing_pending:
@@ -3534,7 +4351,7 @@ class MainWindow(QMainWindow):
                             tr("art.updated", name=self._match.name, files=files_str)
                         )
                     except Exception as exc:
-                        self.failed.emit(str(exc))
+                        self.failed.emit(_format_worker_error(exc))
 
             dl_worker = _ArtDownloadWorker(self.paths, entry, chosen)
             self._track_worker(dl_worker)
@@ -3548,11 +4365,13 @@ class MainWindow(QMainWindow):
         def _ok(msg: str) -> None:
             self._set_steam_busy(False)
             self.status_label.setText(msg)
-            QMessageBox.information(self, __app_name__, msg)
+            if not self._closing_pending:
+                QMessageBox.information(self, __app_name__, msg)
 
         def _err(err: str) -> None:
             self._set_steam_busy(False)
-            QMessageBox.critical(self, __app_name__, tr("art.error", err=err))
+            if not self._closing_pending:
+                QMessageBox.critical(self, __app_name__, tr("art.error", err=err))
 
         worker.found.connect(_on_search_found)
         worker.failed.connect(_err)
@@ -3613,20 +4432,97 @@ class MainWindow(QMainWindow):
         )
 
     def _change_selected_proton(self) -> None:
-        entry = self._selected_shortcut()
-        if not entry or not self.paths:
+        sel = self._selected_library_item()
+        if sel is None:
+            return
+        kind, obj = sel
+        if _is_native_linux_game(kind, obj):
+            return
+
+        if kind == "standalone" and isinstance(obj, StandaloneGame):
+            if self._warn_if_win32_prefix(obj.prefix_dir):
+                return
+            tools: list[tuple[str, str]] = []
+            seen_ids: set[str] = set()
+            for ct in list_installed_compat_tools():
+                if ct.tool_id not in seen_ids:
+                    seen_ids.add(ct.tool_id)
+                    tools.append((ct.tool_id, ct.display_name or ct.tool_id))
+            if self.paths:
+                for tid, disp in list_installed_protons(self.paths.steam_root):
+                    if tid not in seen_ids:
+                        seen_ids.add(tid)
+                        tools.append((tid, disp))
+            if not tools:
+                QMessageBox.warning(self, __app_name__, tr("proton.none_found"))
+                return
+            current_id = obj.proton_name or ""
+            current_disp = current_id or tr("proton.default_label")
+            labels = [disp for _, disp in tools]
+            cur_idx = next((i for i, (tid, _) in enumerate(tools) if tid == current_id), 0)
+            choice, ok = QInputDialog.getItem(
+                self,
+                tr("proton.title"),
+                tr("proton.label", name=obj.name, current=current_disp),
+                labels,
+                cur_idx,
+                False,
+            )
+            if not ok or not choice:
+                return
+            tool_id = tools[labels.index(choice)][0]
+
+            def _do_set_standalone_proton() -> None:
+                self._auto_snapshot_if_enabled(
+                    obj.prefix_dir,
+                    obj.name,
+                    "proton-change",
+                    "proton",
+                )
+                update_standalone_launch_options(
+                    obj.game_dir,
+                    winedlloverrides=obj.winedlloverrides,
+                    launch_options=obj.launch_options,
+                    proton_name=tool_id,
+                )
+
+            worker = SteamOpWorker(_do_set_standalone_proton, need_steam_closed=False)
+            self._track_worker(worker)
+            worker.status.connect(self.status_label.setText)
+
+            def _ok_standalone(_res: object) -> None:
+                self._refresh_shortcuts()
+                msg = tr("proton.updated_standalone", name=obj.name, tool=tool_id)
+                self.status_label.setText(msg)
+                if not self._closing_pending:
+                    QMessageBox.information(self, __app_name__, msg)
+
+            def _err_standalone(err: str) -> None:
+                if not self._closing_pending:
+                    QMessageBox.critical(self, __app_name__, tr("proton.error", err=err))
+
+            worker.finished_ok.connect(_ok_standalone)
+            worker.failed.connect(_err_standalone)
+            worker.start()
+            return
+
+        if kind != "steam" or not isinstance(obj, ShortcutEntry) or not self.paths:
+            return
+        entry = obj
+        if self._warn_if_win32_prefix(self.paths.compatdata_dir / str(entry.appid_u32) / "pfx"):
             return
         protons = list_installed_protons(self.paths.steam_root)
         if not protons:
             QMessageBox.warning(self, __app_name__, tr("proton.none_found"))
             return
-        current = get_shortcut_proton(self.paths.config_vdf, entry.appid_u32) or "default"
+        current_id = get_shortcut_proton(self.paths.config_vdf, entry.appid_u32)
+        current_disp = current_id or tr("proton.default_label")
         labels = [disp for _, disp in protons]
-        cur_idx = next((i for i, (tid, _) in enumerate(protons) if tid == current), 0)
+        cur_idx = next((i for i, (tid, _) in enumerate(protons) if tid == current_id), 0)
         choice, ok = QInputDialog.getItem(
             self,
             tr("proton.title"),
-            tr("proton.label", name=entry.app_name, current=current),
+            tr("proton.label", name=entry.app_name, current=current_disp),
             labels,
             cur_idx,
             False,
@@ -3668,6 +4564,94 @@ class MainWindow(QMainWindow):
         worker.failed.connect(_err)
         worker.start()
 
+    def _fallback_selected_proton10(self) -> None:
+        sel = self._selected_library_item()
+        if sel is None:
+            return
+        kind, obj = sel
+        if _is_native_linux_game(kind, obj):
+            return
+
+        if kind == "steam":
+            if not isinstance(obj, ShortcutEntry) or not self.paths or self._vdf_corrupt:
+                return
+            if self._warn_if_win32_prefix(self.paths.compatdata_dir / str(obj.appid_u32) / "pfx"):
+                return
+            if not self._confirm_close_steam_if_running():
+                return
+            paths = self.paths
+            entry = obj
+            self._set_steam_busy(True)
+
+            def _apply_steam(tool_id: str) -> None:
+                self._auto_snapshot_if_enabled(
+                    paths.compatdata_dir / str(entry.appid_u32) / "pfx",
+                    entry.app_name,
+                    "proton10-fallback",
+                    "proton",
+                )
+                set_shortcut_proton(paths.config_vdf, entry.appid_u32, tool_id)
+
+            worker = FallbackProton10Worker(_apply_steam, need_steam_closed=True)
+            self._track_worker(worker)
+            worker.status.connect(self.status_label.setText)
+
+            def _ok_steam(tool_id: str) -> None:
+                self._set_steam_busy(False)
+                msg = tr("proton10.updated", name=entry.app_name, tool=tool_id)
+                self.status_label.setText(msg)
+                if not self._closing_pending:
+                    QMessageBox.information(self, __app_name__, msg)
+
+            def _err_steam(err: str, is_offline: bool) -> None:
+                self._set_steam_busy(False)
+                if not self._closing_pending:
+                    msg = tr("proton10.offline_error", err=err) if is_offline else tr("proton10.error", err=err)
+                    QMessageBox.critical(self, __app_name__, msg)
+
+            worker.finished_ok.connect(_ok_steam)
+            worker.failed.connect(_err_steam)
+            worker.start()
+            return
+
+        if kind == "standalone" and isinstance(obj, StandaloneGame):
+            if self._warn_if_win32_prefix(obj.prefix_dir):
+                return
+
+            def _apply_standalone(tool_id: str) -> None:
+                self._auto_snapshot_if_enabled(
+                    obj.prefix_dir,
+                    obj.name,
+                    "proton10-fallback",
+                    "proton",
+                )
+                update_standalone_launch_options(
+                    obj.game_dir,
+                    winedlloverrides=obj.winedlloverrides,
+                    launch_options=obj.launch_options,
+                    proton_name=tool_id,
+                )
+
+            worker = FallbackProton10Worker(_apply_standalone, need_steam_closed=False)
+            self._track_worker(worker)
+            worker.status.connect(self.status_label.setText)
+
+            def _ok_standalone(tool_id: str) -> None:
+                self._refresh_shortcuts()
+                msg = tr("proton10.updated_standalone", name=obj.name, tool=tool_id)
+                self.status_label.setText(msg)
+                if not self._closing_pending:
+                    QMessageBox.information(self, __app_name__, msg)
+
+            def _err_standalone(err: str, is_offline: bool) -> None:
+                if not self._closing_pending:
+                    msg = tr("proton10.offline_error", err=err) if is_offline else tr("proton10.error", err=err)
+                    QMessageBox.critical(self, __app_name__, msg)
+
+            worker.finished_ok.connect(_ok_standalone)
+            worker.failed.connect(_err_standalone)
+            worker.start()
+
     def _bulk_migrate_proton_dialog(self) -> None:
         if not self.paths:
             return
@@ -3685,12 +4669,17 @@ class MainWindow(QMainWindow):
         dlg.resize(780, 560)
         lay = QVBoxLayout(dlg)
 
+        empty_tool_label = tr("proton_bulk.empty_tool")
         by_tool: dict[str, list[CompatMappingEntry]] = {}
         for u in usage:
-            by_tool.setdefault(u.tool_name or "(empty)", []).append(u)
+            by_tool.setdefault(u.tool_name or empty_tool_label, []).append(u)
         summary_lines = [
-            f"• {tool}: {sum(1 for x in items if x.source != 'Orphan')} ativos, "
-            f"{sum(1 for x in items if x.source == 'Orphan')} órfãos"
+            tr(
+                "proton_bulk.summary_line",
+                tool=tool,
+                active=sum(1 for x in items if x.source != "Orphan"),
+                orphans=sum(1 for x in items if x.source == "Orphan"),
+            )
             for tool, items in sorted(by_tool.items(), key=lambda kv: (-len(kv[1]), kv[0]))
         ]
         summary_box = QTextEdit()
@@ -3723,7 +4712,7 @@ class MainWindow(QMainWindow):
             flt = filter_combo.currentData()
             lst.clear()
             for u in usage:
-                tkey = u.tool_name or "(empty)"
+                tkey = u.tool_name or empty_tool_label
                 if flt == "__ORPHAN__" and u.source != "Orphan":
                     continue
                 if flt not in ("__ALL__", "__ORPHAN__") and tkey != flt:
@@ -3799,7 +4788,8 @@ class MainWindow(QMainWindow):
                 self._set_steam_busy(False)
                 msg = tr("proton_bulk.orphans_removed", count=count)
                 self.status_label.setText(msg)
-                QMessageBox.information(self, __app_name__, msg)
+                if not self._closing_pending:
+                    QMessageBox.information(self, __app_name__, msg)
 
             worker.finished_ok.connect(_ok_clean)
         else:
@@ -3823,17 +4813,18 @@ class MainWindow(QMainWindow):
                 self._set_steam_busy(False)
                 msg = tr("proton_bulk.migrated", count=count, tool=target_tool)
                 self.status_label.setText(msg)
-                QMessageBox.information(self, __app_name__, msg)
+                if not self._closing_pending:
+                    QMessageBox.information(self, __app_name__, msg)
 
             worker.finished_ok.connect(_ok_mig)
 
+        def _on_bulk_proton_err(err: str) -> None:
+            self._set_steam_busy(False)
+            if not self._closing_pending:
+                QMessageBox.critical(self, __app_name__, tr("proton.error", err=err))
+
         worker.status.connect(self.status_label.setText)
-        worker.failed.connect(
-            lambda err: (
-                self._set_steam_busy(False),
-                QMessageBox.critical(self, __app_name__, tr("proton.error", err=err)),
-            )
-        )
+        worker.failed.connect(_on_bulk_proton_err)
         worker.start()
 
     def _open_proton_manager_dialog(self) -> None:
@@ -3906,33 +4897,77 @@ class MainWindow(QMainWindow):
             if text:
                 lbl_status.setText(text)
 
+        inst_req = {"id": 0}
+
+        class _InstalledToolsWorker(QThread):
+            ready = Signal(int, list, list)
+            failed = Signal(int, str)
+
+            def __init__(self, req_id: int, paths: SteamPaths | None) -> None:
+                super().__init__()
+                self._req_id = req_id
+                self._paths = paths
+
+            def run(self) -> None:
+                try:
+                    tools = list_installed_compat_tools()
+                    usage = list_compat_tool_usage(self._paths) if self._paths else []
+                    self.ready.emit(self._req_id, tools, usage)
+                except Exception as exc:
+                    self.failed.emit(self._req_id, _format_worker_error(exc))
+
         def _refresh_installed() -> None:
+            inst_req["id"] += 1
+            req_id = inst_req["id"]
             installed_list.clear()
-            tools = list_installed_compat_tools()
-            usage = list_compat_tool_usage(self.paths) if self.paths else []
-            by_tool: dict[str, list[CompatMappingEntry]] = {}
-            for u in usage:
-                by_tool.setdefault(u.tool_name, []).append(u)
-            if not tools:
-                empty = QListWidgetItem(tr("proton_mgr.none_installed"))
-                empty.setFlags(Qt.ItemFlag.NoItemFlags)
-                installed_list.addItem(empty)
-                btn_remove_inst.setEnabled(False)
-                return
-            for tool in tools:
-                used_entries = list(by_tool.get(tool.tool_id, []))
-                if tool.folder_name != tool.tool_id:
-                    used_entries.extend(by_tool.get(tool.folder_name, []))
-                size_str = format_size_bytes(tool.size_bytes)
-                usage_tag = (
-                    tr("proton_mgr.in_use", count=len(used_entries))
-                    if used_entries
-                    else tr("proton_mgr.unused")
-                )
-                it = QListWidgetItem(f"{tool.folder_name}  ({size_str}) — {usage_tag}")
-                it.setData(Qt.ItemDataRole.UserRole, (tool, used_entries))
-                installed_list.addItem(it)
+            btn_refresh_inst.setEnabled(False)
             btn_remove_inst.setEnabled(False)
+            lbl_status.setText(tr("proton_mgr.loading_installed"))
+
+            worker = _InstalledToolsWorker(req_id, self.paths)
+            self._track_worker(worker)
+
+            def _on_inst_ready(
+                r_id: int, tools: list[InstalledCompatTool], usage: list[CompatMappingEntry]
+            ) -> None:
+                if not dlg_alive["open"] or self._closing_pending or r_id != inst_req["id"]:
+                    return
+                btn_refresh_inst.setEnabled(True)
+                lbl_status.setText(tr("status.ready"))
+                installed_list.clear()
+                by_tool: dict[str, list[CompatMappingEntry]] = {}
+                for u in usage:
+                    by_tool.setdefault(u.tool_name, []).append(u)
+                if not tools:
+                    empty = QListWidgetItem(tr("proton_mgr.none_installed"))
+                    empty.setFlags(Qt.ItemFlag.NoItemFlags)
+                    installed_list.addItem(empty)
+                    btn_remove_inst.setEnabled(False)
+                    return
+                for tool in tools:
+                    used_entries = list(by_tool.get(tool.tool_id, []))
+                    if tool.folder_name != tool.tool_id:
+                        used_entries.extend(by_tool.get(tool.folder_name, []))
+                    size_str = format_size_bytes(tool.size_bytes)
+                    usage_tag = (
+                        tr("proton_mgr.in_use", count=len(used_entries))
+                        if used_entries
+                        else tr("proton_mgr.unused")
+                    )
+                    it = QListWidgetItem(f"{tool.folder_name}  ({size_str}) — {usage_tag}")
+                    it.setData(Qt.ItemDataRole.UserRole, (tool, used_entries))
+                    installed_list.addItem(it)
+                btn_remove_inst.setEnabled(False)
+
+            def _on_inst_err(r_id: int, err: str) -> None:
+                if not dlg_alive["open"] or self._closing_pending or r_id != inst_req["id"]:
+                    return
+                btn_refresh_inst.setEnabled(True)
+                lbl_status.setText(tr("proton_mgr.error", err=err))
+
+            worker.ready.connect(_on_inst_ready)
+            worker.failed.connect(_on_inst_err)
+            worker.start()
 
         installed_list.currentItemChanged.connect(
             lambda cur, _p: btn_remove_inst.setEnabled(
@@ -4000,7 +5035,7 @@ class MainWindow(QMainWindow):
                     return
                 for rel in rels:
                     size_str = format_size_bytes(rel.size_bytes) if rel.size_bytes else "?"
-                    pre_tag = " [prerelease]" if rel.prerelease else ""
+                    pre_tag = tr("proton_mgr.prerelease_tag") if rel.prerelease else ""
                     it = QListWidgetItem(f"{rel.tag_name} ({size_str}){pre_tag} — {rel.asset_name}")
                     it.setData(Qt.ItemDataRole.UserRole, rel)
                     releases_list.addItem(it)
@@ -4137,14 +5172,45 @@ class MainWindow(QMainWindow):
                 != QMessageBox.StandardButton.Yes
             ):
                 return
-            try:
-                remove_compat_tool(tool.path)
-            except Exception as exc:
-                QMessageBox.critical(dlg, __app_name__, tr("proton_mgr.error", err=str(exc)))
-                return
-            lbl_status.setText(tr("proton_mgr.removed", name=tool.folder_name))
-            _refresh_installed()
-            self._refresh_maintenance_health()
+
+            class _RemoveCompatWorker(QThread):
+                done = Signal()
+                failed = Signal(str)
+
+                def __init__(self, target_path: Path) -> None:
+                    super().__init__()
+                    self._path = target_path
+
+                def run(self) -> None:
+                    try:
+                        remove_compat_tool(self._path)
+                        self.done.emit()
+                    except Exception as exc:
+                        self.failed.emit(_format_worker_error(exc))
+
+            progress.setRange(0, 0)
+            _set_busy(True, tr("proton_mgr.removing", name=tool.folder_name))
+            rm_worker = _RemoveCompatWorker(tool.path)
+            self._track_worker(rm_worker)
+
+            def _on_rm_done() -> None:
+                if not dlg_alive["open"] or self._closing_pending:
+                    return
+                progress.setRange(0, 100)
+                _set_busy(False, tr("proton_mgr.removed", name=tool.folder_name))
+                _refresh_installed()
+                self._refresh_maintenance_health()
+
+            def _on_rm_err(err: str) -> None:
+                if not dlg_alive["open"] or self._closing_pending:
+                    return
+                progress.setRange(0, 100)
+                _set_busy(False, tr("proton_mgr.error", err=err))
+                QMessageBox.critical(dlg, __app_name__, tr("proton_mgr.error", err=err))
+
+            rm_worker.done.connect(_on_rm_done)
+            rm_worker.failed.connect(_on_rm_err)
+            rm_worker.start()
 
         btn_refresh_inst.clicked.connect(_refresh_installed)
         btn_fetch.clicked.connect(_on_fetch)
@@ -4227,11 +5293,30 @@ class MainWindow(QMainWindow):
             self.settings.setValue("save_sync/folder", raw)
             return Path(raw).expanduser()
 
-        def _refresh_plan() -> None:
+        plan_req = {"id": 0}
+
+        class _PlanSyncWorker(QThread):
+            ready = Signal(int, list)
+            failed = Signal(int, str)
+
+            def __init__(
+                self, req_id: int, games: list[tuple[str, Path]], sync_root: Path
+            ) -> None:
+                super().__init__()
+                self._req_id = req_id
+                self._games = games
+                self._sync_root = sync_root
+
+            def run(self) -> None:
+                try:
+                    items = plan_sync_all(self._games, self._sync_root)
+                    self.ready.emit(self._req_id, items)
+                except Exception as exc:
+                    self.failed.emit(self._req_id, _format_worker_error(exc))
+
+        def _apply_plan_items(items: list[SyncPlanItem]) -> None:
             plan_list.clear()
             current_plan.clear()
-            sync_root = _current_sync_root()
-            items = plan_sync_all(_collect_games_for_sync(), sync_root)
             current_plan.extend(items)
             if not items:
                 empty = QListWidgetItem(tr("save_sync.no_games"))
@@ -4248,6 +5333,35 @@ class MainWindow(QMainWindow):
                 plan_list.addItem(it)
             btn_sync.setEnabled(actionable)
 
+        def _refresh_plan() -> None:
+            plan_req["id"] += 1
+            req_id = plan_req["id"]
+            sync_root = _current_sync_root()
+            games = _collect_games_for_sync()
+            btn_sync.setEnabled(False)
+            btn_refresh.setEnabled(False)
+            lbl_status.setText(tr("save_sync.loading_plan"))
+
+            worker = _PlanSyncWorker(req_id, games, sync_root)
+            self._track_worker(worker)
+
+            def _on_plan_ready(r_id: int, items: list[SyncPlanItem]) -> None:
+                if not dlg_alive["open"] or self._closing_pending or r_id != plan_req["id"]:
+                    return
+                btn_refresh.setEnabled(True)
+                lbl_status.setText(tr("status.ready"))
+                _apply_plan_items(items)
+
+            def _on_plan_err(r_id: int, err: str) -> None:
+                if not dlg_alive["open"] or self._closing_pending or r_id != plan_req["id"]:
+                    return
+                btn_refresh.setEnabled(True)
+                lbl_status.setText(tr("save_sync.error", err=err))
+
+            worker.ready.connect(_on_plan_ready)
+            worker.failed.connect(_on_plan_err)
+            worker.start()
+
         def _on_browse() -> None:
             picked = QFileDialog.getExistingDirectory(
                 dlg, tr("save_sync.pick_folder"), str(_current_sync_root())
@@ -4258,7 +5372,7 @@ class MainWindow(QMainWindow):
 
         class _FolderSaveSyncWorker(QThread):
             status = Signal(str)
-            finished_ok = Signal(int, int)
+            finished_ok = Signal(int, int, list)
             failed = Signal(str)
 
             def __init__(
@@ -4273,13 +5387,19 @@ class MainWindow(QMainWindow):
             def run(self) -> None:
                 pushed = 0
                 pulled = 0
-                try:
-                    for item, action in self._ops:
-                        self.status.emit(
-                            tr("save_sync.syncing_game", name=item.game_name, action=action)
-                        )
+                errors: list[str] = []
+                for item, action in self._ops:
+                    self.status.emit(
+                        tr("save_sync.syncing_game", name=item.game_name, action=action)
+                    )
+                    try:
                         if action == "PUSH":
-                            if push_game_saves(item.game_name, item.prefix_dir, self._sync_root) is not None:
+                            if (
+                                push_game_saves(
+                                    item.game_name, item.prefix_dir, self._sync_root
+                                )
+                                is not None
+                            ):
                                 pushed += 1
                         elif action == "PULL":
                             restored, _ = pull_game_saves(
@@ -4287,12 +5407,11 @@ class MainWindow(QMainWindow):
                             )
                             if restored > 0:
                                 pulled += 1
-                    self.finished_ok.emit(pushed, pulled)
-                except Exception as exc:
-                    self.failed.emit(_format_worker_error(exc))
+                    except Exception as exc:
+                        errors.append(f"{item.game_name}: {_format_worker_error(exc)}")
+                self.finished_ok.emit(pushed, pulled, errors)
 
         def _on_sync_now() -> None:
-            _refresh_plan()
             sync_root = _current_sync_root()
             ops: list[tuple[SyncPlanItem, str]] = []
             for item in current_plan:
@@ -4330,18 +5449,23 @@ class MainWindow(QMainWindow):
             worker = _FolderSaveSyncWorker(ops, sync_root)
             self._track_worker(worker)
 
-            def _ok(pushed: int, pulled: int) -> None:
-                if not dlg_alive["open"]:
+            def _ok(pushed: int, pulled: int, errors: list[str]) -> None:
+                if not dlg_alive["open"] or self._closing_pending:
                     return
                 for w in (btn_refresh, btn_browse, sync_dir_edit):
                     w.setEnabled(True)
                 msg = tr("save_sync.done", pushed=pushed, pulled=pulled)
-                lbl_status.setText(msg)
+                if errors:
+                    msg += tr("save_sync.partial_errors", errs="\n".join(errors))
+                lbl_status.setText(msg.splitlines()[0])
                 _refresh_plan()
-                QMessageBox.information(dlg, __app_name__, msg)
+                if errors:
+                    QMessageBox.warning(dlg, __app_name__, msg)
+                else:
+                    QMessageBox.information(dlg, __app_name__, msg)
 
             def _err(err: str) -> None:
-                if not dlg_alive["open"]:
+                if not dlg_alive["open"] or self._closing_pending:
                     return
                 for w in (btn_sync, btn_refresh, btn_browse, sync_dir_edit):
                     w.setEnabled(True)
@@ -5526,10 +6650,12 @@ class MainWindow(QMainWindow):
                     zpath, games, files = backup_all_saves(self._paths)
                     self.done.emit(str(zpath), games, files)
                 except Exception as exc:
-                    self.failed.emit(str(exc))
+                    self.failed.emit(_format_worker_error(exc))
 
         def _ok(zpath: str, games: int, files: int) -> None:
             self._set_steam_busy(False)
+            if self._closing_pending:
+                return
             if files == 0:
                 Path(zpath).unlink(missing_ok=True)
                 msg = tr("backup.empty")
@@ -5540,7 +6666,8 @@ class MainWindow(QMainWindow):
 
         def _err(err: str) -> None:
             self._set_steam_busy(False)
-            QMessageBox.critical(self, __app_name__, tr("backup.error", err=err))
+            if not self._closing_pending:
+                QMessageBox.critical(self, __app_name__, tr("backup.error", err=err))
 
         w = _BackupWorker(self.paths)
         self._track_worker(w)
@@ -5591,7 +6718,7 @@ class MainWindow(QMainWindow):
                     games, files = restore_saves_backup(self._paths, self._zip_file)
                     self.done.emit(games, files)
                 except Exception as exc:
-                    self.failed.emit(str(exc))
+                    self.failed.emit(_format_worker_error(exc))
 
         def _on_restore_done(games: int, files: int) -> None:
             self._set_steam_busy(False)
@@ -5685,6 +6812,8 @@ class MainWindow(QMainWindow):
             return
         game = sel[1]
         assert isinstance(game, StandaloneGame)
+        if not game.native_linux and self._warn_if_win32_prefix(game.prefix_dir):
+            return
         if is_gamescope_session() and is_steam_running():
             ans = QMessageBox.question(self, __app_name__, tr("add.gamescope_confirm"))
             if ans != QMessageBox.StandardButton.Yes:
@@ -5836,7 +6965,7 @@ class MainWindow(QMainWindow):
                     removed = remove_shortcut(self._paths, self._shortcut.appid_u32)
                     self.done.emit(removed)
                 except Exception as exc:
-                    self.failed.emit(str(exc))
+                    self.failed.emit(_format_worker_error(exc))
                 finally:
                     if was_running and not is_steam_running():
                         start_steam()
@@ -5861,6 +6990,75 @@ class MainWindow(QMainWindow):
         worker.failed.connect(_on_remove_err)
         worker.start()
 
+    def _remove_standalone_async(
+        self,
+        sa: StandaloneGame,
+        *,
+        delete_files: bool,
+        delete_prefix: bool,
+        steam_entry: ShortcutEntry | None = None,
+        refresh_games: bool = False,
+    ) -> None:
+        self._set_steam_busy(True)
+
+        class _StandaloneRemoveWorker(QThread):
+            done = Signal()
+            failed = Signal(str)
+
+            def __init__(
+                self,
+                game: StandaloneGame,
+                del_files: bool,
+                del_prefix: bool,
+                snap_fn: Callable[[Path, str, str, str], Path | None],
+            ) -> None:
+                super().__init__()
+                self._game = game
+                self._del_files = del_files
+                self._del_prefix = del_prefix
+                self._snap_fn = snap_fn
+
+            def run(self) -> None:
+                try:
+                    if self._del_files or self._del_prefix:
+                        self._snap_fn(
+                            self._game.prefix_dir, self._game.name, "remove-game", "remove"
+                        )
+                    remove_standalone_game(
+                        self._game,
+                        delete_files=self._del_files,
+                        delete_prefix=self._del_prefix,
+                    )
+                    self.done.emit()
+                except Exception as exc:
+                    self.failed.emit(_format_worker_error(exc))
+
+        worker = _StandaloneRemoveWorker(
+            sa, delete_files, delete_prefix, self._auto_snapshot_if_enabled
+        )
+        self._track_worker(worker)
+
+        def _on_done() -> None:
+            self._set_steam_busy(False)
+            if self._closing_pending:
+                return
+            if steam_entry is not None and self.paths is not None:
+                self._remove_steam_shortcut_async(steam_entry, refresh_games=True)
+                return
+            if refresh_games or delete_files:
+                self._refresh_games()
+            self._refresh_shortcuts()
+            self.status_label.setText(tr("library.removed", name=sa.name))
+
+        def _on_err(err: str) -> None:
+            self._set_steam_busy(False)
+            if not self._closing_pending:
+                QMessageBox.critical(self, __app_name__, err)
+
+        worker.done.connect(_on_done)
+        worker.failed.connect(_on_err)
+        worker.start()
+
     def _remove_existing_from_add(self) -> None:
         """Remove an existing Standalone game and/or Steam shortcut from the Add tab."""
         sa, steam_entry = self._find_matching_installed()
@@ -5873,21 +7071,13 @@ class MainWindow(QMainWindow):
             if choice is None:
                 return
             delete_files, delete_prefix = choice
-            if delete_files or delete_prefix:
-                self._auto_snapshot_if_enabled(sa.prefix_dir, sa.name, "remove-game", "remove")
-            try:
-                remove_standalone_game(
-                    sa, delete_files=delete_files, delete_prefix=delete_prefix
-                )
-            except Exception as exc:
-                QMessageBox.critical(self, __app_name__, str(exc))
-                return
-            if steam_entry is not None and self.paths is not None:
-                self._remove_steam_shortcut_async(steam_entry, refresh_games=True)
-            else:
-                self._refresh_games()
-                self._refresh_shortcuts()
-                self.status_label.setText(tr("library.removed", name=sa.name))
+            self._remove_standalone_async(
+                sa,
+                delete_files=delete_files,
+                delete_prefix=delete_prefix,
+                steam_entry=steam_entry,
+                refresh_games=True,
+            )
             return
 
         if steam_entry is not None and self.paths is not None:
@@ -5910,19 +7100,12 @@ class MainWindow(QMainWindow):
             if choice is None:
                 return
             delete_files, delete_prefix = choice
-            if delete_files or delete_prefix:
-                self._auto_snapshot_if_enabled(obj.prefix_dir, obj.name, "remove-game", "remove")
-            try:
-                remove_standalone_game(
-                    obj, delete_files=delete_files, delete_prefix=delete_prefix
-                )
-            except Exception as exc:
-                QMessageBox.critical(self, __app_name__, str(exc))
-                return
-            if delete_files:
-                self._refresh_games()
-            self._refresh_shortcuts()
-            self.status_label.setText(tr("library.removed", name=obj.name))
+            self._remove_standalone_async(
+                obj,
+                delete_files=delete_files,
+                delete_prefix=delete_prefix,
+                refresh_games=delete_files,
+            )
             return
 
         entry = obj
@@ -6009,7 +7192,7 @@ class MainWindow(QMainWindow):
                     )
                     self.ready.emit(plan)
                 except Exception as exc:
-                    self.failed.emit(str(exc))
+                    self.failed.emit(_format_worker_error(exc))
 
         worker = _BulkPlanWorker(self.paths)
         self._track_worker(worker)
@@ -6018,7 +7201,7 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _confirm_and_run_bulk_plan(self, plan: list[MigrationPlanItem]) -> None:
-        if not self.paths:
+        if self._closing_pending or not self.paths:
             self._set_steam_busy(False)
             return
         if not plan:
@@ -6039,16 +7222,17 @@ class MainWindow(QMainWindow):
                         checked, copied = sync_all_external_saves(self._paths)
                         self.done.emit(checked, copied)
                     except Exception as exc:
-                        self.failed.emit(str(exc))
+                        self.failed.emit(_format_worker_error(exc))
 
             def _on_sync_done(checked: int, copied: int) -> None:
                 self._set_steam_busy(False)
                 self.status_label.setText(tr("status.ready"))
-                QMessageBox.information(
-                    self,
-                    __app_name__,
-                    tr("migrate.all_standardized", checked=checked, copied=copied),
-                )
+                if not self._closing_pending:
+                    QMessageBox.information(
+                        self,
+                        __app_name__,
+                        tr("migrate.all_standardized", checked=checked, copied=copied),
+                    )
 
             sync_worker = _SaveSyncWorker(self.paths)
             self._track_worker(sync_worker)
@@ -6084,11 +7268,13 @@ class MainWindow(QMainWindow):
         self.status_label.setText(tr("migrate.done"))
         self._refresh_games()
         self._refresh_shortcuts()
-        QMessageBox.information(self, __app_name__, summary)
+        if not self._closing_pending:
+            QMessageBox.information(self, __app_name__, summary)
 
     def _on_bulk_failed(self, err: str) -> None:
         self._set_steam_busy(False)
-        QMessageBox.critical(self, __app_name__, tr("migrate.error", err=err))
+        if not self._closing_pending:
+            QMessageBox.critical(self, __app_name__, tr("migrate.error", err=err))
 
 
 def _qt_message_handler(mode, context, message: str) -> None:

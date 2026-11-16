@@ -359,7 +359,7 @@ class StandaloneAndVdfTests(unittest.TestCase):
             active_prefix = prefixes_dir / "ActiveGame"
             (active_prefix / "drive_c" / "users").mkdir(parents=True)
             (active_game_dir / ".deckinstall_standalone.json").write_text(
-                f'{{"name": "ActiveGame", "prefix_dir": "{active_prefix}"}}',
+                f'{{"name": "ActiveGame", "exe_path": "{active_game_dir / "game.exe"}", "prefix_dir": "{active_prefix}"}}',
                 encoding="utf-8",
             )
 

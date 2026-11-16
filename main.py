@@ -24,7 +24,7 @@ try:
     _handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     logging.basicConfig(level=logging.INFO, handlers=[_handler])
 except OSError:
-    pass
+    logging.basicConfig(level=logging.INFO)
 
 SRC_DIR = Path(__file__).resolve().parent / "src"
 if str(SRC_DIR) not in sys.path:

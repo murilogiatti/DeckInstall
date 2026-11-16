@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import struct
 import subprocess
 import tempfile
@@ -23,9 +24,11 @@ from pathlib import Path
 
 import vdf
 
+from .extractor import check_disk_space
 from .scanner import clean_game_name, detect_steam_appid
 from .steam_paths import (
     SteamPaths,
+    _read_compat_tool_id,
     find_default_proton_name,
     is_flatpak_steam,
     is_steam_running,
@@ -99,6 +102,16 @@ def compute_shortcut_appid(exe_quoted: str, app_name: str) -> tuple[int, int]:
 def s32_to_u32(val: int) -> int:
     """Convert signed 32-bit VDF int to unsigned 32-bit AppID."""
     return val & 0xFFFFFFFF
+
+
+def _parse_appid_u32(raw_appid: object) -> int | None:
+    """Safely parse a VDF appid value into an unsigned 32-bit AppID, or None if malformed."""
+    if isinstance(raw_appid, bool):
+        return None
+    try:
+        return s32_to_u32(int(raw_appid))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
 
 
 def _quote_path(path: str) -> str:
@@ -316,7 +329,10 @@ def add_or_update_shortcut(
             if not isinstance(item, dict):
                 continue
             item_name = str(item.get("AppName") or item.get("appname") or "")
-            item_u32 = s32_to_u32(int(item.get("appid", 0)))
+            item_u32 = _parse_appid_u32(item.get("appid", 0))
+            if item_u32 is None:
+                filtered.append(item)
+                continue
             if preserve_from_appid is not None and item_u32 == preserve_from_appid:
                 existing_meta = dict(item)
                 continue
@@ -384,7 +400,16 @@ def add_or_update_shortcut(
             new_compat = paths.compatdata_dir / str(appid_u32)
             for old_id in stale_appids:
                 old_compat = paths.compatdata_dir / str(old_id)
-                if old_compat.is_dir() and not old_compat.is_symlink() and not new_compat.exists():
+                if new_compat.is_symlink() and not new_compat.exists():
+                    try:
+                        new_compat.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                if (
+                    old_compat.is_dir()
+                    and not old_compat.is_symlink()
+                    and not (new_compat.exists() or new_compat.is_symlink())
+                ):
                     used_by_other = False
                     for uid in list_steam_users(paths.steam_root):
                         if uid == paths.user_id:
@@ -438,7 +463,8 @@ def update_shortcut_launch_options(
         for item in shortcuts.values():
             if not isinstance(item, dict):
                 continue
-            if s32_to_u32(int(item.get("appid", 0))) == appid_u32:
+            item_u32 = _parse_appid_u32(item.get("appid", 0))
+            if item_u32 is not None and item_u32 == appid_u32:
                 item["LaunchOptions"] = launch_options
                 updated = True
                 break
@@ -463,8 +489,8 @@ def remove_shortcut(paths: SteamPaths, appid_u32: int) -> bool:
         for item in shortcuts.values():
             if not isinstance(item, dict):
                 continue
-            item_u32 = s32_to_u32(int(item.get("appid", 0)))
-            if item_u32 == appid_u32:
+            item_u32 = _parse_appid_u32(item.get("appid", 0))
+            if item_u32 is not None and item_u32 == appid_u32:
                 removed = True
                 continue
             kept.append(item)
@@ -830,14 +856,77 @@ def _has_proton_mapping(
         return False
 
 
+def _dir_has_game_exe(directory: Path, max_depth: int = 3) -> bool:
+    """Return True if directory contains a .exe or .bat file within max_depth levels."""
+    stack: list[tuple[Path, int]] = [(directory, 0)]
+    while stack:
+        cur, depth = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    name_low = entry.name.lower()
+                    if entry.is_file(follow_symlinks=False):
+                        if name_low.endswith((".exe", ".bat")):
+                            return True
+                    elif (
+                        depth + 1 < max_depth
+                        and entry.is_dir(follow_symlinks=False)
+                        and not entry.name.startswith(".")
+                        and name_low != "drive_c"
+                    ):
+                        stack.append((Path(entry.path), depth + 1))
+        except OSError:
+            continue
+    return False
+
+
+def _looks_like_multi_game_container(directory: Path) -> bool:
+    """Return True if directory is a Syncthing root or contains multiple game subfolders."""
+    try:
+        if (directory / ".stfolder").exists() or (directory / ".stfolder").is_symlink():
+            return True
+    except OSError:
+        pass
+    game_subdirs = 0
+    try:
+        with os.scandir(directory) as it:
+            for entry in it:
+                if entry.name.startswith(".") or not entry.is_dir(follow_symlinks=False):
+                    continue
+                low = entry.name.lower()
+                if low in _SUBDIR_NAMES or low in _FORBIDDEN_ROOT_NAMES:
+                    continue
+                if _dir_has_game_exe(Path(entry.path)):
+                    game_subdirs += 1
+                    if game_subdirs >= 2:
+                        return True
+    except OSError:
+        return False
+    return False
+
+
 def infer_game_root_from_exe(exe_path: Path) -> Path:
     """Infer the top-level game folder from an executable path."""
     home = Path.home()
     known_containers = {
-        home.resolve(),
-        (home / "Games").resolve(),
-        (home / "Downloads").resolve(),
-        (home / "Syncthing").resolve(),
+        p.resolve()
+        for p in (
+            home,
+            home / "Games",
+            home / "Downloads",
+            home / "Syncthing",
+            home / "Desktop",
+            home / "Documents",
+            home / "Music",
+            home / "Pictures",
+            home / "Videos",
+            home / "Public",
+            home / "Templates",
+            Path("/tmp"),
+            Path("/var/tmp"),
+            Path("/mnt"),
+            Path("/media"),
+        )
     }
     resolved = exe_path.resolve()
     if any(part.lower() == "drive_c" for part in resolved.parts):
@@ -845,14 +934,21 @@ def infer_game_root_from_exe(exe_path: Path) -> Path:
             f"O executável está dentro de um prefixo Wine (drive_c): {resolved}. "
             "Mova o jogo para uma pasta própria antes de migrar."
         )
-    if resolved.parent in known_containers:
+    if resolved.parent in known_containers or _looks_like_multi_game_container(resolved.parent):
         raise ValueError(
             f"O executável está solto diretamente em {resolved.parent}; "
             "coloque-o dentro de uma subpasta própria antes de migrar."
         )
+    tmp_containers = {Path("/tmp").resolve(), Path("/var/tmp").resolve()}
     candidate = resolved.parent
     for parent in resolved.parents:
-        if parent.parent in known_containers:
+        if parent.parent in tmp_containers:
+            rel_parts = resolved.relative_to(parent).parts
+            if len(rel_parts) == 1 or rel_parts[0].lower() in _SUBDIR_NAMES:
+                candidate = parent
+                break
+            continue
+        if parent.parent in known_containers or _looks_like_multi_game_container(parent.parent):
             candidate = parent
             break
         if (
@@ -867,13 +963,18 @@ def infer_game_root_from_exe(exe_path: Path) -> Path:
             candidate.name.lower() in _SUBDIR_NAMES
             and candidate.parent != candidate
             and candidate.parent not in known_containers
+            and not _looks_like_multi_game_container(candidate.parent)
             and not (
                 len(candidate.parent.parts) <= 4
                 and candidate.parent.parts[:3] == ("/", "run", "media")
             )
         ):
             candidate = candidate.parent
-    if candidate.name.lower() in _FORBIDDEN_ROOT_NAMES or candidate in known_containers:
+    if (
+        candidate.name.lower() in _FORBIDDEN_ROOT_NAMES
+        or candidate in known_containers
+        or _looks_like_multi_game_container(candidate)
+    ):
         raise ValueError(f"Raiz inferida inválida ou protegida para migração: {candidate}")
     return candidate
 
@@ -927,6 +1028,7 @@ def migrate_shortcut_to_games(
     shortcuts_snap: bytes | None = None
     config_snap: bytes | None = None
     moved_root = False
+    attempted_move_root = False
     moved_compat_pair: tuple[Path, Path] | None = None
     copied_compat_dst: Path | None = None
     backed_compat_pair: tuple[Path, Path] | None = None
@@ -939,6 +1041,13 @@ def migrate_shortcut_to_games(
             if old_root.resolve() != new_root.resolve():
                 if new_root.exists():
                     raise FileExistsError(f"Destination folder already exists: {new_root}")
+                try:
+                    same_dev = old_root.stat().st_dev == games_root.stat().st_dev
+                except OSError:
+                    same_dev = False
+                if not same_dev:
+                    check_disk_space(games_root, _dir_size_bytes(old_root))
+                attempted_move_root = True
                 shutil.move(str(old_root), str(new_root))
                 moved_root = True
             new_appid = add_or_update_shortcut(
@@ -1002,11 +1111,13 @@ def migrate_shortcut_to_games(
                         if any(e.appid_u32 == entry.appid_u32 for e in load_shortcuts(other_sv)):
                             used_by_other = True
                             break
-                    if new_compat.exists():
+                    if new_compat.is_symlink() and not new_compat.exists():
+                        new_compat.unlink(missing_ok=True)
+                    elif new_compat.exists() or new_compat.is_symlink():
                         stamp = time.strftime("%Y%m%d-%H%M%S")
                         backup_compat = paths.compatdata_dir / f"{new_appid}.{stamp}.deckinstall.bak"
                         counter = 1
-                        while backup_compat.exists():
+                        while backup_compat.exists() or backup_compat.is_symlink():
                             backup_compat = paths.compatdata_dir / f"{new_appid}.{stamp}.{counter}.deckinstall.bak"
                             counter += 1
                         shutil.move(str(new_compat), str(backup_compat))
@@ -1030,7 +1141,7 @@ def migrate_shortcut_to_games(
                                 shutil.move(str(art_file), str(dest_art))
                                 moved_art_pairs.append((dest_art, art_file))
 
-                remove_shortcut(paths, entry.appid_u32)
+                remove_compat_tool(paths.config_vdf, entry.appid_u32)
     except Exception:
         for dst_a, src_a in reversed(moved_art_pairs):
             try:
@@ -1048,7 +1159,11 @@ def migrate_shortcut_to_games(
                 shutil.move(str(moved_compat_pair[0]), str(moved_compat_pair[1]))
             except OSError:
                 pass
-        if backed_compat_pair and backed_compat_pair[0].exists() and not backed_compat_pair[1].exists():
+        if (
+            backed_compat_pair
+            and (backed_compat_pair[0].exists() or backed_compat_pair[0].is_symlink())
+            and not (backed_compat_pair[1].exists() or backed_compat_pair[1].is_symlink())
+        ):
             try:
                 shutil.move(str(backed_compat_pair[0]), str(backed_compat_pair[1]))
             except OSError:
@@ -1071,6 +1186,19 @@ def migrate_shortcut_to_games(
                 shutil.move(str(new_root), str(old_root))
             except OSError:
                 logging.exception("Rollback failed moving %s back to %s", new_root, old_root)
+        elif (
+            not moved_root
+            and attempted_move_root
+            and new_root.resolve() != old_root.resolve()
+            and new_root.exists()
+        ):
+            try:
+                if new_root.is_symlink() or new_root.is_file():
+                    new_root.unlink(missing_ok=True)
+                else:
+                    shutil.rmtree(new_root)
+            except OSError:
+                logging.exception("Rollback failed cleaning up partial %s", new_root)
         raise
 
     steam_appid = detect_steam_appid(new_root)
@@ -2110,6 +2238,27 @@ def find_cleanup_candidates(
                             pass
         except OSError:
             pass
+    apps_dir = data_home / "applications"
+    if apps_dir.is_dir():
+        try:
+            for desktop_file in apps_dir.glob("deckinstall-*.desktop"):
+                if desktop_file.is_symlink() or not desktop_file.is_file():
+                    continue
+                try:
+                    for line in desktop_file.read_text(encoding="utf-8", errors="replace").splitlines():
+                        if line.startswith("Path="):
+                            gdir_path = Path(line.split("=", 1)[1].strip().strip('"')).expanduser()
+                            manifest = gdir_path / ".deckinstall_standalone.json"
+                            if manifest.is_file():
+                                mdata = json.loads(manifest.read_text(encoding="utf-8", errors="replace"))
+                                p_raw = mdata.get("prefix_dir")
+                                if p_raw:
+                                    standalone_prefix_paths.add(Path(str(p_raw)).resolve())
+                            break
+                except Exception:
+                    pass
+        except OSError:
+            pass
 
     if extra_external_roots is not None:
         roots = list(extra_external_roots)
@@ -2465,7 +2614,8 @@ def find_cleanup_candidates(
             for child in compat_dir.iterdir():
                 if child.is_symlink() or not child.is_dir():
                     continue
-                if child.name in active_tools:
+                tool_id = _read_compat_tool_id(child / "compatibilitytool.vdf", child.name)
+                if child.name in active_tools or tool_id in active_tools:
                     continue
                 is_old_umu = child.name.startswith("UMU-Proton-")
                 is_old_ge = False
@@ -2842,6 +2992,8 @@ def _safe_parents_within(base_dir: Path, base_resolved: Path, rel_parts: tuple[s
 
 def restore_saves_backup(paths: SteamPaths, zip_path: Path) -> tuple[int, int]:
     """Restore saves from a DeckInstall ZIP backup into matching Steam compatdata folders."""
+    from .standalone import list_standalone_games
+
     with _steam_transaction_lock(paths.shortcuts_vdf):
         entries = load_shortcuts(paths.shortcuts_vdf)
         active_ids = {str(e.appid_u32) for e in entries}
@@ -2852,6 +3004,26 @@ def restore_saves_backup(paths: SteamPaths, zip_path: Path) -> tuple[int, int]:
             if nk:
                 norm_counts.setdefault(nk, []).append(str(e.appid_u32))
         by_norm = {nk: ids[0] for nk, ids in norm_counts.items() if len(ids) == 1}
+
+        standalone_games = list_standalone_games()
+        standalone_by_key: dict[str, Path] = {}
+        standalone_by_exact: dict[str, Path] = {}
+        standalone_norm_counts: dict[str, list[Path]] = {}
+        for sgame in standalone_games:
+            slug_base = re.sub(r"[^a-zA-Z0-9._-]+", "-", sgame.game_dir.name).strip("-") or "game"
+            skey = f"standalone-{slug_base}"
+            idx = 2
+            while skey in standalone_by_key:
+                skey = f"standalone-{slug_base}-{idx}"
+                idx += 1
+            standalone_by_key[skey] = sgame.prefix_dir
+            standalone_by_exact[sgame.name] = sgame.prefix_dir
+            snk = _norm_key(sgame.name)
+            if snk:
+                standalone_norm_counts.setdefault(snk, []).append(sgame.prefix_dir)
+        standalone_by_norm = {
+            nk: pdirs[0] for nk, pdirs in standalone_norm_counts.items() if len(pdirs) == 1
+        }
 
         paths.compatdata_dir.mkdir(parents=True, exist_ok=True)
         compat_root_resolved = paths.compatdata_dir.resolve()
@@ -2887,36 +3059,67 @@ def restore_saves_backup(paths: SteamPaths, zip_path: Path) -> tuple[int, int]:
             for info in infolist:
                 if info.is_dir() or info.filename == "manifest.json":
                     continue
-                parts = Path(info.filename).parts
-                if (
-                    len(parts) < 3
-                    or not (parts[0].isascii() and parts[0].isdigit())
-                    or parts[1] not in ("users", "ProgramData")
-                ):
+                if stat.S_ISLNK((info.external_attr >> 16) & 0o170000):
                     continue
-                appid_str = parts[0]
-                if appid_str not in active_ids:
-                    if manifest:
-                        old_name = manifest.get(appid_str, "")
-                        mapped = by_exact.get(old_name) or by_norm.get(_norm_key(old_name))
-                        if not mapped:
-                            continue
-                        appid_str = mapped
-                    else:
-                        continue
+                parts = Path(info.filename).parts
+                if len(parts) < 3 or parts[1] not in ("users", "ProgramData"):
+                    continue
+                prefix_key = parts[0]
                 section = parts[1]
                 rel_parts = parts[2:]
                 if any(p in ("..", "", ".") for p in rel_parts):
                     continue
                 if info.file_size > _RESTORE_MAX_FILE_BYTES:
                     raise RuntimeError(f"Backup file too large: {info.filename}")
-                prefix_rel = (appid_str, "pfx", "drive_c", section, *rel_parts[:-1])
-                if not _safe_parents_within(paths.compatdata_dir, compat_root_resolved, prefix_rel):
+
+                if prefix_key.isascii() and prefix_key.isdigit():
+                    appid_str = prefix_key
+                    if appid_str not in active_ids:
+                        if manifest:
+                            old_name = manifest.get(appid_str, "")
+                            mapped = by_exact.get(old_name) or by_norm.get(_norm_key(old_name))
+                            if not mapped:
+                                continue
+                            appid_str = mapped
+                        else:
+                            continue
+                    target_root = paths.compatdata_dir
+                    target_root_resolved = compat_root_resolved
+                    target_prefix = paths.compatdata_dir / appid_str
+                    pfx_rel: tuple[str, ...] = ("pfx", "drive_c")
+                    prefix_rel = (appid_str, *pfx_rel, section, *rel_parts[:-1])
+                    game_id_key = appid_str
+                elif prefix_key.startswith("standalone-"):
+                    sprefix = standalone_by_key.get(prefix_key)
+                    if sprefix is None and manifest:
+                        old_name = manifest.get(prefix_key, "")
+                        sprefix = standalone_by_exact.get(old_name) or standalone_by_norm.get(
+                            _norm_key(old_name)
+                        )
+                    if sprefix is None or not sprefix.is_dir() or sprefix.is_symlink():
+                        continue
+                    target_root = sprefix
+                    try:
+                        target_root_resolved = sprefix.resolve()
+                    except OSError:
+                        continue
+                    target_prefix = sprefix
+                    pfx_rel = (
+                        ("pfx", "drive_c")
+                        if (sprefix / "pfx" / "drive_c").is_dir()
+                        else ("drive_c",)
+                    )
+                    prefix_rel = (*pfx_rel, section, *rel_parts[:-1])
+                    game_id_key = prefix_key
+                else:
                     continue
-                dst_base = paths.compatdata_dir / appid_str / "pfx" / "drive_c" / section
+
+                if not _safe_parents_within(target_root, target_root_resolved, prefix_rel):
+                    continue
+                dst_base = target_prefix.joinpath(*pfx_rel, section)
                 dst_base.mkdir(parents=True, exist_ok=True)
                 dst_base_resolved = dst_base.resolve()
-                if not dst_base_resolved.is_relative_to(compat_root_resolved):
+                if not dst_base_resolved.is_relative_to(target_root_resolved):
                     continue
                 target = dst_base.joinpath(*rel_parts)
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -2928,7 +3131,7 @@ def restore_saves_backup(paths: SteamPaths, zip_path: Path) -> tuple[int, int]:
                     _backup_file(
                         target,
                         keep=3,
-                        backup_dir=paths.compatdata_dir / appid_str / ".deckinstall_bak",
+                        backup_dir=target_prefix / ".deckinstall_bak",
                     )
                     backed_up_targets.add(target)
                 fd, tmp_name = tempfile.mkstemp(
@@ -2952,7 +3155,7 @@ def restore_saves_backup(paths: SteamPaths, zip_path: Path) -> tuple[int, int]:
                     except OSError:
                         pass
                     raise
-                restored_games.add(appid_str)
+                restored_games.add(game_id_key)
                 restored_files += 1
         return len(restored_games), restored_files
 
@@ -3079,17 +3282,37 @@ def _is_env_assignment(tok: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k))
 
 
+def _is_clean_single_quoted(s: str) -> bool:
+    return len(s) >= 2 and s[0] == "'" and s[-1] == "'" and "'" not in s[1:-1]
+
+
+def _is_clean_double_quoted(s: str) -> bool:
+    return (
+        len(s) >= 2
+        and s[0] == '"'
+        and s[-1] == '"'
+        and not any(ch in s[1:-1] for ch in ('"', "$", "`", "\\"))
+    )
+
+
 def _format_launch_token(tok: str) -> str:
     if tok in _SHELL_OPS:
-        return tok
-    if ('"' in tok or "'" in tok) and "`" not in tok and "$(" not in tok:
         return tok
     if _is_env_assignment(tok):
         k, v = tok.split("=", 1)
         if "$" in v and _SAFE_UNQUOTED_DOLLAR_RE.fullmatch(v) and "`" not in v and "$(" not in v:
             return f"{k}={v}"
+        if _is_clean_single_quoted(v) or _is_clean_double_quoted(v):
+            return f"{k}={v}"
         return f"{k}={shlex.quote(v)}"
+    for redir in (">>", ">", "<"):
+        if tok.startswith(redir) and len(tok) > len(redir):
+            rest = tok[len(redir):]
+            if _is_clean_single_quoted(rest) or _is_clean_double_quoted(rest):
+                return tok
     if "$" in tok and _SAFE_UNQUOTED_DOLLAR_RE.fullmatch(tok) and "`" not in tok and "$(" not in tok:
+        return tok
+    if _is_clean_single_quoted(tok) or _is_clean_double_quoted(tok):
         return tok
     return shlex.quote(tok)
 
