@@ -67,6 +67,7 @@ class OptiScalerState:
     fg_mode: str = "auto"
     spoof_mode: str = "auto"
     overlay_menu: bool = True
+    prefix_snapshot: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,20 @@ def _atomic_write_text(path: Path, content: str) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_copy_file(src: Path, dst: Path) -> None:
+    """Atomically copy src to dst via a temporary file in dst.parent."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=str(dst.parent))
+    os.close(fd)
+    tmp = Path(tmp_name)
+    try:
+        shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
     except Exception:
         tmp.unlink(missing_ok=True)
         raise
@@ -172,6 +187,12 @@ def inspect_optiscaler_state(exe_path: Path) -> OptiScalerState | None:
         if isinstance(overlay_raw, bool)
         else str(overlay_raw).strip().lower() not in ("false", "0", "no")
     )
+    raw_snapshot = data.get("prefix_snapshot")
+    prefix_snapshot = (
+        Path(raw_snapshot.strip())
+        if isinstance(raw_snapshot, str) and raw_snapshot.strip()
+        else None
+    )
     return OptiScalerState(
         proxy_dll=proxy_dll,
         backend=backend,
@@ -183,6 +204,7 @@ def inspect_optiscaler_state(exe_path: Path) -> OptiScalerState | None:
         fg_mode=fg_mode,
         spoof_mode=spoof_mode,
         overlay_menu=overlay_menu,
+        prefix_snapshot=prefix_snapshot,
     )
 
 
@@ -312,6 +334,49 @@ def _backup_if_needed(
         backed_up_files.append(target_path)
 
 
+def _backup_optiscaler_ini_variants(
+    exe_dir: Path,
+    managed_paths: set[Path],
+    backed_up_files: list[Path],
+) -> None:
+    """Back up any case-variant optiscaler.ini files as well as OptiScaler.ini."""
+    try:
+        entries = list(exe_dir.iterdir())
+    except OSError:
+        entries = []
+    for p in entries:
+        if p.name.lower() == "optiscaler.ini" and p.name != "OptiScaler.ini":
+            _backup_if_needed(p, managed_paths, backed_up_files)
+    _backup_if_needed(exe_dir / "OptiScaler.ini", managed_paths, backed_up_files)
+
+
+def _write_patched_ini(
+    exe_dir: Path,
+    ini_raw: str,
+    *,
+    backend: str,
+    fg_mode: str,
+    spoof_mode: str,
+    overlay_menu: bool,
+    managed_paths: set[Path],
+    backed_up_files: list[Path],
+) -> Path:
+    """Back up any existing OptiScaler.ini (including case variants) and write patched INI."""
+    _backup_optiscaler_ini_variants(exe_dir, managed_paths, backed_up_files)
+    dst_ini = exe_dir / "OptiScaler.ini"
+    if dst_ini.is_symlink():
+        dst_ini.unlink()
+    patched_ini = patch_optiscaler_ini(
+        ini_raw,
+        backend=backend,
+        fg_mode=fg_mode,
+        spoof_mode=spoof_mode,
+        overlay_menu=overlay_menu,
+    )
+    _atomic_write_text(dst_ini, patched_ini)
+    return dst_ini
+
+
 def install_optiscaler_for_game(
     exe_path: Path,
     proxy_dll: str = "dxgi",
@@ -322,6 +387,8 @@ def install_optiscaler_for_game(
     fg_mode: str = "auto",
     spoof_mode: str = "auto",
     overlay_menu: bool = True,
+    prefix_dir: Path | None = None,
+    game_name: str = "",
 ) -> OptiScalerState:
     """Install OptiScaler alongside a Windows game executable."""
     if proxy_dll not in OPTISCALER_PROXY_DLLS:
@@ -377,11 +444,36 @@ def install_optiscaler_for_game(
                 raise OptiScalerConflictError(target_proxy_path)
             _backup_if_needed(target_proxy_path, managed_paths, backed_up_files)
 
+    prefix_snapshot: Path | None = (
+        existing_state.prefix_snapshot if existing_state is not None else None
+    )
+    if prefix_dir is not None and prefix_dir.is_dir():
+        from .save_sync import snapshot_prefix_state
+
+        snap = snapshot_prefix_state(
+            prefix_dir,
+            game_name or exe_path.stem,
+            "pre-optiscaler",
+        )
+        if snap is not None:
+            prefix_snapshot = snap.snapshot_zip
+
     # Remove stale files from a previous DeckInstall OptiScaler install (e.g. proxy DLL change)
     if existing_state is not None:
         for old_file in existing_state.installed_files:
             if old_file.is_file() or old_file.is_symlink():
                 old_file.unlink(missing_ok=True)
+        if existing_state.proxy_dll != proxy_dll:
+            prior_proxy_path = exe_dir / f"{existing_state.proxy_dll}.dll"
+            prior_backup = prior_proxy_path.with_name(f"{prior_proxy_path.name}.deckinstall.bak")
+            if (
+                prior_backup.is_file()
+                and not prior_backup.is_symlink()
+                and not prior_proxy_path.exists()
+                and not prior_proxy_path.is_symlink()
+            ):
+                os.replace(prior_backup, prior_proxy_path)
+                backed_up_files = [p for p in backed_up_files if p != prior_proxy_path]
 
     installed_files: list[Path] = []
     saw_ini = False
@@ -406,50 +498,52 @@ def install_optiscaler_for_game(
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
                 if dst_file.is_symlink():
                     dst_file.unlink()
-                shutil.copy2(src_file, dst_file)
+                _atomic_copy_file(src_file, dst_file)
                 installed_files.append(dst_file)
                 continue
 
             if is_payload_root and low_name == "optiscaler.ini":
                 saw_ini = True
                 ini_raw = src_file.read_text(encoding="utf-8", errors="replace")
-                patched_ini = patch_optiscaler_ini(
+                dst_ini = _write_patched_ini(
+                    exe_dir,
                     ini_raw,
                     backend=backend,
                     fg_mode=fg_mode,
                     spoof_mode=spoof_mode,
                     overlay_menu=overlay_menu,
+                    managed_paths=managed_paths,
+                    backed_up_files=backed_up_files,
                 )
-                dst_ini = exe_dir / "OptiScaler.ini"
-                _backup_if_needed(dst_ini, managed_paths, backed_up_files)
-                if dst_ini.is_symlink():
-                    dst_ini.unlink()
-                _atomic_write_text(dst_ini, patched_ini)
                 installed_files.append(dst_ini)
                 continue
 
+            cur = exe_dir
+            for part in rel_dir.parts:
+                cur = cur / part
+                if cur.is_symlink():
+                    raise RuntimeError(f"Unsafe symlink in destination path: {cur}")
+            target_dir = (exe_dir / rel_dir).resolve()
+            if not target_dir.is_relative_to(exe_dir):
+                raise RuntimeError(f"Destination directory escapes game folder: {target_dir}")
             dst_file = exe_dir / rel_dir / fname
             dst_file.parent.mkdir(parents=True, exist_ok=True)
             _backup_if_needed(dst_file, managed_paths, backed_up_files)
             if dst_file.is_symlink():
                 dst_file.unlink()
-            shutil.copy2(src_file, dst_file)
+            _atomic_copy_file(src_file, dst_file)
             installed_files.append(dst_file)
 
     if not saw_ini:
-        dst_ini = exe_dir / "OptiScaler.ini"
-        _backup_if_needed(dst_ini, managed_paths, backed_up_files)
-        if dst_ini.is_symlink():
-            dst_ini.unlink()
-        _atomic_write_text(
-            dst_ini,
-            patch_optiscaler_ini(
-                "",
-                backend=backend,
-                fg_mode=fg_mode,
-                spoof_mode=spoof_mode,
-                overlay_menu=overlay_menu,
-            ),
+        dst_ini = _write_patched_ini(
+            exe_dir,
+            "",
+            backend=backend,
+            fg_mode=fg_mode,
+            spoof_mode=spoof_mode,
+            overlay_menu=overlay_menu,
+            managed_paths=managed_paths,
+            backed_up_files=backed_up_files,
         )
         installed_files.append(dst_ini)
 
@@ -470,6 +564,7 @@ def install_optiscaler_for_game(
         fg_mode=fg_mode,
         spoof_mode=spoof_mode,
         overlay_menu=overlay_menu,
+        prefix_snapshot=prefix_snapshot,
     )
 
     manifest_data = {
@@ -483,6 +578,7 @@ def install_optiscaler_for_game(
         "fg_mode": state.fg_mode,
         "spoof_mode": state.spoof_mode,
         "overlay_menu": state.overlay_menu,
+        "prefix_snapshot": str(state.prefix_snapshot) if state.prefix_snapshot is not None else None,
     }
     _atomic_write_text(
         exe_dir / OPTISCALER_MANIFEST,

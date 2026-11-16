@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -45,15 +46,51 @@ def _strip_yaml_comment(line: str) -> str:
 
 
 def _unquote_yaml_scalar(value: str) -> str:
-    """Strip surrounding matching quotes and normalize null-like YAML scalars."""
+    """Strip surrounding matching quotes, unescape scalars, and normalize null-like values."""
     val = value.strip()
-    if len(val) >= 2 and (
-        (val[0] == '"' and val[-1] == '"') or (val[0] == "'" and val[-1] == "'")
-    ):
-        return val[1:-1]
+    if len(val) >= 2 and val[0] == "'" and val[-1] == "'":
+        return val[1:-1].replace("''", "'")
+    if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
+        inner = val[1:-1]
+        out: list[str] = []
+        i = 0
+        while i < len(inner):
+            if inner[i] == "\\" and i + 1 < len(inner) and inner[i + 1] in ('"', "\\"):
+                out.append(inner[i + 1])
+                i += 2
+                continue
+            out.append(inner[i])
+            i += 1
+        return "".join(out)
     if val.lower() in ("null", "~"):
         return ""
     return val
+
+
+def _split_yaml_key_value(line: str) -> tuple[str, str] | None:
+    """Split a YAML mapping line on ':' only when followed by whitespace or end-of-line."""
+    in_single = False
+    in_double = False
+    escaped = False
+    n = len(line)
+    for idx, ch in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\" and in_double:
+            escaped = True
+            continue
+        if ch == "'" and not in_double:
+            if in_single and idx + 1 < n and line[idx + 1] == "'":
+                escaped = True
+                continue
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        elif ch == ":" and not in_single and not in_double:
+            if idx + 1 == n or line[idx + 1].isspace():
+                return line[:idx], line[idx + 1 :]
+    return None
 
 
 def _parse_simple_yaml(text: str) -> dict[str, Any]:
@@ -69,12 +106,13 @@ def _parse_simple_yaml(text: str) -> dict[str, Any]:
         if stripped.startswith("- "):
             # Skip YAML list items gracefully without breaking parent mapping.
             continue
-        if ":" not in stripped:
+        split = _split_yaml_key_value(stripped)
+        if split is None:
             continue
 
         indent = len(cleaned) - len(stripped)
-        key, _, rest = stripped.partition(":")
-        key = _unquote_yaml_scalar(key)
+        raw_key, rest = split
+        key = _unquote_yaml_scalar(raw_key)
         if not key:
             continue
         val_str = rest.strip()
@@ -229,7 +267,8 @@ def _scan_lutris(home: Path) -> list[ExternalLauncherGame]:
             continue
         conn: sqlite3.Connection | None = None
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            db_uri = f"file:{urllib.parse.quote(str(db_path))}?mode=ro"
+            conn = sqlite3.connect(db_uri, uri=True)
             conn.row_factory = sqlite3.Row
             cols_rows = conn.execute("PRAGMA table_info(games)").fetchall()
             cols = {str(r["name"]) for r in cols_rows}
@@ -320,11 +359,25 @@ def _heroic_build_game(
     game_cfg = _heroic_game_config(config_root, app_name)
     exe_candidate = str(game_cfg.get("targetExe") or executable or "").strip()
     base_dir = _resolve_existing_dir(install_path)
+    prefix_dir = _resolve_existing_dir(game_cfg.get("winePrefix"))
+    if len(exe_candidate) >= 3 and exe_candidate[1] == ":" and exe_candidate[2] in ("\\", "/"):
+        drive = exe_candidate[0].upper()
+        rel = exe_candidate[3:].replace("\\", "/").lstrip("/")
+        if drive == "Z":
+            exe_candidate = f"/{rel}"
+        elif drive == "C" and prefix_dir is not None:
+            for dc in (prefix_dir / "drive_c", prefix_dir / "pfx" / "drive_c"):
+                cand = dc / rel
+                if cand.is_file():
+                    exe_candidate = str(cand)
+                    break
+        else:
+            exe_candidate = rel
+    else:
+        exe_candidate = exe_candidate.replace("\\", "/")
     exe_path = _resolve_existing_file(exe_candidate, base_dir=base_dir)
     if exe_path is None:
         return None
-
-    prefix_dir = _resolve_existing_dir(game_cfg.get("winePrefix"))
     runner = _normalize_runner(platform, exe_path)
     name = title.strip() or app_name or exe_path.stem
     if app_name:
@@ -463,13 +516,14 @@ def _scan_heroic(home: Path) -> list[ExternalLauncherGame]:
 
 
 def _resolve_bottles_exe(raw_path: str, bottle_dir: Path) -> Path | None:
-    """Resolve a Bottles External_Programs path (POSIX or C:\\... inside drive_c)."""
+    """Resolve a Bottles External_Programs path (POSIX, Z:\\... -> /, or C:\\... -> drive_c)."""
     val = raw_path.strip()
     if not val:
         return None
     if len(val) >= 3 and val[1] == ":" and val[2] in ("\\", "/"):
+        drive = val[0].upper()
         rel = val[3:].replace("\\", "/").lstrip("/")
-        cand = bottle_dir / "drive_c" / rel
+        cand = Path("/") / rel if drive == "Z" else bottle_dir / "drive_c" / rel
         return cand if cand.is_file() else None
     return _resolve_existing_file(val)
 

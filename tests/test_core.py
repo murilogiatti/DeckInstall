@@ -46,7 +46,6 @@ from deckinstall.steam_vdf import (  # noqa: E402
     _backup_file,
     _rewrite_launch_options,
     compute_shortcut_appid,
-    delete_cleanup_candidates,
     find_cleanup_candidates,
     import_external_prefix_saves,
     import_hydra_umu_saves,
@@ -55,7 +54,6 @@ from deckinstall.steam_vdf import (  # noqa: E402
     plan_bulk_migration,
     sync_all_external_saves,
 )
-
 
 _ORIG_UNRAISABLE_HOOK = None
 _UNRAISABLE_ERRORS: list[str] = []
@@ -444,12 +442,16 @@ class CoreTests(unittest.TestCase):
             with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[active_entry]):
                 cands = find_cleanup_candidates(paths, extra_external_roots=[ext_root])
 
-            cand_paths = {c.path for c in cands}
-            self.assertEqual(cand_paths, {orphan, bak, ext_pfx})
-            ext_cand = next(c for c in cands if c.path == ext_pfx)
-            self.assertTrue(ext_cand.has_saves)
+                cand_paths = {c.path for c in cands}
+                self.assertEqual(cand_paths, {orphan, bak, ext_pfx})
+                ext_cand = next(c for c in cands if c.path == ext_pfx)
+                self.assertTrue(ext_cand.has_saves)
 
-            deleted, freed = delete_cleanup_candidates([c for c in cands if c.path in (orphan, bak)])
+                from deckinstall.steam_vdf import delete_cleanup_candidates_checked
+
+                deleted, freed, _ = delete_cleanup_candidates_checked(
+                    paths, [c for c in cands if c.path in (orphan, bak)], allow_unverified_saves=True
+                )
             self.assertEqual(deleted, 2)
             self.assertGreaterEqual(freed, 2560)
             self.assertFalse(orphan.exists())
@@ -590,6 +592,7 @@ class CoreTests(unittest.TestCase):
 
     def test_security_fixes_hash_active_prefix_and_shell_assign(self) -> None:
         import subprocess
+
         from deckinstall.steam_vdf import _prefix_saves_verified_in_target
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -915,8 +918,10 @@ class CoreTests(unittest.TestCase):
         en = json.loads(Path(__file__).resolve().parents[1].joinpath("src/deckinstall/locales/en.json").read_text())
         pt = json.loads(Path(__file__).resolve().parents[1].joinpath("src/deckinstall/locales/pt_BR.json").read_text())
         self.assertEqual(set(en.keys()), set(pt.keys()))
-        ui_src = Path(__file__).resolve().parents[1].joinpath("src/deckinstall/ui.py").read_text()
-        used = set(re.findall(r'\btr\(\s*["\']([^"\']+)["\']', ui_src))
+        pkg_dir = Path(__file__).resolve().parents[1].joinpath("src/deckinstall")
+        used: set[str] = set()
+        for py_file in pkg_dir.rglob("*.py"):
+            used.update(re.findall(r'\btr\(\s*["\']([^"\']+)["\']', py_file.read_text()))
         self.assertEqual(sorted(used - set(en.keys())), [])
         self.assertEqual(sorted(set(en.keys()) - used), [])
 
@@ -1228,6 +1233,7 @@ class CoreTests(unittest.TestCase):
     def test_v075_audit_regressions(self) -> None:
         """Cover v0.7.5 security, backend, frontend, i18n, and packaging regressions."""
         import tarfile
+
         from deckinstall.artwork import _is_valid_image_bytes, _validate_appid, fetch_header_preview
         from deckinstall.i18n import tr, tr_plural
         from deckinstall.scanner import default_scan_roots, rank_executables
@@ -1317,9 +1323,10 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(apply_launch_presets("", **_preset_off), "")
         with tempfile.TemporaryDirectory() as tmp:
             troot = Path(tmp)
-            with _steam_transaction_lock(troot / "shortcuts.vdf"):
+            with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(troot)}):
                 with _steam_transaction_lock(troot / "shortcuts.vdf"):
-                    self.assertTrue((troot / ".deckinstall.vdf.lock").exists())
+                    with _steam_transaction_lock(troot / "shortcuts.vdf"):
+                        self.assertTrue(any((troot / "deckinstall").glob(".deckinstall.*.vdf.lock")))
 
             pfx = troot / "pfx"
             (pfx / "drive_c" / "users" / "Default" / "Documents").mkdir(parents=True)

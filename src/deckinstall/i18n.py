@@ -24,6 +24,7 @@ _LANGUAGE_NAMES: dict[str, str] = {
 }
 
 _en_catalog: dict[str, str] = {}
+_en_loaded: bool = False
 _active_catalog: dict[str, str] = {}
 _current_lang: str = DEFAULT_LANG
 
@@ -53,7 +54,15 @@ def available_languages() -> list[tuple[str, str]]:
 
 def detect_system_language() -> str:
     """Detect best matching locale code from environment/system, defaulting to English."""
-    raw = os.environ.get("LC_ALL") or os.environ.get("LANG") or ""
+    language_env = os.environ.get("LANGUAGE", "")
+    first_lang = language_env.split(":", 1)[0].strip() if language_env else ""
+    raw = (
+        first_lang
+        or os.environ.get("LC_ALL")
+        or os.environ.get("LC_MESSAGES")
+        or os.environ.get("LANG")
+        or ""
+    )
     if not raw:
         try:
             raw = locale.getlocale()[0] or ""
@@ -76,9 +85,10 @@ def detect_system_language() -> str:
 
 def set_language(lang: str) -> str:
     """Set active language ('auto' resolves system locale). Returns resolved language code."""
-    global _en_catalog, _active_catalog, _current_lang
-    if not _en_catalog:
+    global _en_catalog, _en_loaded, _active_catalog, _current_lang
+    if not _en_loaded:
         _en_catalog = _load_catalog(DEFAULT_LANG)
+        _en_loaded = True
     resolved = detect_system_language() if lang == "auto" else lang
     catalog = _load_catalog(resolved)
     if not catalog and resolved != DEFAULT_LANG:
@@ -96,7 +106,7 @@ def get_language() -> str:
 
 def tr(key: str, **kwargs: object) -> str:
     """Translate key using active locale, falling back to English, then key itself."""
-    if not _en_catalog:
+    if not _en_loaded:
         set_language(DEFAULT_LANG)
     if key in _active_catalog:
         text = _active_catalog[key]
@@ -112,11 +122,19 @@ def tr(key: str, **kwargs: object) -> str:
     return text
 
 
+def _plural_suffix(lang: str, count: int) -> str:
+    if lang in ("ja", "zh_CN"):
+        return "_other"
+    if lang in ("pt_BR", "fr"):
+        return "_one" if count in (0, 1) else "_other"
+    return "_one" if count == 1 else "_other"
+
+
 def tr_plural(key: str, count: int, **kwargs: object) -> str:
     """Translate a count-aware key using _one/_other variants when available."""
-    if not _en_catalog:
+    if not _en_loaded:
         set_language(DEFAULT_LANG)
-    suffix = "_one" if count == 1 else "_other"
+    suffix = _plural_suffix(_current_lang, count)
     variant = f"{key}{suffix}"
     if variant in _active_catalog or variant in _en_catalog:
         return tr(variant, count=count, **kwargs)

@@ -33,7 +33,15 @@ jobs:
       - name: Install system graphics and build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1-mesa-dev patchelf librsvg2-bin desktop-file-utils
+          sudo apt-get install -y libegl1 libgl1-mesa-dev patchelf librsvg2-bin desktop-file-utils ccache
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ${{ runner.os }}-ccache-${{ hashFiles('requirements.txt', 'src/**/*.py', 'main.py') }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-
 
       - name: Install Python dependencies and Nuitka
         run: |
@@ -70,6 +78,10 @@ jobs:
             --include-package=deckinstall \
             --include-data-dir=src/deckinstall/locales=locales \
             --include-data-dir=assets=assets \
+            --lto=yes \
+            --python-flag=no_site \
+            --jobs=$(nproc) \
+            --nofollow-import-to=tkinter,unittest,pytest,ruff,mypy,pip,setuptools \
             --output-dir=build \
             --output-filename=deckinstall \
             main.py

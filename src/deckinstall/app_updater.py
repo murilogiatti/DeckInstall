@@ -11,9 +11,9 @@ import subprocess
 import sys
 import tempfile
 import urllib.parse
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 import requests
 
@@ -45,6 +45,39 @@ def _validate_github_url(url: str) -> str:
     if parsed.scheme.lower() != "https" or host not in _ALLOWED_URL_HOSTS:
         raise ValueError(f"Disallowed update URL (must be HTTPS on GitHub): {url!r}")
     return cleaned
+
+
+def _request_github_with_validated_redirects(
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout: float,
+    stream: bool = False,
+    max_redirects: int = 5,
+) -> requests.Response:
+    """Perform a GET request validating every redirect hop against _ALLOWED_URL_HOSTS."""
+    current_url = _validate_github_url(url)
+    for _ in range(max_redirects + 1):
+        resp = requests.get(
+            current_url,
+            headers=headers,
+            timeout=timeout,
+            stream=stream,
+            allow_redirects=False,
+        )
+        status = getattr(resp, "status_code", 200)
+        is_redir = (getattr(resp, "is_redirect", False) is True) or (
+            isinstance(status, int) and status in (301, 302, 303, 307, 308)
+        )
+        if is_redir:
+            location = (getattr(resp, "headers", None) or {}).get("Location") or ""
+            resp.close()
+            if not location:
+                raise RuntimeError("Redirect response missing Location header.")
+            current_url = _validate_github_url(urllib.parse.urljoin(current_url, location))
+            continue
+        return resp
+    raise RuntimeError("Too many redirects while fetching GitHub resource.")
 
 
 @dataclass(frozen=True)
@@ -146,7 +179,7 @@ def check_app_update(timeout: float = 10.0) -> AppUpdateInfo:
         "User-Agent": f"DeckInstall/{current_version}",
     }
     api_url = _validate_github_url(GITHUB_RELEASES_API)
-    response = requests.get(api_url, headers=headers, timeout=timeout)
+    response = _request_github_with_validated_redirects(api_url, headers=headers, timeout=timeout)
     response.raise_for_status()
     data = response.json()
 
@@ -163,7 +196,11 @@ def check_app_update(timeout: float = 10.0) -> AppUpdateInfo:
     expected_sha256 = _extract_sha256(asset) if asset else ""
 
     release_notes = str(data.get("body") or "")
-    html_url = str(data.get("html_url") or GITHUB_RELEASES_URL)
+    raw_html_url = str(data.get("html_url") or GITHUB_RELEASES_URL)
+    try:
+        html_url = _validate_github_url(raw_html_url)
+    except ValueError:
+        html_url = GITHUB_RELEASES_URL
 
     appimage_path = get_running_appimage()
     is_appimage = appimage_path is not None
@@ -213,7 +250,9 @@ def download_and_replace_appimage(
 
     try:
         headers = {"User-Agent": f"DeckInstall/{info.current_version}"}
-        with requests.get(download_url, headers=headers, stream=True, timeout=60.0) as resp:
+        with _request_github_with_validated_redirects(
+            download_url, headers=headers, stream=True, timeout=60.0
+        ) as resp:
             resp.raise_for_status()
             total_size = int(resp.headers.get("Content-Length") or 0)
             downloaded = 0

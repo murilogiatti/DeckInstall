@@ -11,13 +11,23 @@ import shlex
 import shutil
 import struct
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from .extractor import check_disk_space
 from .scanner import detect_steam_appid
-from .steam_paths import SteamPaths, _iter_compat_tool_dirs, _list_steam_library_roots, _read_compat_tool_id, find_steam_root, list_steam_users
+from .steam_paths import (
+    SteamPaths,
+    _iter_compat_tool_dirs,
+    _list_steam_library_roots,
+    _read_compat_tool_id,
+    dir_size_bytes,
+    find_steam_root,
+    list_steam_users,
+)
 from .steam_vdf import (
+    _SHELL_OPS,
     ShortcutEntry,
     _atomic_write_text,
     _is_env_assignment,
@@ -36,12 +46,23 @@ from .steam_vdf import (
 
 _DEFAULT_GAMES_DIR = Path.home() / "Games"
 _DEFAULT_PREFIXES_DIR = _DEFAULT_GAMES_DIR / ".prefixes"
+_DEFAULT_APPLICATIONS_DIR = Path.home() / ".local" / "share" / "applications"
 
 GAMES_DIR = _DEFAULT_GAMES_DIR
 PREFIXES_DIR = _DEFAULT_PREFIXES_DIR
-APPLICATIONS_DIR = Path.home() / ".local" / "share" / "applications"
+APPLICATIONS_DIR = _DEFAULT_APPLICATIONS_DIR
 UMU_RUN_PATH = Path.home() / ".local" / "share" / "DeckInstall" / "runtime" / "umu" / "umu-run"
 STANDALONE_MANIFEST = ".deckinstall_standalone.json"
+
+
+def get_applications_dir() -> Path:
+    """Return the desktop applications directory (respecting monkeypatching and XDG_DATA_HOME)."""
+    if APPLICATIONS_DIR != _DEFAULT_APPLICATIONS_DIR:
+        return APPLICATIONS_DIR
+    xdg_data = os.environ.get("XDG_DATA_HOME", "").strip()
+    if xdg_data:
+        return Path(xdg_data).expanduser() / "applications"
+    return Path.home() / ".local" / "share" / "applications"
 
 
 def get_games_dir() -> Path:
@@ -63,6 +84,23 @@ def get_prefixes_dir() -> Path:
         return PREFIXES_DIR
     return get_games_dir() / ".prefixes"
 
+
+def get_shader_caches_dir() -> Path:
+    """Return the centralized shader caches directory under the standalone games directory."""
+    return get_games_dir() / ".caches"
+
+
+def get_game_cache_dir(game_dir: Path) -> Path:
+    """Return the centralized shader cache directory for a standalone game directory."""
+    safe_name = _sanitize_dir_name(game_dir.name)
+    try:
+        resolved = str(game_dir.resolve())
+    except OSError:
+        resolved = str(game_dir)
+    dir_hash = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:8]
+    return get_shader_caches_dir() / f"{safe_name}-{dir_hash}"
+
+
 _KNOWN_WRAPPERS = frozenset({"gamemoderun", "lsfg-vk", "mangohud"})
 
 
@@ -82,6 +120,16 @@ class StandaloneGame:
     desktop_file: Path
     desktop_shortcut: Path | None = None
     native_linux: bool = False
+    cache_dir: Path | None = None
+
+
+@dataclass(frozen=True)
+class OrphanCacheEntry:
+    """An orphaned shader cache directory under get_shader_caches_dir()."""
+
+    path: Path
+    size_bytes: int
+    name: str = ""
 
 
 def _sanitize_dir_name(name: str) -> str:
@@ -234,36 +282,34 @@ def resolve_standalone_proton_fallback(game: StandaloneGame) -> tuple[Path | Non
     return (None, None)
 
 
-def resolve_umu_game_id(steam_appid: int | None, store: str = "") -> tuple[str, str]:
+def resolve_umu_game_id(
+    steam_appid: int | None,
+    store: str = "",
+    exe_path: Path | None = None,
+    game_title: str = "",
+    db_path: Path | None = None,
+) -> tuple[str, str]:
     """Return (GAMEID, STORE) for umu-run given an optional Steam AppID and store name."""
     cleaned_store = store.strip()
     if isinstance(steam_appid, int) and not isinstance(steam_appid, bool) and steam_appid > 0:
         return f"umu-{steam_appid}", cleaned_store or "steam"
+
+    if exe_path is not None or game_title.strip():
+        from .runtime_manager import lookup_umu_database
+
+        hit = lookup_umu_database(
+            exe_path=exe_path,
+            game_title=game_title,
+            store=cleaned_store,
+            db_path=db_path,
+        )
+        if hit is not None and hit.umu_id.strip():
+            return hit.umu_id.strip(), cleaned_store or hit.store.strip() or "none"
+
     return "umu-default", cleaned_store or "none"
 
 
-def estimate_dir_size(path: Path) -> int:
-    """Return total byte size of regular files under *path*, skipping symlinks."""
-    if path.is_symlink() or not path.exists():
-        return 0
-    if path.is_file():
-        try:
-            return path.lstat().st_size
-        except OSError:
-            return 0
-    total = 0
-    for root, dirs, files in os.walk(path, followlinks=False):
-        root_path = Path(root)
-        dirs[:] = [d for d in dirs if not (root_path / d).is_symlink()]
-        for fname in files:
-            fpath = root_path / fname
-            if fpath.is_symlink():
-                continue
-            try:
-                total += fpath.lstat().st_size
-            except OSError:
-                continue
-    return total
+estimate_dir_size = dir_size_bytes
 
 
 def _parse_launch_tokens(
@@ -314,6 +360,13 @@ def _parse_launch_tokens(
     return env_pairs, wrappers, game_args, effective_dll
 
 
+def _quote_game_arg(arg: str) -> str:
+    """Quote a game argument unless it is a shell operator (excluding %command%)."""
+    if arg in _SHELL_OPS and arg != "%command%":
+        return arg
+    return shlex.quote(arg)
+
+
 def _write_launch_script(
     script_path: Path,
     exe_path: Path,
@@ -323,11 +376,14 @@ def _write_launch_script(
     launch_options: str,
     native_linux: bool = False,
     steam_appid: int | None = None,
+    game_name: str = "",
+    cache_dir: Path | None = None,
 ) -> None:
     """Generate an executable launch.sh script invoking umu-run or a native Linux binary."""
     env_pairs, wrappers, game_args, effective_dll = _parse_launch_tokens(
         launch_options, "" if native_linux else winedlloverrides
     )
+    user_env_keys = {k for k, _ in env_pairs}
 
     lines = [
         "#!/usr/bin/env bash",
@@ -337,7 +393,11 @@ def _write_launch_script(
 
     if not native_linux:
         proton_path = _resolve_proton_path(proton_name)
-        game_id, store = resolve_umu_game_id(steam_appid)
+        game_id, store = resolve_umu_game_id(
+            steam_appid,
+            exe_path=exe_path,
+            game_title=game_name,
+        )
         lines.extend([
             f"export WINEPREFIX={shlex.quote(str(prefix_dir))}",
             f"export PROTONPATH={shlex.quote(proton_path)}",
@@ -348,6 +408,18 @@ def _write_launch_script(
             lines.append(f"export WINEDLLOVERRIDES={shlex.quote(effective_dll)}")
 
     seen_keys = {"WINEPREFIX", "PROTONPATH", "GAMEID", "STORE", "WINEDLLOVERRIDES"}
+    if cache_dir is not None and not cache_dir.is_symlink():
+        dxvk_cache = cache_dir / "dxvk"
+        mesa_cache = cache_dir / "mesa"
+        dxvk_cache.mkdir(parents=True, exist_ok=True)
+        mesa_cache.mkdir(parents=True, exist_ok=True)
+        if not native_linux and "DXVK_STATE_CACHE_PATH" not in user_env_keys:
+            lines.append(f"export DXVK_STATE_CACHE_PATH={shlex.quote(str(dxvk_cache))}")
+            seen_keys.add("DXVK_STATE_CACHE_PATH")
+        if "MESA_SHADER_CACHE_DIR" not in user_env_keys:
+            lines.append(f"export MESA_SHADER_CACHE_DIR={shlex.quote(str(mesa_cache))}")
+            seen_keys.add("MESA_SHADER_CACHE_DIR")
+
     for key, val in env_pairs:
         if key in seen_keys:
             continue
@@ -358,7 +430,7 @@ def _write_launch_script(
     if not native_linux:
         cmd_parts.append(shlex.quote(str(UMU_RUN_PATH)))
     cmd_parts.append(shlex.quote(str(exe_path)))
-    cmd_parts.extend(shlex.quote(arg) for arg in game_args)
+    cmd_parts.extend(_quote_game_arg(arg) for arg in game_args)
     lines.append("exec " + " ".join(cmd_parts))
 
     _atomic_write_text(script_path, "\n".join(lines) + "\n")
@@ -405,8 +477,9 @@ def _desktop_points_to_game_dir(desktop_path: Path, target_game_dir: Path) -> bo
 
 def _resolve_desktop_file_path(clean_name: str, target_game_dir: Path) -> Path:
     """Return a unique .desktop path, disambiguating if slug collides with another game_dir."""
+    apps_dir = get_applications_dir()
     slug = _slugify(clean_name)
-    candidate = APPLICATIONS_DIR / f"deckinstall-{slug}.desktop"
+    candidate = apps_dir / f"deckinstall-{slug}.desktop"
     if not candidate.exists() or _desktop_points_to_game_dir(candidate, target_game_dir):
         return candidate
     try:
@@ -414,12 +487,12 @@ def _resolve_desktop_file_path(clean_name: str, target_game_dir: Path) -> Path:
     except OSError:
         key = str(target_game_dir)
     short_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
-    hashed = APPLICATIONS_DIR / f"deckinstall-{slug}-{short_hash}.desktop"
+    hashed = apps_dir / f"deckinstall-{slug}-{short_hash}.desktop"
     if not hashed.exists() or _desktop_points_to_game_dir(hashed, target_game_dir):
         return hashed
     idx = 2
     while True:
-        numbered = APPLICATIONS_DIR / f"deckinstall-{slug}-{short_hash}-{idx}.desktop"
+        numbered = apps_dir / f"deckinstall-{slug}-{short_hash}-{idx}.desktop"
         if not numbered.exists() or _desktop_points_to_game_dir(numbered, target_game_dir):
             return numbered
         idx += 1
@@ -485,83 +558,131 @@ def _parse_rsrc_entries(data: bytes, rsrc_off: int, dir_off: int) -> list[tuple[
     return entries
 
 
+_MAX_PE_SECTIONS = 96
+_MAX_PE_OPT_SIZE = 4096
+_MAX_PE_RSRC_BYTES = 16 * 1024 * 1024
+
+
+def _atomic_write_bytes(dest: Path, payload: bytes) -> None:
+    """Atomically write bytes to dest via a temp file in dest.parent + os.replace."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp", delete=False
+        ) as tf:
+            tmp_path = Path(tf.name)
+            tf.write(payload)
+            tf.flush()
+        os.replace(tmp_path, dest)
+    except Exception:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def extract_pe_icon(exe_path: Path, out_ico: Path) -> Path | None:
     """Extract the primary embedded icon group from a Windows PE .exe into a .ico file."""
     try:
-        if not exe_path.is_file():
+        if exe_path.is_symlink() or out_ico.is_symlink() or not exe_path.is_file():
             return None
-        data = exe_path.read_bytes()
-        if len(data) < 0x40 or data[:2] != b"MZ":
-            return None
-        pe_off = struct.unpack_from("<I", data, 0x3C)[0]
-        if pe_off + 24 > len(data) or data[pe_off : pe_off + 4] != b"PE\x00\x00":
-            return None
-        num_sections = struct.unpack_from("<H", data, pe_off + 6)[0]
-        opt_size = struct.unpack_from("<H", data, pe_off + 20)[0]
-        opt_off = pe_off + 24
-        if opt_off + opt_size > len(data) or opt_size < 2:
-            return None
-        magic = struct.unpack_from("<H", data, opt_off)[0]
-        if magic == 0x10B and opt_size >= 112:
-            rsrc_rva, _ = struct.unpack_from("<II", data, opt_off + 96 + 2 * 8)
-        elif magic == 0x20B and opt_size >= 128:
-            rsrc_rva, _ = struct.unpack_from("<II", data, opt_off + 112 + 2 * 8)
-        else:
-            return None
-        if not rsrc_rva:
-            return None
+        with open(exe_path, "rb") as fh:
+            dos = fh.read(0x40)
+            if len(dos) < 0x40 or dos[:2] != b"MZ":
+                return None
+            pe_off = struct.unpack_from("<I", dos, 0x3C)[0]
+            fh.seek(pe_off)
+            pe_hdr = fh.read(24)
+            if len(pe_hdr) < 24 or pe_hdr[:4] != b"PE\x00\x00":
+                return None
+            num_sections = struct.unpack_from("<H", pe_hdr, 6)[0]
+            opt_size = struct.unpack_from("<H", pe_hdr, 20)[0]
+            if (
+                num_sections == 0
+                or num_sections > _MAX_PE_SECTIONS
+                or opt_size < 2
+                or opt_size > _MAX_PE_OPT_SIZE
+            ):
+                return None
+            opt_hdr = fh.read(opt_size)
+            if len(opt_hdr) < opt_size:
+                return None
+            magic = struct.unpack_from("<H", opt_hdr, 0)[0]
+            if magic == 0x10B and opt_size >= 112:
+                rsrc_rva, _ = struct.unpack_from("<II", opt_hdr, 96 + 2 * 8)
+            elif magic == 0x20B and opt_size >= 128:
+                rsrc_rva, _ = struct.unpack_from("<II", opt_hdr, 112 + 2 * 8)
+            else:
+                return None
+            if not rsrc_rva:
+                return None
 
-        sec_off = opt_off + opt_size
-        sections: list[tuple[int, int, int, int]] = []
-        for i in range(num_sections):
-            s_pos = sec_off + i * 40
-            if s_pos + 40 > len(data):
-                break
-            v_size, v_addr, raw_size, raw_ptr = struct.unpack_from("<IIII", data, s_pos + 8)
-            sections.append((v_size, v_addr, raw_size, raw_ptr))
+            sec_bytes = fh.read(num_sections * 40)
+            sections: list[tuple[int, int, int, int]] = []
+            for i in range(len(sec_bytes) // 40):
+                v_size, v_addr, raw_size, raw_ptr = struct.unpack_from("<IIII", sec_bytes, i * 40 + 8)
+                sections.append((v_size, v_addr, raw_size, raw_ptr))
 
-        rsrc_off = _rva_to_offset(rsrc_rva, sections)
-        if rsrc_off is None:
+            rsrc_sec: tuple[int, int, int, int] | None = None
+            for v_size, v_addr, raw_size, raw_ptr in sections:
+                span = max(v_size, raw_size)
+                if v_addr <= rsrc_rva < v_addr + span:
+                    rsrc_sec = (v_size, v_addr, raw_size, raw_ptr)
+                    break
+            if rsrc_sec is None:
+                return None
+            _v_size, rsrc_vaddr, rsrc_raw_size, rsrc_raw_ptr = rsrc_sec
+            if rsrc_raw_size == 0 or rsrc_raw_size > _MAX_PE_RSRC_BYTES:
+                return None
+            fh.seek(rsrc_raw_ptr)
+            rsrc_data = fh.read(rsrc_raw_size)
+
+        rsrc_local_off = rsrc_rva - rsrc_vaddr
+        if rsrc_local_off < 0 or rsrc_local_off >= len(rsrc_data):
             return None
 
         # Collect RT_ICON (3) blobs keyed by icon ID, and first RT_GROUP_ICON (14)
         rt_icons: dict[int, bytes] = {}
         group_blob: bytes | None = None
 
-        for type_id, type_sub in _parse_rsrc_entries(data, rsrc_off, rsrc_off):
+        for type_id, type_sub in _parse_rsrc_entries(rsrc_data, rsrc_local_off, rsrc_local_off):
             if not (type_sub & 0x80000000):
                 continue
-            l2_off = rsrc_off + (type_sub & 0x7FFFFFFF)
+            l2_off = rsrc_local_off + (type_sub & 0x7FFFFFFF)
             if type_id == 3:  # RT_ICON
-                for icon_id, icon_sub in _parse_rsrc_entries(data, rsrc_off, l2_off):
+                for icon_id, icon_sub in _parse_rsrc_entries(rsrc_data, rsrc_local_off, l2_off):
                     if not (icon_sub & 0x80000000):
                         continue
-                    l3_off = rsrc_off + (icon_sub & 0x7FFFFFFF)
-                    for _lang, data_entry_rel in _parse_rsrc_entries(data, rsrc_off, l3_off):
+                    l3_off = rsrc_local_off + (icon_sub & 0x7FFFFFFF)
+                    for _lang, data_entry_rel in _parse_rsrc_entries(rsrc_data, rsrc_local_off, l3_off):
                         if data_entry_rel & 0x80000000:
                             continue
-                        de_off = rsrc_off + data_entry_rel
-                        if de_off + 16 <= len(data):
-                            blob_rva, blob_size = struct.unpack_from("<II", data, de_off)
+                        de_off = rsrc_local_off + data_entry_rel
+                        if de_off + 16 <= len(rsrc_data):
+                            blob_rva, blob_size = struct.unpack_from("<II", rsrc_data, de_off)
                             blob_off = _rva_to_offset(blob_rva, sections)
-                            if blob_off is not None and blob_off + blob_size <= len(data):
-                                rt_icons[icon_id] = data[blob_off : blob_off + blob_size]
-                                break
+                            if blob_off is not None and blob_off >= rsrc_raw_ptr:
+                                local_blob_off = blob_off - rsrc_raw_ptr
+                                if local_blob_off + blob_size <= len(rsrc_data):
+                                    rt_icons[icon_id] = rsrc_data[local_blob_off : local_blob_off + blob_size]
+                                    break
             elif type_id == 14 and group_blob is None:  # RT_GROUP_ICON
-                for _grp_id, grp_sub in _parse_rsrc_entries(data, rsrc_off, l2_off):
+                for _grp_id, grp_sub in _parse_rsrc_entries(rsrc_data, rsrc_local_off, l2_off):
                     if not (grp_sub & 0x80000000):
                         continue
-                    l3_off = rsrc_off + (grp_sub & 0x7FFFFFFF)
-                    for _lang, data_entry_rel in _parse_rsrc_entries(data, rsrc_off, l3_off):
+                    l3_off = rsrc_local_off + (grp_sub & 0x7FFFFFFF)
+                    for _lang, data_entry_rel in _parse_rsrc_entries(rsrc_data, rsrc_local_off, l3_off):
                         if data_entry_rel & 0x80000000:
                             continue
-                        de_off = rsrc_off + data_entry_rel
-                        if de_off + 16 <= len(data):
-                            blob_rva, blob_size = struct.unpack_from("<II", data, de_off)
+                        de_off = rsrc_local_off + data_entry_rel
+                        if de_off + 16 <= len(rsrc_data):
+                            blob_rva, blob_size = struct.unpack_from("<II", rsrc_data, de_off)
                             blob_off = _rva_to_offset(blob_rva, sections)
-                            if blob_off is not None and blob_off + blob_size <= len(data):
-                                group_blob = data[blob_off : blob_off + blob_size]
-                                break
+                            if blob_off is not None and blob_off >= rsrc_raw_ptr:
+                                local_blob_off = blob_off - rsrc_raw_ptr
+                                if local_blob_off + blob_size <= len(rsrc_data):
+                                    group_blob = rsrc_data[local_blob_off : local_blob_off + blob_size]
+                                    break
                     if group_blob is not None:
                         break
 
@@ -596,8 +717,7 @@ def extract_pe_icon(exe_path: Path, out_ico: Path) -> Path | None:
             img_data.extend(blob)
             offset += len(blob)
 
-        out_ico.parent.mkdir(parents=True, exist_ok=True)
-        out_ico.write_bytes(header + bytes(dir_table) + bytes(img_data))
+        _atomic_write_bytes(out_ico, header + bytes(dir_table) + bytes(img_data))
         return out_ico
     except Exception as exc:
         logging.debug("PE icon extraction skipped for %s: %s", exe_path, exc)
@@ -661,30 +781,31 @@ def resolve_game_icon(
     explicit_icon: Path | None = None,
 ) -> Path | None:
     """Resolve or extract a local icon file for a standalone game's .desktop launcher."""
-    if explicit_icon is not None and explicit_icon.is_file():
+    if explicit_icon is not None and not explicit_icon.is_symlink() and explicit_icon.is_file():
         try:
             if _is_under_dir(explicit_icon.resolve(), target_game_dir.resolve()):
                 return explicit_icon
         except OSError:
             pass
         dest = target_game_dir / f".deckinstall_icon{explicit_icon.suffix.lower()}"
-        try:
-            target_game_dir.mkdir(parents=True, exist_ok=True)
-            if explicit_icon.resolve() != dest.resolve():
-                shutil.copy2(explicit_icon, dest)
-            return dest
-        except OSError:
-            return explicit_icon
+        if not dest.is_symlink():
+            try:
+                target_game_dir.mkdir(parents=True, exist_ok=True)
+                if explicit_icon.resolve() != dest.resolve():
+                    _atomic_write_bytes(dest, explicit_icon.read_bytes())
+                return dest
+            except OSError:
+                return explicit_icon
 
     # 1) Existing .deckinstall_icon.{ico,png,jpg,svg}
     for ext in (".ico", ".png", ".jpg", ".svg"):
         cand = target_game_dir / f".deckinstall_icon{ext}"
-        if cand.is_file():
+        if not cand.is_symlink() and cand.is_file():
             return cand
 
     exe_stem_lower = exe_path.stem.lower()
     try:
-        root_files = [p for p in target_game_dir.iterdir() if p.is_file()]
+        root_files = [p for p in target_game_dir.iterdir() if not p.is_symlink() and p.is_file()]
     except OSError:
         root_files = []
 
@@ -722,7 +843,9 @@ def resolve_game_icon(
             raw = fetch_header_preview(int(steam_appid))
             if raw:
                 out_img = target_game_dir / ".deckinstall_icon.jpg"
-                out_img.write_bytes(raw)
+                if out_img.is_symlink():
+                    return None
+                _atomic_write_bytes(out_img, raw)
                 return out_img
         except Exception as exc:
             logging.debug("Steam header icon fallback failed for %s: %s", steam_appid, exc)
@@ -792,6 +915,7 @@ def _write_manifest(game: StandaloneGame) -> None:
         "desktop_file": str(game.desktop_file),
         "desktop_shortcut": str(game.desktop_shortcut) if game.desktop_shortcut else "",
         "native_linux": bool(game.native_linux),
+        "cache_dir": str(game.cache_dir) if game.cache_dir else "",
     }
     _atomic_write_text(
         game.game_dir / STANDALONE_MANIFEST,
@@ -888,7 +1012,12 @@ def install_standalone_game(
             else:
                 target_exe_path = exe_path
 
-    prefix_dir = prefixes_dir / _sanitize_dir_name(target_game_dir.name)
+    base_pfx_name = _sanitize_dir_name(target_game_dir.name)
+    if keep_in_place:
+        resolved_game_dir = target_game_dir.resolve()
+        dir_hash = hashlib.sha256(str(resolved_game_dir).encode("utf-8")).hexdigest()[:8]
+        base_pfx_name = f"{base_pfx_name}-{dir_hash}"
+    prefix_dir = prefixes_dir / base_pfx_name
     if not native_linux:
         prefixes_dir.mkdir(parents=True, exist_ok=True)
         if prefix_dir.is_symlink():
@@ -912,6 +1041,7 @@ def install_standalone_game(
         explicit_icon=icon_path,
     )
 
+    cache_dir = get_game_cache_dir(target_game_dir)
     game = StandaloneGame(
         name=clean_name,
         game_dir=target_game_dir,
@@ -925,6 +1055,7 @@ def install_standalone_game(
         desktop_file=desktop_file,
         desktop_shortcut=desktop_shortcut,
         native_linux=native_linux,
+        cache_dir=cache_dir,
     )
 
     _write_launch_script(
@@ -936,6 +1067,8 @@ def install_standalone_game(
         game.launch_options,
         native_linux=game.native_linux,
         steam_appid=game.steam_appid,
+        game_name=game.name,
+        cache_dir=game.cache_dir,
     )
     if native_linux:
         startup_wm_class = target_exe_path.name
@@ -970,6 +1103,9 @@ def install_standalone_game(
 def _load_manifest(manifest_path: Path) -> StandaloneGame | None:
     """Load a StandaloneGame from a .deckinstall_standalone.json file."""
     try:
+        if manifest_path.is_symlink() or manifest_path.parent.is_symlink():
+            logging.warning("Refusing to load symlinked standalone manifest %s", manifest_path)
+            return None
         raw = json.loads(manifest_path.read_text(encoding="utf-8", errors="replace"))
         if not isinstance(raw, dict):
             return None
@@ -979,16 +1115,39 @@ def _load_manifest(manifest_path: Path) -> StandaloneGame | None:
         prefix_dir = Path(str(raw["prefix_dir"]))
         proton_name = str(raw.get("proton_name") or "")
         sa_raw = raw.get("steam_appid")
-        steam_appid = int(sa_raw) if isinstance(sa_raw, int) else None
+        steam_appid = int(sa_raw) if isinstance(sa_raw, int) and not isinstance(sa_raw, bool) else None
         winedlloverrides = str(raw.get("winedlloverrides") or "")
         launch_options = str(raw.get("launch_options") or "")
         launch_script = Path(str(raw.get("launch_script") or (game_dir / "launch.sh")))
+        if not _is_strictly_under_dir(exe_path, game_dir):
+            logging.warning("Manifest exe_path %s escapes game_dir %s", exe_path, game_dir)
+            return None
+        if not _is_strictly_under_dir(launch_script, game_dir):
+            logging.warning("Manifest launch_script %s escapes game_dir %s", launch_script, game_dir)
+            return None
+        if prefix_dir.is_symlink() or not (
+            _is_under_dir(prefix_dir, get_prefixes_dir())
+            or _is_under_dir(prefix_dir, game_dir.parent / ".prefixes")
+            or _is_under_dir(prefix_dir, game_dir)
+        ):
+            logging.warning("Manifest prefix_dir %s is invalid or out of bounds", prefix_dir)
+            return None
         desktop_file = Path(
-            str(raw.get("desktop_file") or (APPLICATIONS_DIR / f"deckinstall-{_slugify(name)}.desktop"))
+            str(raw.get("desktop_file") or (get_applications_dir() / f"deckinstall-{_slugify(name)}.desktop"))
         )
         ds_raw = str(raw.get("desktop_shortcut") or "").strip()
         desktop_shortcut = Path(ds_raw) if ds_raw else None
         native_linux = bool(raw.get("native_linux", False))
+        cd_raw = str(raw.get("cache_dir") or "").strip()
+        cache_dir: Path | None = None
+        if cd_raw:
+            cand_cache = Path(cd_raw)
+            if _is_strictly_under_dir(cand_cache, get_shader_caches_dir()) or _is_strictly_under_dir(
+                cand_cache, game_dir.parent / ".caches"
+            ):
+                cache_dir = cand_cache
+            else:
+                logging.warning("Manifest cache_dir %s is invalid or out of bounds", cand_cache)
         return StandaloneGame(
             name=name,
             game_dir=game_dir,
@@ -1002,6 +1161,7 @@ def _load_manifest(manifest_path: Path) -> StandaloneGame | None:
             desktop_file=desktop_file,
             desktop_shortcut=desktop_shortcut,
             native_linux=native_linux,
+            cache_dir=cache_dir,
         )
     except Exception as exc:
         logging.warning("Failed to load standalone manifest %s: %s", manifest_path, exc)
@@ -1048,6 +1208,8 @@ def update_standalone_launch_options(
     game.launch_options = launch_options.strip()
     if not game.native_linux and proton_name.strip():
         game.proton_name = proton_name.strip()
+    if game.cache_dir is None:
+        game.cache_dir = get_game_cache_dir(game.game_dir)
 
     _write_launch_script(
         game.launch_script,
@@ -1058,6 +1220,8 @@ def update_standalone_launch_options(
         game.launch_options,
         native_linux=game.native_linux,
         steam_appid=game.steam_appid,
+        game_name=game.name,
+        cache_dir=game.cache_dir,
     )
     _write_manifest(game)
     return game
@@ -1082,19 +1246,110 @@ def _safe_remove_prefix_dir(prefix_dir: Path) -> None:
     _remove_path_or_tree(prefix_dir)
 
 
+def _safe_remove_cache_dir(cache_dir: Path | None) -> None:
+    """Remove cache_dir only if it is a non-symlink strictly inside get_shader_caches_dir()."""
+    if cache_dir is None:
+        return
+    if not _is_strictly_under_dir(cache_dir, get_shader_caches_dir()):
+        logging.warning(
+            "Refusing to remove cache_dir outside shader caches directory: %s",
+            cache_dir,
+        )
+        return
+    _remove_path_or_tree(cache_dir)
+
+
+def find_orphan_shader_caches(games_dir: Path | None = None) -> list[OrphanCacheEntry]:
+    """Return shader cache directories under get_shader_caches_dir() with no active standalone game."""
+    caches_dir = (games_dir / ".caches") if games_dir is not None else get_shader_caches_dir()
+    if caches_dir.is_symlink() or not caches_dir.is_dir():
+        return []
+
+    active_games = list_standalone_games(games_dir=games_dir)
+    if games_dir is None:
+        from .scanner import default_scan_roots
+
+        for scan_root in default_scan_roots():
+            if scan_root != get_games_dir():
+                active_games.extend(list_standalone_games(games_dir=scan_root))
+    active_caches: set[Path] = set()
+    for game in active_games:
+        if game.cache_dir is not None:
+            try:
+                active_caches.add(game.cache_dir.resolve())
+            except OSError:
+                pass
+        else:
+            try:
+                fallback_name = get_game_cache_dir(game.game_dir).name
+                active_caches.add((caches_dir / fallback_name).resolve())
+            except OSError:
+                pass
+
+    orphans: list[OrphanCacheEntry] = []
+    try:
+        entries = list(caches_dir.iterdir())
+    except OSError:
+        return []
+
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_dir() or entry.name.startswith("."):
+            continue
+        try:
+            resolved_entry = entry.resolve()
+        except OSError:
+            continue
+        if resolved_entry not in active_caches:
+            orphans.append(
+                OrphanCacheEntry(
+                    path=entry,
+                    size_bytes=dir_size_bytes(entry),
+                    name=entry.name,
+                )
+            )
+    orphans.sort(key=lambda e: e.name.lower())
+    return orphans
+
+
+def prune_orphan_shader_caches(
+    entries: list[OrphanCacheEntry] | None = None,
+    games_dir: Path | None = None,
+) -> tuple[int, int]:
+    """Delete orphaned shader cache directories safely and return (deleted_count, freed_bytes)."""
+    caches_dir = (games_dir / ".caches") if games_dir is not None else get_shader_caches_dir()
+    targets = entries if entries is not None else find_orphan_shader_caches(games_dir=games_dir)
+    deleted = 0
+    freed = 0
+    for entry in targets:
+        if not _is_strictly_under_dir(entry.path, caches_dir):
+            logging.warning(
+                "Refusing to prune cache directory outside %s: %s",
+                caches_dir,
+                entry.path,
+            )
+            continue
+        if entry.path.is_dir() and not entry.path.is_symlink():
+            _remove_path_or_tree(entry.path)
+            if not entry.path.exists():
+                deleted += 1
+                freed += entry.size_bytes
+    return deleted, freed
+
+
 def remove_standalone_game(
     game: StandaloneGame,
     delete_files: bool = False,
     delete_prefix: bool = False,
+    delete_cache: bool = True,
 ) -> None:
-    """Remove standalone integration files and optionally delete game & prefix directories."""
+    """Remove standalone integration files and optionally delete game, prefix, and cache directories."""
     try:
         resolved_game_dir = game.game_dir.resolve()
     except OSError:
         resolved_game_dir = game.game_dir
 
     validated_targets: list[tuple[Path, Path]] = [
-        (game.desktop_file, APPLICATIONS_DIR),
+        (game.desktop_file, get_applications_dir()),
         (game.launch_script, resolved_game_dir),
         (game.game_dir / STANDALONE_MANIFEST, resolved_game_dir),
     ]
@@ -1126,6 +1381,9 @@ def remove_standalone_game(
         _safe_remove_prefix_dir(game.prefix_dir)
     elif delete_prefix:
         _safe_remove_prefix_dir(game.prefix_dir)
+
+    if delete_cache:
+        _safe_remove_cache_dir(game.cache_dir)
 
 
 def _unlink_prefix_symlinks_for_compat(
@@ -1236,7 +1494,7 @@ def export_steam_to_standalone(
     clean_tokens.extend(wrappers)
     if clean_tokens or game_args:
         clean_tokens.append("%command%")
-        clean_tokens.extend(game_args)
+        clean_tokens.extend(_quote_game_arg(arg) for arg in game_args)
     clean_launch_options = " ".join(clean_tokens)
 
     icon_raw = _strip_vdf_quotes(shortcut.icon)
@@ -1269,6 +1527,10 @@ def export_steam_to_standalone(
         except Exception:
             if moved_prefix and game.prefix_dir.is_dir() and not game.prefix_dir.is_symlink():
                 _copy_or_move_dir_contents(game.prefix_dir, src_pfx, move=True)
+            try:
+                remove_standalone_game(game, delete_files=False, delete_prefix=not moved_prefix)
+            except Exception:
+                pass
             raise
         if moved_prefix:
             shutil.rmtree(src_compat, ignore_errors=True)
@@ -1309,8 +1571,8 @@ def import_standalone_to_steam(
     )
 
     resolved_icon = resolve_game_icon(
-        game.game_dir,
         game.exe_path,
+        game.game_dir,
         steam_appid=game.steam_appid,
     )
 
@@ -1333,10 +1595,10 @@ def import_standalone_to_steam(
     if game.prefix_dir.is_dir() and not game.prefix_dir.is_symlink():
         _copy_or_move_dir_contents(game.prefix_dir, target_pfx, move=remove_standalone_files)
         if remove_standalone_files:
-            shutil.rmtree(game.prefix_dir, ignore_errors=True)
+            _safe_remove_prefix_dir(game.prefix_dir)
 
     if remove_standalone_files:
-        remove_standalone_game(game, delete_files=False)
+        remove_standalone_game(game, delete_files=False, delete_cache=True)
 
     sync_prefix_symlinks(paths)
     return appid_u32

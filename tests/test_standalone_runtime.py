@@ -153,14 +153,16 @@ class RuntimeManagerTests(unittest.TestCase):
                 ["pacman", "-S", "--noconfirm", "mangohud"],
             )
         with mock.patch("shutil.which", return_value=None):
-            ok, msg = runtime_manager.fix_bwrap_userns()
+            ok_unconfirmed, _ = runtime_manager.fix_bwrap_userns()
+            self.assertFalse(ok_unconfirmed)
+            ok, msg = runtime_manager.fix_bwrap_userns(confirmed=True)
             self.assertFalse(ok)
-            self.assertIn("sysctl", msg)
+            self.assertIn("apparmor_parser", msg)
         with (
             mock.patch("shutil.which", side_effect=lambda b: "/usr/bin/pkexec" if b == "pkexec" else None),
             mock.patch("subprocess.run", return_value=mock.Mock(returncode=0, stdout="", stderr="")) as mrun,
         ):
-            ok, _ = runtime_manager.fix_bwrap_userns()
+            ok, _ = runtime_manager.fix_bwrap_userns(confirmed=True)
             self.assertTrue(ok)
             self.assertEqual(mrun.call_args[0][0][0], "/usr/bin/pkexec")
 

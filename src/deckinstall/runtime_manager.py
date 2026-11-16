@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import codecs
 import contextlib
+import csv
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -60,6 +62,14 @@ _ALLOWED_URL_HOSTS = frozenset(
         "github-releases.githubusercontent.com",
     }
 )
+_ALLOWED_UMU_DB_HOSTS = frozenset(
+    {
+        "umu.openwinecomponents.org",
+        "raw.githubusercontent.com",
+    }
+)
+UMU_DATABASE_URL = "https://umu.openwinecomponents.org/umu-database.csv"
+UMU_DATABASE_TTL_SECONDS = 7 * 24 * 60 * 60
 _VERSIONS_LOCK = threading.Lock()
 
 WINETRICKS_PRESETS: dict[str, str] = {
@@ -92,6 +102,7 @@ class ProtonRelease:
     asset_name: str
     download_url: str
     checksum_url: str | None = None
+    sha256_digest: str | None = None
     size_bytes: int = 0
     published_at: str = ""
     prerelease: bool = False
@@ -105,6 +116,29 @@ class InstalledCompatTool:
     tool_id: str
     path: Path
     size_bytes: int
+
+
+@dataclass(frozen=True)
+class ProtonIntegrityReport:
+    """Integrity verification result for an installed GE-Proton directory."""
+
+    proton_dir: Path
+    valid: bool
+    missing_files: tuple[str, ...]
+    broken_symlinks: tuple[str, ...]
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class UmuDbLookupResult:
+    """Match result from the local umu-database.csv cache."""
+
+    umu_id: str
+    store: str
+    title: str
+    common_redist: str
+    note: str
+    match_source: str
 
 
 PROTON_FAMILIES: dict[str, ProtonFamily] = {
@@ -223,6 +257,11 @@ def get_optiscaler_dir() -> Path:
     return get_runtime_dir() / "optiscaler" / "current"
 
 
+def get_umu_database_path() -> Path:
+    """Return the local cache path for umu-database.csv."""
+    return get_runtime_dir() / "umu-database.csv"
+
+
 def _iter_extra_compat_tool_dirs() -> list[Path]:
     """Return expanded paths from STEAM_EXTRA_COMPAT_TOOLS_PATHS."""
     raw = os.environ.get("STEAM_EXTRA_COMPAT_TOOLS_PATHS", "").strip()
@@ -266,6 +305,9 @@ def get_compat_tools_dir() -> Path:
 
 def get_steamrt4_dir() -> Path:
     """Return the umu steamrt4 runtime directory."""
+    xdg_data = os.environ.get("XDG_DATA_HOME", "").strip()
+    if xdg_data:
+        return Path(xdg_data).expanduser() / "umu" / "steamrt4"
     return Path.home() / ".local" / "share" / "umu" / "steamrt4"
 
 
@@ -376,43 +418,128 @@ def _versions_lock():
                 fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
 
 
+def _read_versions_unlocked() -> dict[str, Any]:
+    path = get_versions_file()
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_versions_unlocked(data: dict[str, Any]) -> None:
+    path = get_versions_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=".versions_", suffix=".json", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
 def _load_versions() -> dict[str, Any]:
     with _versions_lock():
-        path = get_versions_file()
-        if not path.is_file():
-            return {}
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except (OSError, ValueError):
-            return {}
+        return _read_versions_unlocked()
 
 
 def _save_versions(data: dict[str, Any]) -> None:
     with _versions_lock():
-        path = get_versions_file()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(prefix=".versions_", suffix=".json", dir=str(path.parent))
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(data, handle, indent=2, sort_keys=True)
-            os.replace(tmp_name, path)
-        except Exception:
-            try:
-                os.unlink(tmp_name)
-            except OSError:
-                pass
-            raise
+        _write_versions_unlocked(data)
+
+
+def _update_versions(mutator: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
+    """Atomically read, mutate, and write versions.json under _versions_lock."""
+    with _versions_lock():
+        data = _read_versions_unlocked()
+        mutator(data)
+        _write_versions_unlocked(data)
+        return data
+
+
+def _validate_allowed_url(
+    url: str,
+    allowed_hosts: frozenset[str],
+    label: str = "resource",
+) -> str:
+    """Validate that url uses HTTPS and points to an allowlisted host."""
+    cleaned = url.strip()
+    parsed = urllib.parse.urlparse(cleaned)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme.lower() != "https" or host not in allowed_hosts:
+        raise ValueError(f"Disallowed URL for {label} (must be HTTPS on allowlisted host): {url!r}")
+    return cleaned
 
 
 def _validate_github_url(url: str) -> str:
     """Validate that url uses HTTPS and points to an allowlisted GitHub/CDN host."""
-    cleaned = url.strip()
-    parsed = urllib.parse.urlparse(cleaned)
-    host = (parsed.hostname or "").lower()
-    if parsed.scheme.lower() != "https" or host not in _ALLOWED_URL_HOSTS:
-        raise ValueError(f"Disallowed URL (must be HTTPS on GitHub): {url!r}")
-    return cleaned
+    return _validate_allowed_url(url, _ALLOWED_URL_HOSTS, label="GitHub")
+
+
+def _request_with_validated_redirects(
+    url: str,
+    *,
+    allowed_hosts: frozenset[str],
+    headers: dict[str, str],
+    timeout: float,
+    stream: bool = False,
+    max_redirects: int = 5,
+    label: str = "resource",
+) -> requests.Response:
+    """Perform a GET request validating every redirect hop against allowed_hosts."""
+    current_url = _validate_allowed_url(url, allowed_hosts, label=label)
+    for _ in range(max_redirects + 1):
+        resp = requests.get(
+            current_url,
+            headers=headers,
+            timeout=timeout,
+            stream=stream,
+            allow_redirects=False,
+        )
+        status = getattr(resp, "status_code", 200)
+        is_redir = (getattr(resp, "is_redirect", False) is True) or (
+            isinstance(status, int) and status in (301, 302, 303, 307, 308)
+        )
+        if is_redir:
+            location = (getattr(resp, "headers", None) or {}).get("Location") or ""
+            resp.close()
+            if not location:
+                raise RuntimeError("Redirect response missing Location header.")
+            current_url = _validate_allowed_url(
+                urllib.parse.urljoin(current_url, location),
+                allowed_hosts,
+                label=label,
+            )
+            continue
+        return resp
+    raise RuntimeError(f"Too many redirects while fetching {label}.")
+
+
+def _request_github_with_validated_redirects(
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout: float,
+    stream: bool = False,
+    max_redirects: int = 5,
+) -> requests.Response:
+    """Perform a GET request validating every redirect hop against _ALLOWED_URL_HOSTS."""
+    return _request_with_validated_redirects(
+        url,
+        allowed_hosts=_ALLOWED_URL_HOSTS,
+        headers=headers,
+        timeout=timeout,
+        stream=stream,
+        max_redirects=max_redirects,
+        label="GitHub resource",
+    )
 
 
 def _sanitize_asset_name(name: str) -> str:
@@ -427,9 +554,8 @@ def _sanitize_asset_name(name: str) -> str:
 
 
 def _fetch_json(url: str, timeout: int = 20) -> Any:
-    validated_url = _validate_github_url(url)
-    resp = requests.get(
-        validated_url,
+    resp = _request_github_with_validated_redirects(
+        url,
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "application/vnd.github+json",
@@ -447,10 +573,9 @@ def _download_file(
     progress_cb: ProgressCallback | None = None,
     timeout: int = 60,
 ) -> None:
-    validated_url = _validate_github_url(url)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    with requests.get(
-        validated_url,
+    with _request_github_with_validated_redirects(
+        url,
         headers={"User-Agent": USER_AGENT},
         stream=True,
         timeout=timeout,
@@ -475,12 +600,20 @@ def _download_file(
     _emit_progress(progress_cb, f"Downloaded {label}.", 100)
 
 
+_MAX_RUNTIME_TAR_ENTRIES = 50_000
+_MAX_RUNTIME_TAR_FILE_BYTES = 1024 * 1024 * 1024
+_MAX_RUNTIME_TAR_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+
+
 def _safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:
-    """Safely extract a tar/tar.gz archive preventing path traversal and special files."""
+    """Safely extract a tar/tar.gz archive preventing path traversal, bombs, and special files."""
     dest_resolved = dest_dir.resolve()
+    total_bytes = 0
+    members: list[tarfile.TarInfo] = []
     with tarfile.open(tar_path, "r:*") as tf:
-        members = tf.getmembers()
-        for member in members:
+        for idx, member in enumerate(tf):
+            if idx >= _MAX_RUNTIME_TAR_ENTRIES:
+                raise RuntimeError("Archive exceeds maximum allowed entry count.")
             member_path = Path(member.name)
             if member_path.is_absolute() or ".." in member_path.parts:
                 raise RuntimeError(f"Unsafe archive member path: {member.name}")
@@ -497,10 +630,24 @@ def _safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:
                 resolved_link = (base / link_target).resolve()
                 if resolved_link != dest_resolved and dest_resolved not in resolved_link.parents:
                     raise RuntimeError(f"Unsafe archive link target: {member.linkname}")
+            elif member.isfile():
+                if member.size > _MAX_RUNTIME_TAR_FILE_BYTES:
+                    raise RuntimeError(f"Archive member exceeds maximum allowed size: {member.name}")
+                total_bytes += max(0, int(member.size))
+                if total_bytes > _MAX_RUNTIME_TAR_TOTAL_BYTES:
+                    raise RuntimeError("Archive exceeds maximum allowed total uncompressed size.")
+            member.mode &= 0o777
+            members.append(member)
         if sys.version_info >= (3, 12):
             tf.extractall(dest_dir, members=members, filter="data")
         else:
-            tf.extractall(dest_dir, members=members)
+            for member in members:
+                if member.issym() or member.islnk():
+                    continue
+                parent = (dest_resolved / Path(member.name)).parent
+                if parent.is_symlink():
+                    raise RuntimeError(f"Unsafe symlink parent directory for: {member.name}")
+                tf.extract(member, dest_dir)
 
 
 def _fetch_latest_ge_proton11_release() -> dict[str, Any]:
@@ -572,6 +719,136 @@ def _verify_sha512(file_path: Path, checksum_text: str) -> None:
         )
 
 
+def _verify_sha256(file_path: Path, checksum_text_or_hex: str) -> None:
+    """Verify file_path against a raw 64-hex SHA-256 digest or a SHA256SUMS-formatted text."""
+    text = checksum_text_or_hex.strip()
+    if re.fullmatch(r"[0-9a-fA-F]{64}", text):
+        expected = text.lower()
+    else:
+        entries: list[tuple[str, str]] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            match = re.match(r"^([0-9a-fA-F]{64})(?:\s+[* ]?(.+))?$", line)
+            if match:
+                digest_hex = match.group(1).lower()
+                entry_name = Path((match.group(2) or "").strip()).name
+                entries.append((digest_hex, entry_name))
+        if not entries:
+            raise RuntimeError("Invalid SHA-256 checksum format.")
+        expected_opt: str | None = None
+        for digest_hex, entry_name in entries:
+            if entry_name == file_path.name:
+                expected_opt = digest_hex
+                break
+        if expected_opt is None:
+            if len(entries) == 1:
+                expected_opt = entries[0][0]
+            else:
+                raise RuntimeError(f"No SHA-256 entry matching {file_path.name!r}.")
+        expected = expected_opt
+
+    with open(file_path, "rb") as fh:
+        if hasattr(hashlib, "file_digest"):
+            actual = hashlib.file_digest(fh, "sha256").hexdigest().lower()
+        else:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: fh.read(65536), b""):
+                digest.update(chunk)
+            actual = digest.hexdigest().lower()
+    if actual != expected:
+        raise RuntimeError(
+            f"SHA-256 checksum mismatch for {file_path.name}: expected {expected}, got {actual}"
+        )
+
+
+def _extract_github_asset_sha256(asset: dict[str, Any]) -> str | None:
+    raw = str(asset.get("digest") or "").strip()
+    if not raw:
+        return None
+    if raw.lower().startswith("sha256:"):
+        raw = raw.split(":", 1)[1].strip()
+    if re.fullmatch(r"[0-9a-fA-F]{64}", raw):
+        return raw.lower()
+    return None
+
+
+def _find_release_checksum_asset(
+    release: dict[str, Any], asset_name: str
+) -> tuple[dict[str, Any], str] | None:
+    assets = release.get("assets", [])
+    if not isinstance(assets, list):
+        return None
+    candidates = [
+        (f"{asset_name}.sha512sum", "sha512"),
+        (f"{asset_name}.sha256sum", "sha256"),
+        (f"{asset_name}.sha256", "sha256"),
+        ("SHA512SUMS", "sha512"),
+        ("SHA256SUMS", "sha256"),
+    ]
+    for target_name, algo in candidates:
+        for asset in assets:
+            if isinstance(asset, dict) and str(asset.get("name", "")) == target_name:
+                if asset.get("browser_download_url"):
+                    return asset, algo
+    return None
+
+
+def _verify_release_asset_integrity(
+    release: dict[str, Any],
+    asset: dict[str, Any],
+    downloaded_path: Path,
+    tmp_dir: Path,
+    *,
+    label: str,
+    require_checksum: bool = False,
+) -> None:
+    """Verify downloaded asset against GitHub digest, checksum asset, and reported size.
+
+    When ``require_checksum`` is False (default), missing checksum metadata logs a
+    warning and falls back to size-only verification so upstream releases without
+    published digests remain installable. When ``require_checksum`` is True, a
+    missing digest/checksum asset raises ``RuntimeError``.
+    """
+    raw_size = asset.get("size")
+    if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size > 0:
+        actual_size = downloaded_path.stat().st_size
+        if actual_size != raw_size:
+            raise RuntimeError(
+                f"Downloaded {label} size mismatch: expected {raw_size} bytes, got {actual_size}."
+            )
+
+    sha256_digest = _extract_github_asset_sha256(asset)
+    if sha256_digest:
+        _verify_sha256(downloaded_path, sha256_digest)
+        return
+
+    found = _find_release_checksum_asset(release, downloaded_path.name)
+    if found is not None:
+        cs_asset, algo = found
+        cs_url = str(cs_asset.get("browser_download_url", ""))
+        cs_name = _sanitize_asset_name(str(cs_asset.get("name", f"{downloaded_path.name}.{algo}")))
+        cs_path = tmp_dir / cs_name
+        _download_file(cs_url, cs_path, cs_name)
+        cs_text = cs_path.read_text(encoding="utf-8", errors="ignore")
+        if algo == "sha512":
+            _verify_sha512(downloaded_path, cs_text)
+        else:
+            _verify_sha256(downloaded_path, cs_text)
+        return
+
+    if require_checksum:
+        raise RuntimeError(
+            f"No checksum metadata published for {label} ({downloaded_path.name})."
+        )
+    logging.warning(
+        "No checksum metadata published for %s (%s); verified size only.",
+        label,
+        downloaded_path.name,
+    )
+
+
 def ensure_umu_run(
     force_update: bool = False,
     progress_cb: ProgressCallback | None = None,
@@ -612,6 +889,7 @@ def ensure_umu_run(
         tmp_path = Path(tmp_dir)
         tar_path = tmp_path / asset_name
         _download_file(download_url, tar_path, asset_name, progress_cb=progress_cb)
+        _verify_release_asset_integrity(release, zipapp_asset, tar_path, tmp_path, label="umu-run")
 
         _emit_progress(progress_cb, "Extracting umu-run...", 90)
         extract_dir = tmp_path / "extract"
@@ -636,11 +914,12 @@ def ensure_umu_run(
             staged_path.unlink(missing_ok=True)
             raise
 
-    versions = _load_versions()
     if tag:
-        versions["umu_installed_version"] = tag
-        versions["umu_latest_version"] = tag
-    _save_versions(versions)
+        def _set_umu(versions: dict[str, Any]) -> None:
+            versions["umu_installed_version"] = tag
+            versions["umu_latest_version"] = tag
+
+        _update_versions(_set_umu)
     _emit_progress(progress_cb, "umu-run ready.", 100)
     return umu_run
 
@@ -729,6 +1008,7 @@ def ensure_optiscaler(
         tmp_path = Path(tmp_dir)
         archive_path = tmp_path / asset_name
         _download_file(download_url, archive_path, asset_name, progress_cb=progress_cb)
+        _verify_release_asset_integrity(release, asset, archive_path, tmp_path, label="OptiScaler")
 
         _emit_progress(progress_cb, "Extracting OptiScaler...", 90)
         extract_dir = tmp_path / "extract"
@@ -746,24 +1026,143 @@ def ensure_optiscaler(
         _emit_progress(progress_cb, "Installing OptiScaler runtime...", 96)
         _swap_directory_atomic(payload_src, opti_dir)
 
-    versions = _load_versions()
-    if tag:
-        versions["optiscaler_installed_version"] = tag
-        versions["optiscaler_latest_version"] = tag
-    versions["optiscaler_last_check"] = int(time.time())
-    _save_versions(versions)
+    def _set_opti(versions: dict[str, Any]) -> None:
+        if tag:
+            versions["optiscaler_installed_version"] = tag
+            versions["optiscaler_latest_version"] = tag
+        versions["optiscaler_last_check"] = int(time.time())
+
+    _update_versions(_set_opti)
     _emit_progress(progress_cb, "OptiScaler ready.", 100)
     return opti_dir
+
+
+def _is_nonempty_file(path: Path) -> bool:
+    """Return True if path exists as a regular (or symlink-resolved) non-empty file."""
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def validate_ge_proton_integrity(proton_dir: Path) -> ProtonIntegrityReport:
+    """Validate an installed GE-Proton directory for required files and broken symlinks."""
+    if proton_dir.is_symlink():
+        return ProtonIntegrityReport(
+            proton_dir=proton_dir,
+            valid=False,
+            missing_files=(),
+            broken_symlinks=(),
+            error="Proton directory is a symlink.",
+        )
+    if not proton_dir.is_dir():
+        return ProtonIntegrityReport(
+            proton_dir=proton_dir,
+            valid=False,
+            missing_files=(),
+            broken_symlinks=(),
+            error="Proton directory does not exist.",
+        )
+
+    missing: list[str] = []
+    for rel in ("proton", "compatibilitytool.vdf", "toolmanifest.vdf"):
+        if not _is_nonempty_file(proton_dir / rel):
+            missing.append(rel)
+
+    wine_candidates = ("files/bin/wine", "dist/bin/wine")
+    if not any(_is_nonempty_file(proton_dir / rel) for rel in wine_candidates):
+        if (proton_dir / "dist").is_dir() and not (proton_dir / "files").is_dir():
+            missing.append("dist/bin/wine")
+        else:
+            missing.append("files/bin/wine")
+
+    broken_symlinks: list[str] = []
+    for bin_rel in ("files/bin", "dist/bin"):
+        bin_dir = proton_dir / bin_rel
+        if not bin_dir.is_dir():
+            continue
+        try:
+            entries = sorted(bin_dir.iterdir(), key=lambda p: p.name)
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_symlink() and not entry.exists():
+                broken_symlinks.append(f"{bin_rel}/{entry.name}")
+
+    valid = not missing and not broken_symlinks
+    errors: list[str] = []
+    if missing:
+        errors.append(f"Missing or empty required files: {', '.join(missing)}")
+    if broken_symlinks:
+        errors.append(f"Broken symlinks: {', '.join(broken_symlinks)}")
+    error = "; ".join(errors) if errors else None
+    return ProtonIntegrityReport(
+        proton_dir=proton_dir,
+        valid=valid,
+        missing_files=tuple(missing),
+        broken_symlinks=tuple(broken_symlinks),
+        error=error,
+    )
+
+
+def repair_ge_proton(
+    proton_dir: Path,
+    progress_cb: ProgressCallback | None = None,
+) -> Path:
+    """Remove a broken GE-Proton directory under compatibilitytools.d and reinstall it."""
+    compat_parent = proton_dir.parent
+    expected_compat_dir = get_compat_tools_dir()
+    if (
+        compat_parent.name != "compatibilitytools.d"
+        and compat_parent.resolve() != expected_compat_dir.resolve()
+    ):
+        raise ValueError(
+            f"Refusing to repair {proton_dir}: must be a direct child of compatibilitytools.d."
+        )
+    if proton_dir.name in ("", ".", ".."):
+        raise ValueError(f"Unsafe GE-Proton directory name: {proton_dir!r}")
+
+    _emit_progress(progress_cb, f"Removing broken GE-Proton directory {proton_dir.name}...", 0)
+    if proton_dir.is_symlink():
+        proton_dir.unlink()
+    elif proton_dir.exists():
+        shutil.rmtree(proton_dir)
+
+    tag = proton_dir.name
+    if _parse_ge_proton_version(tag, min_major=1) is not None:
+        try:
+            releases = fetch_available_proton_releases("ge-proton", limit=50)
+            for rel in releases:
+                if rel.tag_name == tag:
+                    return install_compat_tool(rel, progress_cb=progress_cb)
+        except Exception:
+            pass
+    return ensure_ge_proton11(force_update=True, progress_cb=progress_cb)
 
 
 def ensure_ge_proton11(
     force_update: bool = False,
     progress_cb: ProgressCallback | None = None,
+    verify_integrity: bool = True,
 ) -> Path:
     """Ensure a GE-Proton11+ directory is installed in Steam compatibilitytools.d."""
     existing = list_ge_proton11_dirs()
     if existing and not force_update:
-        return existing[0]
+        if not verify_integrity:
+            return existing[0]
+        first_report: ProtonIntegrityReport | None = None
+        for candidate in existing:
+            report = validate_ge_proton_integrity(candidate)
+            if first_report is None:
+                first_report = report
+            if report.valid:
+                return candidate
+        logging.warning(
+            "GE-Proton11+ integrity check failed for %s (%s); attempting auto-repair.",
+            existing[0],
+            first_report.error if first_report else "unknown error",
+        )
+        return repair_ge_proton(existing[0], progress_cb=progress_cb)
 
     _emit_progress(progress_cb, "Checking latest GE-Proton11+ release...", 0)
     release = _fetch_latest_ge_proton11_release()
@@ -843,9 +1242,10 @@ def ensure_ge_proton11(
         if backup_dir is not None:
             shutil.rmtree(backup_dir, ignore_errors=True)
 
-    versions = _load_versions()
-    versions["ge_proton_latest_version"] = tag
-    _save_versions(versions)
+    def _set_ge(versions: dict[str, Any]) -> None:
+        versions["ge_proton_latest_version"] = tag
+
+    _update_versions(_set_ge)
     _emit_progress(progress_cb, f"{tag} ready.", 100)
     return target_dir
 
@@ -997,6 +1397,7 @@ def fetch_available_proton_releases(
                 asset_name=asset_name,
                 download_url=download_url,
                 checksum_url=checksum_url,
+                sha256_digest=_extract_github_asset_sha256(tar_asset),
                 size_bytes=size_bytes,
                 published_at=str(rel.get("published_at") or "").strip(),
                 prerelease=bool(rel.get("prerelease", False)),
@@ -1098,10 +1499,26 @@ def install_compat_tool(
             timeout=180,
         )
 
+        if release.size_bytes > 0:
+            actual_size = tar_path.stat().st_size
+            if actual_size != release.size_bytes:
+                raise RuntimeError(
+                    f"Downloaded {tar_name} size mismatch: expected {release.size_bytes} bytes, got {actual_size}."
+                )
+
         if sha_path is not None:
             _emit_progress(progress_cb, f"Verifying SHA-512 for {tar_name}...", 92)
             _verify_sha512(
                 tar_path, sha_path.read_text(encoding="utf-8", errors="ignore")
+            )
+        elif release.sha256_digest:
+            _emit_progress(progress_cb, f"Verifying SHA-256 for {tar_name}...", 92)
+            _verify_sha256(tar_path, release.sha256_digest)
+        else:
+            logging.warning(
+                "No checksum_url or sha256_digest published for compatibility tool %s (%s); verified size only.",
+                release.tag_name,
+                tar_name,
             )
 
         _emit_progress(progress_cb, f"Extracting {tar_name}...", 95)
@@ -1204,12 +1621,14 @@ def check_runtime_updates(force: bool = False) -> dict[str, Any]:
     ge_release = _fetch_latest_ge_proton11_release()
     latest_ge = str(ge_release.get("tag_name", "")).strip() or None
 
-    versions["last_check"] = now
-    if latest_umu:
-        versions["umu_latest_version"] = latest_umu
-    if latest_ge:
-        versions["ge_proton_latest_version"] = latest_ge
-    _save_versions(versions)
+    def _set_checked(v: dict[str, Any]) -> None:
+        v["last_check"] = now
+        if latest_umu:
+            v["umu_latest_version"] = latest_umu
+        if latest_ge:
+            v["ge_proton_latest_version"] = latest_ge
+
+    _update_versions(_set_checked)
 
     return {
         "checked_at": now,
@@ -1243,7 +1662,7 @@ def validate_steamrt4_integrity() -> bool:
 
 
 def check_ubuntu_bwrap_userns() -> str | None:
-    """Check if AppArmor unprivileged userns restriction (kernel.apparmor_restrict_unprivileged_userns=1) blocks bwrap."""
+    """Check if AppArmor unprivileged userns restriction blocks bwrap."""
     sysctl_path = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
     if not sysctl_path.is_file():
         return None
@@ -1329,23 +1748,29 @@ def install_system_package(bin_name: str) -> tuple[bool, str]:
     pkexec = shutil.which("pkexec")
     if not pkexec:
         return (False, f"sudo {' '.join(cmd)}")
-    proc = subprocess.run(
-        [pkexec, *cmd],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            [pkexec, *cmd],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return (False, f"Timed out installing {bin_name}.")
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
         return (False, err)
     return (True, f"{bin_name} installed.")
 
 
-def fix_bwrap_userns() -> tuple[bool, str]:
-    """Install a persistent AppArmor userns profile for bwrap (or fallback sysctl) via pkexec."""
+def fix_bwrap_userns(confirmed: bool = False) -> tuple[bool, str]:
+    """Install a persistent AppArmor userns profile for bwrap via pkexec."""
+    if not confirmed:
+        return (False, "User confirmation required to modify AppArmor bwrap profile.")
     pkexec = shutil.which("pkexec")
     if not pkexec:
-        return (False, "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0")
+        return (False, "sudo apparmor_parser -r /etc/apparmor.d/bwrap")
     script = (
         "set -e; "
         "if [ -d /etc/apparmor.d ] && command -v apparmor_parser >/dev/null 2>&1; then "
@@ -1357,18 +1782,21 @@ def fix_bwrap_userns() -> tuple[bool, str]:
         "  include if exists <local/bwrap>\n"
         "}\n"
         "EOF\n"
-        "apparmor_parser -r /etc/apparmor.d/bwrap || true; "
-        "fi; "
-        "if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then "
-        "sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true; "
+        "apparmor_parser -r /etc/apparmor.d/bwrap; "
+        "else "
+        "echo 'AppArmor profile directory or apparmor_parser not found.' >&2; exit 1; "
         "fi"
     )
-    proc = subprocess.run(
-        [pkexec, "sh", "-c", script],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            [pkexec, "sh", "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return (False, "Timed out applying AppArmor bwrap profile.")
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
         return (False, err)
@@ -1384,6 +1812,26 @@ def kill_proc_group(proc: subprocess.Popen[bytes], sig: int) -> None:
             proc.kill()
         else:
             proc.terminate()
+
+
+def _emit_buffered_lines(buf: str, on_line: Callable[[str], None]) -> str:
+    """Emit complete newline/CR-terminated lines from buf and return the remainder."""
+    while True:
+        idx_n = buf.find("\n")
+        idx_r = buf.find("\r")
+        if idx_n == -1 and idx_r == -1:
+            break
+        if idx_n == -1:
+            sep = idx_r
+        elif idx_r == -1:
+            sep = idx_n
+        else:
+            sep = min(idx_n, idx_r)
+        line = buf[:sep]
+        buf = buf[sep + 1 :]
+        if line.strip():
+            on_line(line)
+    return buf
 
 
 def drain_stream_lines(
@@ -1410,29 +1858,28 @@ def drain_stream_lines(
                 raise RuntimeError(cancel_msg)
             ready, _, _ = select.select([fd], [], [], 0.2)
             if ready:
-                chunk = os.read(fd, 4096)
-                if not chunk:
-                    buf += decoder.decode(b"", final=True)
-                    if buf.strip():
-                        on_line(buf)
-                    break
-                buf += decoder.decode(chunk, final=False)
-                while True:
-                    idx_n = buf.find("\n")
-                    idx_r = buf.find("\r")
-                    if idx_n == -1 and idx_r == -1:
+                try:
+                    chunk = os.read(fd, 4096)
+                except BlockingIOError:
+                    chunk = None
+                if chunk is not None:
+                    if not chunk:
+                        buf += decoder.decode(b"", final=True)
+                        if buf.strip():
+                            on_line(buf)
                         break
-                    if idx_n == -1:
-                        sep = idx_r
-                    elif idx_r == -1:
-                        sep = idx_n
-                    else:
-                        sep = min(idx_n, idx_r)
-                    line = buf[:sep]
-                    buf = buf[sep + 1 :]
-                    if line.strip():
-                        on_line(line)
+                    buf += decoder.decode(chunk, final=False)
+                    buf = _emit_buffered_lines(buf, on_line)
             elif proc.poll() is not None:
+                while True:
+                    try:
+                        chunk = os.read(fd, 4096)
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        break
+                    buf += decoder.decode(chunk, final=False)
+                    buf = _emit_buffered_lines(buf, on_line)
                 buf += decoder.decode(b"", final=True)
                 if buf.strip():
                     on_line(buf)
@@ -1446,6 +1893,85 @@ def drain_stream_lines(
             proc.stdout.close()
         except OSError:
             pass
+
+
+def _resolve_proton_name_in_compat_dirs(
+    proton_name: str, steam_root: Path | None = None
+) -> Path | None:
+    """Resolve a Proton/compat tool name or path across all compatibility tool directories."""
+    cleaned = proton_name.strip()
+    if not cleaned:
+        return None
+    as_path = Path(cleaned)
+    if as_path.is_dir() and (as_path / "proton").is_file():
+        return as_path
+
+    from .steam_paths import _iter_compat_tool_dirs, _read_compat_tool_id, find_steam_root
+
+    effective_steam_root = steam_root if steam_root is not None else find_steam_root()
+    candidate_dirs: list[Path] = [get_compat_tools_dir()]
+    if effective_steam_root is not None:
+        candidate_dirs.extend(_iter_compat_tool_dirs(effective_steam_root))
+    candidate_dirs.extend(_iter_extra_compat_tool_dirs())
+
+    seen_dirs: set[Path] = set()
+    for compat_dir in candidate_dirs:
+        if not compat_dir.is_dir():
+            continue
+        try:
+            resolved_dir = compat_dir.resolve()
+        except OSError:
+            resolved_dir = compat_dir
+        if resolved_dir in seen_dirs:
+            continue
+        seen_dirs.add(resolved_dir)
+
+        direct = compat_dir / cleaned
+        if direct.is_dir() and (direct / "proton").is_file():
+            return direct
+
+        try:
+            entries = list(compat_dir.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.is_dir() or not (entry / "proton").is_file():
+                continue
+            vdf_file = entry / "compatibilitytool.vdf"
+            if vdf_file.is_file() and _read_compat_tool_id(vdf_file, entry.name) == cleaned:
+                return entry
+    return None
+
+
+def _resolve_builtin_steam_proton(proton_name: str, steam_root: Path) -> Path | None:
+    """Resolve a built-in Steam Proton tool name across Steam library common/ directories."""
+    from .steam_paths import _list_steam_library_roots
+
+    cleaned = proton_name.strip()
+    if not cleaned:
+        return None
+    low = cleaned.lower()
+    candidates: list[str] = []
+    if low == "proton_experimental":
+        candidates.append("Proton - Experimental")
+    elif low == "proton_hotfix":
+        candidates.append("Proton - Hotfix")
+    else:
+        m = re.fullmatch(r"proton_(\d+)", low)
+        if m:
+            num = m.group(1)
+            candidates.extend([f"Proton {num}.0", f"Proton {num}"])
+    candidates.append(cleaned)
+
+    for lib in _list_steam_library_roots(steam_root):
+        common_dir = lib / "steamapps" / "common"
+        if not common_dir.is_dir():
+            continue
+        for cand_name in candidates:
+            cand = common_dir / cand_name
+            if cand.is_dir() and (cand / "proton").is_file():
+                return cand
+    return None
 
 
 def resolve_game_prefix(
@@ -1463,9 +1989,17 @@ def resolve_game_prefix(
             raise ValueError(f"Expected integer appid or ShortcutEntry, got {type(obj).__name__}.")
         prefix_dir = paths.compatdata_dir / str(appid) / "pfx"
         from .steam_paths import find_proton_binary
+        from .steam_vdf import get_shortcut_proton
 
-        proton_bin = find_proton_binary(paths.steam_root)
-        proton_dir = proton_bin.parent if proton_bin is not None else None
+        proton_dir: Path | None = None
+        proton_name = get_shortcut_proton(paths.config_vdf, appid)
+        if proton_name:
+            proton_dir = _resolve_proton_name_in_compat_dirs(proton_name, paths.steam_root)
+            if proton_dir is None:
+                proton_dir = _resolve_builtin_steam_proton(proton_name, paths.steam_root)
+        if proton_dir is None:
+            proton_bin = find_proton_binary(paths.steam_root)
+            proton_dir = proton_bin.parent if proton_bin is not None else None
         return (prefix_dir, proton_dir)
 
     if kind_norm == "standalone":
@@ -1476,21 +2010,10 @@ def resolve_game_prefix(
         if (prefix_dir / "pfx").is_dir() and not (prefix_dir / "drive_c").is_dir():
             prefix_dir = prefix_dir / "pfx"
 
-        proton_dir: Path | None = None
+        proton_dir = None
         proton_name = str(getattr(obj, "proton_name", "") or "").strip()
         if proton_name:
-            as_path = Path(proton_name)
-            if as_path.is_dir() and (as_path / "proton").is_file():
-                proton_dir = as_path
-            else:
-                for cand in list_ge_proton11_dirs():
-                    if cand.name == proton_name:
-                        proton_dir = cand
-                        break
-                if proton_dir is None:
-                    compat_cand = get_compat_tools_dir() / proton_name
-                    if compat_cand.is_dir() and (compat_cand / "proton").is_file():
-                        proton_dir = compat_cand
+            proton_dir = _resolve_proton_name_in_compat_dirs(proton_name)
         if proton_dir is None:
             ge_dirs = list_ge_proton11_dirs()
             if ge_dirs:
@@ -1522,6 +2045,8 @@ def run_winetricks_verbs(
     proton_dir: Path | None = None,
     on_log: Callable[[str], None] | None = None,
     cancel_flag: Callable[[], bool] | None = None,
+    game_name: str = "",
+    snapshot_before: bool = True,
 ) -> None:
     """Install one or more winetricks verbs silently into prefix_dir."""
     if not verbs:
@@ -1533,6 +2058,21 @@ def run_winetricks_verbs(
     winetricks = shutil.which("winetricks")
     if winetricks is None:
         raise RuntimeError("winetricks is not installed or not found in PATH.")
+
+    if snapshot_before and prefix_dir.is_dir():
+        try:
+            from .save_sync import snapshot_prefix_state
+
+            label = game_name.strip() or prefix_dir.name
+            snapshot_path = snapshot_prefix_state(prefix_dir, label)
+            if on_log and snapshot_path is not None:
+                on_log(f"Created prefix snapshot before winetricks: {snapshot_path}")
+        except (ImportError, AttributeError):
+            pass
+        except Exception as exc:
+            logging.warning("Prefix snapshot before winetricks failed: %s", exc)
+            if on_log:
+                on_log(f"Warning: prefix snapshot failed ({exc}); continuing winetricks.")
 
     prefix_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -1600,7 +2140,22 @@ def run_with_umu(
 ) -> subprocess.CompletedProcess[bytes]:
     """Ensure umu-run, GE-Proton11+, and steamrt4 integrity, then execute exe_path."""
     umu_run = ensure_umu_run()
-    resolved_proton = proton_dir if proton_dir is not None else ensure_ge_proton11()
+    if proton_dir is not None:
+        report = validate_ge_proton_integrity(proton_dir)
+        if report.valid:
+            resolved_proton = proton_dir
+        else:
+            logging.warning(
+                "Provided Proton directory %s failed integrity check (%s); attempting repair/fallback.",
+                proton_dir,
+                report.error,
+            )
+            try:
+                resolved_proton = repair_ge_proton(proton_dir)
+            except Exception:
+                resolved_proton = ensure_ge_proton11()
+    else:
+        resolved_proton = ensure_ge_proton11()
     validate_steamrt4_integrity()
     prefix_dir.mkdir(parents=True, exist_ok=True)
     env = build_umu_env(prefix_dir, resolved_proton, extra_env=extra_env)
@@ -1669,3 +2224,346 @@ def run_exe_in_prefix(
         start_new_session=True,
     )
     return 0
+
+
+@dataclass(frozen=True)
+class _UmuDbIndex:
+    """Structure-of-Arrays in-memory index for umu-database.csv."""
+
+    titles: tuple[str, ...]
+    norm_titles: tuple[str, ...]
+    stores: tuple[str, ...]
+    codenames: tuple[str, ...]
+    umu_ids: tuple[str, ...]
+    common_redists: tuple[str, ...]
+    notes: tuple[str, ...]
+    by_norm_title: dict[str, tuple[int, ...]]
+    by_codename: dict[str, tuple[int, ...]]
+    by_umu_id: dict[str, tuple[int, ...]]
+
+
+_UMU_DB_CACHE_LOCK = threading.Lock()
+_UMU_DB_CACHE: tuple[tuple[str, int, int], _UmuDbIndex] | None = None
+_GENERIC_EXE_PARENTS = frozenset(
+    {"", "bin", "binaries", "game", "win32", "win64", "x64", "x86"}
+)
+
+
+def _normalize_umu_title(text: str) -> str:
+    """Normalize a game title or executable stem for umu-database lookup."""
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _validate_umu_csv_header(csv_path: Path) -> None:
+    """Verify csv_path has a valid umu-database.csv header."""
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as fh:
+        reader = csv.reader(fh)
+        header = next(reader, None)
+    if not header:
+        raise RuntimeError("Downloaded umu-database.csv is empty.")
+    cols = {col.strip().upper() for col in header if col.strip()}
+    if "TITLE" not in cols or "UMU_ID" not in cols:
+        raise RuntimeError(f"Invalid umu-database.csv header: {header!r}")
+
+
+def _build_umu_db_index(csv_path: Path) -> _UmuDbIndex:
+    """Parse umu-database.csv into a Structure-of-Arrays index."""
+    titles: list[str] = []
+    norm_titles: list[str] = []
+    stores: list[str] = []
+    codenames: list[str] = []
+    umu_ids: list[str] = []
+    common_redists: list[str] = []
+    notes: list[str] = []
+    by_norm_title: dict[str, list[int]] = {}
+    by_codename: dict[str, list[int]] = {}
+    by_umu_id: dict[str, list[int]] = {}
+
+    with csv_path.open("r", encoding="utf-8-sig", newline="") as fh:
+        reader = csv.reader(fh)
+        raw_header = next(reader, None)
+        if not raw_header:
+            raise RuntimeError("Empty umu-database.csv.")
+        col_map = {col.strip().upper(): idx for idx, col in enumerate(raw_header)}
+        if "TITLE" not in col_map or "UMU_ID" not in col_map:
+            raise RuntimeError(f"Invalid umu-database.csv header: {raw_header!r}")
+
+        title_i = col_map["TITLE"]
+        store_i = col_map.get("STORE", -1)
+        codename_i = col_map.get("CODENAME", -1)
+        umu_id_i = col_map["UMU_ID"]
+        redist_i = col_map.get("COMMON_REDIST", col_map.get("COMMONREDIST", -1))
+        note_i = col_map.get("NOTE", -1)
+
+        def _cell(row: list[str], idx: int) -> str:
+            return row[idx].strip() if 0 <= idx < len(row) else ""
+
+        for row in reader:
+            if not row:
+                continue
+            title = _cell(row, title_i)
+            umu_id = _cell(row, umu_id_i)
+            if not title and not umu_id:
+                continue
+            store = _cell(row, store_i)
+            codename = _cell(row, codename_i)
+            common_redist = _cell(row, redist_i)
+            note = _cell(row, note_i)
+            norm = _normalize_umu_title(title)
+
+            row_idx = len(titles)
+            titles.append(title)
+            norm_titles.append(norm)
+            stores.append(store)
+            codenames.append(codename)
+            umu_ids.append(umu_id)
+            common_redists.append(common_redist)
+            notes.append(note)
+
+            if norm:
+                by_norm_title.setdefault(norm, []).append(row_idx)
+            if codename:
+                by_codename.setdefault(codename.lower(), []).append(row_idx)
+            if umu_id:
+                by_umu_id.setdefault(umu_id.lower(), []).append(row_idx)
+
+    return _UmuDbIndex(
+        titles=tuple(titles),
+        norm_titles=tuple(norm_titles),
+        stores=tuple(stores),
+        codenames=tuple(codenames),
+        umu_ids=tuple(umu_ids),
+        common_redists=tuple(common_redists),
+        notes=tuple(notes),
+        by_norm_title={k: tuple(v) for k, v in by_norm_title.items()},
+        by_codename={k: tuple(v) for k, v in by_codename.items()},
+        by_umu_id={k: tuple(v) for k, v in by_umu_id.items()},
+    )
+
+
+def _get_umu_db_index(db_path: Path) -> _UmuDbIndex | None:
+    """Return cached SoA index for db_path, rebuilding if file mtime/size changed."""
+    global _UMU_DB_CACHE
+    try:
+        st = db_path.stat()
+    except OSError:
+        return None
+    if st.st_size <= 0:
+        return None
+    cache_key = (str(db_path.resolve()), st.st_mtime_ns, st.st_size)
+
+    with _UMU_DB_CACHE_LOCK:
+        if _UMU_DB_CACHE is not None and _UMU_DB_CACHE[0] == cache_key:
+            return _UMU_DB_CACHE[1]
+
+    try:
+        index = _build_umu_db_index(db_path)
+    except (OSError, RuntimeError, csv.Error):
+        return None
+
+    with _UMU_DB_CACHE_LOCK:
+        _UMU_DB_CACHE = (cache_key, index)
+    return index
+
+
+def ensure_umu_database(
+    force_update: bool = False,
+    progress_cb: ProgressCallback | None = None,
+) -> Path | None:
+    """Ensure umu-database.csv is cached locally, refreshing when TTL expires."""
+    db_path = get_umu_database_path()
+    has_cached = db_path.is_file() and db_path.stat().st_size > 0
+    if not force_update and has_cached:
+        versions = _load_versions()
+        try:
+            last_check = int(versions.get("umu_db_last_check", 0) or 0)
+        except (TypeError, ValueError):
+            last_check = 0
+        if (time.time() - last_check) < UMU_DATABASE_TTL_SECONDS:
+            return db_path
+
+    tmp_path: Path | None = None
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        _emit_progress(progress_cb, "Downloading umu-database.csv...", 0)
+        with _request_with_validated_redirects(
+            UMU_DATABASE_URL,
+            allowed_hosts=_ALLOWED_UMU_DB_HOSTS,
+            headers={"User-Agent": USER_AGENT},
+            timeout=30,
+            stream=True,
+            label="umu-database.csv",
+        ) as resp:
+            resp.raise_for_status()
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=".umu-database_",
+                suffix=".csv",
+                dir=str(db_path.parent),
+            )
+            tmp_path = Path(tmp_name)
+            with os.fdopen(fd, "wb") as handle:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if chunk:
+                        handle.write(chunk)
+
+        _validate_umu_csv_header(tmp_path)
+        os.replace(tmp_path, db_path)
+        tmp_path = None
+
+        def _set_umu_db(versions: dict[str, Any]) -> None:
+            versions["umu_db_last_check"] = int(time.time())
+
+        _update_versions(_set_umu_db)
+        _emit_progress(progress_cb, "umu-database.csv ready.", 100)
+        return db_path
+    except Exception as exc:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if has_cached:
+            logging.warning(
+                "Failed to update umu-database.csv (%s); using cached copy at %s.",
+                exc,
+                db_path,
+            )
+            return db_path
+        logging.warning("Failed to fetch umu-database.csv and no local cache exists: %s", exc)
+        return None
+
+
+def _pick_store_row(
+    index: _UmuDbIndex,
+    candidates: tuple[int, ...],
+    store: str,
+) -> int:
+    """Select the row matching store (case-insensitive), or the first candidate."""
+    store_low = store.strip().lower()
+    if store_low:
+        for idx in candidates:
+            if index.stores[idx].lower() == store_low:
+                return idx
+    return candidates[0]
+
+
+def lookup_umu_database(
+    exe_path: Path | None = None,
+    game_title: str = "",
+    store: str = "",
+    db_path: Path | None = None,
+) -> UmuDbLookupResult | None:
+    """Look up a game in the local umu-database.csv cache by title or executable path."""
+    resolved_db = db_path if db_path is not None else get_umu_database_path()
+    index = _get_umu_db_index(resolved_db)
+    if index is None:
+        return None
+
+    matched_idx: int | None = None
+    match_source = ""
+
+    if game_title.strip():
+        norm = _normalize_umu_title(game_title)
+        rows = index.by_norm_title.get(norm)
+        if rows:
+            matched_idx = _pick_store_row(index, rows, store)
+            match_source = "title"
+
+    if matched_idx is None and exe_path is not None:
+        stem = exe_path.stem.strip()
+        if stem:
+            norm_stem = _normalize_umu_title(stem)
+            rows = index.by_norm_title.get(norm_stem) or index.by_codename.get(stem.lower())
+            if rows:
+                matched_idx = _pick_store_row(index, rows, store)
+                match_source = "exe_stem"
+
+        if matched_idx is None:
+            parent_name = exe_path.parent.name.strip()
+            if parent_name.lower() not in _GENERIC_EXE_PARENTS:
+                norm_parent = _normalize_umu_title(parent_name)
+                rows = index.by_norm_title.get(norm_parent)
+                if rows:
+                    matched_idx = _pick_store_row(index, rows, store)
+                    match_source = "exe_parent"
+
+    if matched_idx is None:
+        return None
+
+    return UmuDbLookupResult(
+        umu_id=index.umu_ids[matched_idx],
+        store=index.stores[matched_idx],
+        title=index.titles[matched_idx],
+        common_redist=index.common_redists[matched_idx],
+        note=index.notes[matched_idx],
+        match_source=match_source,
+    )
+
+
+def get_umu_protonfix_status(
+    game_id: str,
+    store: str = "",
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    """Return protonfix/database status for a UMU game_id from local umu-database.csv."""
+    resolved_db = db_path if db_path is not None else get_umu_database_path()
+    db_cached = resolved_db.is_file()
+    cleaned_id = game_id.strip()
+    if not cleaned_id or cleaned_id.lower() in ("umu-default", "none"):
+        return {
+            "game_id": cleaned_id,
+            "store": store,
+            "found": False,
+            "has_protonfix": False,
+            "umu_id": "",
+            "title": "",
+            "common_redist": "",
+            "note": "",
+            "db_cached": db_cached,
+        }
+
+    index = _get_umu_db_index(resolved_db)
+    if index is None:
+        return {
+            "game_id": cleaned_id,
+            "store": store,
+            "found": False,
+            "has_protonfix": False,
+            "umu_id": "",
+            "title": "",
+            "common_redist": "",
+            "note": "",
+            "db_cached": db_cached,
+        }
+
+    low_id = cleaned_id.lower()
+    rows = index.by_umu_id.get(low_id)
+    if not rows and not low_id.startswith("umu-"):
+        rows = index.by_umu_id.get(f"umu-{low_id}")
+
+    if not rows:
+        return {
+            "game_id": cleaned_id,
+            "store": store,
+            "found": False,
+            "has_protonfix": False,
+            "umu_id": "",
+            "title": "",
+            "common_redist": "",
+            "note": "",
+            "db_cached": True,
+        }
+
+    idx = _pick_store_row(index, rows, store)
+    matched_umu_id = index.umu_ids[idx]
+    return {
+        "game_id": cleaned_id,
+        "store": index.stores[idx] or store,
+        "found": True,
+        "has_protonfix": bool(matched_umu_id and matched_umu_id.lower() != "umu-default"),
+        "umu_id": matched_umu_id,
+        "title": index.titles[idx],
+        "common_redist": index.common_redists[idx],
+        "note": index.notes[idx],
+        "db_cached": True,
+    }

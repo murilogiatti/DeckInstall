@@ -158,7 +158,7 @@ def _grid_files_for_appid(shortcut_appid_u32: int, grid_dir: Path) -> list[Path]
         if p.is_symlink() or not p.is_file() or not p.name.startswith(prefix):
             continue
         rest = p.name[len(prefix) :]
-        if rest and not (rest[0] in ("p", "_", ".")):
+        if rest and rest[0] not in ("p", "_", "."):
             continue
         matched.append(p)
     return matched

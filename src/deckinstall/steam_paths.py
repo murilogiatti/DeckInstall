@@ -21,6 +21,36 @@ class SteamPaths:
     config_vdf: Path
     compatdata_dir: Path
 
+    @property
+    def localconfig_vdf(self) -> Path:
+        """Return the path to the user's localconfig.vdf."""
+        return self.userdata_dir / "config" / "localconfig.vdf"
+
+
+def dir_size_bytes(path: Path) -> int:
+    """Return total byte size of regular files under path, skipping symlinks."""
+    if path.is_symlink() or not path.is_dir():
+        return 0
+    total = 0
+    stack: list[Path | str] = [path]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                        elif entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
 
 def find_steam_root() -> Path | None:
     """Return the active Steam installation directory, if present."""
@@ -45,6 +75,25 @@ def is_flatpak_steam(steam_root: Path | None = None) -> bool:
     return "com.valvesoftware.Steam" in root.parts
 
 
+_VDF_READ_ERRORS = (
+    OSError,
+    UnicodeDecodeError,
+    ValueError,
+    KeyError,
+    TypeError,
+    SyntaxError,
+    ImportError,
+)
+
+
+def _safe_iterdir(directory: Path) -> list[Path]:
+    """Return directory entries, or an empty list if the directory cannot be read."""
+    try:
+        return list(directory.iterdir())
+    except OSError:
+        return []
+
+
 def _parse_loginusers_priority(steam_root: Path) -> dict[str, tuple[int, int]]:
     """Return {steam3_id: (most_recent_flag, timestamp)} from config/loginusers.vdf."""
     loginusers = steam_root / "config" / "loginusers.vdf"
@@ -54,7 +103,7 @@ def _parse_loginusers_priority(steam_root: Path) -> dict[str, tuple[int, int]]:
         import vdf
 
         data = vdf.loads(loginusers.read_text(encoding="utf-8", errors="replace"))
-    except Exception:
+    except _VDF_READ_ERRORS:
         return {}
     users_map = data.get("users")
     if not isinstance(users_map, dict):
@@ -81,7 +130,7 @@ def list_steam_users(steam_root: Path) -> list[str]:
         return []
     users = [
         p
-        for p in userdata.iterdir()
+        for p in _safe_iterdir(userdata)
         if p.is_dir() and p.name.isascii() and p.name.isdigit() and p.name != "0"
     ]
     login_prio = _parse_loginusers_priority(steam_root)
@@ -135,7 +184,7 @@ def _list_steam_library_roots(steam_root: Path) -> list[Path]:
         import vdf
 
         data = vdf.loads(lib_vdf.read_text(encoding="utf-8", errors="replace"))
-    except Exception:
+    except _VDF_READ_ERRORS:
         return roots
     folders = data.get("libraryfolders") or data.get("LibraryFolders") or {}
     if isinstance(folders, dict):
@@ -168,7 +217,7 @@ def _read_compat_tool_id(vdf_path: Path, fallback: str) -> str:
             first_key = next(iter(tools.keys()))
             if isinstance(first_key, str) and first_key.strip():
                 return first_key.strip()
-    except Exception:
+    except _VDF_READ_ERRORS:
         pass
     return fallback
 
@@ -179,7 +228,16 @@ def _iter_compat_tool_dirs(steam_root: Path) -> list[Path]:
         steam_root / "compatibilitytools.d",
         Path.home() / ".local" / "share" / "Steam" / "compatibilitytools.d",
         Path.home() / ".steam" / "root" / "compatibilitytools.d",
-        Path.home() / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam" / "compatibilitytools.d",
+        (
+            Path.home()
+            / ".var"
+            / "app"
+            / "com.valvesoftware.Steam"
+            / ".local"
+            / "share"
+            / "Steam"
+            / "compatibilitytools.d"
+        ),
     ]
     out: list[Path] = []
     visited: set[Path] = set()
@@ -226,11 +284,14 @@ def find_default_proton_name(steam_root: Path) -> str:
         if (lib / "steamapps" / "common" / "Proton - Experimental" / "proton").is_file():
             return "proton_experimental"
     for compat_tools in _iter_compat_tool_dirs(steam_root):
-        for entry in sorted(compat_tools.iterdir(), key=_proton_version_key, reverse=True):
+        for entry in sorted(_safe_iterdir(compat_tools), key=_proton_version_key, reverse=True):
             vdf_file = entry / "compatibilitytool.vdf"
             if entry.is_dir() and vdf_file.is_file() and (entry / "proton").is_file():
                 return _read_compat_tool_id(vdf_file, entry.name)
-    return "proton_11"
+    installed = list_installed_protons(steam_root)
+    if installed:
+        return installed[0][0]
+    return "proton_experimental"
 
 
 def find_proton_binary(steam_root: Path) -> Path | None:
@@ -249,7 +310,7 @@ def find_proton_binary(steam_root: Path) -> Path | None:
                 if proton.is_file():
                     return proton
     for compat_tools in _iter_compat_tool_dirs(steam_root):
-        for entry in sorted(compat_tools.iterdir(), key=_proton_version_key, reverse=True):
+        for entry in sorted(_safe_iterdir(compat_tools), key=_proton_version_key, reverse=True):
             proton = entry / "proton"
             if entry.is_dir() and proton.is_file():
                 return proton
@@ -262,7 +323,7 @@ def list_installed_protons(steam_root: Path) -> list[tuple[str, str]]:
     seen: set[str] = set()
 
     for compat_tools in _iter_compat_tool_dirs(steam_root):
-        for entry in sorted(compat_tools.iterdir(), key=_proton_version_key, reverse=True):
+        for entry in sorted(_safe_iterdir(compat_tools), key=_proton_version_key, reverse=True):
             vdf_file = entry / "compatibilitytool.vdf"
             if entry.is_dir() and vdf_file.is_file():
                 tool_id = _read_compat_tool_id(vdf_file, entry.name)
@@ -308,9 +369,10 @@ def is_gamescope_session() -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
+            timeout=3,
         )
         return res.returncode == 0
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return False
 
 
@@ -322,7 +384,8 @@ def is_steam_running() -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
+            timeout=3,
         )
         return res.returncode == 0
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return False

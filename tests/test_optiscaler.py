@@ -323,6 +323,28 @@ class LaunchPresetsAndStandaloneGuardTests(unittest.TestCase):
             self.assertFalse(desktop_file.exists())
             self.assertFalse(launch_script.exists())
 
+    def test_install_optiscaler_rejects_symlink_subdir_escaping_exe_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root / "outside"
+            outside.mkdir()
+            game_dir = root / "game"
+            game_dir.mkdir()
+            exe_path = game_dir / "Game.exe"
+            exe_path.write_bytes(b"MZ\x90\x00")
+            (game_dir / "sub").symlink_to(outside)
+
+            payload_dir = root / "payload"
+            payload_dir.mkdir()
+            (payload_dir / "OptiScaler.dll").write_bytes(b"OPTIDLL")
+            (payload_dir / "sub").mkdir()
+            (payload_dir / "sub" / "extra.dll").write_bytes(b"EXTRADLL")
+
+            with self.assertRaisesRegex(RuntimeError, "Unsafe symlink in destination path"):
+                install_optiscaler_for_game(exe_path, payload_dir=payload_dir)
+
+            self.assertFalse((outside / "extra.dll").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

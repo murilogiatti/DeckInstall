@@ -548,5 +548,245 @@ class Fase4RegressionTests(unittest.TestCase):
             self.assertIsNone(fallback_name)
 
 
+class Phase1SecurityAndCoreTests(unittest.TestCase):
+    def test_extractor_precheck_tar_and_unzip_rejects_links_and_traversal(self) -> None:
+        from deckinstall import extractor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = Path(tmp) / "fake.tar.zst"
+            arc.write_bytes(b"dummy")
+
+            sym_proc = mock.Mock(
+                returncode=0,
+                stdout="lrwxrwxrwx user/user 0 2026-01-01 00:00 sub -> /etc/passwd\n",
+                stderr="",
+            )
+            with mock.patch("deckinstall.extractor.subprocess.run", return_value=sym_proc):
+                with self.assertRaises(RuntimeError):
+                    extractor._precheck_cli_archive("/usr/bin/tar", arc)
+
+            trav_proc = mock.Mock(
+                returncode=0,
+                stdout="-rw-r--r-- user/user 10 2026-01-01 00:00 ../evil.txt\n",
+                stderr="",
+            )
+            with mock.patch("deckinstall.extractor.subprocess.run", return_value=trav_proc):
+                with self.assertRaises(RuntimeError):
+                    extractor._precheck_cli_archive("/usr/bin/tar", arc)
+
+            unzip_proc = mock.Mock(returncode=0, stdout="../evil.txt\n", stderr="")
+            with mock.patch("deckinstall.extractor.subprocess.run", return_value=unzip_proc):
+                with self.assertRaises(RuntimeError):
+                    extractor._precheck_cli_archive("/usr/bin/unzip", arc)
+
+    def test_extractor_zip_entry_limit_and_staging_cleanup(self) -> None:
+        import zipfile
+
+        from deckinstall import extractor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            zpath = root / "many.zip"
+            with zipfile.ZipFile(zpath, "w") as zf:
+                zf.writestr("a.txt", "1")
+                zf.writestr("b.txt", "2")
+            dest = root / "out"
+            with mock.patch.object(extractor, "_MAX_ARCHIVE_ENTRIES", 1):
+                with self.assertRaises(RuntimeError):
+                    extractor._extract_zip_safe(zpath, dest)
+
+    def test_redirect_validation_blocks_non_github_host(self) -> None:
+        from deckinstall import app_updater, runtime_manager
+
+        redir_resp = mock.Mock()
+        redir_resp.status_code = 302
+        redir_resp.is_redirect = True
+        redir_resp.headers = {"Location": "https://evil.example.com/payload.AppImage"}
+
+        with mock.patch("deckinstall.app_updater.requests.get", return_value=redir_resp):
+            with self.assertRaises(ValueError):
+                app_updater._request_github_with_validated_redirects(
+                    "https://github.com/owner/repo/releases/download/v1/app.AppImage",
+                    headers={},
+                    timeout=5,
+                )
+
+        with mock.patch("deckinstall.runtime_manager.requests.get", return_value=redir_resp):
+            with self.assertRaises(ValueError):
+                runtime_manager._request_github_with_validated_redirects(
+                    "https://github.com/owner/repo/releases/latest",
+                    headers={},
+                    timeout=5,
+                )
+
+    def test_import_standalone_to_steam_passes_correct_resolve_icon_arg_order(self) -> None:
+        from deckinstall.standalone import StandaloneGame, import_standalone_to_steam
+        from deckinstall.steam_paths import SteamPaths
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            game_dir = root / "MyGame"
+            game_dir.mkdir()
+            exe_path = game_dir / "game.exe"
+            exe_path.write_bytes(b"MZ")
+            game = StandaloneGame(
+                name="MyGame",
+                game_dir=game_dir,
+                exe_path=exe_path,
+                prefix_dir=root / "pfx",
+                native_linux=False,
+                proton_name="GE-Proton11-1",
+                steam_appid=None,
+                winedlloverrides="",
+                launch_options="",
+                launch_script=game_dir / "launch.sh",
+                desktop_file=root / "mygame.desktop",
+            )
+            paths = SteamPaths(
+                steam_root=root,
+                user_id="123",
+                userdata_dir=root,
+                shortcuts_vdf=root / "shortcuts.vdf",
+                config_vdf=root / "config.vdf",
+                grid_dir=root / "grid",
+                compatdata_dir=root / "compatdata",
+            )
+            with (
+                mock.patch("deckinstall.standalone.resolve_game_icon", return_value=None) as m_icon,
+                mock.patch("deckinstall.standalone.add_or_update_shortcut", return_value=999),
+                mock.patch("deckinstall.standalone.set_shortcut_proton"),
+            ):
+                import_standalone_to_steam(paths, game)
+            m_icon.assert_called_once_with(exe_path, game_dir, steam_appid=None)
+
+    def test_steam_vdf_hardening_shortcuts_config_sd_card_and_quotes(self) -> None:
+        from deckinstall import steam_vdf
+
+        self.assertEqual(steam_vdf._format_launch_token('--opt="a b"'), '--opt="a b"')
+        self.assertEqual(steam_vdf._format_launch_token('FOO="bar\\"baz"'), 'FOO="bar\\"baz"')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            corrupt = root / "shortcuts.vdf"
+            corrupt.write_bytes(b"\xff\xfe\x00corrupt")
+            self.assertEqual(steam_vdf.load_shortcuts(corrupt), [])
+
+            cfg = root / "config.vdf"
+            cfg.write_text(
+                '"InstallConfigStore"\n{\n\t"software"\n\t{\n\t\t"valve"\n\t\t{\n\t\t\t"steam"\n\t\t\t{\n\t\t\t}\n\t\t}\n\t}\n}\n',
+                encoding="utf-8",
+            )
+            steam_vdf.set_compat_tool(cfg, 12345, "GE-Proton11-1")
+            text = cfg.read_text(encoding="utf-8")
+            self.assertIn("12345", text)
+            self.assertEqual(text.lower().count('"software"'), 1)
+            steam_vdf.remove_compat_tool(cfg, 12345)
+            self.assertNotIn("12345", cfg.read_text(encoding="utf-8"))
+
+        sd_exe = Path("/run/media/deck/SDCard/MyGame/Binaries/Win64/Game.exe")
+        self.assertEqual(steam_vdf.infer_game_root_from_exe(sd_exe), Path("/run/media/deck/SDCard/MyGame"))
+        with self.assertRaises(ValueError):
+            steam_vdf.infer_game_root_from_exe(Path("/run/media/deck/SDCard/Game.exe"))
+
+    def test_pull_game_saves_restores_mtime_and_requires_metadata(self) -> None:
+        import json
+        import zipfile
+
+        from deckinstall import save_sync
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pfx = root / "pfx"
+            sync_root = root / "sync"
+            game_sync = sync_root / "mygame"
+            game_sync.mkdir(parents=True)
+            zpath = game_sync / "latest.zip"
+            with zipfile.ZipFile(zpath, "w") as zf:
+                zf.writestr("users/steamuser/AppData/Local/MyGame/save.dat", b"SAVE1")
+
+            with self.assertRaises(RuntimeError):
+                save_sync.pull_game_saves("MyGame", pfx, sync_root, snapshots_root=root / "snaps")
+
+            sha = save_sync._sha256_file(zpath)
+            target_ts = 1700000123.0
+            (game_sync / "meta.json").write_text(
+                json.dumps({"sha256": sha, "updated_at": target_ts}),
+                encoding="utf-8",
+            )
+            count, _ = save_sync.pull_game_saves("MyGame", pfx, sync_root, snapshots_root=root / "snaps")
+            self.assertEqual(count, 1)
+            restored = pfx / "drive_c" / "users" / "steamuser" / "AppData" / "Local" / "MyGame" / "save.dat"
+            self.assertAlmostEqual(restored.stat().st_mtime, target_ts, delta=1.0)
+
+    def test_apply_launch_presets_keeps_lsfg_vk_before_command_and_preserves_winedlloverrides_when_none(
+        self,
+    ) -> None:
+        from deckinstall import steam_vdf
+
+        res1 = steam_vdf.apply_launch_presets(
+            "lsfg-vk --flag",
+            gamemode=False,
+            mangohud=False,
+            wined3d=False,
+            no_esync=False,
+            no_fsync=False,
+            winedlloverrides=None,
+        )
+        self.assertEqual(res1, "lsfg-vk %command% --flag")
+
+        res2 = steam_vdf.apply_launch_presets(
+            "WINEDLLOVERRIDES=dxgi=n,b lsfg-vk %command% --flag",
+            gamemode=True,
+            mangohud=False,
+            wined3d=False,
+            no_esync=False,
+            no_fsync=False,
+            winedlloverrides=None,
+        )
+        tokens = res2.split()
+        cmd_idx = tokens.index("%command%")
+        self.assertIn("WINEDLLOVERRIDES=dxgi=n,b", tokens[:cmd_idx])
+        self.assertIn("lsfg-vk", tokens[:cmd_idx])
+        self.assertIn("gamemoderun", tokens[:cmd_idx])
+        self.assertEqual(tokens[cmd_idx + 1 :], ["--flag"])
+
+    def test_file_lock_rejects_symlinked_lockfile(self) -> None:
+        from deckinstall import steam_vdf
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            real_lock = root / "real.lock"
+            real_lock.write_text("", encoding="utf-8")
+            sym_lock = root / "sym.lock"
+            sym_lock.symlink_to(real_lock)
+
+            with self.assertRaisesRegex(RuntimeError, "Refusing symlink lockfile"):
+                with steam_vdf._file_lock(sym_lock):
+                    pass
+
+    def test_push_game_saves_allows_exact_max_entries_and_rejects_excess(self) -> None:
+        from unittest.mock import patch
+
+        from deckinstall import save_sync
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pfx = root / "pfx"
+            save_dir = pfx / "drive_c" / "users" / "steamuser" / "AppData" / "Local" / "MyGame"
+            save_dir.mkdir(parents=True)
+            (save_dir / "s1.dat").write_bytes(b"ONE")
+            (save_dir / "s2.dat").write_bytes(b"TWO")
+            sync_root = root / "sync"
+
+            with patch.object(save_sync, "_RESTORE_MAX_ENTRIES", 2):
+                out_zip = save_sync.push_game_saves("MyGame", pfx, sync_root)
+                self.assertIsNotNone(out_zip)
+                self.assertTrue(out_zip.is_file())
+
+                (save_dir / "s3.dat").write_bytes(b"THREE")
+                with self.assertRaisesRegex(RuntimeError, "maximum entry count"):
+                    save_sync.push_game_saves("MyGame", pfx, sync_root)
+
+
 if __name__ == "__main__":
     unittest.main()
