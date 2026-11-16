@@ -59,6 +59,54 @@ ProgressCb = ProgressCallback
 
 
 @dataclass(frozen=True)
+class ProtonFamily:
+    """Supported custom Proton release family hosted on GitHub."""
+
+    id: str
+    label: str
+    repo: str
+
+
+@dataclass(frozen=True)
+class ProtonRelease:
+    """Metadata for an available custom Proton release asset on GitHub."""
+
+    family_id: str
+    tag_name: str
+    name: str
+    asset_name: str
+    download_url: str
+    checksum_url: str | None = None
+    size_bytes: int = 0
+    published_at: str = ""
+    prerelease: bool = False
+
+
+@dataclass(frozen=True)
+class InstalledCompatTool:
+    """An installed custom compatibility tool in compatibilitytools.d."""
+
+    folder_name: str
+    tool_id: str
+    path: Path
+    size_bytes: int
+
+
+PROTON_FAMILIES: dict[str, ProtonFamily] = {
+    "ge-proton": ProtonFamily(
+        id="ge-proton",
+        label="GE-Proton (GloriousEggroll)",
+        repo="GloriousEggroll/proton-ge-custom",
+    ),
+    "cachyos-proton": ProtonFamily(
+        id="cachyos-proton",
+        label="CachyOS-Proton",
+        repo="CachyOS/proton-cachyos",
+    ),
+}
+
+
+@dataclass(frozen=True)
 class GpuProfile:
     """Detected GPU hardware, driver, and display-session capabilities."""
 
@@ -681,6 +729,298 @@ def ensure_ge_proton11(
     return target_dir
 
 
+def _dir_size_bytes(path: Path) -> int:
+    """Return total byte size of regular files under path without following symlinks."""
+    total = 0
+    for root, _dirs, files in os.walk(path, followlinks=False):
+        root_path = Path(root)
+        for fname in files:
+            fpath = root_path / fname
+            try:
+                if not fpath.is_symlink():
+                    total += fpath.stat().st_size
+            except OSError:
+                continue
+    return total
+
+
+def _strip_tar_suffix(name: str) -> str:
+    for suffix in (".tar.gz", ".tar.xz"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _pick_proton_tar_asset(assets: list[Any], arch: str) -> dict[str, Any] | None:
+    """Select the best .tar.gz or .tar.xz Proton release asset for the host arch."""
+    tar_assets = [
+        asset
+        for asset in assets
+        if isinstance(asset, dict)
+        and str(asset.get("name") or "").endswith((".tar.gz", ".tar.xz"))
+    ]
+    if not tar_assets:
+        return None
+
+    def _score(asset: dict[str, Any]) -> tuple[int, int, str]:
+        name = str(asset.get("name") or "")
+        low = name.lower()
+        if arch == "x86_64" and ("aarch64" in low or "arm64" in low):
+            return (-10, 0, name)
+        if arch == "aarch64" and ("x86_64" in low or "amd64" in low):
+            return (-10, 0, name)
+        arch_score = 0
+        if f"-{arch}." in low or f"_{arch}." in low:
+            arch_score = 4
+        elif arch in low:
+            arch_score = 2 if ("_v3" in low or "_v4" in low) else 3
+        else:
+            arch_score = 1
+        ext_score = 1 if low.endswith(".tar.xz") else 0
+        return (arch_score, ext_score, name)
+
+    best = max(tar_assets, key=_score)
+    if _score(best)[0] < 0:
+        return None
+    return best
+
+
+def _find_proton_checksum_asset(
+    assets: list[Any], asset_name: str
+) -> dict[str, Any] | None:
+    """Find an optional .sha512sum asset corresponding to asset_name."""
+    stem = _strip_tar_suffix(asset_name)
+    for target_name in (f"{asset_name}.sha512sum", f"{stem}.sha512sum"):
+        for asset in assets:
+            if isinstance(asset, dict) and asset.get("name") == target_name:
+                return asset
+    sha_assets = [
+        asset
+        for asset in assets
+        if isinstance(asset, dict) and str(asset.get("name") or "").endswith(".sha512sum")
+    ]
+    if len(sha_assets) == 1:
+        return sha_assets[0]
+    return None
+
+
+def fetch_available_proton_releases(
+    family_id: str, limit: int = 15
+) -> list[ProtonRelease]:
+    """Fetch available custom Proton releases from GitHub for the given family."""
+    family = PROTON_FAMILIES.get(family_id)
+    if family is None:
+        raise ValueError(f"Unknown Proton family: {family_id!r}")
+
+    per_page = max(1, min(100, int(limit)))
+    url = f"https://api.github.com/repos/{family.repo}/releases?per_page={per_page}"
+    releases_raw = _fetch_json(url)
+    if not isinstance(releases_raw, list):
+        raise RuntimeError(f"Unexpected GitHub releases response for {family.label}.")
+
+    arch = _get_arch()
+    results: list[ProtonRelease] = []
+    for rel in releases_raw:
+        if not isinstance(rel, dict) or rel.get("draft"):
+            continue
+        tag_name = str(rel.get("tag_name") or "").strip()
+        if not tag_name:
+            continue
+        assets = rel.get("assets")
+        if not isinstance(assets, list):
+            continue
+        tar_asset = _pick_proton_tar_asset(assets, arch)
+        if tar_asset is None:
+            continue
+        download_url = str(tar_asset.get("browser_download_url") or "").strip()
+        if not download_url:
+            continue
+        asset_name = str(tar_asset.get("name") or "").strip()
+        sha_asset = _find_proton_checksum_asset(assets, asset_name)
+        checksum_url = (
+            str(sha_asset.get("browser_download_url") or "").strip() or None
+            if sha_asset is not None
+            else None
+        )
+        raw_size = tar_asset.get("size")
+        size_bytes = int(raw_size) if isinstance(raw_size, int) and raw_size >= 0 else 0
+        results.append(
+            ProtonRelease(
+                family_id=family.id,
+                tag_name=tag_name,
+                name=str(rel.get("name") or tag_name).strip() or tag_name,
+                asset_name=asset_name,
+                download_url=download_url,
+                checksum_url=checksum_url,
+                size_bytes=size_bytes,
+                published_at=str(rel.get("published_at") or "").strip(),
+                prerelease=bool(rel.get("prerelease", False)),
+            )
+        )
+    return results
+
+
+def list_installed_compat_tools() -> list[InstalledCompatTool]:
+    """List all custom compatibility tools with compatibilitytool.vdf installed."""
+    from .steam_paths import _iter_compat_tool_dirs, _read_compat_tool_id, find_steam_root
+
+    steam_root = find_steam_root()
+    candidate_dirs: list[Path] = [get_compat_tools_dir()]
+    if steam_root is not None:
+        candidate_dirs.extend(_iter_compat_tool_dirs(steam_root))
+    candidate_dirs.extend(_iter_extra_compat_tool_dirs())
+
+    seen_dirs: set[Path] = set()
+    seen_entries: set[Path] = set()
+    tools: list[InstalledCompatTool] = []
+
+    for compat_dir in candidate_dirs:
+        if not compat_dir.is_dir():
+            continue
+        try:
+            resolved_dir = compat_dir.resolve()
+        except OSError:
+            resolved_dir = compat_dir
+        if resolved_dir in seen_dirs:
+            continue
+        seen_dirs.add(resolved_dir)
+
+        try:
+            entries = list(compat_dir.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if not entry.is_dir():
+                    continue
+                resolved_entry = entry.resolve()
+            except OSError:
+                continue
+            if resolved_entry in seen_entries:
+                continue
+            vdf_file = entry / "compatibilitytool.vdf"
+            if not vdf_file.is_file():
+                continue
+            seen_entries.add(resolved_entry)
+            tool_id = _read_compat_tool_id(vdf_file, entry.name)
+            tools.append(
+                InstalledCompatTool(
+                    folder_name=entry.name,
+                    tool_id=tool_id,
+                    path=entry,
+                    size_bytes=_dir_size_bytes(entry),
+                )
+            )
+
+    tools.sort(
+        key=lambda t: (
+            tuple(int(n) for n in re.findall(r"\d+", t.folder_name)),
+            t.folder_name.lower(),
+        ),
+        reverse=True,
+    )
+    return tools
+
+
+def install_compat_tool(
+    release: ProtonRelease,
+    progress_cb: ProgressCb | None = None,
+) -> Path:
+    """Download, verify (when checksum_url is set), and install a Proton release."""
+    if not release.download_url:
+        raise ValueError("ProtonRelease is missing download_url.")
+
+    compat_dir = get_compat_tools_dir()
+    compat_dir.mkdir(parents=True, exist_ok=True)
+    tar_name = release.asset_name or Path(release.download_url.split("?", 1)[0]).name
+
+    with tempfile.TemporaryDirectory(
+        prefix="deckinstall_proton_", dir=str(compat_dir)
+    ) as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        tar_path = tmp_path / tar_name
+        sha_path: Path | None = None
+        if release.checksum_url:
+            sha_path = tmp_path / f"{tar_name}.sha512sum"
+            _download_file(release.checksum_url, sha_path, sha_path.name)
+
+        _download_file(
+            release.download_url,
+            tar_path,
+            tar_name,
+            progress_cb=progress_cb,
+            timeout=180,
+        )
+
+        if sha_path is not None:
+            _emit_progress(progress_cb, f"Verifying SHA-512 for {tar_name}...", 92)
+            _verify_sha512(
+                tar_path, sha_path.read_text(encoding="utf-8", errors="ignore")
+            )
+
+        _emit_progress(progress_cb, f"Extracting {tar_name}...", 95)
+        extract_dir = tmp_path / "extract"
+        extract_dir.mkdir(parents=True, exist_ok=True)
+        _safe_extract_tar(tar_path, extract_dir)
+
+        subdirs = [p for p in extract_dir.iterdir() if p.is_dir()]
+        if len(subdirs) == 1:
+            extracted_root = subdirs[0]
+            folder_name = extracted_root.name
+        elif (extract_dir / release.tag_name).is_dir():
+            extracted_root = extract_dir / release.tag_name
+            folder_name = extracted_root.name
+        else:
+            extracted_root = extract_dir
+            folder_name = _strip_tar_suffix(tar_name) or release.tag_name
+
+        if not folder_name or folder_name in (".", "..") or "/" in folder_name:
+            raise RuntimeError(f"Unsafe compatibility tool folder name: {folder_name!r}")
+
+        target_dir = compat_dir / folder_name
+        backup_dir: Path | None = None
+        try:
+            if target_dir.exists() or target_dir.is_symlink():
+                backup_dir = Path(
+                    tempfile.mkdtemp(
+                        prefix=f".{folder_name}_old_", dir=str(compat_dir)
+                    )
+                )
+                backup_dir.rmdir()
+                os.replace(target_dir, backup_dir)
+            os.replace(extracted_root, target_dir)
+        except Exception:
+            if backup_dir is not None and backup_dir.exists() and not target_dir.exists():
+                try:
+                    os.replace(backup_dir, target_dir)
+                except OSError:
+                    pass
+            raise
+        if backup_dir is not None:
+            shutil.rmtree(backup_dir, ignore_errors=True)
+
+    _emit_progress(progress_cb, f"{folder_name} installed.", 100)
+    return target_dir
+
+
+def remove_compat_tool(tool_path: Path) -> None:
+    """Safely remove a custom compatibility tool directory from compatibilitytools.d."""
+    if tool_path.is_symlink():
+        raise ValueError(f"Refusing to remove symlink: {tool_path}")
+    if not tool_path.exists() or not tool_path.is_dir():
+        raise FileNotFoundError(f"Compatibility tool directory not found: {tool_path}")
+    parent = tool_path.parent
+    if parent.name != "compatibilitytools.d" or tool_path.name in ("", ".", ".."):
+        raise ValueError(
+            f"Refusing to remove path outside compatibilitytools.d: {tool_path}"
+        )
+    if tool_path.resolve().parent != parent.resolve():
+        raise ValueError(
+            f"Refusing to remove non-direct child of compatibilitytools.d: {tool_path}"
+        )
+    shutil.rmtree(tool_path)
+
+
 def check_runtime_updates(force: bool = False) -> dict[str, Any]:
     """Check GitHub for newer umu-launcher and GE-Proton11+ releases (24h cache)."""
     versions = _load_versions()
@@ -1007,6 +1347,22 @@ def resolve_game_prefix(
             ge_dirs = list_ge_proton11_dirs()
             if ge_dirs:
                 proton_dir = ge_dirs[0]
+        return (prefix_dir, proton_dir)
+
+    if kind_norm == "external":
+        raw_prefix = getattr(obj, "prefix_dir", None)
+        if raw_prefix is None:
+            raise ValueError("External game object has no prefix_dir attribute.")
+        prefix_dir = Path(raw_prefix)
+        if (prefix_dir / "pfx").is_dir() and not (prefix_dir / "drive_c").is_dir():
+            prefix_dir = prefix_dir / "pfx"
+        proton_dir = None
+        if paths is not None:
+            from .steam_paths import find_proton_binary
+
+            proton_bin = find_proton_binary(paths.steam_root)
+            if proton_bin is not None:
+                proton_dir = proton_bin.parent
         return (prefix_dir, proton_dir)
 
     raise ValueError(f"Unsupported game kind: {kind!r}")

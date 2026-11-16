@@ -655,6 +655,7 @@ def _write_desktop_file(
     game_dir: Path,
     icon_path: Path | None = None,
     executable: bool = False,
+    startup_wm_class: str = "",
 ) -> None:
     """Create or update a .desktop launcher file."""
     desktop_path.parent.mkdir(parents=True, exist_ok=True)
@@ -668,6 +669,9 @@ def _write_desktop_file(
         "Categories=Game;",
         "StartupNotify=true",
     ]
+    clean_wm_class = startup_wm_class.strip()
+    if clean_wm_class:
+        lines.append(f"StartupWMClass={clean_wm_class}")
     if icon_path is not None and icon_path.is_file():
         lines.append(f"Icon={icon_path}")
     _atomic_write_text(desktop_path, "\n".join(lines) + "\n")
@@ -843,6 +847,13 @@ def install_standalone_game(
         native_linux=game.native_linux,
         steam_appid=game.steam_appid,
     )
+    if native_linux:
+        startup_wm_class = target_exe_path.name
+    elif steam_appid and steam_appid > 0:
+        startup_wm_class = f"steam_app_{steam_appid}"
+    else:
+        startup_wm_class = "steam_app_0"
+
     if create_menu_shortcut:
         _write_desktop_file(
             desktop_file,
@@ -850,6 +861,7 @@ def install_standalone_game(
             launch_script,
             game.game_dir,
             icon_path=resolved_icon,
+            startup_wm_class=startup_wm_class,
         )
     if desktop_shortcut is not None:
         _write_desktop_file(
@@ -859,6 +871,7 @@ def install_standalone_game(
             game.game_dir,
             icon_path=resolved_icon,
             executable=True,
+            startup_wm_class=startup_wm_class,
         )
     _write_manifest(game)
     return game
