@@ -596,6 +596,12 @@ _SYSTEM_PACKAGE_MAP: dict[str, dict[str, list[str]]] = {
         "pacman": ["mangohud"],
         "zypper": ["mangohud"],
     },
+    "gamescope": {
+        "apt-get": ["gamescope"],
+        "dnf": ["gamescope"],
+        "pacman": ["gamescope"],
+        "zypper": ["gamescope"],
+    },
 }
 
 

@@ -2997,12 +2997,19 @@ def set_shortcut_proton(config_vdf: Path, appid_u32: int, tool_name: str) -> Non
 
 _PRESET_ENV_KEYS = (
     "MANGOHUD",
+    "MANGOHUD_CONFIG",
     "PROTON_USE_WINED3D",
     "PROTON_NO_ESYNC",
     "PROTON_NO_FSYNC",
     "PROTON_DLSS_UPGRADE",
     "WINEDLLOVERRIDES",
 )
+_GAMESCOPE_MODES: dict[str, list[str]] = {
+    "fullscreen": ["-f"],
+    "steamdeck": ["-W", "1280", "-H", "800", "-f"],
+    "720p": ["-W", "1280", "-H", "720", "-f"],
+    "1080p": ["-W", "1920", "-H", "1080", "-f"],
+}
 _HELIXSR_OPTISCALER_DLLS = frozenset(
     {"dxgi", "amd_fidelityfx_dx12", "amd_fidelityfx_vk", "winmm", "version"}
 )
@@ -3136,6 +3143,9 @@ def apply_launch_presets(
     no_fsync: bool,
     winedlloverrides: str = "",
     dlss_upgrade: bool = False,
+    mangohud_level: int | None = None,
+    gamescope: bool = False,
+    gamescope_mode: str = "fullscreen",
 ) -> str:
     """Toggle common SteamOS/Proton launch presets while preserving existing custom options."""
     _validate_launch_options(launch_options)
@@ -3145,9 +3155,22 @@ def apply_launch_presets(
     except ValueError:
         tokens = launch_options.split()
 
-    # Strip existing managed presets
+    # Strip existing managed presets (including any existing gamescope wrapper up to '--')
     filtered: list[str] = []
+    skip_gamescope = False
     for tok in tokens:
+        if skip_gamescope:
+            if tok == "--":
+                skip_gamescope = False
+                continue
+            if tok == "%command%":
+                skip_gamescope = False
+                filtered.append(tok)
+                continue
+            continue
+        if tok == "gamescope":
+            skip_gamescope = True
+            continue
         if tok == "gamemoderun":
             continue
         if _is_env_assignment(tok) and tok.split("=", 1)[0] in _PRESET_ENV_KEYS:
@@ -3168,6 +3191,8 @@ def apply_launch_presets(
     preset_envs: list[str] = []
     if mangohud:
         preset_envs.append("MANGOHUD=1")
+        if mangohud_level in (1, 2, 3, 4):
+            preset_envs.append(f"MANGOHUD_CONFIG=preset={mangohud_level}")
     if wined3d:
         preset_envs.append("PROTON_USE_WINED3D=1")
     if no_esync:
@@ -3183,6 +3208,9 @@ def apply_launch_presets(
     if gamemode:
         wrappers_out.append("gamemoderun")
     wrappers_out.extend(wrappers_before)
+    if gamescope:
+        flags = _GAMESCOPE_MODES.get(gamescope_mode, _GAMESCOPE_MODES["fullscreen"])
+        wrappers_out.extend(["gamescope", *flags, "--"])
 
     if not env_before and not preset_envs and not wrappers_out and not after_cmd:
         return ""

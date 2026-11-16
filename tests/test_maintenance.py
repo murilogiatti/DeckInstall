@@ -343,6 +343,41 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(format_size_bytes(1024 * 1024 * 1024), "1.00 GB")
         self.assertEqual(format_size_bytes(int(1.5 * 1024 * 1024 * 1024)), "1.50 GB")
 
+    def test_mangohud_levels_and_gamescope_presets(self) -> None:
+        opts = steam_vdf.apply_launch_presets(
+            "",
+            gamemode=True,
+            mangohud=True,
+            wined3d=False,
+            no_esync=False,
+            no_fsync=False,
+            mangohud_level=2,
+            gamescope=True,
+            gamescope_mode="steamdeck",
+        )
+        self.assertIn("MANGOHUD=1", opts)
+        self.assertIn("MANGOHUD_CONFIG=preset=2", opts)
+        self.assertIn("gamemoderun", opts)
+        self.assertIn("gamescope -W 1280 -H 800 -f -- %command%", opts)
+
+        # Turning off MangoHud & Gamescope strips MANGOHUD_CONFIG and gamescope ... --
+        stripped = steam_vdf.apply_launch_presets(
+            opts,
+            gamemode=False,
+            mangohud=False,
+            wined3d=False,
+            no_esync=False,
+            no_fsync=False,
+            gamescope=False,
+        )
+        self.assertEqual(stripped, "")
+
+        with mock.patch("shutil.which", side_effect=lambda b: "/usr/bin/apt-get" if b == "apt-get" else None):
+            self.assertEqual(
+                runtime_manager.get_system_package_install_cmd("gamescope"),
+                ["apt-get", "install", "-y", "gamescope"],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

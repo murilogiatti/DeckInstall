@@ -11,7 +11,17 @@ from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import QPoint, QRect, QSettings, QSize, Qt, QThread, Signal, qInstallMessageHandler
-from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QIcon, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QCloseEvent,
+    QDragEnterEvent,
+    QDragLeaveEvent,
+    QDropEvent,
+    QIcon,
+    QKeySequence,
+    QPixmap,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -200,8 +210,17 @@ class DropZoneFrame(QFrame):
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
+            self.setStyleSheet(
+                "QFrame#DropZone { border: 2px dashed #3daee9; "
+                "background-color: rgba(61, 174, 233, 0.10); }"
+            )
+
+    def dragLeaveEvent(self, event: QDragLeaveEvent) -> None:
+        self.setStyleSheet("")
+        super().dragLeaveEvent(event)
 
     def dropEvent(self, event: QDropEvent) -> None:
+        self.setStyleSheet("")
         urls = event.mimeData().urls()
         if urls:
             local = urls[0].toLocalFile()
@@ -301,6 +320,24 @@ class PreviewWorker(QThread):
             self.loaded.emit(self.req_id, data)
         else:
             self.failed.emit(self.req_id)
+
+
+class PkexecWorker(QThread):
+    """Background worker for pkexec/system package operations so the GUI never freezes."""
+
+    finished_result = Signal(bool, str)
+    failed = Signal(str)
+
+    def __init__(self, fn: Callable[[], tuple[bool, str]]) -> None:
+        super().__init__()
+        self.fn = fn
+
+    def run(self) -> None:
+        try:
+            ok, out = self.fn()
+            self.finished_result.emit(ok, out)
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class SteamOpWorker(QThread):
@@ -944,10 +981,12 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(_wrap_scroll(self._build_add_page()))
         self.stack.addWidget(_wrap_scroll(self._build_library_page()))
         self.stack.addWidget(_wrap_scroll(self._build_maintenance_page()))
+        self.stack.currentChanged.connect(self._on_stack_tab_changed)
         right_layout.addWidget(self.stack)
 
         self.status_label = QLabel(tr("status.ready"))
         self.status_label.setObjectName("MutedText")
+        self.status_label.setWordWrap(True)
         right_layout.addWidget(self.status_label)
 
         main_splitter.addWidget(right)
@@ -1053,7 +1092,32 @@ class MainWindow(QMainWindow):
         btn_about = QPushButton(tr("header.about"))
         btn_about.clicked.connect(self._show_about_dialog)
         layout.addWidget(btn_about)
-        return sidebar
+        self._update_steam_status_style()
+
+        sidebar_scroll = QScrollArea()
+        sidebar_scroll.setObjectName("Sidebar")
+        sidebar_scroll.setWidgetResizable(True)
+        sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sidebar_scroll.setMinimumWidth(180)
+        sidebar_scroll.setMaximumWidth(360)
+        sidebar_scroll.setWidget(sidebar)
+        return sidebar_scroll
+
+    def _update_steam_status_style(self) -> None:
+        """Apply subtle semantic color to the sidebar Steam status label."""
+        if self.paths:
+            color = "#4caf50"
+        elif find_steam_root() is not None:
+            color = "#ffb74d"
+        else:
+            color = "#64b5f6"
+        self.steam_status_lbl.setStyleSheet(f"color: {color}; font-size: 12px;")
+
+    def _on_stack_tab_changed(self, idx: int) -> None:
+        """Refresh Maintenance health metrics when switching to the Maintenance tab."""
+        if idx == 3:
+            self._refresh_maintenance_health()
 
     def _format_steam_status_text(self) -> str:
         """Return localized sidebar status text for the current Steam detection state."""
@@ -1068,15 +1132,17 @@ class MainWindow(QMainWindow):
         self.paths = resolve_steam_paths()
         status_text = self._format_steam_status_text()
         self.steam_status_lbl.setText(status_text)
+        self._update_steam_status_style()
         self._update_steam_mode_ui()
         self._refresh_shortcuts()
         self.status_label.setText(status_text)
 
     def _update_steam_mode_ui(self) -> None:
-        """Adapt Add/Extract/Maintenance controls for Steam vs Standalone-only mode."""
+        """Adapt Add/Extract/Library/Maintenance controls for Steam vs Standalone-only mode."""
         has_steam = self.paths is not None
         self.add_no_steam_banner.setVisible(not has_steam)
         self.btn_add_steam.setVisible(has_steam)
+        self.lbl_steam_opts_group.setVisible(has_steam)
         self.chk_proton.setVisible(has_steam)
         self.chk_restart.setVisible(has_steam)
         self.btn_add_steam.setObjectName("primaryBtn" if has_steam else "")
@@ -1085,11 +1151,10 @@ class MainWindow(QMainWindow):
             btn.style().unpolish(btn)
             btn.style().polish(btn)
             btn.update()
-        self.btn_use_extracted.setText(
-            tr("install.btn_add_steam") if has_steam else tr("install.btn_continue_add")
-        )
+        self.btn_bulk_migrate.setVisible(has_steam)
         if hasattr(self, "btn_maint_revalidate"):
             self.btn_maint_revalidate.setEnabled(has_steam)
+        self._update_steam_status_style()
 
     def _build_extract_page(self) -> QWidget:
         page = QWidget()
@@ -1148,7 +1213,7 @@ class MainWindow(QMainWindow):
         self.btn_cancel_extract = QPushButton(tr("install.btn_cancel"))
         self.btn_cancel_extract.setEnabled(False)
         self.btn_cancel_extract.clicked.connect(self._cancel_extract)
-        self.btn_use_extracted = QPushButton(tr("install.btn_add_steam"))
+        self.btn_use_extracted = QPushButton(tr("install.btn_continue_add"))
         self.btn_use_extracted.setEnabled(False)
         self.btn_use_extracted.clicked.connect(self._send_extracted_to_add_tab)
         btn_row.addWidget(self.btn_extract)
@@ -1161,6 +1226,7 @@ class MainWindow(QMainWindow):
 
         self.extract_log = QTextEdit()
         self.extract_log.setReadOnly(True)
+        self.extract_log.setPlaceholderText(tr("install.log_placeholder"))
         prog_layout.addWidget(self.extract_log)
         layout.addWidget(prog_card, 1)
         return page
@@ -1254,6 +1320,11 @@ class MainWindow(QMainWindow):
         self.steam_match_combo.currentIndexChanged.connect(self._on_steam_match_changed)
         form.addRow(tr("add.match_label"), self.steam_match_combo)
 
+        self.lbl_steam_opts_group = QLabel(tr("add.group_steam_opts"))
+        self.lbl_steam_opts_group.setObjectName("MutedText")
+        self.lbl_steam_opts_group.setStyleSheet("font-weight: 700; margin-top: 4px;")
+        form.addRow(self.lbl_steam_opts_group)
+
         self.chk_proton = QCheckBox(tr("install.enable_proton"))
         self.chk_proton.setChecked(True)
         form.addRow("", self.chk_proton)
@@ -1261,6 +1332,11 @@ class MainWindow(QMainWindow):
         self.chk_restart = QCheckBox(tr("add.reopen_steam"))
         self.chk_restart.setChecked(True)
         form.addRow("", self.chk_restart)
+
+        lbl_standalone_opts_group = QLabel(tr("add.group_standalone_opts"))
+        lbl_standalone_opts_group.setObjectName("MutedText")
+        lbl_standalone_opts_group.setStyleSheet("font-weight: 700; margin-top: 6px;")
+        form.addRow(lbl_standalone_opts_group)
 
         targets_row = QHBoxLayout()
         self.chk_shortcut_menu = QCheckBox(tr("add.shortcut_menu"))
@@ -1288,6 +1364,11 @@ class MainWindow(QMainWindow):
         self.preview_label.setMinimumSize(180, 108)
         preview_lay.addWidget(self.preview_label)
 
+        lbl_standalone_icon = QLabel(tr("add.group_standalone_icon"))
+        lbl_standalone_icon.setObjectName("MutedText")
+        lbl_standalone_icon.setStyleSheet("font-weight: 700; margin-top: 4px;")
+        preview_lay.addWidget(lbl_standalone_icon)
+
         icon_btn_row = QHBoxLayout()
         icon_btn_row.setSpacing(6)
         self.btn_pick_icon = QPushButton(tr("add.btn_pick_icon"))
@@ -1306,18 +1387,18 @@ class MainWindow(QMainWindow):
 
         cfg_layout.addWidget(cfg_split, 1)
 
-        actions_row = QHBoxLayout()
-        actions_row.setSpacing(10)
+        actions_row = FlowLayout(spacing=8)
         self.btn_add_steam = QPushButton(tr("install.btn_add_steam"))
         self.btn_add_steam.setObjectName("primaryBtn")
         self.btn_add_steam.clicked.connect(self._add_selected_to_steam)
-        actions_row.addWidget(self.btn_add_steam, 1)
+        actions_row.addWidget(self.btn_add_steam)
 
         self.btn_add_standalone = QPushButton(tr("install.btn_add_standalone"))
         self.btn_add_standalone.clicked.connect(self._add_selected_standalone)
-        actions_row.addWidget(self.btn_add_standalone, 1)
+        actions_row.addWidget(self.btn_add_standalone)
 
         self.btn_remove_existing = QPushButton(tr("add.btn_remove_existing"))
+        self.btn_remove_existing.setObjectName("dangerBtn")
         self.btn_remove_existing.clicked.connect(self._remove_existing_from_add)
         self.btn_remove_existing.setVisible(False)
         actions_row.addWidget(self.btn_remove_existing)
@@ -1364,10 +1445,26 @@ class MainWindow(QMainWindow):
         self.vdf_error_banner.setVisible(False)
         lib_layout.addWidget(self.vdf_error_banner)
 
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(8)
+        self.library_search_input = QLineEdit()
+        self.library_search_input.setPlaceholderText(tr("library.search_placeholder"))
+        self.library_search_input.setClearButtonEnabled(True)
+        self.library_search_input.textChanged.connect(self._filter_library_list)
+        self.lbl_library_count = QLabel()
+        self.lbl_library_count.setObjectName("MutedText")
+        filter_row.addWidget(self.library_search_input, 1)
+        filter_row.addWidget(self.lbl_library_count)
+        lib_layout.addLayout(filter_row)
+
         self.shortcuts_list = QListWidget()
         self.shortcuts_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.shortcuts_list.customContextMenuRequested.connect(self._show_shortcut_context_menu)
         self.shortcuts_list.currentItemChanged.connect(lambda _c, _p: self._update_library_action_states())
+        self.shortcuts_list.itemDoubleClicked.connect(lambda _item: self._edit_launch_options_presets())
+        del_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Delete), self.shortcuts_list)
+        del_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        del_shortcut.activated.connect(self._remove_selected_shortcut)
         lib_layout.addWidget(self.shortcuts_list, 1)
 
         actions = FlowLayout(spacing=8)
@@ -1384,8 +1481,6 @@ class MainWindow(QMainWindow):
         self.act_revert_art.triggered.connect(self._revert_selected_shortcut_art)
         self.act_proton = QAction(tr("library.btn_proton"), self)
         self.act_proton.triggered.connect(self._change_selected_proton)
-        self.act_bulk_proton = QAction(tr("library.btn_bulk_proton"), self)
-        self.act_bulk_proton.triggered.connect(self._bulk_migrate_proton_dialog)
         self.act_launch_opts = QAction(tr("library.btn_launch_opts"), self)
         self.act_launch_opts.triggered.connect(self._edit_launch_options_presets)
         self.act_export_standalone = QAction(tr("library.btn_export_standalone"), self)
@@ -1399,7 +1494,6 @@ class MainWindow(QMainWindow):
             self.act_art,
             self.act_revert_art,
             self.act_proton,
-            self.act_bulk_proton,
             self.act_launch_opts,
             self.act_export_standalone,
             self.act_import_steam,
@@ -1418,9 +1512,16 @@ class MainWindow(QMainWindow):
         self.act_restore_saves.triggered.connect(self._restore_saves_backup)
         self.act_link_prefixes = QAction(tr("library.btn_link_prefixes"), self)
         self.act_link_prefixes.triggered.connect(self._sync_prefix_links)
+        self.act_bulk_proton = QAction(tr("library.btn_bulk_proton"), self)
+        self.act_bulk_proton.triggered.connect(self._bulk_migrate_proton_dialog)
         self.act_cleanup = QAction(tr("library.btn_cleanup"), self)
         self.act_cleanup.triggered.connect(lambda: self._open_maintenance_page(auto_scan=True))
-        for act in (self.act_backup_saves, self.act_restore_saves, self.act_link_prefixes):
+        for act in (
+            self.act_backup_saves,
+            self.act_restore_saves,
+            self.act_link_prefixes,
+            self.act_bulk_proton,
+        ):
             self._tools_menu.addAction(act)
         self._tools_menu.addSeparator()
         self._tools_menu.addAction(self.act_cleanup)
@@ -1443,6 +1544,7 @@ class MainWindow(QMainWindow):
         self._maint_candidates: list[CleanupCandidate] = []
         self._maint_checked: dict[Path, bool] = {}
         self._maint_active_filter = "all"
+        self._maint_scanned = False
 
         title = QLabel(tr("maint.page_title"))
         title.setObjectName("PageTitle")
@@ -1514,7 +1616,13 @@ class MainWindow(QMainWindow):
             pill.clicked.connect(lambda _=False, k=key: self._on_maint_filter_changed(k))
             self._maint_filter_group.addButton(pill)
             pills_flow.addWidget(pill)
-        clean_layout.addLayout(pills_flow)
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(8)
+        filter_row.addLayout(pills_flow, 1)
+        self.btn_maint_toggle_filter = QPushButton(tr("maint.btn_select_all_filter"))
+        self.btn_maint_toggle_filter.clicked.connect(self._toggle_maint_filter_selection)
+        filter_row.addWidget(self.btn_maint_toggle_filter, 0, Qt.AlignmentFlag.AlignTop)
+        clean_layout.addLayout(filter_row)
 
         self.maint_list = QListWidget()
         self.maint_list.setMinimumHeight(220)
@@ -1537,7 +1645,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(clean_card, 1)
 
         self._refresh_maintenance_health()
-        self._update_maint_summary()
+        self._populate_maint_list()
         return page
 
     def _open_maintenance_page(self, *, auto_scan: bool = True) -> None:
@@ -1555,20 +1663,26 @@ class MainWindow(QMainWindow):
         )
 
         umu_path = get_umu_run_path()
-        umu_status = f"OK ({umu_path})" if umu_path.is_file() else "Missing"
+        umu_status = (
+            f"{tr('maint.status_ok')} ({umu_path})"
+            if umu_path.is_file()
+            else tr("maint.status_missing")
+        )
         self.lbl_maint_umu.setText(tr("maint.health_umu", status=umu_status))
 
         ge_dirs = list_ge_proton11_dirs()
-        proton_status = f"{len(ge_dirs)} ({ge_dirs[0].name})" if ge_dirs else "Missing"
+        proton_status = (
+            f"{len(ge_dirs)} ({ge_dirs[0].name})" if ge_dirs else tr("maint.status_missing")
+        )
         self.lbl_maint_proton.setText(tr("maint.health_proton", status=proton_status))
 
         steamrt4_dir = get_steamrt4_dir()
         if not steamrt4_dir.is_dir():
-            rt4_status = "Missing"
+            rt4_status = tr("maint.status_missing")
         elif validate_steamrt4_integrity():
-            rt4_status = "OK"
+            rt4_status = tr("maint.status_ok")
         else:
-            rt4_status = "Corrupted (cleaned)"
+            rt4_status = tr("maint.status_corrupted")
         self.lbl_maint_steamrt4.setText(tr("maint.health_steamrt4", status=rt4_status))
 
         prefix_dirs: list[Path] = []
@@ -1613,24 +1727,53 @@ class MainWindow(QMainWindow):
             self._maint_checked[cand.path] = item.checkState() == Qt.CheckState.Checked
             self._update_maint_summary()
 
-    def _populate_maint_list(self) -> None:
+    def _visible_maint_candidates(self) -> list[CleanupCandidate]:
+        """Return cleanup candidates matching the currently active filter pill."""
         allowed_cats = _MAINT_FILTER_CATEGORIES.get(self._maint_active_filter)
+        if allowed_cats is None:
+            return list(self._maint_candidates)
+        return [c for c in self._maint_candidates if c.category in allowed_cats]
+
+    def _toggle_maint_filter_selection(self) -> None:
+        """Toggle selection for all candidates visible in the active filter."""
+        visible = self._visible_maint_candidates()
+        if not visible:
+            return
+        all_checked = all(self._maint_checked.get(c.path, False) for c in visible)
+        new_state = not all_checked
+        for cand in visible:
+            self._maint_checked[cand.path] = new_state
+        self._populate_maint_list()
+
+    def _populate_maint_list(self) -> None:
+        visible = self._visible_maint_candidates()
         self.maint_list.blockSignals(True)
         self.maint_list.clear()
-        for cand in self._maint_candidates:
-            if allowed_cats is not None and cand.category not in allowed_cats:
-                continue
-            item = QListWidgetItem(_format_cleanup_candidate_label(cand))
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            checked = self._maint_checked.get(cand.path, _cleanup_candidate_auto_check(cand))
-            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
-            item.setData(Qt.ItemDataRole.UserRole, cand)
-            self.maint_list.addItem(item)
+        if not visible:
+            if not self._maint_scanned:
+                msg = tr("maint.empty_prompt")
+            elif not self._maint_candidates:
+                msg = tr("cleanup.none_found")
+            else:
+                msg = tr("maint.filter_empty")
+            placeholder = QListWidgetItem(msg)
+            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.maint_list.addItem(placeholder)
+        else:
+            for cand in visible:
+                item = QListWidgetItem(_format_cleanup_candidate_label(cand))
+                item.setToolTip(str(cand.path))
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                checked = self._maint_checked.get(cand.path, _cleanup_candidate_auto_check(cand))
+                item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+                item.setData(Qt.ItemDataRole.UserRole, cand)
+                self.maint_list.addItem(item)
         self.maint_list.blockSignals(False)
         self._update_maint_summary()
 
     def _update_maint_summary(self) -> None:
-        sel_items = [c for c in self._maint_candidates if self._maint_checked.get(c.path, False)]
+        visible = self._visible_maint_candidates()
+        sel_items = [c for c in visible if self._maint_checked.get(c.path, False)]
         sel_count = len(sel_items)
         sel_size = format_size_bytes(sum(c.size_bytes for c in sel_items))
         safe_items = [c for c in self._maint_candidates if _cleanup_candidate_auto_check(c)]
@@ -1640,8 +1783,21 @@ class MainWindow(QMainWindow):
         )
         self.btn_maint_clean_safe.setText(tr("maint.btn_clean_safe", size=safe_size))
         self.btn_maint_delete_selected.setText(tr("maint.btn_delete_selected", size=sel_size))
+        self.btn_maint_clean_safe.setEnabled(len(safe_items) > 0)
+        self.btn_maint_delete_selected.setEnabled(sel_count > 0)
+
+        all_checked = bool(visible) and all(
+            self._maint_checked.get(c.path, False) for c in visible
+        )
+        self.btn_maint_toggle_filter.setEnabled(bool(visible))
+        self.btn_maint_toggle_filter.setText(
+            tr("maint.btn_deselect_all_filter")
+            if all_checked
+            else tr("maint.btn_select_all_filter")
+        )
 
     def _apply_maint_scan_results(self, candidates: list[CleanupCandidate]) -> None:
+        self._maint_scanned = True
         self._maint_candidates = candidates
         self._maint_checked = {c.path: _cleanup_candidate_auto_check(c) for c in candidates}
         self._populate_maint_list()
@@ -1759,7 +1915,9 @@ class MainWindow(QMainWindow):
         if _is_wine_game_running():
             QMessageBox.warning(self, __app_name__, tr("cleanup.wine_running"))
             return
-        selected = [c for c in self._maint_candidates if self._maint_checked.get(c.path, False)]
+        selected = [
+            c for c in self._visible_maint_candidates() if self._maint_checked.get(c.path, False)
+        ]
         if not selected:
             return
         sel_size = format_size_bytes(sum(c.size_bytes for c in selected))
@@ -1869,11 +2027,27 @@ class MainWindow(QMainWindow):
         box.addButton(QMessageBox.StandardButton.Ok)
         box.exec()
         if box.clickedButton() is fix_btn:
-            ok, out = fix_bwrap_userns()
-            if ok:
-                QMessageBox.information(self, __app_name__, tr("runtime.bwrap_fix_done"))
-            else:
-                QMessageBox.warning(self, __app_name__, tr("runtime.bwrap_fix_error", err=out))
+            self.status_label.setText(tr("runtime.bwrap_fix_btn"))
+            worker = PkexecWorker(fix_bwrap_userns)
+            self._track_worker(worker)
+
+            def _on_fix_done(ok: bool, out: str) -> None:
+                self.status_label.setText(tr("status.ready"))
+                if self._closing_pending:
+                    return
+                if ok:
+                    QMessageBox.information(self, __app_name__, tr("runtime.bwrap_fix_done"))
+                else:
+                    QMessageBox.warning(self, __app_name__, tr("runtime.bwrap_fix_error", err=out))
+
+            def _on_fix_err(err: str) -> None:
+                self.status_label.setText(tr("status.ready"))
+                if not self._closing_pending:
+                    QMessageBox.warning(self, __app_name__, tr("runtime.bwrap_fix_error", err=err))
+
+            worker.finished_result.connect(_on_fix_done)
+            worker.failed.connect(_on_fix_err)
+            worker.start()
 
     def _update_runtimes(self) -> None:
         self.btn_update_runtimes.setEnabled(False)
@@ -2472,6 +2646,7 @@ class MainWindow(QMainWindow):
             empty_item = QListWidgetItem(tr("library.no_shortcuts"))
             empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
             self.shortcuts_list.addItem(empty_item)
+            self._filter_library_list()
             self._update_library_action_states()
             return
 
@@ -2486,7 +2661,25 @@ class MainWindow(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, ("standalone", game))
             self.shortcuts_list.addItem(item)
 
+        self._filter_library_list()
         self._update_library_action_states()
+
+    def _filter_library_list(self) -> None:
+        """Filter Steam and Standalone library items live and update the count label."""
+        query = self.library_search_input.text().strip().lower()
+        total = 0
+        shown = 0
+        for i in range(self.shortcuts_list.count()):
+            item = self.shortcuts_list.item(i)
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if not (isinstance(data, tuple) and len(data) == 2 and data[0] in ("steam", "standalone")):
+                continue
+            total += 1
+            visible = (not query) or (query in item.text().lower())
+            item.setHidden(not visible)
+            if visible:
+                shown += 1
+        self.lbl_library_count.setText(tr("library.count_summary", shown=shown, total=total))
 
     def _selected_library_item(self) -> tuple[str, ShortcutEntry | StandaloneGame] | None:
         item = self.shortcuts_list.currentItem()
@@ -2509,6 +2702,24 @@ class MainWindow(QMainWindow):
         is_standalone = sel is not None and sel[0] == "standalone"
         can_write_vdf = bool(self.paths) and not self._vdf_corrupt
 
+        self.btn_game_actions.setEnabled(sel is not None)
+        self.act_remove.setText(
+            tr("library.btn_remove_standalone") if is_standalone else tr("library.btn_remove")
+        )
+
+        # Hide mutually exclusive per-game actions instead of merely disabling them
+        for act in (
+            self.act_migrate,
+            self.act_art,
+            self.act_revert_art,
+            self.act_proton,
+            self.act_export_standalone,
+        ):
+            act.setVisible(not is_standalone)
+        self.act_import_steam.setVisible(is_standalone)
+        self.act_launch_opts.setVisible(True)
+        self.act_remove.setVisible(True)
+
         self.act_migrate.setEnabled(is_steam and can_write_vdf)
         self.act_art.setEnabled(is_steam and bool(self.paths))
         self.act_revert_art.setEnabled(is_steam and bool(self.paths))
@@ -2526,7 +2737,6 @@ class MainWindow(QMainWindow):
             self.act_proton,
             self.act_bulk_proton,
             self.act_launch_opts,
-            self.act_backup_saves,
             self.act_restore_saves,
             self.act_link_prefixes,
             self.act_import_steam,
@@ -2537,6 +2747,7 @@ class MainWindow(QMainWindow):
     def _set_steam_busy(self, busy: bool) -> None:
         enabled = not busy
         for w in (
+            self.btn_redetect_steam,
             self.btn_reload,
             self.btn_add_standalone,
             self.shortcuts_list,
@@ -2544,17 +2755,20 @@ class MainWindow(QMainWindow):
             self.btn_tools_menu,
             self.act_art,
             self.act_revert_art,
+            self.act_backup_saves,
             self.act_cleanup,
             self.act_export_standalone,
             self.btn_maint_scan,
             self.btn_maint_clean_safe,
             self.btn_maint_delete_selected,
+            self.btn_maint_toggle_filter,
         ):
             w.setEnabled(enabled)
         self.btn_maint_revalidate.setEnabled(enabled and (self.paths is not None))
         self._set_vdf_write_enabled(enabled and bool(self.paths) and not self._vdf_corrupt)
         if enabled:
             self._update_library_action_states()
+            self._update_maint_summary()
         self._update_remove_existing_state()
 
     def _update_selected_shortcut_art(self) -> None:
@@ -2950,7 +3164,14 @@ class MainWindow(QMainWindow):
         dlg = QDialog(self)
         dlg.setWindowTitle(tr("launch.title", name=title_name))
         dlg.resize(580, 500)
-        lay = QVBoxLayout(dlg)
+        dlg_lay = QVBoxLayout(dlg)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(0, 0, 4, 0)
 
         def _muted_hint(text: str) -> QLabel:
             lbl = QLabel(text)
@@ -2963,6 +3184,31 @@ class MainWindow(QMainWindow):
         chk_gm.setChecked("gamemoderun" in tokens_now)
         chk_mh = QCheckBox(tr("launch.mangohud"))
         chk_mh.setChecked("MANGOHUD=1" in tokens_now)
+
+        mh_level_row = QHBoxLayout()
+        mh_level_row.setContentsMargins(20, 0, 0, 4)
+        mh_level_lbl = QLabel(tr("launch.mangohud_level_label"))
+        mh_level_combo = QComboBox()
+        mh_level_combo.addItem(tr("launch.mangohud_level_default"), 0)
+        mh_level_combo.addItem(tr("launch.mangohud_level_1"), 1)
+        mh_level_combo.addItem(tr("launch.mangohud_level_2"), 2)
+        mh_level_combo.addItem(tr("launch.mangohud_level_3"), 3)
+        mh_level_combo.addItem(tr("launch.mangohud_level_4"), 4)
+        cur_mh_level = 0
+        for tok in tokens_now:
+            if tok.startswith("MANGOHUD_CONFIG="):
+                val = tok.split("=", 1)[1]
+                for lv in (1, 2, 3, 4):
+                    if f"preset={lv}" in val:
+                        cur_mh_level = lv
+                        break
+        mh_idx = mh_level_combo.findData(cur_mh_level)
+        if mh_idx >= 0:
+            mh_level_combo.setCurrentIndex(mh_idx)
+        mh_level_combo.setEnabled(chk_mh.isChecked())
+        mh_level_row.addWidget(mh_level_lbl)
+        mh_level_row.addWidget(mh_level_combo, 1)
+
         btn_mh_topbar = QPushButton(tr("launch.btn_mangohud_topbar"))
         btn_mh_topbar.clicked.connect(
             lambda: QMessageBox.information(
@@ -2971,6 +3217,30 @@ class MainWindow(QMainWindow):
                 tr("launch.mangohud_topbar_done", path=str(install_mangohud_topbar_config())),
             )
         )
+
+        chk_gs = QCheckBox(tr("launch.gamescope"))
+        chk_gs.setChecked("gamescope" in tokens_now)
+        gs_mode_row = QHBoxLayout()
+        gs_mode_row.setContentsMargins(20, 0, 0, 4)
+        gs_mode_lbl = QLabel(tr("launch.gamescope_mode_label"))
+        gs_mode_combo = QComboBox()
+        gs_mode_combo.addItem(tr("launch.gamescope_mode_fullscreen"), "fullscreen")
+        gs_mode_combo.addItem(tr("launch.gamescope_mode_deck"), "steamdeck")
+        gs_mode_combo.addItem(tr("launch.gamescope_mode_720p"), "720p")
+        gs_mode_combo.addItem(tr("launch.gamescope_mode_1080p"), "1080p")
+        cur_gs_mode = "fullscreen"
+        if "1280" in tokens_now and "800" in tokens_now:
+            cur_gs_mode = "steamdeck"
+        elif "1280" in tokens_now and "720" in tokens_now:
+            cur_gs_mode = "720p"
+        elif "1920" in tokens_now and "1080" in tokens_now:
+            cur_gs_mode = "1080p"
+        gs_idx = gs_mode_combo.findData(cur_gs_mode)
+        if gs_idx >= 0:
+            gs_mode_combo.setCurrentIndex(gs_idx)
+        gs_mode_combo.setEnabled(chk_gs.isChecked())
+        gs_mode_row.addWidget(gs_mode_lbl)
+        gs_mode_row.addWidget(gs_mode_combo, 1)
         chk_dlss = QCheckBox(tr("launch.dlss_upgrade"))
         chk_dlss.setChecked("PROTON_DLSS_UPGRADE=1" in tokens_now)
         chk_w3d = QCheckBox(tr("launch.wined3d"))
@@ -3005,11 +3275,15 @@ class MainWindow(QMainWindow):
             conflict_warn.setVisible(has_conflict)
 
         def _sync_preview() -> None:
+            mh_level_combo.setEnabled(chk_mh.isChecked())
+            gs_mode_combo.setEnabled(chk_gs.isChecked())
             if syncing["active"]:
                 return
             syncing["active"] = True
             try:
                 dll_val = winedll_edit.text().strip() if kind == "steam" else ""
+                mh_lvl = mh_level_combo.currentData()
+                gs_mode = str(gs_mode_combo.currentData() or "fullscreen")
                 updated = apply_launch_presets(
                     raw_edit.text(),
                     gamemode=chk_gm.isChecked(),
@@ -3019,6 +3293,9 @@ class MainWindow(QMainWindow):
                     no_fsync=chk_fsync.isChecked(),
                     winedlloverrides=dll_val,
                     dlss_upgrade=chk_dlss.isChecked(),
+                    mangohud_level=int(mh_lvl) if isinstance(mh_lvl, int) and mh_lvl in (1, 2, 3, 4) else None,
+                    gamescope=chk_gs.isChecked(),
+                    gamescope_mode=gs_mode,
                 )
                 raw_edit.setText(updated)
             except ValueError:
@@ -3036,10 +3313,15 @@ class MainWindow(QMainWindow):
                 parts = [p for p in parts if p.lower() != "dxgi=n,b"]
             winedll_edit.setText(";".join(parts))
 
-        def _add_tool_preset(chk: QCheckBox, hint_text: str, bin_name: str) -> None:
+        dlg_alive = {"open": True}
+        dlg.finished.connect(lambda _r: dlg_alive.__setitem__("open", False))
+
+        def _add_tool_preset(chk: QCheckBox, hint_text: str, bin_name: str, extra_row: QLayout | None = None) -> None:
             chk.toggled.connect(_sync_preview)
             lay.addWidget(chk)
             lay.addWidget(_muted_hint(hint_text))
+            if extra_row is not None:
+                lay.addLayout(extra_row)
             if shutil.which(bin_name) is None:
                 warn_row = QWidget()
                 warn_lay = QHBoxLayout(warn_row)
@@ -3069,26 +3351,56 @@ class MainWindow(QMainWindow):
                     if ans != QMessageBox.StandardButton.Yes:
                         return
                     install_btn.setEnabled(False)
-                    ok, out = install_system_package(bin_name)
-                    install_btn.setEnabled(True)
-                    if ok and shutil.which(bin_name):
-                        warn_row.setVisible(False)
-                        QMessageBox.information(dlg, __app_name__, tr("launch.install_bin_done", bin=bin_name))
-                    elif ok:
-                        warn_row.setVisible(False)
-                        QMessageBox.information(dlg, __app_name__, tr("launch.install_bin_done", bin=bin_name))
-                    else:
-                        QMessageBox.warning(
-                            dlg, __app_name__, tr("launch.install_bin_error", bin=bin_name, err=out)
-                        )
+                    install_btn.setText(tr("launch.installing_bin", bin=bin_name))
+                    self.status_label.setText(tr("launch.installing_bin", bin=bin_name))
+                    worker = PkexecWorker(lambda b=bin_name: install_system_package(b))
+                    self._track_worker(worker)
+
+                    def _on_pkg_done(ok: bool, out: str) -> None:
+                        self.status_label.setText(tr("status.ready"))
+                        if dlg_alive["open"]:
+                            install_btn.setEnabled(True)
+                            install_btn.setText(tr("launch.btn_install_bin", bin=bin_name))
+                        parent_win = dlg if dlg_alive["open"] else self
+                        if self._closing_pending:
+                            return
+                        if ok:
+                            if dlg_alive["open"]:
+                                warn_row.setVisible(False)
+                            QMessageBox.information(
+                                parent_win, __app_name__, tr("launch.install_bin_done", bin=bin_name)
+                            )
+                        else:
+                            QMessageBox.warning(
+                                parent_win, __app_name__, tr("launch.install_bin_error", bin=bin_name, err=out)
+                            )
+
+                    def _on_pkg_err(err: str) -> None:
+                        self.status_label.setText(tr("status.ready"))
+                        if dlg_alive["open"]:
+                            install_btn.setEnabled(True)
+                            install_btn.setText(tr("launch.btn_install_bin", bin=bin_name))
+                        if not self._closing_pending:
+                            QMessageBox.warning(
+                                dlg if dlg_alive["open"] else self,
+                                __app_name__,
+                                tr("launch.install_bin_error", bin=bin_name, err=err),
+                            )
+
+                    worker.finished_result.connect(_on_pkg_done)
+                    worker.failed.connect(_on_pkg_err)
+                    worker.start()
 
                 install_btn.clicked.connect(_on_install_bin)
                 warn_lay.addWidget(install_btn)
                 lay.addWidget(warn_row)
 
         _add_tool_preset(chk_gm, tr("launch.gamemode_hint"), "gamemoderun")
-        _add_tool_preset(chk_mh, tr("launch.mangohud_hint"), "mangohud")
+        _add_tool_preset(chk_mh, tr("launch.mangohud_hint"), "mangohud", extra_row=mh_level_row)
+        mh_level_combo.currentIndexChanged.connect(_sync_preview)
         lay.addWidget(btn_mh_topbar)
+        _add_tool_preset(chk_gs, tr("launch.gamescope_hint"), "gamescope", extra_row=gs_mode_row)
+        gs_mode_combo.currentIndexChanged.connect(_sync_preview)
 
         chk_dlss.toggled.connect(_sync_preview)
         lay.addWidget(chk_dlss)
@@ -3110,12 +3422,15 @@ class MainWindow(QMainWindow):
         raw_edit.textChanged.connect(_update_conflict_warning)
         _update_conflict_warning()
 
+        scroll.setWidget(body)
+        dlg_lay.addWidget(scroll, 1)
+
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
-        lay.addWidget(btns)
+        dlg_lay.addWidget(btns)
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -3740,233 +4055,6 @@ class MainWindow(QMainWindow):
     def _on_bulk_failed(self, err: str) -> None:
         self._set_steam_busy(False)
         QMessageBox.critical(self, __app_name__, tr("migrate.error", err=err))
-
-    def _cleanup_old_prefixes(self) -> None:
-        if not self.paths:
-            return
-        self._set_steam_busy(True)
-        self.status_label.setText(tr("cleanup.scanning"))
-
-        class _CleanupScanWorker(QThread):
-            found = Signal(list)
-            failed = Signal(str)
-
-            def __init__(self, paths: SteamPaths) -> None:
-                super().__init__()
-                self._paths = paths
-
-            def run(self) -> None:
-                try:
-                    self.found.emit(find_cleanup_candidates(self._paths, include_system_caches=True))
-                except Exception as exc:
-                    self.failed.emit(str(exc))
-
-        def _on_scan_failed(err: str) -> None:
-            self._set_steam_busy(False)
-            self.status_label.setText(tr("cleanup.scan_error", err=err))
-            QMessageBox.critical(self, __app_name__, tr("cleanup.scan_error", err=err))
-
-        worker = _CleanupScanWorker(self.paths)
-        self._track_worker(worker)
-        worker.found.connect(self._show_cleanup_dialog)
-        worker.failed.connect(_on_scan_failed)
-        worker.start()
-
-    def _show_cleanup_dialog(self, candidates: list[CleanupCandidate]) -> None:
-        if not candidates:
-            self._set_steam_busy(False)
-            self.status_label.setText(tr("cleanup.none_found"))
-            QMessageBox.information(self, __app_name__, tr("cleanup.none_found"))
-            return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle(tr("cleanup.title"))
-        dlg.resize(720, 460)
-        lay = QVBoxLayout(dlg)
-        info = QLabel(tr("cleanup.info"))
-        info.setWordWrap(True)
-        lay.addWidget(info)
-
-        lst = QListWidget()
-        lay.addWidget(lst, 1)
-
-        total_lbl = QLabel()
-
-        def _update_total() -> None:
-            sel_bytes = 0
-            for i in range(lst.count()):
-                it = lst.item(i)
-                if it.checkState() == Qt.CheckState.Checked:
-                    c: CleanupCandidate = it.data(Qt.ItemDataRole.UserRole)
-                    sel_bytes += c.size_bytes
-            total_lbl.setText(tr("cleanup.total", size=format_size_bytes(sel_bytes)))
-
-        def _populate_list(items: list[CleanupCandidate]) -> None:
-            lst.blockSignals(True)
-            lst.clear()
-            for cand in items:
-                item = QListWidgetItem(_format_cleanup_candidate_label(cand))
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                auto_check = _cleanup_candidate_auto_check(cand)
-                item.setCheckState(
-                    Qt.CheckState.Checked if auto_check else Qt.CheckState.Unchecked
-                )
-                item.setData(Qt.ItemDataRole.UserRole, cand)
-                lst.addItem(item)
-            lst.blockSignals(False)
-            _update_total()
-
-        _populate_list(candidates)
-        lst.itemChanged.connect(lambda _: _update_total())
-        lay.addWidget(total_lbl)
-
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        ok_btn = btns.button(QDialogButtonBox.StandardButton.Ok)
-        ok_btn.setText(tr("cleanup.btn_delete"))
-        btn_revalidate = btns.addButton(
-            tr("cleanup.btn_revalidate"), QDialogButtonBox.ButtonRole.ActionRole
-        )
-        btns.accepted.connect(dlg.accept)
-        btns.rejected.connect(dlg.reject)
-        lay.addWidget(btns)
-
-        dialog_open = True
-        reval_running = False
-        dlg.finished.connect(lambda _: nonlocal_close())
-
-        def nonlocal_close() -> None:
-            nonlocal dialog_open
-            dialog_open = False
-
-        def _revalidate_now() -> None:
-            nonlocal reval_running
-            if not self.paths or reval_running:
-                return
-            reval_running = True
-            btn_revalidate.setEnabled(False)
-            ok_btn.setEnabled(False)
-            lst.setEnabled(False)
-            info.setText(tr("cleanup.revalidating"))
-
-            class _RevalidateWorker(QThread):
-                done = Signal(list, int, int, int)
-                failed = Signal(str)
-
-                def __init__(self, paths: SteamPaths) -> None:
-                    super().__init__()
-                    self._paths = paths
-
-                def run(self) -> None:
-                    try:
-                        if _is_wine_game_running():
-                            raise RuntimeError(tr("cleanup.wine_running"))
-                        entries = load_shortcuts(self._paths.shortcuts_vdf)
-                        pending_plan = plan_bulk_migration(
-                            entries=entries,
-                            games_root=Path.home() / "Games",
-                            compatdata_dir=self._paths.compatdata_dir,
-                            config_vdf=self._paths.config_vdf,
-                        )
-                        checked, copied = sync_all_external_saves(self._paths)
-                        new_cands = find_cleanup_candidates(self._paths, include_system_caches=True)
-                        self.done.emit(new_cands, checked, copied, len(pending_plan))
-                    except Exception as exc:
-                        self.failed.emit(str(exc))
-
-            def _on_reval_done(
-                new_cands: list[CleanupCandidate], checked: int, copied: int, pending: int
-            ) -> None:
-                nonlocal reval_running
-                reval_running = False
-                if not dialog_open:
-                    self._set_steam_busy(False)
-                    return
-                btn_revalidate.setEnabled(True)
-                ok_btn.setEnabled(True)
-                lst.setEnabled(True)
-                _populate_list(new_cands)
-                extra = tr("cleanup.reval_pending", pending=pending) if pending else ""
-                info.setText(tr("cleanup.reval_done", checked=checked, copied=copied) + extra)
-
-            def _on_reval_err(err: str) -> None:
-                nonlocal reval_running
-                reval_running = False
-                if not dialog_open:
-                    self._set_steam_busy(False)
-                    return
-                btn_revalidate.setEnabled(True)
-                ok_btn.setEnabled(True)
-                lst.setEnabled(True)
-                info.setText(tr("cleanup.reval_error", err=err))
-
-            w = _RevalidateWorker(self.paths)
-            self._track_worker(w)
-            w.done.connect(_on_reval_done)
-            w.failed.connect(_on_reval_err)
-            w.start()
-
-        btn_revalidate.clicked.connect(_revalidate_now)
-
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            if not reval_running:
-                self._set_steam_busy(False)
-            return
-        selected = [
-            lst.item(i).data(Qt.ItemDataRole.UserRole)
-            for i in range(lst.count())
-            if lst.item(i).checkState() == Qt.CheckState.Checked
-        ]
-        if not selected or not self.paths:
-            if not reval_running:
-                self._set_steam_busy(False)
-            return
-        self.status_label.setText(tr("cleanup.deleting", count=len(selected)))
-
-        class _CleanupDeleteWorker(QThread):
-            done = Signal(int, int, list)
-            failed = Signal(str)
-
-            def __init__(self, paths: SteamPaths, items: list[CleanupCandidate]) -> None:
-                super().__init__()
-                self._paths = paths
-                self._items = items
-
-            def run(self) -> None:
-                try:
-                    if _is_wine_game_running():
-                        raise RuntimeError(tr("cleanup.wine_running"))
-                    deleted, freed, errs = delete_cleanup_candidates_checked(
-                        self._paths, self._items, include_system_caches=True
-                    )
-                    self.done.emit(deleted, freed, errs)
-                except Exception as exc:
-                    self.failed.emit(str(exc))
-
-        worker = _CleanupDeleteWorker(self.paths, selected)
-        self._track_worker(worker)
-
-        def _on_deleted(deleted: int, freed: int, errs: list[str]) -> None:
-            self._set_steam_busy(False)
-            msg = tr("cleanup.deleted", deleted=deleted, size=format_size_bytes(freed))
-            if errs:
-                msg += tr("cleanup.delete_warnings", errs="\n".join(errs[:10]))
-            self.status_label.setText(msg.splitlines()[0])
-            if errs:
-                QMessageBox.warning(self, __app_name__, msg)
-            else:
-                QMessageBox.information(self, __app_name__, msg)
-
-        def _on_delete_failed(err: str) -> None:
-            self._set_steam_busy(False)
-            msg = tr("cleanup.delete_error", err=err)
-            self.status_label.setText(msg)
-            QMessageBox.critical(self, __app_name__, msg)
-
-        worker.done.connect(_on_deleted)
-        worker.failed.connect(_on_delete_failed)
-        worker.start()
 
 
 def _qt_message_handler(mode, context, message: str) -> None:
