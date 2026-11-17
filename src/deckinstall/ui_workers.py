@@ -731,6 +731,8 @@ from .ui_workers_library import (  # noqa: E402, F401
     BatchVdfApplyWorker,
     BulkPlanWorker,
     DirStatsWorker,
+    ExtImportSavesWorker,
+    ExtStandaloneWorker,
     LaunchPrepWorker,
     ProtonPrepWorker,
     RemoveShortcutWorker,
@@ -741,6 +743,7 @@ from .ui_workers_library import (  # noqa: E402, F401
     StandaloneRemoveWorker,
     SteamDetectWorker,
     SteamRunningWorker,
+    compute_library_runner_labels,
 )
 from .ui_workers_maint import (  # noqa: E402, F401
     MaintBackupWorker,

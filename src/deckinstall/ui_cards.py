@@ -80,10 +80,20 @@ class _SortableTableItem(QTableWidgetItem):
         return NotImplemented
 
 
+def get_game_log_path(game_name: str) -> Path:
+    """Return the path to the last execution log file for a game."""
+    safe = (
+        "".join(c if c.isalnum() or c in "._-" else "_" for c in game_name.strip()).strip("_")
+        or "game"
+    )
+    return Path.home() / ".local" / "share" / "DeckInstall" / "logs" / f"{safe}.log"
+
+
 def _start_detached_process(
     cmd: list[str],
     cwd: Path | None = None,
     env: dict[str, str] | None = None,
+    log_file: Path | None = None,
 ) -> None:
     """Spawn a fire-and-forget process via QProcess.startDetached without Popen leaks."""
     if not cmd:
@@ -98,6 +108,13 @@ def _start_detached_process(
         for k, v in env.items():
             qenv.insert(k, v)
         proc.setProcessEnvironment(qenv)
+    if log_file is not None:
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            proc.setStandardOutputFile(str(log_file))
+            proc.setStandardErrorFile(str(log_file))
+        except OSError:
+            pass
     if not proc.startDetached():
         raise RuntimeError(f"Failed to launch: {cmd[0]}")
 

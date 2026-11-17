@@ -15,11 +15,10 @@ from .runtime_manager import (
     list_ge_proton11_dirs,
     validate_steamrt4_integrity,
 )
-from .steam_paths import SteamPaths, find_proton_binary, find_steam_root
+from .steam_paths import SteamPaths, dir_size_bytes_many, find_proton_binary, find_steam_root
 from .steam_vdf import (
     CleanupCandidate,
     ShortcutEntry,
-    _dir_size_bytes,
     backup_prefix_candidates_to_zip,
     delete_cleanup_candidates_checked,
     find_cleanup_candidates,
@@ -100,12 +99,12 @@ class MaintHealthWorker(QThread):
         ):
             if extra_pfx_root.is_dir():
                 prefix_dirs.append(extra_pfx_root)
-        prefixes_bytes = sum(_dir_size_bytes(p) for p in prefix_dirs)
+        prefixes_bytes = dir_size_bytes_many(prefix_dirs)
 
         runtime_dirs = [
             p for p in (umu_path.parent, get_compat_tools_dir()) if p.is_dir()
         ]
-        runtimes_bytes = sum(_dir_size_bytes(p) for p in runtime_dirs)
+        runtimes_bytes = dir_size_bytes_many(runtime_dirs)
 
         self.ready.emit(
             self._req_id,

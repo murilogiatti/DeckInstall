@@ -3385,12 +3385,17 @@ def _safe_parents_within(base_dir: Path, base_resolved: Path, rel_parts: tuple[s
     return True
 
 
-def restore_saves_backup(paths: SteamPaths, zip_path: Path) -> tuple[int, int]:
-    """Restore saves from a DeckInstall ZIP backup into matching Steam compatdata folders."""
+def restore_saves_backup(paths: SteamPaths | None, zip_path: Path) -> tuple[int, int]:
+    """Restore saves from a DeckInstall ZIP backup into matching Steam or Standalone prefixes."""
     from .standalone import list_standalone_games
 
-    with _steam_transaction_lock(paths.shortcuts_vdf):
-        entries = load_shortcuts(paths.shortcuts_vdf)
+    lock_ctx = (
+        _steam_transaction_lock(paths.shortcuts_vdf)
+        if paths is not None
+        else _file_lock(Path.home() / ".local" / "share" / "DeckInstall" / "restore.lock")
+    )
+    with lock_ctx:
+        entries = load_shortcuts(paths.shortcuts_vdf) if paths is not None else []
         active_ids = {str(e.appid_u32) for e in entries}
         by_exact = {e.app_name: str(e.appid_u32) for e in entries}
         norm_counts: dict[str, list[str]] = {}
@@ -3420,8 +3425,10 @@ def restore_saves_backup(paths: SteamPaths, zip_path: Path) -> tuple[int, int]:
             nk: pdirs[0] for nk, pdirs in standalone_norm_counts.items() if len(pdirs) == 1
         }
 
-        paths.compatdata_dir.mkdir(parents=True, exist_ok=True)
-        compat_root_resolved = paths.compatdata_dir.resolve()
+        compat_root_resolved: Path | None = None
+        if paths is not None:
+            paths.compatdata_dir.mkdir(parents=True, exist_ok=True)
+            compat_root_resolved = paths.compatdata_dir.resolve()
         restored_games: set[str] = set()
         restored_files = 0
         total_bytes = 0
@@ -3468,6 +3475,8 @@ def restore_saves_backup(paths: SteamPaths, zip_path: Path) -> tuple[int, int]:
                     raise RuntimeError(f"Backup file too large: {info.filename}")
 
                 if prefix_key.isascii() and prefix_key.isdigit():
+                    if paths is None or compat_root_resolved is None:
+                        continue
                     appid_str = prefix_key
                     if appid_str not in active_ids:
                         if manifest:
@@ -3622,23 +3631,35 @@ def sync_prefix_symlinks(
     return created, removed
 
 
-def get_shortcut_proton(config_vdf: Path, appid_u32: int) -> str:
-    """Return configured compatibility tool name for appid_u32, or ''."""
+def get_compat_tool_map(config_vdf: Path) -> dict[int, str]:
+    """Return a mapping of appid_u32 -> configured compatibility tool name from config.vdf."""
     if not config_vdf.is_file():
-        return ""
+        return {}
     try:
         data = vdf.loads(config_vdf.read_text(encoding="utf-8", errors="replace"))
-        entry = (
+        mapping = (
             data.get("InstallConfigStore", {})
             .get("Software", {})
             .get("Valve", {})
             .get("Steam", {})
             .get("CompatToolMapping", {})
-            .get(str(appid_u32), {})
         )
-        return str(entry.get("name") or "").strip() if isinstance(entry, dict) else ""
     except Exception:
-        return ""
+        return {}
+    if not isinstance(mapping, dict):
+        return {}
+    out: dict[int, str] = {}
+    for k, val in mapping.items():
+        if str(k).isascii() and str(k).isdigit() and isinstance(val, dict):
+            name = str(val.get("name") or "").strip()
+            if name:
+                out[int(k)] = name
+    return out
+
+
+def get_shortcut_proton(config_vdf: Path, appid_u32: int) -> str:
+    """Return configured compatibility tool name for appid_u32, or ''."""
+    return get_compat_tool_map(config_vdf).get(appid_u32, "")
 
 
 def set_shortcut_proton(config_vdf: Path, appid_u32: int, tool_name: str) -> None:

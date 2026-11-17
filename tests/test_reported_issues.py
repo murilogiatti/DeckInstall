@@ -272,3 +272,370 @@ class SortableTablesTests(unittest.TestCase):
                 app.processEvents()
                 win.close()
                 app.processEvents()
+
+
+class StandaloneRestoreAndSavesTabTests(unittest.TestCase):
+    def test_restore_saves_backup_standalone_only_without_steam(self) -> None:
+        from deckinstall import steam_vdf
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            game_dir = root / "Games" / "MyGame"
+            pfx_dir = game_dir / "prefix"
+            (pfx_dir / "drive_c").mkdir(parents=True)
+            exe_path = game_dir / "MyGame.exe"
+            exe_path.write_bytes(b"MZ")
+            sa = standalone.StandaloneGame(
+                name="MyGame",
+                game_dir=game_dir,
+                exe_path=exe_path,
+                prefix_dir=pfx_dir,
+                proton_name="GE-Proton11",
+                steam_appid=None,
+                winedlloverrides="",
+                launch_options="",
+                launch_script=game_dir / "launch.sh",
+                desktop_file=root / "mygame.desktop",
+            )
+            zip_path = root / "backup.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("standalone-MyGame/users/steamuser/Documents/slot1.sav", b"SAVE123")
+                zf.writestr("3000000001/users/steamuser/Documents/steam_only.sav", b"SKIPME")
+
+            with (
+                mock.patch.dict("os.environ", {"HOME": str(root)}),
+                mock.patch.object(standalone, "list_standalone_games", return_value=[sa]),
+            ):
+                games, files = steam_vdf.restore_saves_backup(None, zip_path)
+
+            self.assertEqual((games, files), (1, 1))
+            restored = pfx_dir / "drive_c" / "users" / "steamuser" / "Documents" / "slot1.sav"
+            self.assertTrue(restored.is_file())
+            self.assertEqual(restored.read_bytes(), b"SAVE123")
+
+    def test_list_save_archives_discovers_backups_and_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            saves_dir = root / "saves"
+            backups_dir = saves_dir / "backups"
+            snap_dir = saves_dir / "snapshots" / "mygame"
+            state_dir = snap_dir / "state"
+            legacy_dir = root / "legacy_backups"
+            for d in (backups_dir, state_dir, legacy_dir):
+                d.mkdir(parents=True)
+
+            (backups_dir / "saves-backup-20260101.zip").write_bytes(b"zip1")
+            (legacy_dir / "legacy-backup.zip").write_bytes(b"zip2")
+            (snap_dir / "20260102-manual.zip").write_bytes(b"zip3")
+            (state_dir / "20260103-pre-winetricks.zip").write_bytes(b"zip4")
+
+            entries = save_sync.list_save_archives(saves_dir, legacy_dir)
+            kinds_by_name = {entry.path.name: (entry.kind, entry.game_slug) for entry in entries}
+            self.assertEqual(
+                kinds_by_name["saves-backup-20260101.zip"], ("backup", "")
+            )
+            self.assertEqual(kinds_by_name["legacy-backup.zip"], ("backup", ""))
+            self.assertEqual(kinds_by_name["20260102-manual.zip"], ("save_snapshot", "mygame"))
+            self.assertEqual(
+                kinds_by_name["20260103-pre-winetricks.zip"], ("state_snapshot", "mygame")
+            )
+
+
+class LibraryColumnsFilterAndLogsTests(unittest.TestCase):
+    def test_mainwindow_library_columns_filter_pills_and_saves_table(self) -> None:
+        from PySide6.QtCore import QSettings
+        from PySide6.QtWidgets import QApplication
+
+        from deckinstall import ui
+        from deckinstall.launcher_scan import ExternalLauncherGame
+        from deckinstall.steam_vdf import ShortcutEntry
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_archive = save_sync.SaveArchiveEntry(
+                path=root / "bak.zip",
+                kind="save_snapshot",
+                label="[MyGame] snap.zip",
+                game_slug="mygame",
+                mtime=1700000000.0,
+                size_bytes=2048,
+            )
+            with (
+                mock.patch.object(
+                    ui,
+                    "QSettings",
+                    return_value=QSettings(str(root / "prefs.ini"), QSettings.Format.IniFormat),
+                ),
+                mock.patch.object(ui, "list_save_archives", return_value=[fake_archive]),
+                mock.patch.object(ui.MainWindow, "_refresh_games"),
+                mock.patch.object(ui.MainWindow, "_redetect_steam"),
+            ):
+                win = ui.MainWindow(app)
+                try:
+                    self.assertEqual(win.shortcuts_list.columnCount(), 4)
+                    self.assertEqual(win.saves_list.columnCount(), 4)
+                    self.assertEqual(win.saves_list.rowCount(), 1)
+                    self.assertTrue(win.btn_save_restore.isEnabled())
+
+                    sc = ShortcutEntry(
+                        index="0",
+                        appid_u32=3000000001,
+                        app_name="Steam Game",
+                        exe='"/games/steam/game.exe"',
+                        start_dir='"/games/steam"',
+                        icon="",
+                        launch_options="",
+                    )
+                    sa = standalone.StandaloneGame(
+                        name="Standalone Game",
+                        game_dir=root / "sa",
+                        exe_path=root / "sa" / "sa.exe",
+                        prefix_dir=root / "sa" / "prefix",
+                        proton_name="GE-Proton11",
+                        steam_appid=None,
+                        winedlloverrides="",
+                        launch_options="",
+                        launch_script=root / "sa" / "launch.sh",
+                        desktop_file=root / "sa.desktop",
+                    )
+                    ext = ExternalLauncherGame(
+                        source="lutris",
+                        name="Lutris Game",
+                        exe_path=root / "ext" / "ext.exe",
+                        game_dir=root / "ext",
+                        prefix_dir=None,
+                        runner="wine",
+                    )
+                    runner_labels = {
+                        ("steam", str(sc.appid_u32)): "GE-Proton9 [OptiScaler]",
+                        ("standalone", str(sa.game_dir)): "GE-Proton11",
+                        ("external", f"{ext.source}:{ext.name}:{ext.exe_path}"): "wine",
+                    }
+                    win._apply_shortcuts_data(
+                        None, [sc], [sa], [ext], "", runner_labels=runner_labels
+                    )
+                    win.shortcuts_list.setSortingEnabled(False)
+                    self.assertEqual(win.shortcuts_list.rowCount(), 3)
+                    col2_texts = {
+                        win.shortcuts_list.item(r, 0).text(): win.shortcuts_list.item(r, 2).text()
+                        for r in range(3)
+                        if win.shortcuts_list.item(r, 0) and win.shortcuts_list.item(r, 2)
+                    }
+                    self.assertEqual(col2_texts["Steam Game"], "GE-Proton9 [OptiScaler]")
+                    self.assertEqual(col2_texts["Standalone Game"], "GE-Proton11")
+
+                    win._on_library_source_filter_changed("steam")
+                    visible_names = [
+                        win.shortcuts_list.item(r, 0).text()
+                        for r in range(win.shortcuts_list.rowCount())
+                        if not win.shortcuts_list.isRowHidden(r)
+                    ]
+                    self.assertEqual(visible_names, ["Steam Game"])
+
+                    win._on_library_source_filter_changed("external")
+                    visible_names = [
+                        win.shortcuts_list.item(r, 0).text()
+                        for r in range(win.shortcuts_list.rowCount())
+                        if not win.shortcuts_list.isRowHidden(r)
+                    ]
+                    self.assertEqual(visible_names, ["Lutris Game"])
+
+                    win._on_library_source_filter_changed("all")
+                    self.assertEqual(
+                        sum(
+                            1
+                            for r in range(win.shortcuts_list.rowCount())
+                            if not win.shortcuts_list.isRowHidden(r)
+                        ),
+                        3,
+                    )
+                finally:
+                    for worker in list(win._active_workers):
+                        worker.wait(5000)
+                    app.processEvents()
+                    win.close()
+                    app.processEvents()
+
+    def test_get_game_log_path_and_dir_size_bytes_many(self) -> None:
+        from deckinstall import steam_paths, ui_cards
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            d1 = root / "d1"
+            d2 = root / "d2"
+            d1.mkdir()
+            d2.mkdir()
+            (d1 / "a.bin").write_bytes(b"x" * 100)
+            (d2 / "b.bin").write_bytes(b"y" * 250)
+            self.assertEqual(steam_paths.dir_size_bytes_many([d1, d2, d1]), 350)
+
+            with mock.patch.dict("os.environ", {"HOME": str(root)}):
+                log_p = ui_cards.get_game_log_path("My: Game!")
+            self.assertEqual(log_p, root / ".local" / "share" / "DeckInstall" / "logs" / "My__Game.log")
+
+
+class UiUxSimplificationTests(unittest.TestCase):
+    def test_unified_tab0_progressive_disclosure_smart_drop_and_maint_buttons(self) -> None:
+        from PySide6.QtCore import QSettings
+        from PySide6.QtWidgets import QApplication
+
+        from deckinstall import ui
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            zip_file = root / "CoolGame-v1.zip"
+            zip_file.write_bytes(b"PK\x05\x06" + b"\x00" * 18)
+            game_dir = root / "CoolGame"
+            game_dir.mkdir()
+            game_exe = game_dir / "CoolGame.exe"
+            game_exe.write_bytes(b"MZ")
+            with (
+                mock.patch.object(
+                    ui,
+                    "QSettings",
+                    return_value=QSettings(str(root / "prefs.ini"), QSettings.Format.IniFormat),
+                ),
+                mock.patch.object(ui, "list_save_archives", return_value=[]),
+                mock.patch.object(ui.MainWindow, "_refresh_games"),
+                mock.patch.object(ui.MainWindow, "_redetect_steam"),
+            ):
+                win = ui.MainWindow(app)
+                try:
+                    self.assertFalse(hasattr(win, "scan_add_dialog"))
+                    self.assertTrue(win.add_advanced_box.isHidden())
+                    self.assertTrue(win.extract_details_box.isHidden())
+                    self.assertTrue(win.stack.widget(0).isAncestorOf(win.add_name))
+                    self.assertTrue(win.stack.widget(3).isAncestorOf(win.btn_update_runtimes))
+                    self.assertTrue(win.stack.widget(3).isAncestorOf(win.btn_app_update))
+
+                    win.btn_toggle_add_advanced.click()
+                    self.assertFalse(win.add_advanced_box.isHidden())
+
+                    win._set_extract_source(str(zip_file))
+                    self.assertEqual(win.extract_src.text(), str(zip_file))
+                    self.assertFalse(win.extract_details_box.isHidden())
+
+                    win._set_extract_source(str(game_exe))
+                    self.assertEqual(win.add_name.text(), "CoolGame")
+                    self.assertEqual(win.add_exe_combo.currentText(), str(game_exe))
+                finally:
+                    for worker in list(win._active_workers):
+                        worker.wait(5000)
+                    app.processEvents()
+                    win.close()
+                    app.processEvents()
+
+    def test_smart_initial_tab_and_two_tab_configure_dialog(self) -> None:
+        from PySide6.QtCore import QSettings, QTimer
+        from PySide6.QtWidgets import QApplication, QComboBox, QTabWidget
+
+        from deckinstall import ui
+        from deckinstall.ui_dialogs import configure_game_dialog
+
+        app = QApplication.instance() or QApplication([])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sa = standalone.StandaloneGame(
+                name="Standalone Game",
+                game_dir=root / "sa",
+                exe_path=root / "sa" / "sa.exe",
+                prefix_dir=root / "sa" / "prefix",
+                proton_name="GE-Proton11",
+                steam_appid=None,
+                winedlloverrides="",
+                launch_options="",
+                launch_script=root / "sa" / "launch.sh",
+                desktop_file=root / "sa.desktop",
+            )
+            sa.game_dir.mkdir(parents=True)
+            sa.exe_path.write_bytes(b"MZ")
+            with (
+                mock.patch.object(
+                    ui,
+                    "QSettings",
+                    return_value=QSettings(str(root / "empty.ini"), QSettings.Format.IniFormat),
+                ),
+                mock.patch.object(ui, "list_save_archives", return_value=[]),
+                mock.patch.object(ui.MainWindow, "_refresh_games"),
+                mock.patch.object(ui.MainWindow, "_redetect_steam"),
+            ):
+                win_empty = ui.MainWindow(app)
+                try:
+                    win_empty._apply_shortcuts_data(None, [], [], [], "", runner_labels={})
+                    self.assertEqual(win_empty.stack.currentIndex(), 0)
+                finally:
+                    for worker in list(win_empty._active_workers):
+                        worker.wait(5000)
+                    win_empty.close()
+                    app.processEvents()
+
+            with (
+                mock.patch.object(
+                    ui,
+                    "QSettings",
+                    return_value=QSettings(str(root / "filled.ini"), QSettings.Format.IniFormat),
+                ),
+                mock.patch.object(ui, "list_save_archives", return_value=[]),
+                mock.patch.object(ui.MainWindow, "_refresh_games"),
+                mock.patch.object(ui.MainWindow, "_redetect_steam"),
+            ):
+                win = ui.MainWindow(app)
+                try:
+                    win._apply_shortcuts_data(
+                        None,
+                        [],
+                        [sa],
+                        [],
+                        "",
+                        runner_labels={("standalone", str(sa.game_dir)): "GE-Proton11"},
+                    )
+                    self.assertEqual(win.stack.currentIndex(), 1)
+                    win.shortcuts_list.selectRow(0)
+
+                    observed: dict[str, int] = {}
+
+                    def _inspect_and_close() -> None:
+                        modal = QApplication.activeModalWidget()
+                        if modal is None:
+                            QTimer.singleShot(10, _inspect_and_close)
+                            return
+                        tabs = modal.findChild(QTabWidget)
+                        combos = modal.findChildren(QComboBox)
+                        observed["tabs"] = tabs.count() if tabs is not None else 0
+                        observed["combos"] = len(combos)
+                        modal.accept()
+
+                    with (
+                        mock.patch.object(
+                            configure_game_dialog, "list_installed_compat_tools", return_value=[]
+                        ),
+                        mock.patch.object(
+                            configure_game_dialog, "list_installed_protons", return_value=[]
+                        ),
+                        mock.patch.object(
+                            configure_game_dialog,
+                            "resolve_game_prefix",
+                            return_value=(sa.prefix_dir, None),
+                        ),
+                        mock.patch.object(
+                            configure_game_dialog, "is_win32_prefix", return_value=False
+                        ),
+                        mock.patch.object(
+                            configure_game_dialog,
+                            "get_umu_protonfix_status",
+                            return_value={"found": False, "has_protonfix": False},
+                        ),
+                    ):
+                        QTimer.singleShot(0, _inspect_and_close)
+                        configure_game_dialog.open_configure_game_dialog(win)
+
+                    self.assertEqual(observed.get("tabs"), 2)
+                    self.assertGreaterEqual(observed.get("combos", 0), 1)
+                finally:
+                    for worker in list(win._active_workers):
+                        worker.wait(5000)
+                    app.processEvents()
+                    win.close()
+                    app.processEvents()

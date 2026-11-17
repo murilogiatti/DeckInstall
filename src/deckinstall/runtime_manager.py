@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 import requests
 
 from . import __version__
+from .steam_paths import dir_size_bytes as _dir_size_bytes
 
 if TYPE_CHECKING:
     from .steam_paths import SteamPaths
@@ -1297,21 +1298,6 @@ def ensure_ge_proton10(
         raise RuntimeError("No GE-Proton10 release found.")
 
     return install_compat_tool(release, progress_cb=progress_cb)
-
-
-def _dir_size_bytes(path: Path) -> int:
-    """Return total byte size of regular files under path without following symlinks."""
-    total = 0
-    for root, _dirs, files in os.walk(path, followlinks=False):
-        root_path = Path(root)
-        for fname in files:
-            fpath = root_path / fname
-            try:
-                if not fpath.is_symlink():
-                    total += fpath.stat().st_size
-            except OSError:
-                continue
-    return total
 
 
 def _strip_tar_suffix(name: str) -> str:

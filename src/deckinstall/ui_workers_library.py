@@ -9,9 +9,14 @@ from typing import Literal
 from PySide6.QtCore import QThread, Signal
 
 from .artwork import SteamMatch, download_steam_artwork, search_steam_games
+from .external_actions import (
+    create_standalone_from_external,
+    import_external_saves_to_target,
+)
 from .extractor import sanitize_folder_name
 from .i18n import tr
 from .launcher_scan import ExternalLauncherGame, scan_external_launcher_games
+from .optiscaler import inspect_optiscaler_state
 from .runtime_manager import (
     build_umu_env,
     get_umu_run_path,
@@ -19,6 +24,7 @@ from .runtime_manager import (
     list_ge_proton11_dirs,
     list_installed_compat_tools,
 )
+from .save_sync import snapshot_prefix_saves
 from .standalone import (
     StandaloneGame,
     list_standalone_games,
@@ -38,7 +44,9 @@ from .steam_paths import (
 from .steam_vdf import (
     ShortcutEntry,
     _dir_size_bytes,
+    _strip_vdf_quotes,
     backup_all_saves,
+    get_compat_tool_map,
     get_shortcut_proton,
     load_shortcuts,
     plan_bulk_migration,
@@ -52,10 +60,54 @@ from .ui_cards import _format_worker_error, _is_wine_game_running
 from .vdf_queue import VdfEditQueue
 
 
+def compute_library_runner_labels(
+    paths: SteamPaths | None,
+    entries: list[ShortcutEntry],
+    standalone_games: list[StandaloneGame],
+    external_games: list[ExternalLauncherGame],
+) -> dict[tuple[str, str], str]:
+    """Resolve display labels for Proton/Runner + OptiScaler status off the UI thread."""
+    labels: dict[tuple[str, str], str] = {}
+    compat_map = get_compat_tool_map(paths.config_vdf) if paths is not None else {}
+
+    def _opti_tag(exe_path: Path) -> str:
+        try:
+            if exe_path.parent.is_dir() and inspect_optiscaler_state(exe_path) is not None:
+                return " [OptiScaler]"
+        except OSError:
+            pass
+        return ""
+
+    default_lbl = tr("proton.default_label")
+    native_lbl = tr("library.tag_native_linux")
+
+    for entry in entries:
+        runner = compat_map.get(entry.appid_u32, "") or default_lbl
+        exe_clean = _strip_vdf_quotes(entry.exe)
+        if exe_clean:
+            runner += _opti_tag(Path(exe_clean))
+        labels[("steam", str(entry.appid_u32))] = runner
+
+    for game in standalone_games:
+        if game.native_linux:
+            runner = native_lbl
+        else:
+            runner = (game.proton_name or default_lbl) + _opti_tag(game.exe_path)
+        labels[("standalone", str(game.game_dir))] = runner
+
+    for ext in external_games:
+        runner = native_lbl if ext.runner == "linux" else (ext.runner or default_lbl)
+        if ext.runner != "linux":
+            runner += _opti_tag(ext.exe_path)
+        labels[("external", f"{ext.source}:{ext.name}:{ext.exe_path}")] = runner
+
+    return labels
+
+
 class SteamDetectWorker(QThread):
     """Detect Steam paths and load Steam, standalone, and external games."""
 
-    ready = Signal(int, int, object, bool, list, list, list, str)
+    ready = Signal(int, int, object, bool, list, list, list, str, object)
 
     def __init__(
         self,
@@ -93,6 +145,9 @@ class SteamDetectWorker(QThread):
                 vdf_err = str(exc)
         standalone_games = self._list_standalone_games()
         external_games = self._scan_external_launcher_games()
+        runner_labels = compute_library_runner_labels(
+            paths, entries, standalone_games, external_games
+        )
         self.ready.emit(
             self._req_id,
             self._sc_req_id,
@@ -102,13 +157,14 @@ class SteamDetectWorker(QThread):
             standalone_games,
             external_games,
             vdf_err,
+            runner_labels,
         )
 
 
 class ShortcutsRefreshWorker(QThread):
     """Reload Steam shortcuts, standalone games, and external launcher games."""
 
-    ready = Signal(int, list, list, list, str)
+    ready = Signal(int, list, list, list, str, object)
 
     def __init__(
         self,
@@ -138,8 +194,11 @@ class ShortcutsRefreshWorker(QThread):
                 vdf_err = str(exc)
         standalone_games = self._list_standalone_games()
         external_games = self._scan_external_launcher_games()
+        runner_labels = compute_library_runner_labels(
+            self._paths, entries, standalone_games, external_games
+        )
         self.ready.emit(
-            self._req_id, entries, standalone_games, external_games, vdf_err
+            self._req_id, entries, standalone_games, external_games, vdf_err, runner_labels
         )
 
 
@@ -367,7 +426,7 @@ class RestoreWorker(QThread):
     done = Signal(int, int)
     failed = Signal(str)
 
-    def __init__(self, paths: SteamPaths, zip_file: Path) -> None:
+    def __init__(self, paths: SteamPaths | None, zip_file: Path) -> None:
         super().__init__()
         self._paths = paths
         self._zip_file = zip_file
@@ -590,4 +649,58 @@ class BatchVdfApplyWorker(QThread):
                     start_steam()
                 except Exception:
                     pass
+            self.failed.emit(_format_worker_error(exc))
+
+
+class ExtStandaloneWorker(QThread):
+    """Create a standalone wrapper for an external launcher game."""
+
+    finished_ok = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, ext: ExternalLauncherGame, launch_options: str) -> None:
+        super().__init__()
+        self._ext = ext
+        self._launch_options = launch_options
+
+    def run(self) -> None:
+        try:
+            game = create_standalone_from_external(self._ext, launch_options=self._launch_options)
+            self.finished_ok.emit(game)
+        except Exception as exc:
+            self.failed.emit(_format_worker_error(exc))
+
+
+class ExtImportSavesWorker(QThread):
+    """Import saves from an external launcher prefix into a Steam or Standalone prefix."""
+
+    finished_ok = Signal(int)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        ext: ExternalLauncherGame,
+        target_pfx: Path,
+        target_label: str,
+        *,
+        auto_snap: bool,
+    ) -> None:
+        super().__init__()
+        self._ext = ext
+        self._target_pfx = target_pfx
+        self._target_label = target_label
+        self._auto_snap = auto_snap
+
+    def run(self) -> None:
+        try:
+            snap_fn = (
+                (lambda pfx, gname: snapshot_prefix_saves(pfx, gname, reason="ext-import"))
+                if self._auto_snap
+                else None
+            )
+            copied = import_external_saves_to_target(
+                self._ext, self._target_pfx, self._target_label, auto_snapshot_fn=snap_fn
+            )
+            self.finished_ok.emit(copied)
+        except Exception as exc:
             self.failed.emit(_format_worker_error(exc))

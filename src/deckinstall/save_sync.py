@@ -1612,3 +1612,83 @@ def preview_sync_operation(
         total_bytes=total_bytes,
         registry_entries=registry_entries,
     )
+
+
+@dataclass(frozen=True)
+class SaveArchiveEntry:
+    """Discovered backup or snapshot ZIP archive."""
+
+    path: Path
+    kind: str  # "backup" | "save_snapshot" | "state_snapshot"
+    label: str
+    game_slug: str
+    mtime: float
+    size_bytes: int
+
+
+def list_save_archives(
+    saves_dir: Path | None = None,
+    legacy_backups_dir: Path | None = None,
+) -> list[SaveArchiveEntry]:
+    """List backup and snapshot ZIP archives across current and legacy save folders."""
+    base_saves = saves_dir or DEFAULT_SAVES_DIR
+    legacy_base = legacy_backups_dir or (Path.home() / "Backups" / "DeckInstall")
+    seen: set[Path] = set()
+    entries: list[SaveArchiveEntry] = []
+
+    def _add_entry(path: Path, kind: str, label: str, game_slug: str) -> None:
+        if path.is_symlink() or not path.is_file() or path.suffix.lower() != ".zip":
+            return
+        try:
+            resolved = path.resolve()
+            if resolved in seen:
+                return
+            st = path.stat()
+        except OSError:
+            return
+        seen.add(resolved)
+        entries.append(
+            SaveArchiveEntry(
+                path=path,
+                kind=kind,
+                label=label,
+                game_slug=game_slug,
+                mtime=st.st_mtime,
+                size_bytes=st.st_size,
+            )
+        )
+
+    for bdir in (base_saves / "backups", legacy_base):
+        if not bdir.is_dir() or bdir.is_symlink():
+            continue
+        try:
+            for child in bdir.iterdir():
+                _add_entry(child, "backup", child.name, "")
+        except OSError:
+            continue
+
+    for sroot in (base_saves / "snapshots", legacy_base / "snapshots"):
+        if not sroot.is_dir() or sroot.is_symlink():
+            continue
+        try:
+            game_dirs = list(sroot.iterdir())
+        except OSError:
+            continue
+        for gdir in game_dirs:
+            if gdir.is_symlink() or not gdir.is_dir():
+                continue
+            slug = gdir.name
+            try:
+                for child in gdir.iterdir():
+                    if child.is_symlink():
+                        continue
+                    if child.is_file():
+                        _add_entry(child, "save_snapshot", f"{slug} — {child.stem}", slug)
+                    elif child.is_dir() and child.name == "state":
+                        for st_zip in child.iterdir():
+                            _add_entry(st_zip, "state_snapshot", f"{slug} — {st_zip.stem}", slug)
+            except OSError:
+                continue
+
+    entries.sort(key=lambda e: e.mtime, reverse=True)
+    return entries

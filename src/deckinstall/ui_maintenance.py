@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QPoint, Qt, QUrl
@@ -27,6 +28,7 @@ from .steam_vdf import CleanupCandidate
 from .ui_cards import (
     FlowLayout,
     _cleanup_candidate_auto_check,
+    _dialog_parent,
     _format_cleanup_candidate_label,
     _is_wine_game_running,
     _make_card,
@@ -107,7 +109,27 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     ):
         lbl.setWordWrap(True)
         health_layout.addWidget(lbl)
+    health_actions = FlowLayout(spacing=8)
+    win.btn_update_runtimes = QPushButton(tr("runtime.btn_update"))
+    win.btn_update_runtimes.setToolTip(tr("runtime.tooltip"))
+    win.btn_update_runtimes.clicked.connect(win._update_runtimes)
+    win.btn_app_update = QPushButton(tr("app_update.btn"))
+    win.btn_app_update.clicked.connect(win._check_and_update_app)
+    health_actions.addWidget(win.btn_update_runtimes)
+    health_actions.addWidget(win.btn_app_update)
+    health_layout.addLayout(health_actions)
     layout.addWidget(health_card)
+
+    batch_card, batch_layout = _make_card()
+    win.maint_batch_card = batch_card
+    batch_layout.addWidget(QLabel(tr("library.menu_batch")))
+    for action in (win.act_bulk_migrate, win.act_bulk_proton):
+        button = QPushButton(action.text())
+        button.setEnabled(action.isEnabled())
+        action.changed.connect(lambda a=action, b=button: b.setEnabled(a.isEnabled()))
+        button.clicked.connect(lambda _checked=False, a=action: a.trigger())
+        batch_layout.addWidget(button)
+    layout.addWidget(batch_card)
 
     clean_card, clean_layout = _make_card()
     clean_top = QHBoxLayout()
@@ -240,7 +262,14 @@ def refresh_maintenance_health(win: MainWindow) -> None:
             )
         )
 
-    worker = MaintHealthWorker(req_id, paths_snapshot, caches_bytes)
+    ui_mod = sys.modules.get("deckinstall.ui")
+    find_steam_fn = getattr(ui_mod, "find_steam_root", None) if ui_mod is not None else None
+    worker = MaintHealthWorker(
+        req_id,
+        paths_snapshot,
+        caches_bytes,
+        find_steam_root_fn=find_steam_fn,
+    )
     win._track_worker(worker)
     worker.ready.connect(_on_health_ready)
     worker.start()
@@ -384,7 +413,7 @@ def scan_maintenance_cleanup(win: MainWindow) -> None:
             return
         msg = tr("cleanup.scan_error", err=err)
         win.status_label.setText(msg)
-        QMessageBox.critical(win, __app_name__, msg)
+        QMessageBox.critical(_dialog_parent(win), __app_name__, msg)
 
     worker = MaintScanWorker(win.paths)
     win._track_worker(worker)
@@ -398,7 +427,7 @@ def revalidate_maintenance_cleanup(win: MainWindow) -> None:
     if not win.paths:
         return
     if _is_wine_game_running():
-        QMessageBox.warning(win, __app_name__, tr("cleanup.wine_running"))
+        QMessageBox.warning(_dialog_parent(win), __app_name__, tr("cleanup.wine_running"))
         return
     win._set_steam_busy(True)
     win.status_label.setText(tr("cleanup.revalidating"))
@@ -421,9 +450,11 @@ def revalidate_maintenance_cleanup(win: MainWindow) -> None:
             return
         msg = tr("cleanup.reval_error", err=err)
         win.status_label.setText(msg)
-        QMessageBox.critical(win, __app_name__, msg)
+        QMessageBox.critical(_dialog_parent(win), __app_name__, msg)
 
-    worker = MaintRevalWorker(win.paths)
+    ui_mod = sys.modules.get("deckinstall.ui")
+    load_sc_fn = getattr(ui_mod, "load_shortcuts", None) if ui_mod is not None else None
+    worker = MaintRevalWorker(win.paths, load_shortcuts_fn=load_sc_fn)
     win._track_worker(worker)
     worker.done.connect(_on_done)
     worker.failed.connect(_on_failed)
@@ -433,17 +464,17 @@ def revalidate_maintenance_cleanup(win: MainWindow) -> None:
 def maint_clean_safe(win: MainWindow) -> None:
     """Confirm and delete all auto-checked safe cleanup candidates."""
     if _is_wine_game_running():
-        QMessageBox.warning(win, __app_name__, tr("cleanup.wine_running"))
+        QMessageBox.warning(_dialog_parent(win), __app_name__, tr("cleanup.wine_running"))
         return
     safe_items = [
         c for c in win._maint_candidates if _cleanup_candidate_auto_check(c)
     ]
     safe_size = format_size_bytes(sum(c.size_bytes for c in safe_items))
     if not safe_items:
-        QMessageBox.information(win, __app_name__, tr("maint.safe_clean_empty"))
+        QMessageBox.information(_dialog_parent(win), __app_name__, tr("maint.safe_clean_empty"))
         return
     ans = QMessageBox.question(
-        win,
+        _dialog_parent(win),
         __app_name__,
         tr("maint.confirm_safe_clean", count=len(safe_items), size=safe_size),
     )
@@ -454,7 +485,7 @@ def maint_clean_safe(win: MainWindow) -> None:
 def maint_delete_selected(win: MainWindow) -> None:
     """Confirm and delete currently checked cleanup candidates."""
     if _is_wine_game_running():
-        QMessageBox.warning(win, __app_name__, tr("cleanup.wine_running"))
+        QMessageBox.warning(_dialog_parent(win), __app_name__, tr("cleanup.wine_running"))
         return
     selected = [
         c
@@ -500,7 +531,7 @@ def maint_delete_selected(win: MainWindow) -> None:
 
     sel_size = format_size_bytes(sum(c.size_bytes for c in selected))
     ans = QMessageBox.question(
-        win,
+        _dialog_parent(win),
         __app_name__,
         tr("maint.confirm_delete_selected", count=len(selected), size=sel_size),
     )
@@ -536,9 +567,9 @@ def _run_maint_delete(
             msg += tr("cleanup.delete_warnings", errs="\n".join(errs[:10]))
         win.status_label.setText(msg.splitlines()[0])
         if errs:
-            QMessageBox.warning(win, __app_name__, msg)
+            QMessageBox.warning(_dialog_parent(win), __app_name__, msg)
         else:
-            QMessageBox.information(win, __app_name__, msg)
+            QMessageBox.information(_dialog_parent(win), __app_name__, msg)
 
     def _on_failed(err: str) -> None:
         win._set_steam_busy(False)
@@ -546,7 +577,7 @@ def _run_maint_delete(
             return
         msg = tr("cleanup.delete_error", err=err)
         win.status_label.setText(msg)
-        QMessageBox.critical(win, __app_name__, msg)
+        QMessageBox.critical(_dialog_parent(win), __app_name__, msg)
 
     worker = MaintDeleteWorker(
         win.paths, items, allow_unverified_saves, backup_unverified
@@ -596,13 +627,15 @@ def show_maint_context_menu(win: MainWindow, pos: QPoint) -> None:
             if win._closing_pending:
                 return
             if files_backed > 0:
+                if hasattr(win, "_refresh_saves_list"):
+                    win._refresh_saves_list()
                 QMessageBox.information(
-                    win,
+                    _dialog_parent(win),
                     __app_name__,
                     tr("maint.backup_done", path=zip_str, files=files_backed),
                 )
             else:
-                QMessageBox.information(win, __app_name__, tr("maint.backup_empty"))
+                QMessageBox.information(_dialog_parent(win), __app_name__, tr("maint.backup_empty"))
 
         def _on_backup_failed(err: str) -> None:
             win._set_steam_busy(False)
@@ -610,7 +643,7 @@ def show_maint_context_menu(win: MainWindow, pos: QPoint) -> None:
             if win._closing_pending:
                 return
             QMessageBox.critical(
-                win, __app_name__, tr("maint.backup_error", err=err)
+                _dialog_parent(win), __app_name__, tr("maint.backup_error", err=err)
             )
 
         worker = MaintBackupWorker(cand)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -50,6 +51,29 @@ def dir_size_bytes(path: Path) -> int:
         except OSError:
             continue
     return total
+
+
+def dir_size_bytes_many(paths: list[Path]) -> int:
+    """Compute summed regular-file sizes across multiple directories using bounded parallelism."""
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for p in paths:
+        if p.is_symlink() or not p.is_dir():
+            continue
+        try:
+            resolved = p.resolve()
+        except OSError:
+            resolved = p
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(p)
+    if not unique:
+        return 0
+    if len(unique) == 1:
+        return dir_size_bytes(unique[0])
+    workers = min(8, len(unique))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return sum(pool.map(dir_size_bytes, unique))
 
 
 def find_steam_root() -> Path | None:
