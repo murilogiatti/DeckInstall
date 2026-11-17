@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -10,13 +11,39 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .runtime_manager import ProgressCb, _load_versions, ensure_optiscaler
-from .scanner import detect_exe_kind
+from .scanner import detect_exe_kind, detect_pe_arch
 
 OPTISCALER_PROXY_DLLS: tuple[str, ...] = ("dxgi", "winmm", "version", "dbghelp")
 OPTISCALER_BACKENDS: tuple[str, ...] = ("auto", "fsr3", "fsr22", "fsr21", "xess", "dlss")
 OPTISCALER_FG_MODES: tuple[str, ...] = ("auto", "nofg", "optifg", "nukems")
 OPTISCALER_SPOOF_MODES: tuple[str, ...] = ("auto", "true", "false")
 OPTISCALER_MANIFEST = ".deckinstall_optiscaler.json"
+
+_DLSS_DLL_NAMES: frozenset[str] = frozenset(
+    {
+        "nvngx_dlss.dll",
+        "nvngx_dlssd.dll",
+        "nvngx_dlssg.dll",
+        "sl.interposer.dll",
+        "sl.dlss.dll",
+        "sl.dlss_g.dll",
+    }
+)
+_FSR_DLL_NAMES: frozenset[str] = frozenset(
+    {
+        "ffx_fsr2_api_x64.dll",
+        "ffx_fsr2_api_dx12_x64.dll",
+        "ffx_fsr2_api_vk_x64.dll",
+        "ffx_fsr3_x64.dll",
+        "ffx_fsr3upscaler_x64.dll",
+        "ffx_framegeneration_x64.dll",
+        "amd_fidelityfx_dx12.dll",
+        "amd_fidelityfx_vk.dll",
+        "amd_fidelityfx_upscaler_dx12.dll",
+        "amd_fidelityfx_framegeneration_dx12.dll",
+    }
+)
+_XESS_DLL_NAMES: frozenset[str] = frozenset({"libxess.dll", "libxess_fg.dll"})
 
 _BACKEND_UPSCALER_MAP: dict[str, str] = {
     "auto": "auto",
@@ -77,6 +104,119 @@ class OptiScalerResult:
     state: OptiScalerState | None
     removed_count: int = 0
     restored_count: int = 0
+
+
+@dataclass(frozen=True)
+class OptiScalerCompatibility:
+    """Compatibility assessment of a game executable and folder for OptiScaler."""
+
+    compatible: bool
+    tier: str  # "verified" | "likely" | "incompatible"
+    pe_arch: str
+    upscalers: tuple[str, ...]
+    installed_state: OptiScalerState | None = None
+
+
+def _resolve_upscaler_scan_root(exe_path: Path, game_dir: Path | None) -> Path:
+    """Choose a safe directory root to scan for DLSS/FSR/XeSS upscaler DLLs."""
+    exe_dir = exe_path.parent
+    if game_dir is None or not game_dir.is_dir() or game_dir.is_symlink():
+        return exe_dir
+    try:
+        resolved_game = game_dir.resolve()
+        resolved_exe_dir = exe_dir.resolve()
+        home_resolved = Path.home().resolve()
+        if resolved_game in (Path("/"), home_resolved, home_resolved / "Games"):
+            return exe_dir
+        if resolved_exe_dir.is_relative_to(resolved_game):
+            return game_dir
+    except OSError:
+        return exe_dir
+    return exe_dir
+
+
+def check_optiscaler_compatibility(
+    exe_path: Path,
+    game_dir: Path | None = None,
+) -> OptiScalerCompatibility:
+    """Inspect executable architecture and game DLLs to determine OptiScaler compatibility."""
+    if not exe_path.is_file() or not exe_path.parent.is_dir():
+        return OptiScalerCompatibility(
+            compatible=False,
+            tier="incompatible",
+            pe_arch="unknown",
+            upscalers=(),
+            installed_state=None,
+        )
+
+    pe_arch = detect_pe_arch(exe_path)
+    exe_kind = detect_exe_kind(exe_path)
+    if pe_arch in ("linux_elf", "x86", "arm64") or exe_kind != "windows_pe":
+        return OptiScalerCompatibility(
+            compatible=False,
+            tier="incompatible",
+            pe_arch=pe_arch,
+            upscalers=(),
+            installed_state=None,
+        )
+
+    scan_root = _resolve_upscaler_scan_root(exe_path, game_dir)
+    has_dlss = False
+    has_fsr = False
+    has_xess = False
+    base_parts = len(scan_root.parts)
+
+    try:
+        for dirpath, dirnames, filenames in os.walk(scan_root, followlinks=False):
+            cur = Path(dirpath)
+            depth = len(cur.parts) - base_parts
+            if depth >= 5:
+                dirnames[:] = []
+            else:
+                dirnames[:] = [
+                    d
+                    for d in dirnames
+                    if not d.startswith(".") and not (cur / d).is_symlink()
+                ]
+            for fname in filenames:
+                low = fname.lower()
+                if not low.endswith(".dll"):
+                    continue
+                if low in _DLSS_DLL_NAMES:
+                    has_dlss = True
+                elif low in _FSR_DLL_NAMES:
+                    has_fsr = True
+                elif low in _XESS_DLL_NAMES:
+                    has_xess = True
+            if has_dlss and has_fsr and has_xess:
+                break
+    except OSError:
+        pass
+
+    found: list[str] = []
+    if has_dlss:
+        found.append("DLSS")
+    if has_fsr:
+        found.append("FSR")
+    if has_xess:
+        found.append("XeSS")
+    upscalers = tuple(found)
+    tier = "verified" if upscalers else "likely"
+    installed_state = inspect_optiscaler_state(exe_path)
+    return OptiScalerCompatibility(
+        compatible=True,
+        tier=tier,
+        pe_arch=pe_arch,
+        upscalers=upscalers,
+        installed_state=installed_state,
+    )
+
+
+def scan_optiscaler_compatibility_batch(
+    entries: list[tuple[Path, Path | None]],
+) -> list[OptiScalerCompatibility]:
+    """Assess OptiScaler compatibility for a flat batch of (exe_path, game_dir) pairs."""
+    return [check_optiscaler_compatibility(exe_path, game_dir) for exe_path, game_dir in entries]
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -313,6 +453,24 @@ def patch_optiscaler_ini(
     return ("\n".join(updated_lines) + "\n") if updated_lines else ""
 
 
+def _same_file_content(a: Path, b: Path) -> bool:
+    """Byte-compare two regular files; False on any doubt."""
+    try:
+        if a.is_symlink() or b.is_symlink() or not (a.is_file() and b.is_file()):
+            return False
+        if a.stat().st_size != b.stat().st_size:
+            return False
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            while True:
+                ca, cb = fa.read(1 << 20), fb.read(1 << 20)
+                if ca != cb:
+                    return False
+                if not ca:
+                    return True
+    except OSError:
+        return False
+
+
 def _backup_if_needed(
     target_path: Path,
     managed_paths: set[Path],
@@ -334,8 +492,18 @@ def _backup_if_needed(
         return
     if not (backup_path.exists() or backup_path.is_symlink()):
         os.replace(target_path, backup_path)
-    else:
+    elif _same_file_content(target_path, backup_path):
         target_path.unlink(missing_ok=True)
+    else:
+        # A stale backup already exists and the current file differs (e.g. the game was
+        # updated). Never delete it: keep it next to the original backup.
+        idx = 1
+        extra = target_path.with_name(f"{backup_path.name}.{idx}")
+        while extra.exists() or extra.is_symlink():
+            idx += 1
+            extra = target_path.with_name(f"{backup_path.name}.{idx}")
+        os.replace(target_path, extra)
+        logging.warning("Preserved unmanaged %s as %s (backup already existed)", target_path, extra)
     if target_path not in backed_up_files:
         backed_up_files.append(target_path)
 

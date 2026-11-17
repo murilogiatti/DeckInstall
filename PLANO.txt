@@ -1,0 +1,76 @@
+DeckInstall - Plano de acao v3 (2026-11-17)
+==========================================
+
+IDEIA CENTRAL: ciclo de vida por jogo
+- Cada jogo tem um manifesto v2 que registra TUDO que o app criou:
+  pasta do jogo, exe, loja/GAMEID, origem, prefixo, caches, logs, versao do Proton,
+  DLLs do OptiScaler, .desktop, AppID Steam, link compatdata, artes da grid.
+- Instalar -> Jogar -> Atalhos (Steam/Menu/Desktop) -> Desinstalar (le o manifesto e remove exatamente aquilo).
+- Um jogo = um prefixo. Steam aponta para ele (compatdata como link). Importar/exportar viram caixas de marcar.
+- Manutencao continua: (1) sobras de desinstalacoes antigas / outros launchers; (2) sistema (opcional, desmarcado).
+
+REFERENCIA HYDRA (codigo lido): umu-run 1.4.4 embutido, prefixo por jogo, sem /DIR nem modo silencioso,
+detecta exe por pastas novas em drive_c + lista conhecida, fallback wine do sistema.
+Desinstalar NAO apaga o prefixo. "UMU-Proton 10" = apenas o mais recente do umu na epoca (sem motivo tecnico).
+
+FASE 0 - Arrumar a casa (Sonnet, sem mudar comportamento)
+1. [FEITO] ARM64 em scanner.detect_pe_arch corrigido.
+2. Remover LSFG inteiro (~220 referencias em 11 arquivos); launch.sh antigos devem continuar funcionando.
+3. Remover codigo morto: ensure_umu_database, run_with_umu, _save_versions, import_hydra_umu_saves,
+   _prefix_has_saves, install_mangohud_topbar_config, BatchVdfApplyWorker, wrappers de manutencao em ui.py:1446-1487,
+   rank_executables, _kill_proc_group.
+4. fsutil.py: unificar escrita atomica (6x), SHA-256 (3x), slug/sanitize, "esta dentro de", copiar/mover.
+   Unificar leitura de libraryfolders.vdf (4x) e resolucao de Proton (4x) em steam_paths.
+
+FASE 1 - Manifesto e biblioteca (Opus)
+1. Manifesto v2 com caminhos relativos e registro de tudo que foi criado.
+2. Biblioteca por disco: <disco>/DeckInstall/{Games,Prefixes,Caches} + library.json.
+   Deteccao ao montar (/run/media/$USER/*, /media/*, /mnt/*); jogos de disco ausente = "indisponivel".
+   exFAT/NTFS: prefixo vai para o disco interno, com aviso.
+3. Um jogo, um prefixo; Steam via link do compatdata.
+4. Migracao automatica dos jogos atuais, com snapshot e caminho de volta.
+
+FASE 2 - Instalar
+1. Classificar: arquivo -> extrair; setup GOG -> innoextract (fallback setup); repack (fg-*.bin, unarc.dll, ISDone.dll)
+   -> instalador; .sh nativo -> executar; pasta pronta -> escolher exe.
+2. Repack: achar setup.exe como o Hydra (pular redist/DLC/patch); MD5 opcional; espaco 2x; prefixo descartavel;
+   /DIR= na biblioteca (testar se repacks respeitam); WINE_LARGE_ADDRESS_AWARE=0 so na instalacao; silencioso opcional;
+   fallback wine do sistema; mensagem especifica para erro unarc; apagar prefixo do instalador no fim.
+3. Exe: goggame playTasks -> pastas novas desde inicio do instalador -> ranking; troca em 1 clique.
+4. Deteccao: OnlineFix/Goldberg/CODEX (overrides de DLL), STORE=gog; fazer download do umu-database funcionar.
+5. Remover limite de 4 GiB (usar razao de compressao + espaco livre).
+
+FASE 3 - Jogar e Proton
+1. Proton "Padrao (mais recente)" ou fixado por jogo; "Usar versao anterior"; atualizar move os "Padrao";
+   manter atual + anterior; visao de versoes com fixar/desafixar em lote.
+2. Um so dialogo de presets (MangoHud, gamemode, DLSS, NVAPI, wined3d, esync/fsync). Sem LSFG.
+3. OptiScaler: compatibilidade + instalacao em massa; corrigir instalacao pela metade; registrar no manifesto.
+4. Logs de execucao no manifesto.
+
+FASE 4 - Desinstalar e limpar
+1. Dialogo Desinstalar guiado pelo manifesto (jogo, prefixo, saves com snapshot, atalhos, artes, cache, logs);
+   mostra espaco liberado; preserva prefixo compartilhado.
+2. cleanup.py com regras declarativas (Jogos, Runtimes, Sobras de outros launchers, Sistema desmarcado),
+   no lugar da funcao de ~750 linhas.
+3. Medidor de espaco por disco e por jogo.
+
+FASE 5 - Adotar jogos (importacoes unificadas)
+1. Assistente unico: Hydra, Heroic, Lutris, Bottles, UMU, atalhos antigos da Steam, pasta solta.
+2. Mover para a biblioteca, adotar prefixo (mover, nao copiar), migrar saves, criar manifesto v2.
+3. Hydra: recuperar jogo que ficou em drive_c.
+
+FASE 6 - Saves e interface
+1. Saves: snapshot automatico + tela Backup/Sync com import/export formato Ludusavi.
+2. Abas: Instalar (Fonte -> Exe -> Atalhos, resto em Avancado), Biblioteca (Jogar/Configurar/Desinstalar), Saves, Manutencao.
+3. Cortar Steam Input e mover para microSD; fila VDF vira "aplicar ao fechar a Steam".
+4. Workers: tratar erros, flag ocupado vira contador, reiniciar Steam apos operacoes.
+
+CONTINUO
+- Dividir steam_vdf.py (79% nao e VDF) e ui.py conforme cada area for mexida.
+- tr() em todas as mensagens; uma unica pasta de dados ~/.local/share/DeckInstall.
+
+PENDENCIAS CONHECIDAS (da revisao)
+- app_updater: confiar so em APPIMAGE; exigir que o codigo rode dentro de APPDIR.
+- runtime_manager: falha do OptiScaler derruba o RuntimeUpdateWorker; consulta GitHub a cada chamada.
+- ui.py: botao "Remover existente" ativo durante outras operacoes; dialogo Configurar perde a selecao apos trocar Proton.
+- launcher_scan: slug do Lutris provavelmente errado.

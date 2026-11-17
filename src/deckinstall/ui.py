@@ -413,8 +413,10 @@ class MainWindow(QMainWindow):
                 apply_failed = False
                 try:
                     was_running = is_steam_running()
-                    if was_running:
-                        shutdown_steam()
+                    if was_running and not shutdown_steam():
+                        # Steam rewrites its VDFs on exit; writing now would be silently lost.
+                        was_running = False
+                        raise RuntimeError(tr("add.close_steam_timeout"))
                     batch_res = self._vdf_queue.apply_all(self.paths)
                     if batch_res.errors:
                         apply_failed = True

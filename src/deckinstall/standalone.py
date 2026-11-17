@@ -39,6 +39,7 @@ from .steam_vdf import (
     get_shortcut_proton,
     infer_game_root_from_exe,
     load_shortcuts,
+    move_dir_safely,
     remove_shortcut,
     set_shortcut_proton,
     sync_prefix_symlinks,
@@ -972,6 +973,39 @@ def _copy_or_move_dir_contents(src_dir: Path, dst_dir: Path, move: bool) -> None
                 shutil.copy2(item, target)
 
 
+def _prefix_used_by_other_game(prefix_dir: Path, game_dir: Path) -> bool:
+    """True when another registered standalone game already uses prefix_dir."""
+    try:
+        own = game_dir.resolve()
+        target = prefix_dir.resolve()
+    except OSError:
+        return True
+    for other in list_standalone_games():
+        try:
+            if other.game_dir.resolve() != own and other.prefix_dir.resolve() == target:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _choose_prefix_dir(target_game_dir: Path, prefixes_dir: Path, keep_in_place: bool) -> Path:
+    """Reuse the game's existing prefix, else pick one not shared with another game."""
+    manifest = target_game_dir / STANDALONE_MANIFEST
+    if manifest.is_file():
+        existing = _load_manifest(manifest)
+        if existing is not None and _is_strictly_under_dir(existing.prefix_dir, prefixes_dir):
+            return existing.prefix_dir
+    base_pfx_name = _sanitize_dir_name(target_game_dir.name)
+    dir_hash = hashlib.sha256(str(target_game_dir.resolve()).encode("utf-8")).hexdigest()[:8]
+    if keep_in_place:
+        return prefixes_dir / f"{base_pfx_name}-{dir_hash}"
+    prefix_dir = prefixes_dir / base_pfx_name
+    if _prefix_used_by_other_game(prefix_dir, target_game_dir):
+        prefix_dir = prefixes_dir / f"{base_pfx_name}-{dir_hash}"
+    return prefix_dir
+
+
 def install_standalone_game(
     game_name: str,
     exe_path: Path,
@@ -1036,17 +1070,12 @@ def install_standalone_game(
                     rel_exe = Path(src_exe.name)
                 if src_dir.stat().st_dev != games_dir.stat().st_dev:
                     check_disk_space(games_dir, estimate_dir_size(src_dir))
-                shutil.move(str(game_dir), str(target_game_dir))
+                move_dir_safely(game_dir, target_game_dir)
                 target_exe_path = target_game_dir / rel_exe
             else:
                 target_exe_path = exe_path
 
-    base_pfx_name = _sanitize_dir_name(target_game_dir.name)
-    if keep_in_place:
-        resolved_game_dir = target_game_dir.resolve()
-        dir_hash = hashlib.sha256(str(resolved_game_dir).encode("utf-8")).hexdigest()[:8]
-        base_pfx_name = f"{base_pfx_name}-{dir_hash}"
-    prefix_dir = prefixes_dir / base_pfx_name
+    prefix_dir = _choose_prefix_dir(target_game_dir, prefixes_dir, keep_in_place)
     if not native_linux:
         prefixes_dir.mkdir(parents=True, exist_ok=True)
         if prefix_dir.is_symlink():
@@ -1457,9 +1486,10 @@ def remove_standalone_game(
             )
         else:
             _remove_path_or_tree(game.game_dir)
+    if (delete_files or delete_prefix) and not _prefix_used_by_other_game(game.prefix_dir, game.game_dir):
         _safe_remove_prefix_dir(game.prefix_dir)
-    elif delete_prefix:
-        _safe_remove_prefix_dir(game.prefix_dir)
+    elif delete_files or delete_prefix:
+        logging.warning("Keeping prefix %s: it is shared with another standalone game", game.prefix_dir)
 
     if delete_cache:
         _safe_remove_cache_dir(game.cache_dir)

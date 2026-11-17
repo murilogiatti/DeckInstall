@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import glob
 import hashlib
@@ -340,6 +341,55 @@ def start_steam(steam_root: Path | None = None) -> None:
     )
 
 
+def move_dir_safely(src: Path, dst: Path) -> None:
+    """Move a directory without ever leaving the only full copy at risk.
+
+    Same filesystem: atomic rename. Across filesystems: copy everything first, and only
+    then delete the source. A failure while copying raises (source untouched, partial
+    destination may remain). A failure while deleting the source is only logged: the
+    destination is already complete, so leftovers are preferable to data loss.
+    """
+    try:
+        os.rename(src, dst)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+    shutil.copytree(src, dst, symlinks=True)
+    try:
+        shutil.rmtree(src)
+    except OSError:
+        logging.warning("Moved %s to %s but could not fully remove the source", src, dst, exc_info=True)
+
+
+def _is_same_game_entry(item: dict, exe_path: Path, start_dir: Path) -> bool:
+    """Decide whether a same-named shortcut refers to the game being added.
+
+    Two different games may share an AppName (e.g. "Launcher"); only treat a name match as
+    the same game when its folder overlaps the new one or its executable is gone from a
+    non-removable location (the game folder was moved/renamed).
+    """
+    old_exe_raw = str(item.get("Exe") or item.get("exe") or "").strip().strip('"')
+    if not old_exe_raw:
+        return True
+    old_exe = Path(old_exe_raw)
+    old_dir_raw = str(item.get("StartDir") or item.get("startdir") or "").strip().strip('"')
+    old_dir = Path(old_dir_raw) if old_dir_raw else old_exe.parent
+    if old_exe == exe_path:
+        return True
+    for a, b in ((old_dir, start_dir), (old_exe.parent, exe_path.parent)):
+        if a == b or a in b.parents or b in a.parents:
+            return True
+    removable = ("/run/media/", "/media/", "/mnt/")
+    if not old_exe_raw.startswith(removable):
+        try:
+            if not old_exe.exists():
+                return True
+        except OSError:
+            return False
+    return False
+
+
 def add_or_update_shortcut(
     paths: SteamPaths,
     app_name: str,
@@ -385,7 +435,9 @@ def add_or_update_shortcut(
             if preserve_from_appid is not None and item_u32 == preserve_from_appid:
                 existing_meta = dict(item)
                 continue
-            if item_u32 == appid_u32 or item_name == app_name:
+            if item_u32 == appid_u32 or (
+                item_name == app_name and _is_same_game_entry(item, exe_path, start_dir or exe_path.parent)
+            ):
                 if not existing_meta:
                     existing_meta = dict(item)
                 if item_u32 != appid_u32 and item_u32 != preserve_from_appid:
@@ -1167,7 +1219,7 @@ def migrate_shortcut_to_games(
                     if not same_dev:
                         check_disk_space(games_root, _dir_size_bytes(old_root))
                     attempted_move_root = True
-                    shutil.move(str(old_root), str(new_root))
+                    move_dir_safely(old_root, new_root)
                     moved_root = True
                 new_appid = add_or_update_shortcut(
                     paths=paths,

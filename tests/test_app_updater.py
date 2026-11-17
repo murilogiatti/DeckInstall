@@ -56,6 +56,29 @@ class AppUpdaterTests(unittest.TestCase):
         with mock.patch("deckinstall.app_updater.os.access", return_value=True):
             self.assertEqual(app_updater.can_replace_appimage(target), (True, ""))
 
+    def test_get_running_appimage_accepts_extensionless_and_rejects_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            extensionless = base / "DeckInstall"
+            extensionless.write_bytes(b"appimage")
+            symlink_path = base / "DeckInstallLink"
+            symlink_path.symlink_to(extensionless)
+
+            with mock.patch.dict(os.environ, {"APPIMAGE": str(extensionless)}, clear=False):
+                self.assertEqual(app_updater.get_running_appimage(), extensionless)
+
+            with mock.patch.dict(os.environ, {"APPIMAGE": str(symlink_path)}, clear=False):
+                self.assertIsNone(app_updater.get_running_appimage())
+
+            with mock.patch.dict(os.environ, {"APPIMAGE": "DeckInstall"}, clear=False):
+                self.assertIsNone(app_updater.get_running_appimage())
+
+            with mock.patch.dict(os.environ, {"APPIMAGE": str(base / "missing")}, clear=False):
+                self.assertIsNone(app_updater.get_running_appimage())
+
+            with mock.patch.dict(os.environ, {"APPIMAGE": ""}, clear=False):
+                self.assertIsNone(app_updater.get_running_appimage())
+
     def test_check_app_update_finds_x86_64_asset_and_digest(self) -> None:
         valid_x64_sha = "a" * 64
         valid_arm_sha = "1" * 64

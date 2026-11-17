@@ -161,16 +161,36 @@ class SaveSyncTests(unittest.TestCase):
             self.assertEqual(by_name["Sync Game"], "IN_SYNC")
             self.assertEqual(by_name["Conflict Game"], "CONFLICT")
 
-            # Also verify CONFLICT when local and remote differ with identical timestamps.
-            p_ts = root / "pfx_ts"
-            ts_file = _make_prefix_with_save(p_ts, content=b"v1")
-            push_game_saves("TS Game", p_ts, sync_root)
+            # Three-way decision against the last synced digest (base), not timestamps.
+            dev_a = root / "dev_a"
+            a_file = _make_prefix_with_save(dev_a, content=b"v1")
+            push_game_saves("TS Game", dev_a, sync_root)
+            dev_b = root / "dev_b"
+            dev_b.mkdir()
             meta_path = sync_root / "ts-game" / "meta.json"
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            ts_file.write_bytes(b"v2-modified")
-            os.utime(ts_file, (meta["updated_at"], meta["updated_at"]))
-            ts_plan = plan_sync_all([("TS Game", p_ts)], sync_root)
-            self.assertEqual(ts_plan[0].action, "CONFLICT")
+            self.assertEqual(plan_sync_all([("TS Game", dev_b)], sync_root)[0].action, "PULL")
+            pull_game_saves("TS Game", dev_b, sync_root, snapshots_root=root / "snaps_b")
+            self.assertEqual(plan_sync_all([("TS Game", dev_b)], sync_root)[0].action, "IN_SYNC")
+
+            # Only local changed (even with an older mtime) -> PUSH.
+            a_file.write_bytes(b"v2-local")
+            os.utime(a_file, (meta["updated_at"] - 1000, meta["updated_at"] - 1000))
+            self.assertEqual(plan_sync_all([("TS Game", dev_a)], sync_root)[0].action, "PUSH")
+            push_game_saves("TS Game", dev_a, sync_root)
+
+            # Device B only has the old base -> remote changed only -> PULL.
+            self.assertEqual(plan_sync_all([("TS Game", dev_b)], sync_root)[0].action, "PULL")
+
+            # Both changed since base -> CONFLICT even if B's files are newer.
+            b_file = next((dev_b / "drive_c").rglob("save.dat"))
+            b_file.write_bytes(b"v2-from-b")
+            self.assertEqual(plan_sync_all([("TS Game", dev_b)], sync_root)[0].action, "CONFLICT")
+
+            # No base recorded on this device and digests differ -> CONFLICT.
+            dev_c = root / "dev_c"
+            _make_prefix_with_save(dev_c, content=b"other")
+            self.assertEqual(plan_sync_all([("TS Game", dev_c)], sync_root)[0].action, "CONFLICT")
 
 
 class LauncherScanTests(unittest.TestCase):

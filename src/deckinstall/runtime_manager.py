@@ -990,6 +990,8 @@ def _swap_directory_atomic(src_dir: Path, target_dir: Path) -> None:
 def ensure_optiscaler(
     force_update: bool = False,
     progress_cb: ProgressCb | None = None,
+    *,
+    check_update: bool = False,
 ) -> Path:
     """Ensure OptiScaler payload is cached under runtime/optiscaler/current."""
     opti_dir = get_optiscaler_dir()
@@ -1000,16 +1002,23 @@ def ensure_optiscaler(
             if not stat.S_ISREG(os.fstat(fd).st_mode):
                 raise RuntimeError("OptiScaler cache lock must be a regular file")
             fcntl.flock(fd, fcntl.LOCK_EX)
-            return _ensure_optiscaler_payload(opti_dir, force_update, progress_cb)
+            return _ensure_optiscaler_payload(
+                opti_dir, force_update, progress_cb, check_update=check_update
+            )
         finally:
             os.close(fd)
 
 
 def _ensure_optiscaler_payload(
-    opti_dir: Path, force_update: bool, progress_cb: ProgressCb | None,
+    opti_dir: Path,
+    force_update: bool,
+    progress_cb: ProgressCb | None,
+    *,
+    check_update: bool = False,
 ) -> Path:
     """Check and populate the cache while its install lock is held."""
-    if not force_update and _has_optiscaler_dll(opti_dir):
+    has_cached = _has_optiscaler_dll(opti_dir)
+    if not force_update and not check_update and has_cached:
         version = str(_load_versions().get("optiscaler_installed_version") or "")
         logging.info("Using cached OptiScaler %s from %s; no download", version, opti_dir)
         _emit_progress(progress_cb, f"Using cached OptiScaler {version} (no download).".strip(), 100)
@@ -1018,11 +1027,39 @@ def _ensure_optiscaler_payload(
     from .extractor import extract_archive_to_dir
 
     _emit_progress(progress_cb, "Checking latest OptiScaler release...", 0)
-    release = _fetch_json(OPTISCALER_RELEASES_API)
+    if not force_update and check_update and has_cached:
+        installed_ver = str(_load_versions().get("optiscaler_installed_version") or "").strip()
+        try:
+            release = _fetch_json(OPTISCALER_RELEASES_API)
+        except Exception as exc:
+            logging.warning(
+                "Failed checking OptiScaler updates (%s); using cached %s.",
+                exc,
+                installed_ver or "payload",
+            )
+            _emit_progress(
+                progress_cb,
+                f"Using cached OptiScaler {installed_ver} (offline fallback).".strip(),
+                100,
+            )
+            return opti_dir
+    else:
+        release = _fetch_json(OPTISCALER_RELEASES_API)
+
     if not isinstance(release, dict):
         raise RuntimeError("Unexpected GitHub release response for OptiScaler.")
 
     tag = str(release.get("tag_name", "")).strip()
+    if not force_update and check_update and has_cached:
+        installed_ver = str(_load_versions().get("optiscaler_installed_version") or "").strip()
+        if tag and installed_ver and tag == installed_ver:
+            def _touch_opti(versions: dict[str, Any]) -> None:
+                versions["optiscaler_latest_version"] = tag
+                versions["optiscaler_last_check"] = int(time.time())
+
+            _update_versions(_touch_opti)
+            _emit_progress(progress_cb, f"Using cached OptiScaler {tag} (up to date).", 100)
+            return opti_dir
     asset = _pick_optiscaler_asset(release)
     download_url = str(asset.get("browser_download_url", "")).strip()
     asset_name = _sanitize_asset_name(str(asset.get("name", "OptiScaler.zip")))

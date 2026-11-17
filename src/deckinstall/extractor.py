@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import re
 import shutil
@@ -620,12 +621,24 @@ def _strip_symlinks_and_specials(root: Path) -> None:
                 p.unlink(missing_ok=True)
 
 
+def _set_aside(path: Path) -> Path:
+    """Rename an existing file/folder to '<name>.deckinstall-old[.N]' instead of deleting it."""
+    candidate = path.with_name(f"{path.name}.deckinstall-old")
+    idx = 1
+    while candidate.exists() or candidate.is_symlink():
+        idx += 1
+        candidate = path.with_name(f"{path.name}.deckinstall-old.{idx}")
+    os.replace(path, candidate)
+    logging.warning("Kept existing %s as %s (type clash with archive content)", path, candidate)
+    return candidate
+
+
 def _move_file_replace(src_f: Path, dst_f: Path) -> None:
     """Atomically replace dst_f with src_f on same filesystem, falling back to move."""
     if dst_f.is_symlink():
         dst_f.unlink()
     elif dst_f.is_dir():
-        shutil.rmtree(dst_f)
+        _set_aside(dst_f)
     try:
         os.replace(src_f, dst_f)
     except OSError as exc:
@@ -661,8 +674,10 @@ def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
                 for root_s, dirs_s, files_s in os.walk(item, followlinks=False):
                     rel = Path(root_s).relative_to(item)
                     target_sub = dest / rel
-                    if target_sub.is_symlink() or target_sub.is_file():
+                    if target_sub.is_symlink():
                         target_sub.unlink()
+                    elif target_sub.is_file():
+                        _set_aside(target_sub)
                     target_sub.mkdir(parents=True, exist_ok=True)
                     if not target_sub.resolve().is_relative_to(final_resolved):
                         raise RuntimeError(f"Destination escapes target folder: {target_sub}")
@@ -679,8 +694,9 @@ def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
                         _move_file_replace(src_f, target_sub / f)
                 shutil.rmtree(item)
                 continue
-            if dest.is_dir():
-                shutil.rmtree(dest)
+            if dest.is_dir() or item.is_dir():
+                # File/folder type clash: never delete existing user data, rename it aside.
+                _set_aside(dest)
             else:
                 dest.unlink()
         shutil.move(str(item), str(dest))

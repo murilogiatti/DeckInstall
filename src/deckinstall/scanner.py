@@ -165,6 +165,34 @@ def detect_exe_kind(exe_path: Path) -> str:
     return "unknown"
 
 
+def detect_pe_arch(exe_path: Path) -> str:
+    """Inspect executable header and return 'x64', 'x86', 'linux_elf', or 'unknown'."""
+    try:
+        with open(exe_path, "rb") as handle:
+            header = handle.read(64)
+            if header.startswith(b"\x7fELF"):
+                return "linux_elf"
+            if not header.startswith(b"MZ") or len(header) < 64:
+                return "unknown"
+            e_lfanew = int.from_bytes(header[60:64], "little")
+            if e_lfanew < 4:
+                return "unknown"
+            handle.seek(e_lfanew)
+            pe_hdr = handle.read(6)
+            if len(pe_hdr) < 6 or pe_hdr[:4] != b"PE\x00\x00":
+                return "unknown"
+            machine = int.from_bytes(pe_hdr[4:6], "little")
+            if machine == 0x8664:
+                return "x64"
+            if machine == 0xAA64:
+                return "arm64"
+            if machine == 0x014C:
+                return "x86"
+    except OSError:
+        return "unknown"
+    return "unknown"
+
+
 def _is_ignored_exe(exe: Path) -> bool:
     low = exe.name.lower()
     return any(pat in low for pat in IGNORED_EXE_PATTERNS)

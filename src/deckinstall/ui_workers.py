@@ -28,10 +28,14 @@ from .extractor import (
 )
 from .i18n import tr
 from .runtime_manager import (
+    _has_optiscaler_dll,
+    _load_versions,
     check_runtime_updates,
     check_ubuntu_bwrap_userns,
     ensure_ge_proton11,
+    ensure_optiscaler,
     ensure_umu_run,
+    get_optiscaler_dir,
     run_exe_in_prefix,
     run_winetricks_verbs,
 )
@@ -421,12 +425,25 @@ class RuntimeUpdateWorker(QThread):
                     progress_cb=lambda msg, _pct: self.status.emit(msg),
                 )
 
+            opti_ver = ""
+            if _has_optiscaler_dll(get_optiscaler_dir()):
+                old_opti_ver = str(_load_versions().get("optiscaler_installed_version") or "").strip()
+                ensure_optiscaler(
+                    check_update=True,
+                    progress_cb=lambda msg, _pct: self.status.emit(msg),
+                )
+                opti_ver = str(_load_versions().get("optiscaler_installed_version") or "").strip()
+                if opti_ver and opti_ver != old_opti_ver:
+                    any_updated = True
+
             bwrap_warn = check_ubuntu_bwrap_userns() or ""
             msg = (
                 tr("runtime.updated", umu=umu_path.name, proton=ge_path.name)
                 if any_updated
                 else tr("runtime.up_to_date", umu=umu_path.name, proton=ge_path.name)
             )
+            if opti_ver:
+                msg = f"{msg} | OptiScaler {opti_ver}"
             self.finished_ok.emit(msg, bwrap_warn)
         except Exception as exc:
             self.failed.emit(_format_worker_error(exc))

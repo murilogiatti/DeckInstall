@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
@@ -1061,6 +1062,50 @@ def compute_prefix_saves_fingerprint(
     )
 
 
+_SYNC_BASE_FILE = ".deckinstall_sync_base.json"
+
+
+def _sync_base_key(sync_root: Path, slug: str) -> str:
+    try:
+        root = str(sync_root.resolve())
+    except OSError:
+        root = str(sync_root)
+    return f"{root}|{slug}"
+
+
+def _read_sync_base(prefix_dir: Path, sync_root: Path, slug: str) -> str:
+    """Return the save digest last pushed/pulled by this device for (sync_root, slug)."""
+    state_path = prefix_dir / _SYNC_BASE_FILE
+    try:
+        if state_path.is_symlink() or not state_path.is_file() or state_path.stat().st_size > 1_048_576:
+            return ""
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    value = data.get(_sync_base_key(sync_root, slug)) if isinstance(data, dict) else None
+    return value if isinstance(value, str) else ""
+
+
+def _record_sync_base(prefix_dir: Path, sync_root: Path, slug: str, digest: str) -> None:
+    """Remember the digest both sides agreed on; stored locally in the prefix (never synced)."""
+    state_path = prefix_dir / _SYNC_BASE_FILE
+    try:
+        if state_path.is_symlink():
+            return
+        data: dict[str, object] = {}
+        if state_path.is_file():
+            try:
+                loaded = json.loads(state_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except ValueError:
+                data = {}
+        data[_sync_base_key(sync_root, slug)] = digest
+        _atomic_write_bytes(state_path, json.dumps(data, indent=2).encode("utf-8"))
+    except OSError:
+        logging.warning("Could not record sync base for %s in %s", slug, prefix_dir, exc_info=True)
+
+
 def push_game_saves(
     game_name: str,
     prefix_dir: Path,
@@ -1173,6 +1218,7 @@ def push_game_saves(
     }
     meta_bytes = json.dumps(meta, indent=2, ensure_ascii=False).encode("utf-8")
     _atomic_write_bytes(game_sync_dir / "meta.json", meta_bytes)
+    _record_sync_base(prefix_dir, sync_root, slug, str(meta["fingerprint_digest"]))
     return latest_zip
 
 
@@ -1249,6 +1295,9 @@ def pull_game_saves(
     )
 
     restored_files = _restore_saves_archive(latest_zip, prefix_dir, game_dir, remote_updated_at)
+    remote_digest = meta.get("fingerprint_digest") if meta is not None else None
+    if isinstance(remote_digest, str) and remote_digest:
+        _record_sync_base(prefix_dir, sync_root, slug, remote_digest)
     return restored_files, snap_path
 
 
@@ -1470,21 +1519,27 @@ def plan_sync_all(
         else:
             remote_updated_at = 0.0
 
+        # Three-way decision against the last digest this machine synced (the "base").
+        # Timestamps alone cannot tell "only one side changed" from "both sides changed".
+        base_digest = _read_sync_base(prefix_dir, sync_root, slug)
         if remote_digest and local_fp.digest == remote_digest:
             action = "IN_SYNC"
             reason = "Local and remote save digests match"
         elif not remote_digest or remote_updated_at <= 0.0:
             action = "CONFLICT"
             reason = "Incomplete remote metadata; manual resolution required"
-        elif local_fp.latest_mtime > remote_updated_at:
+        elif not base_digest:
+            action = "CONFLICT"
+            reason = "No previous sync recorded on this device; choose which saves to keep"
+        elif remote_digest == base_digest:
             action = "PUSH"
-            reason = "Local saves are newer than remote sync"
-        elif remote_updated_at > local_fp.latest_mtime:
+            reason = "Only local saves changed since last sync"
+        elif local_fp.digest == base_digest:
             action = "PULL"
-            reason = "Remote sync is newer than local saves"
+            reason = "Only remote saves changed since last sync"
         else:
             action = "CONFLICT"
-            reason = "Local and remote saves differ with identical timestamps"
+            reason = "Both local and remote saves changed since last sync"
 
         plan.append(
             SyncPlanItem(

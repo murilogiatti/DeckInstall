@@ -114,7 +114,6 @@ def get_running_appimage() -> Path | None:
     if (
         not path.is_absolute()
         or path.is_symlink()
-        or path.suffix.lower() != ".appimage"
         or not path.is_file()
     ):
         return None
