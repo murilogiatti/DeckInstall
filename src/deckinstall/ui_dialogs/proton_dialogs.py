@@ -10,13 +10,14 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
 )
@@ -32,6 +33,7 @@ from ..runtime_manager import (
     list_installed_compat_tools,
     remove_compat_tool,
 )
+from ..standalone import list_standalone_games, resolve_standalone_proton_fallback
 from ..steam_paths import SteamPaths, list_installed_protons
 from ..steam_vdf import (
     CompatMappingEntry,
@@ -39,11 +41,32 @@ from ..steam_vdf import (
     list_compat_tool_usage,
     remove_compat_tools,
 )
-from ..ui_cards import _format_worker_error, format_size_bytes
+from ..ui_cards import _dialog_parent, _format_worker_error, _SortableTableItem, format_size_bytes
 from ..ui_workers import SteamOpWorker
 
 if TYPE_CHECKING:
     from ..ui import MainWindow
+
+
+def _selected_table_data(tbl: QTableWidget) -> object:
+    """Return UserRole data from column 0 of the selected row, or None."""
+    row = tbl.currentRow()
+    if row < 0:
+        return None
+    item = tbl.item(row, 0)
+    return item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+
+
+def _manager_tool_usage(paths: SteamPaths | None) -> list[CompatMappingEntry]:
+    usage = list_compat_tool_usage(paths) if paths is not None else []
+    for game in list_standalone_games():
+        if game.native_linux:
+            continue
+        resolved, _ = resolve_standalone_proton_fallback(game)
+        tool_name = resolved.name if resolved is not None else game.proton_name
+        if tool_name:
+            usage.append(CompatMappingEntry(0, game.name, "Standalone", tool_name))
+    return usage
 
 
 def bulk_migrate_proton_dialog(win: MainWindow) -> None:
@@ -84,7 +107,7 @@ def bulk_migrate_proton_dialog(win: MainWindow) -> None:
             QMessageBox.warning(win, __app_name__, tr("proton.none_found"))
             return
 
-        dlg = QDialog(win)
+        dlg = QDialog(_dialog_parent(win))
         dlg.setWindowTitle(tr("proton_bulk.title"))
         dlg.resize(780, 560)
         lay = QVBoxLayout(dlg)
@@ -125,26 +148,43 @@ def bulk_migrate_proton_dialog(win: MainWindow) -> None:
         filter_row.addWidget(target_combo, 1)
         lay.addLayout(filter_row)
 
-        lst = QListWidget()
+        lst = QTableWidget(0, 3)
+        lst.setHorizontalHeaderLabels(
+            [tr("table.name"), tr("table.source"), tr("proton_mgr.column_version")]
+        )
+        lst.verticalHeader().setVisible(False)
+        lst.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        lst.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        lst.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        lst.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        lst.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        lst.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        lst.horizontalHeader().setStretchLastSection(True)
+        lst.horizontalHeader().setSectionsClickable(True)
+        lst.setSortingEnabled(True)
         lay.addWidget(lst, 1)
 
         def _populate() -> None:
             flt = filter_combo.currentData()
-            lst.clear()
+            lst.setSortingEnabled(False)
+            lst.setRowCount(0)
             for u in usage:
                 tkey = u.tool_name or empty_tool_label
                 if flt == "__ORPHAN__" and u.source != "Orphan":
                     continue
                 if flt not in ("__ALL__", "__ORPHAN__") and tkey != flt:
                     continue
-                it = QListWidgetItem(
-                    f"[{u.source}] {u.name} ({u.appid_u32}) — {tkey}"
-                )
+                row = lst.rowCount()
+                lst.insertRow(row)
+                it = QTableWidgetItem(f"{u.name} ({u.appid_u32})")
                 it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 auto_check = flt != "__ALL__"
                 it.setCheckState(Qt.CheckState.Checked if auto_check else Qt.CheckState.Unchecked)
                 it.setData(Qt.ItemDataRole.UserRole, u)
-                lst.addItem(it)
+                lst.setItem(row, 0, it)
+                lst.setItem(row, 1, QTableWidgetItem(u.source))
+                lst.setItem(row, 2, QTableWidgetItem(tkey))
+            lst.setSortingEnabled(True)
 
         filter_combo.currentIndexChanged.connect(_populate)
         _populate()
@@ -165,10 +205,12 @@ def bulk_migrate_proton_dialog(win: MainWindow) -> None:
 
         def _selected_entries() -> list[CompatMappingEntry]:
             out: list[CompatMappingEntry] = []
-            for i in range(lst.count()):
-                it = lst.item(i)
-                if it.checkState() == Qt.CheckState.Checked:
-                    out.append(it.data(Qt.ItemDataRole.UserRole))
+            for i in range(lst.rowCount()):
+                it = lst.item(i, 0)
+                if it is not None and it.checkState() == Qt.CheckState.Checked:
+                    data = it.data(Qt.ItemDataRole.UserRole)
+                    if isinstance(data, CompatMappingEntry):
+                        out.append(data)
             return out
 
         def _on_migrate() -> None:
@@ -265,7 +307,7 @@ def bulk_migrate_proton_dialog(win: MainWindow) -> None:
 
 def open_proton_manager_dialog(win: MainWindow) -> None:
     """Manage installed custom Proton tools and download/install new releases."""
-    dlg = QDialog(win)
+    dlg = QDialog(_dialog_parent(win))
     dlg.setWindowTitle(tr("proton_mgr.title"))
     dlg.resize(640, 580)
     lay = QVBoxLayout(dlg)
@@ -277,7 +319,20 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
     dlg.finished.connect(_on_finished)
 
     lay.addWidget(QLabel(tr("proton_mgr.installed_label")))
-    installed_list = QListWidget()
+    installed_list = QTableWidget(0, 3)
+    installed_list.setHorizontalHeaderLabels(
+        [tr("proton_mgr.column_version"), tr("proton_mgr.column_size"), tr("proton_mgr.column_usage")]
+    )
+    installed_list.verticalHeader().setVisible(False)
+    installed_list.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    installed_list.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+    installed_list.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    installed_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+    installed_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+    installed_list.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+    installed_list.horizontalHeader().setStretchLastSection(True)
+    installed_list.horizontalHeader().setSectionsClickable(True)
+    installed_list.setSortingEnabled(True)
     lay.addWidget(installed_list, 1)
 
     inst_btns = QHBoxLayout()
@@ -300,7 +355,20 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
     fetch_row.addWidget(btn_fetch)
     lay.addLayout(fetch_row)
 
-    releases_list = QListWidget()
+    releases_list = QTableWidget(0, 3)
+    releases_list.setHorizontalHeaderLabels(
+        [tr("proton_mgr.column_version"), tr("proton_mgr.column_size"), tr("proton_mgr.column_file")]
+    )
+    releases_list.verticalHeader().setVisible(False)
+    releases_list.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    releases_list.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+    releases_list.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    releases_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+    releases_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+    releases_list.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+    releases_list.horizontalHeader().setStretchLastSection(True)
+    releases_list.horizontalHeader().setSectionsClickable(True)
+    releases_list.setSortingEnabled(True)
     lay.addWidget(releases_list, 1)
 
     lbl_status = QLabel(tr("status.ready"))
@@ -327,8 +395,12 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
     def _set_busy(busy: bool, text: str = "") -> None:
         for w in (btn_refresh_inst, btn_fetch, family_combo):
             w.setEnabled(not busy)
-        btn_remove_inst.setEnabled((not busy) and (installed_list.currentItem() is not None))
-        btn_install.setEnabled((not busy) and (releases_list.currentItem() is not None))
+        btn_remove_inst.setEnabled(
+            (not busy) and isinstance(_selected_table_data(installed_list), tuple)
+        )
+        btn_install.setEnabled(
+            (not busy) and isinstance(_selected_table_data(releases_list), ProtonRelease)
+        )
         progress.setVisible(busy)
         if text:
             lbl_status.setText(text)
@@ -347,7 +419,7 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
         def run(self) -> None:
             try:
                 tools = list_installed_compat_tools()
-                usage = list_compat_tool_usage(self._paths) if self._paths else []
+                usage = _manager_tool_usage(self._paths)
                 self.ready.emit(self._req_id, tools, usage)
             except Exception as exc:
                 self.failed.emit(self._req_id, _format_worker_error(exc))
@@ -355,7 +427,9 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
     def _refresh_installed() -> None:
         inst_req["id"] += 1
         req_id = inst_req["id"]
-        installed_list.clear()
+        installed_list.setSortingEnabled(False)
+        installed_list.clearSpans()
+        installed_list.setRowCount(0)
         btn_refresh_inst.setEnabled(False)
         btn_remove_inst.setEnabled(False)
         lbl_status.setText(tr("proton_mgr.loading_installed"))
@@ -370,17 +444,21 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
                 return
             btn_refresh_inst.setEnabled(True)
             lbl_status.setText(tr("status.ready"))
-            installed_list.clear()
+            installed_list.setSortingEnabled(False)
+            installed_list.clearSpans()
+            installed_list.setRowCount(0)
             by_tool: dict[str, list[CompatMappingEntry]] = {}
             for u in usage:
                 by_tool.setdefault(u.tool_name, []).append(u)
             if not tools:
-                empty = QListWidgetItem(tr("proton_mgr.none_installed"))
+                installed_list.setRowCount(1)
+                installed_list.setSpan(0, 0, 1, 3)
+                empty = QTableWidgetItem(tr("proton_mgr.none_installed"))
                 empty.setFlags(Qt.ItemFlag.NoItemFlags)
-                installed_list.addItem(empty)
+                installed_list.setItem(0, 0, empty)
                 btn_remove_inst.setEnabled(False)
                 return
-            for tool in tools:
+            for row, tool in enumerate(tools):
                 used_entries = list(by_tool.get(tool.tool_id, []))
                 if tool.folder_name != tool.tool_id:
                     used_entries.extend(by_tool.get(tool.folder_name, []))
@@ -390,9 +468,15 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
                     if used_entries
                     else tr("proton_mgr.unused")
                 )
-                it = QListWidgetItem(f"{tool.folder_name}  ({size_str}) — {usage_tag}")
+                installed_list.insertRow(row)
+                it = QTableWidgetItem(tool.folder_name)
                 it.setData(Qt.ItemDataRole.UserRole, (tool, used_entries))
-                installed_list.addItem(it)
+                installed_list.setItem(row, 0, it)
+                installed_list.setItem(
+                    row, 1, _SortableTableItem(size_str, tool.size_bytes)
+                )
+                installed_list.setItem(row, 2, QTableWidgetItem(usage_tag))
+            installed_list.setSortingEnabled(True)
             btn_remove_inst.setEnabled(False)
 
         def _on_inst_err(r_id: int, err: str) -> None:
@@ -405,14 +489,14 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
         worker.failed.connect(_on_inst_err)
         worker.start()
 
-    installed_list.currentItemChanged.connect(
-        lambda cur, _p: btn_remove_inst.setEnabled(
-            cur is not None and isinstance(cur.data(Qt.ItemDataRole.UserRole), tuple)
+    installed_list.currentCellChanged.connect(
+        lambda *_args: btn_remove_inst.setEnabled(
+            isinstance(_selected_table_data(installed_list), tuple)
         )
     )
-    releases_list.currentItemChanged.connect(
-        lambda cur, _p: btn_install.setEnabled(
-            cur is not None and isinstance(cur.data(Qt.ItemDataRole.UserRole), ProtonRelease)
+    releases_list.currentCellChanged.connect(
+        lambda *_args: btn_install.setEnabled(
+            isinstance(_selected_table_data(releases_list), ProtonRelease)
         )
     )
 
@@ -453,7 +537,9 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
         fam_id = str(family_combo.currentData() or "")
         if not fam_id:
             return
-        releases_list.clear()
+        releases_list.setSortingEnabled(False)
+        releases_list.clearSpans()
+        releases_list.setRowCount(0)
         progress.setRange(0, 0)
         _set_busy(True, tr("proton_mgr.fetching"))
         worker = _FetchProtonWorker(fam_id)
@@ -464,17 +550,28 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
                 return
             progress.setRange(0, 100)
             _set_busy(False, tr("proton_mgr.fetched", count=len(rels)))
+            releases_list.setSortingEnabled(False)
+            releases_list.clearSpans()
+            releases_list.setRowCount(0)
             if not rels:
-                empty = QListWidgetItem(tr("proton_mgr.no_releases"))
+                releases_list.setRowCount(1)
+                releases_list.setSpan(0, 0, 1, 3)
+                empty = QTableWidgetItem(tr("proton_mgr.no_releases"))
                 empty.setFlags(Qt.ItemFlag.NoItemFlags)
-                releases_list.addItem(empty)
+                releases_list.setItem(0, 0, empty)
                 return
-            for rel in rels:
+            for row, rel in enumerate(rels):
                 size_str = format_size_bytes(rel.size_bytes) if rel.size_bytes else "?"
                 pre_tag = tr("proton_mgr.prerelease_tag") if rel.prerelease else ""
-                it = QListWidgetItem(f"{rel.tag_name} ({size_str}){pre_tag} — {rel.asset_name}")
+                releases_list.insertRow(row)
+                it = QTableWidgetItem(f"{rel.tag_name}{pre_tag}")
                 it.setData(Qt.ItemDataRole.UserRole, rel)
-                releases_list.addItem(it)
+                releases_list.setItem(row, 0, it)
+                releases_list.setItem(
+                    row, 1, _SortableTableItem(size_str, rel.size_bytes or 0)
+                )
+                releases_list.setItem(row, 2, QTableWidgetItem(rel.asset_name))
+            releases_list.setSortingEnabled(True)
 
         def _err(err: str) -> None:
             if not dlg_alive["open"]:
@@ -488,10 +585,7 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
         worker.start()
 
     def _on_install() -> None:
-        cur = releases_list.currentItem()
-        if cur is None:
-            return
-        rel = cur.data(Qt.ItemDataRole.UserRole)
+        rel = _selected_table_data(releases_list)
         if not isinstance(rel, ProtonRelease):
             return
         progress.setRange(0, 100)
@@ -525,14 +619,23 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
         worker.start()
 
     def _on_remove() -> None:
-        cur = installed_list.currentItem()
-        if cur is None:
-            return
-        data = cur.data(Qt.ItemDataRole.UserRole)
+        data = _selected_table_data(installed_list)
         if not (isinstance(data, tuple) and len(data) == 2):
             return
         tool, used_entries = data
         assert isinstance(tool, InstalledCompatTool)
+        # Refresh usage before removal: the list may predate a new game install.
+        active_standalone = [
+            entry for entry in _manager_tool_usage(win.paths)
+            if entry.source == "Standalone" and entry.tool_name in (tool.tool_id, tool.folder_name)
+        ]
+        if active_standalone:
+            QMessageBox.warning(
+                dlg, __app_name__,
+                tr("proton_mgr.standalone_in_use", name=tool.folder_name,
+                   games="\n".join(entry.name for entry in active_standalone)),
+            )
+            return
         if used_entries and win.paths is not None:
             paths = win.paths
             auto_snap_enabled = win._is_auto_snapshot_enabled()

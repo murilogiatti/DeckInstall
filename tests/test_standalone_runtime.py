@@ -30,7 +30,7 @@ from deckinstall.scanner import detect_exe_kind, detect_steam_appid  # noqa: E40
 from deckinstall.steam_paths import SteamPaths  # noqa: E402
 from deckinstall.steam_vdf import (  # noqa: E402
     apply_launch_presets,
-    detect_helixsr_lsfg_conflict,
+    detect_optiscaler_lsfg_conflict,
     find_cleanup_candidates,
 )
 
@@ -261,7 +261,7 @@ class ScannerTests(unittest.TestCase):
 
 
 class StandaloneAndVdfTests(unittest.TestCase):
-    """Tests for standalone game lifecycle, launch presets, HelixSR/LSFG conflict, and cleanup."""
+    """Tests for standalone game lifecycle, launch presets, OptiScaler/LSFG conflict, and cleanup."""
 
     def test_prefix_merge_does_not_follow_destination_symlinks(self) -> None:
         for move in (False, True):
@@ -410,7 +410,7 @@ class StandaloneAndVdfTests(unittest.TestCase):
                 self.assertFalse(installed.game_dir.exists())
                 self.assertFalse(installed.prefix_dir.exists())
 
-    def test_apply_launch_presets_and_helixsr_lsfg_conflict(self) -> None:
+    def test_apply_launch_presets_and_optiscaler_lsfg_conflict(self) -> None:
         opts = apply_launch_presets(
             launch_options="",
             gamemode=True,
@@ -425,10 +425,10 @@ class StandaloneAndVdfTests(unittest.TestCase):
         self.assertIn("%command%", opts)
 
         # Only dxgi=n,b without lsfg-vk -> False
-        self.assertFalse(detect_helixsr_lsfg_conflict(opts, winedlloverrides="dxgi=n,b"))
+        self.assertFalse(detect_optiscaler_lsfg_conflict(opts, winedlloverrides="dxgi=n,b"))
         # lsfg-vk + dxgi=n,b -> True
-        self.assertTrue(detect_helixsr_lsfg_conflict("lsfg-vk %command%", winedlloverrides="dxgi=n,b"))
-        self.assertTrue(detect_helixsr_lsfg_conflict('WINEDLLOVERRIDES="dxgi=n,b" lsfg-vk %command%'))
+        self.assertTrue(detect_optiscaler_lsfg_conflict("lsfg-vk %command%", winedlloverrides="dxgi=n,b"))
+        self.assertTrue(detect_optiscaler_lsfg_conflict('WINEDLLOVERRIDES="dxgi=n,b" lsfg-vk %command%'))
 
     def test_find_cleanup_candidates_protects_active_standalone_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

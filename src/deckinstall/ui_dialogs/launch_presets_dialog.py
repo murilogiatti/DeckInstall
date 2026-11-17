@@ -33,14 +33,14 @@ from ..standalone import StandaloneGame, update_standalone_launch_options
 from ..steam_vdf import (
     ShortcutEntry,
     apply_launch_presets,
-    detect_helixsr_lsfg_conflict,
-    load_shortcuts,
+    detect_optiscaler_lsfg_conflict,
     merge_winedlloverride,
     remove_winedlloverride,
     update_shortcut_launch_options,
 )
 from ..ui_cards import (
     _dialog_guard,
+    _dialog_parent,
     _is_native_linux_game,
     _parse_launch_preset_state,
     _resolve_game_exe_path,
@@ -73,7 +73,7 @@ def open_launch_presets_dialog(
         if extracted_dll:
             winedll_now = extracted_dll
 
-    dlg = QDialog(win)
+    dlg = QDialog(_dialog_parent(win))
     dlg.setWindowTitle(tr("launch.title", name=title))
     dlg.resize(580, 500)
     dlg_lay = QVBoxLayout(dlg)
@@ -223,13 +223,13 @@ def open_launch_presets_dialog(
     chk_esync.setChecked(bool(st["no_esync"]))
     chk_fsync = QCheckBox(tr("launch.no_fsync"))
     chk_fsync.setChecked(bool(st["no_fsync"]))
-    chk_helixsr = QCheckBox(tr("launch.helixsr_preset"))
-    chk_helixsr.setChecked(remove_winedlloverride(winedll_now, "dxgi") != winedll_now)
+    chk_dxgi = QCheckBox(tr("launch.dxgi_preset"))
+    chk_dxgi.setChecked(remove_winedlloverride(winedll_now, "dxgi") != winedll_now)
 
     winedll_lbl = QLabel(tr("launch.winedlloverrides_label"))
     winedll_edit = QLineEdit(winedll_now)
 
-    conflict_warn = QLabel(tr("launch.helixsr_lsfg_warn"))
+    conflict_warn = QLabel(tr("launch.optiscaler_lsfg_warn"))
     conflict_warn.setWordWrap(True)
     conflict_warn.setStyleSheet(
         "color: #ffd180; background-color: rgba(180, 110, 20, 0.22); "
@@ -251,7 +251,7 @@ def open_launch_presets_dialog(
     syncing = {"active": False}
 
     def _update_conflict_warning() -> None:
-        has_conflict = (not is_native_linux) and detect_helixsr_lsfg_conflict(
+        has_conflict = (not is_native_linux) and detect_optiscaler_lsfg_conflict(
             raw_edit.text(), winedll_edit.text()
         )
         conflict_warn.setVisible(has_conflict)
@@ -265,7 +265,7 @@ def open_launch_presets_dialog(
         has_vulkan_feat = (
             chk_dlss.isChecked()
             or chk_nvapi.isChecked()
-            or chk_helixsr.isChecked()
+            or chk_dxgi.isChecked()
             or has_lsfg
         )
         wined3d_warn.setVisible(has_vulkan_feat)
@@ -274,12 +274,12 @@ def open_launch_presets_dialog(
         if not dlg_alive():
             return
         if opt_st is not None and getattr(opt_st, "proxy_dll", None) == "dxgi":
-            chk_helixsr.setChecked(True)
-            chk_helixsr.setEnabled(False)
-            chk_helixsr.setToolTip(tr("launch.helixsr_optiscaler_locked"))
+            chk_dxgi.setChecked(True)
+            chk_dxgi.setEnabled(False)
+            chk_dxgi.setToolTip(tr("launch.dxgi_optiscaler_locked"))
         else:
-            chk_helixsr.setEnabled(True)
-            chk_helixsr.setToolTip("")
+            chk_dxgi.setEnabled(True)
+            chk_dxgi.setToolTip("")
 
     def _update_optiscaler_dxgi_guard() -> None:
         if is_native_linux or game_obj is None:
@@ -355,7 +355,7 @@ def open_launch_presets_dialog(
         _update_conflict_warning()
         _update_wined3d_warning()
 
-    def _on_helixsr_toggled(checked: bool) -> None:
+    def _on_dxgi_toggled(checked: bool) -> None:
         if syncing["active"]:
             return
         cur_dll = winedll_edit.text()
@@ -369,10 +369,10 @@ def open_launch_presets_dialog(
     def _on_winedll_text_changed(text: str) -> None:
         if not syncing["active"]:
             has_dxgi = remove_winedlloverride(text, "dxgi") != text
-            if chk_helixsr.isChecked() != has_dxgi:
+            if chk_dxgi.isChecked() != has_dxgi:
                 syncing["active"] = True
                 try:
-                    chk_helixsr.setChecked(has_dxgi)
+                    chk_dxgi.setChecked(has_dxgi)
                 finally:
                     syncing["active"] = False
         _sync_preview()
@@ -511,90 +511,13 @@ def open_launch_presets_dialog(
         for chk in (chk_w3d, chk_esync, chk_fsync):
             chk.toggled.connect(_sync_preview)
             lay.addWidget(chk)
-        chk_helixsr.toggled.connect(_on_helixsr_toggled)
-        lay.addWidget(chk_helixsr)
-        lay.addWidget(_muted_hint(tr("launch.helixsr_hint")))
+        chk_dxgi.toggled.connect(_on_dxgi_toggled)
+        lay.addWidget(chk_dxgi)
+        lay.addWidget(_muted_hint(tr("launch.dxgi_hint")))
     else:
-        for chk in (chk_w3d, chk_esync, chk_fsync, chk_helixsr):
+        for chk in (chk_w3d, chk_esync, chk_fsync, chk_dxgi):
             chk.setVisible(False)
             chk.setEnabled(False)
-
-    if game_obj is not None and not is_native_linux:
-        btn_winetricks = QPushButton(tr("launch.btn_winetricks"))
-        btn_winetricks.clicked.connect(lambda: win._open_winetricks_dialog(kind, game_obj))
-        lay.addWidget(btn_winetricks)
-        btn_optiscaler = QPushButton(tr("launch.btn_optiscaler"))
-
-        def _on_optiscaler_clicked() -> None:
-            win._open_optiscaler_dialog(kind, game_obj)
-            if not dlg_alive():
-                return
-            cur_opts = raw_edit.text()
-            cur_dll = winedll_edit.text()
-            paths_snap = win.paths
-            exe_p = _resolve_game_exe_path(kind, game_obj)
-
-            class _OptiPostRefreshWorker(QThread):
-                ready = Signal(str, str, object)
-
-                def run(self) -> None:
-                    new_opts_after = cur_opts
-                    new_dll_after = cur_dll
-                    if kind == "standalone":
-                        new_dll_after = str(getattr(game_obj, "winedlloverrides", "") or "")
-                        new_opts_after = str(getattr(game_obj, "launch_options", "") or "")
-                    elif kind == "steam" and paths_snap is not None:
-                        target_appid = getattr(game_obj, "appid_u32", None)
-                        try:
-                            shortcuts = load_shortcuts(paths_snap.shortcuts_vdf)
-                        except Exception:
-                            shortcuts = []
-                        matched = next(
-                            (sc for sc in shortcuts if sc.appid_u32 == target_appid),
-                            None,
-                        )
-                        if matched is not None:
-                            new_opts_after = matched.launch_options or ""
-                        else:
-                            new_opts_after = str(getattr(game_obj, "launch_options", "") or "")
-                        new_dll_after = str(_parse_launch_preset_state(new_opts_after)["winedll"])
-                    elif kind == "external" and isinstance(game_obj, ExternalLauncherGame):
-                        new_opts_after = load_external_launch_presets(game_obj)
-                        new_dll_after = str(_parse_launch_preset_state(new_opts_after)["winedll"])
-                    opt_st = (
-                        inspect_optiscaler_state(exe_p)
-                        if exe_p is not None and exe_p.parent.is_dir()
-                        else None
-                    )
-                    self.ready.emit(new_opts_after, new_dll_after, opt_st)
-
-            def _on_refreshed(
-                new_opts_after: str,
-                new_dll_after: str,
-                opt_st: object | None,
-            ) -> None:
-                if not dlg_alive() or win._closing_pending:
-                    return
-                syncing["active"] = True
-                try:
-                    raw_edit.setText(new_opts_after)
-                    winedll_edit.setText(new_dll_after)
-                    chk_helixsr.setChecked(
-                        remove_winedlloverride(new_dll_after, "dxgi") != new_dll_after
-                    )
-                finally:
-                    syncing["active"] = False
-                _apply_optiscaler_dxgi_guard(opt_st)
-                _update_conflict_warning()
-                _update_wined3d_warning()
-
-            worker = _OptiPostRefreshWorker()
-            win._track_worker(worker)
-            worker.ready.connect(_on_refreshed)
-            worker.start()
-
-        btn_optiscaler.clicked.connect(_on_optiscaler_clicked)
-        lay.addWidget(btn_optiscaler)
 
     if not is_native_linux:
         lay.addWidget(winedll_lbl)
@@ -690,12 +613,12 @@ def edit_launch_options_presets(win: MainWindow) -> None:
         try:
             save_external_launch_presets(obj, new_opts)
         except Exception as exc:
-            QMessageBox.critical(win, __app_name__, str(exc))
+            QMessageBox.critical(_dialog_parent(win), __app_name__, str(exc))
             return
         msg = tr("launch.saved", name=title_name)
         win.status_label.setText(msg)
         if not win._closing_pending:
-            QMessageBox.information(win, __app_name__, msg)
+            QMessageBox.information(_dialog_parent(win), __app_name__, msg)
         return
 
     if isinstance(obj, StandaloneGame):
@@ -706,13 +629,13 @@ def edit_launch_options_presets(win: MainWindow) -> None:
                 launch_options=new_opts,
             )
         except Exception as exc:
-            QMessageBox.critical(win, __app_name__, str(exc))
+            QMessageBox.critical(_dialog_parent(win), __app_name__, str(exc))
             return
         win._refresh_shortcuts()
         msg = tr("launch.saved", name=title_name)
         win.status_label.setText(msg)
         if not win._closing_pending:
-            QMessageBox.information(win, __app_name__, msg)
+            QMessageBox.information(_dialog_parent(win), __app_name__, msg)
         return
 
     if not win.paths:
@@ -751,12 +674,12 @@ def edit_launch_options_presets(win: MainWindow) -> None:
             msg = tr("launch.saved", name=title_name)
             win.status_label.setText(msg)
             if not win._closing_pending:
-                QMessageBox.information(win, __app_name__, msg)
+                QMessageBox.information(_dialog_parent(win), __app_name__, msg)
 
         def _err(err: str) -> None:
             win._set_steam_busy(False)
             if not win._closing_pending:
-                QMessageBox.critical(win, __app_name__, err)
+                QMessageBox.critical(_dialog_parent(win), __app_name__, err)
 
         worker.finished_ok.connect(_ok)
         worker.failed.connect(_err)

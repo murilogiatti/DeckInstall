@@ -319,7 +319,12 @@ def _backup_if_needed(
     backed_up_files: list[Path],
 ) -> None:
     """Move an existing unmanaged file to .deckinstall.bak if no backup exists yet."""
+    backup_path = target_path.with_name(f"{target_path.name}.deckinstall.bak")
     if not (target_path.exists() or target_path.is_symlink()):
+        # An interrupted older installation may already have moved this file.
+        # Keep its original backup tracked so uninstall can still restore it.
+        if backup_path.is_file() and not backup_path.is_symlink() and target_path not in backed_up_files:
+            backed_up_files.append(target_path)
         return
     try:
         resolved = target_path.resolve()
@@ -327,7 +332,6 @@ def _backup_if_needed(
         resolved = target_path
     if resolved in managed_paths:
         return
-    backup_path = target_path.with_name(f"{target_path.name}.deckinstall.bak")
     if not (backup_path.exists() or backup_path.is_symlink()):
         os.replace(target_path, backup_path)
     else:
@@ -444,7 +448,6 @@ def install_optiscaler_for_game(
         if resolved_proxy not in managed_paths:
             if not overwrite_existing:
                 raise OptiScalerConflictError(target_proxy_path)
-            _backup_if_needed(target_proxy_path, managed_paths, backed_up_files)
 
     prefix_snapshot: Path | None = (
         existing_state.prefix_snapshot if existing_state is not None else None
@@ -456,9 +459,14 @@ def install_optiscaler_for_game(
             prefix_dir,
             game_name or exe_path.stem,
             "pre-optiscaler",
+            include_system_dlls=False,
         )
         if snap is not None:
             prefix_snapshot = snap.snapshot_zip
+
+    # Complete the snapshot before moving any existing game DLL. OptiScaler
+    # modifies game-folder files, so system DLLs do not belong in its snapshot.
+    _backup_if_needed(target_proxy_path, managed_paths, backed_up_files)
 
     # Remove stale files from a previous DeckInstall OptiScaler install (e.g. proxy DLL change)
     if existing_state is not None:

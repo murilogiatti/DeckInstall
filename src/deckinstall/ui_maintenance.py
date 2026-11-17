@@ -9,12 +9,13 @@ from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMenu,
     QMessageBox,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -29,6 +30,7 @@ from .ui_cards import (
     _format_cleanup_candidate_label,
     _is_wine_game_running,
     _make_card,
+    _SortableTableItem,
     format_size_bytes,
 )
 from .ui_workers_maint import (
@@ -150,7 +152,22 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     filter_row.addWidget(win.btn_maint_toggle_filter, 0, Qt.AlignmentFlag.AlignTop)
     clean_layout.addLayout(filter_row)
 
-    win.maint_list = QListWidget()
+    win.maint_list = QTableWidget(0, 3)
+    win.maint_list.setHorizontalHeaderLabels(
+        [tr("maint.column_item"), tr("maint.column_folder"), tr("maint.column_size")]
+    )
+    win.maint_list.verticalHeader().setVisible(False)
+    win.maint_list.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    win.maint_list.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    win.maint_list.horizontalHeader().setSectionResizeMode(
+        0, QHeaderView.ResizeMode.ResizeToContents
+    )
+    win.maint_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+    win.maint_list.horizontalHeader().setSectionResizeMode(
+        2, QHeaderView.ResizeMode.ResizeToContents
+    )
+    win.maint_list.horizontalHeader().setSectionsClickable(True)
+    win.maint_list.setSortingEnabled(True)
     win.maint_list.setMinimumHeight(220)
     win.maint_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
     win.maint_list.customContextMenuRequested.connect(
@@ -181,9 +198,9 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
 
 def open_maintenance_page(win: MainWindow, *, auto_scan: bool = True) -> None:
     """Switch to the Maintenance page and refresh health/cleanup data."""
-    win.stack.setCurrentIndex(2)
-    if len(win._nav_buttons) > 2:
-        win._nav_buttons[2].setChecked(True)
+    win.stack.setCurrentIndex(3)
+    if len(win._nav_buttons) > 3:
+        win._nav_buttons[3].setChecked(True)
     refresh_maintenance_health(win)
     if auto_scan:
         scan_maintenance_cleanup(win)
@@ -235,7 +252,7 @@ def on_maint_filter_changed(win: MainWindow, key: str) -> None:
     _populate_maint_list(win)
 
 
-def on_maint_item_changed(win: MainWindow, item: QListWidgetItem) -> None:
+def on_maint_item_changed(win: MainWindow, item: QTableWidgetItem) -> None:
     """Sync check-state changes for a cleanup candidate item."""
     cand = item.data(Qt.ItemDataRole.UserRole)
     if isinstance(cand, CleanupCandidate):
@@ -266,7 +283,9 @@ def toggle_maint_filter_selection(win: MainWindow) -> None:
 def _populate_maint_list(win: MainWindow) -> None:
     visible = _visible_maint_candidates(win)
     win.maint_list.blockSignals(True)
-    win.maint_list.clear()
+    win.maint_list.setSortingEnabled(False)
+    win.maint_list.clearSpans()
+    win.maint_list.setRowCount(0)
     if not visible:
         if not win._maint_scanned:
             msg = tr("maint.empty_prompt")
@@ -274,12 +293,15 @@ def _populate_maint_list(win: MainWindow) -> None:
             msg = tr("cleanup.none_found")
         else:
             msg = tr("maint.filter_empty")
-        placeholder = QListWidgetItem(msg)
+        win.maint_list.setRowCount(1)
+        win.maint_list.setSpan(0, 0, 1, 3)
+        placeholder = QTableWidgetItem(msg)
         placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
-        win.maint_list.addItem(placeholder)
+        win.maint_list.setItem(0, 0, placeholder)
     else:
-        for cand in visible:
-            item = QListWidgetItem(_format_cleanup_candidate_label(cand))
+        for row, cand in enumerate(visible):
+            win.maint_list.insertRow(row)
+            item = QTableWidgetItem(_format_cleanup_candidate_label(cand))
             item.setToolTip(str(cand.path))
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             checked = win._maint_checked.get(
@@ -289,7 +311,13 @@ def _populate_maint_list(win: MainWindow) -> None:
                 Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
             )
             item.setData(Qt.ItemDataRole.UserRole, cand)
-            win.maint_list.addItem(item)
+            win.maint_list.setItem(row, 0, item)
+            win.maint_list.setItem(row, 1, QTableWidgetItem(str(cand.path)))
+            size_item = _SortableTableItem(
+                format_size_bytes(cand.size_bytes), cand.size_bytes
+            )
+            win.maint_list.setItem(row, 2, size_item)
+    win.maint_list.setSortingEnabled(True)
     win.maint_list.blockSignals(False)
     _update_maint_summary(win)
 
@@ -532,6 +560,9 @@ def _run_maint_delete(
 def show_maint_context_menu(win: MainWindow, pos: QPoint) -> None:
     """Show the context menu for a maintenance cleanup item."""
     item = win.maint_list.itemAt(pos)
+    if item is None:
+        return
+    item = win.maint_list.item(item.row(), 0)
     if item is None:
         return
     cand = item.data(Qt.ItemDataRole.UserRole)

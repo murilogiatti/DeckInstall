@@ -47,13 +47,14 @@ from ..standalone import StandaloneGame, update_standalone_launch_options
 from ..steam_vdf import (
     ShortcutEntry,
     apply_launch_presets,
-    detect_helixsr_lsfg_conflict,
+    detect_optiscaler_lsfg_conflict,
     merge_winedlloverride,
     remove_winedlloverride,
     update_shortcut_launch_options,
 )
 from ..ui_cards import (
     _dialog_guard,
+    _dialog_parent,
     _format_worker_error,
     _is_native_linux_game,
     _parse_launch_preset_state,
@@ -144,7 +145,7 @@ def open_winetricks_dialog(
         if isinstance(obj, ShortcutEntry)
         else str(getattr(obj, "name", "") or "")
     )
-    dlg = QDialog(win)
+    dlg = QDialog(_dialog_parent(win))
     dlg.setWindowTitle(tr("winetricks.title", name=title_name))
     dlg.resize(560, 480)
     lay = QVBoxLayout(dlg)
@@ -368,7 +369,7 @@ def open_optiscaler_dialog(
         if isinstance(obj, ShortcutEntry)
         else str(getattr(obj, "name", "") or "")
     )
-    dlg = QDialog(win)
+    dlg = QDialog(_dialog_parent(win))
     dlg.setWindowTitle(tr("optiscaler.title", name=title_name))
     dlg.resize(520, 360)
     lay = QVBoxLayout(dlg)
@@ -454,8 +455,13 @@ def open_optiscaler_dialog(
     btn_row.addWidget(btn_close)
     lay.addLayout(btn_row)
 
-    def _on_state_refreshed(st_now: object) -> None:
-        if not dlg_alive() or win._closing_pending:
+    operation = {"busy": False, "refresh_id": 0}
+
+    def _on_state_refreshed(req_id: int, st_now: object) -> None:
+        if (
+            not dlg_alive() or win._closing_pending or operation["busy"]
+            or req_id != operation["refresh_id"]
+        ):
             return
         if isinstance(st_now, OptiScalerState):
             lbl_state.setText(
@@ -489,12 +495,14 @@ def open_optiscaler_dialog(
     def _refresh_state_ui() -> None:
         game_exe = exe_path
         assert game_exe is not None
+        operation["refresh_id"] += 1
+        req_id = operation["refresh_id"]
 
         class _OptiRefreshWorker(QThread):
-            ready = Signal(object)
+            ready = Signal(int, object)
 
             def run(self) -> None:
-                self.ready.emit(inspect_optiscaler_state(game_exe))
+                self.ready.emit(req_id, inspect_optiscaler_state(game_exe))
 
         refresh_worker = _OptiRefreshWorker()
         win._track_worker(refresh_worker)
@@ -502,6 +510,7 @@ def open_optiscaler_dialog(
         refresh_worker.start()
 
     def _set_busy(busy: bool, status_text: str = "") -> None:
+        operation["busy"] = busy
         if not dlg_alive():
             return
         combo_backend.setEnabled(not busy)
@@ -585,8 +594,8 @@ def open_optiscaler_dialog(
             _set_busy(False)
             win.status_label.setText(done_msg)
             if not win._closing_pending:
-                if check_conflict and detect_helixsr_lsfg_conflict(cur_opts, new_winedll):
-                    QMessageBox.warning(parent_win, __app_name__, tr("optiscaler.helixsr_lsfg_warn"))
+                if check_conflict and detect_optiscaler_lsfg_conflict(cur_opts, new_winedll):
+                    QMessageBox.warning(parent_win, __app_name__, tr("optiscaler.lsfg_warn"))
                 QMessageBox.information(parent_win, __app_name__, done_msg)
             return
 
@@ -609,8 +618,8 @@ def open_optiscaler_dialog(
             _set_busy(False)
             win.status_label.setText(done_msg)
             if not win._closing_pending:
-                if check_conflict and detect_helixsr_lsfg_conflict(new_opts, new_winedll):
-                    QMessageBox.warning(parent_win, __app_name__, tr("optiscaler.helixsr_lsfg_warn"))
+                if check_conflict and detect_optiscaler_lsfg_conflict(new_opts, new_winedll):
+                    QMessageBox.warning(parent_win, __app_name__, tr("optiscaler.lsfg_warn"))
                 QMessageBox.information(parent_win, __app_name__, done_msg)
             return
 
@@ -639,8 +648,8 @@ def open_optiscaler_dialog(
                 win.status_label.setText(tr("vdf_queue.enqueued", name=entry.app_name))
                 p_win = dlg if dlg_alive() else win
                 if not win._closing_pending:
-                    if check_conflict and detect_helixsr_lsfg_conflict(new_opts, new_winedll):
-                        QMessageBox.warning(p_win, __app_name__, tr("optiscaler.helixsr_lsfg_warn"))
+                    if check_conflict and detect_optiscaler_lsfg_conflict(new_opts, new_winedll):
+                        QMessageBox.warning(p_win, __app_name__, tr("optiscaler.lsfg_warn"))
                     QMessageBox.information(p_win, __app_name__, tr("vdf_queue.enqueued", name=entry.app_name))
                 return
 
@@ -659,8 +668,8 @@ def open_optiscaler_dialog(
                 win.status_label.setText(done_msg)
                 p_win = dlg if dlg_alive() else win
                 if not win._closing_pending:
-                    if check_conflict and detect_helixsr_lsfg_conflict(new_opts, new_winedll):
-                        QMessageBox.warning(p_win, __app_name__, tr("optiscaler.helixsr_lsfg_warn"))
+                    if check_conflict and detect_optiscaler_lsfg_conflict(new_opts, new_winedll):
+                        QMessageBox.warning(p_win, __app_name__, tr("optiscaler.lsfg_warn"))
                     QMessageBox.information(p_win, __app_name__, done_msg)
 
             def _steam_err(err: str) -> None:
@@ -724,6 +733,8 @@ def open_optiscaler_dialog(
         )
 
     def _start_install(overwrite_existing: bool) -> None:
+        if operation["busy"]:
+            return
         proxy_dll = str(combo_proxy.currentData() or "dxgi")
         backend = str(combo_backend.currentData() or "auto")
         fg_mode = str(fg_combo.currentData() or "auto")
@@ -796,6 +807,7 @@ def open_optiscaler_dialog(
                 "optiscaler.install_done",
                 proxy=f"{state.proxy_dll}.dll",
                 backend=state.backend,
+                version=state.version or "-",
             )
             _apply_winedll_update(new_winedll, done_msg, check_conflict=True)
 
@@ -816,6 +828,8 @@ def open_optiscaler_dialog(
         worker.start()
 
     def _on_remove() -> None:
+        if operation["busy"]:
+            return
         auto_snap_enabled = win._is_auto_snapshot_enabled()
         _set_busy(True, tr("optiscaler.removing"))
         win.status_label.setText(tr("optiscaler.removing"))

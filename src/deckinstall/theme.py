@@ -13,10 +13,13 @@ from PySide6.QtWidgets import QApplication
 ThemeMode = Literal["auto", "dark", "light"]
 
 _THEME_QSS_TEMPLATE = Template("""
-QMainWindow, #ContentArea {
+QWidget {
+    font-size: 12px;
+}
+QMainWindow, QDialog, #ContentArea {
     background-color: $bg_window;
     color: $fg_text;
-    font-size: 13px;
+    font-size: 12px;
 }
 #Sidebar {
     background-color: $bg_surface;
@@ -29,7 +32,7 @@ QMainWindow, #ContentArea {
     padding: 11px 14px;
     border: none;
     border-radius: 8px;
-    font-size: 13px;
+    font-size: 12px;
     font-weight: 600;
 }
 #Sidebar QPushButton:hover {
@@ -48,11 +51,29 @@ QFrame#Card, QFrame#DropZone {
 QFrame#DropZone {
     border: 2px dashed $dropzone_border;
 }
+QTabWidget::pane {
+    background-color: $bg_surface;
+    border: 1px solid $border_subtle;
+    border-radius: 6px;
+}
+QTabWidget > QStackedWidget > QWidget {
+    background-color: $bg_surface;
+}
+QTabBar::tab {
+    background-color: $bg_input;
+    color: $fg_text;
+    padding: 7px 12px;
+    border: 1px solid $border_subtle;
+}
+QTabBar::tab:selected {
+    background-color: $bg_surface;
+    border-bottom: 2px solid $focus_border;
+}
 QLabel {
     color: $fg_text;
 }
 QLabel#PageTitle {
-    font-size: 20px;
+    font-size: 18px;
     font-weight: 700;
     color: $title_fg;
 }
@@ -61,11 +82,11 @@ QLabel#MutedText {
     font-size: 12px;
 }
 QLabel#SectionTitle {
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 600;
     color: $section_fg;
 }
-QLineEdit, QComboBox, QListWidget, QTextEdit {
+QLineEdit, QComboBox, QListWidget, QTableWidget, QTextEdit {
     background-color: $bg_input;
     border: 1px solid $input_border;
     border-radius: 8px;
@@ -73,19 +94,28 @@ QLineEdit, QComboBox, QListWidget, QTextEdit {
     color: $fg_text;
     min-height: 20px;
 }
-QLineEdit:focus, QComboBox:focus, QListWidget:focus, QTextEdit:focus {
+QLineEdit:focus, QComboBox:focus, QListWidget:focus, QTableWidget:focus, QTextEdit:focus {
     border: 2px solid $focus_border;
 }
-QListWidget::item {
+QListWidget::item, QTableWidget::item {
     padding: 8px 10px;
     border-radius: 6px;
 }
-QListWidget::item:selected {
+QListWidget::item:selected, QTableWidget::item:selected {
     background-color: #1d6fa5;
     color: #ffffff;
 }
-QListWidget::item:focus {
+QListWidget::item:focus, QTableWidget::item:focus {
     border: 1px solid $focus_border;
+}
+QHeaderView::section {
+    background-color: $bg_surface;
+    color: $fg_text;
+    border: none;
+    border-bottom: 1px solid $border_subtle;
+    border-right: 1px solid $border_subtle;
+    padding: 6px 10px;
+    font-weight: 600;
 }
 QCheckBox:focus {
     outline: 1px solid $focus_border;

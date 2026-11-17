@@ -70,6 +70,7 @@ _ALLOWED_UMU_DB_HOSTS = frozenset(
 UMU_DATABASE_URL = "https://umu.openwinecomponents.org/umu-database.csv"
 UMU_DATABASE_TTL_SECONDS = 7 * 24 * 60 * 60
 _VERSIONS_LOCK = threading.Lock()
+_OPTISCALER_LOCK = threading.Lock()
 
 WINETRICKS_PRESETS: dict[str, str] = {
     "vcrun2022": "Visual C++ 2015-2022 Redistributable",
@@ -991,7 +992,26 @@ def ensure_optiscaler(
 ) -> Path:
     """Ensure OptiScaler payload is cached under runtime/optiscaler/current."""
     opti_dir = get_optiscaler_dir()
+    opti_dir.parent.mkdir(parents=True, exist_ok=True)
+    with _OPTISCALER_LOCK:
+        fd = os.open(str(opti_dir.parent / "install.lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise RuntimeError("OptiScaler cache lock must be a regular file")
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            return _ensure_optiscaler_payload(opti_dir, force_update, progress_cb)
+        finally:
+            os.close(fd)
+
+
+def _ensure_optiscaler_payload(
+    opti_dir: Path, force_update: bool, progress_cb: ProgressCb | None,
+) -> Path:
+    """Check and populate the cache while its install lock is held."""
     if not force_update and _has_optiscaler_dll(opti_dir):
+        version = str(_load_versions().get("optiscaler_installed_version") or "")
+        logging.info("Using cached OptiScaler %s from %s; no download", version, opti_dir)
+        _emit_progress(progress_cb, f"Using cached OptiScaler {version} (no download).".strip(), 100)
         return opti_dir
 
     from .extractor import extract_archive_to_dir
@@ -1005,6 +1025,7 @@ def ensure_optiscaler(
     asset = _pick_optiscaler_asset(release)
     download_url = str(asset.get("browser_download_url", "")).strip()
     asset_name = _sanitize_asset_name(str(asset.get("name", "OptiScaler.zip")))
+    logging.info("Downloading OptiScaler %s: %s", tag, asset_name)
 
     opti_parent = opti_dir.parent
     opti_parent.mkdir(parents=True, exist_ok=True)

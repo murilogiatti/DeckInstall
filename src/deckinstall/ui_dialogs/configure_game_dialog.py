@@ -14,13 +14,14 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -42,7 +43,7 @@ from ..steam_vdf import (
     restore_compatdata_from_microsd,
     set_steam_input_mode,
 )
-from ..ui_cards import _dialog_guard, _format_worker_error, _is_native_linux_game
+from ..ui_cards import _dialog_guard, _dialog_parent, _format_worker_error, _is_native_linux_game
 
 if TYPE_CHECKING:
     from ..ui import MainWindow
@@ -50,7 +51,7 @@ if TYPE_CHECKING:
 
 def open_scan_folders_dialog(win: MainWindow) -> None:
     """Open a dialog to enable/disable default scan roots and manage custom folders."""
-    dlg = QDialog(win)
+    dlg = QDialog(_dialog_parent(win))
     dlg.setWindowTitle(tr("scan_folders.title"))
     dlg.resize(560, 420)
     lay = QVBoxLayout(dlg)
@@ -60,14 +61,23 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
     sub.setWordWrap(True)
     lay.addWidget(sub)
 
-    folder_list = QListWidget()
-    defaults, custom_entries = win._load_scan_folders()
-    tag_default = tr("scan_folders.tag_default")
-    tag_custom = tr("scan_folders.tag_custom")
+    folder_list = QTableWidget(0, 1)
+    folder_list.setHorizontalHeaderLabels([tr("scan_folders.column_folder")])
+    folder_list.verticalHeader().setVisible(False)
+    folder_list.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    folder_list.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+    folder_list.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    folder_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+    folder_list.horizontalHeader().setSectionsClickable(True)
+    folder_list.setSortingEnabled(True)
+    _, custom_entries = win._load_scan_folders()
 
-    def _add_entry(kind: str, path_str: str, enabled: bool) -> QListWidgetItem:
-        tag = tag_default if kind == "default" else tag_custom
-        item = QListWidgetItem(f"[{tag}] {path_str}")
+    def _add_entry(kind: str, path_str: str, enabled: bool) -> QTableWidgetItem:
+        was_sorting = folder_list.isSortingEnabled()
+        folder_list.setSortingEnabled(False)
+        row = folder_list.rowCount()
+        folder_list.insertRow(row)
+        item = QTableWidgetItem(path_str)
         item.setFlags(
             Qt.ItemFlag.ItemIsEnabled
             | Qt.ItemFlag.ItemIsSelectable
@@ -77,11 +87,10 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
             Qt.CheckState.Checked if enabled else Qt.CheckState.Unchecked
         )
         item.setData(Qt.ItemDataRole.UserRole, (kind, path_str))
-        folder_list.addItem(item)
+        folder_list.setItem(row, 0, item)
+        folder_list.setSortingEnabled(was_sorting)
         return item
 
-    for p, enabled in defaults:
-        _add_entry("default", str(p), enabled)
     for entry in custom_entries:
         _add_entry("custom", str(entry["path"]), bool(entry.get("enabled", True)))
 
@@ -97,13 +106,14 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
     lay.addLayout(ctrl_row)
 
     def _update_remove_state() -> None:
-        cur = folder_list.currentItem()
+        row = folder_list.currentRow()
+        cur = folder_list.item(row, 0) if row >= 0 else None
         data = cur.data(Qt.ItemDataRole.UserRole) if cur is not None else None
         btn_remove.setEnabled(
             isinstance(data, tuple) and len(data) == 2 and data[0] == "custom"
         )
 
-    folder_list.currentItemChanged.connect(lambda _c, _p: _update_remove_state())
+    folder_list.currentCellChanged.connect(lambda *_args: _update_remove_state())
 
     def _on_add_folder() -> None:
         chosen = QFileDialog.getExistingDirectory(
@@ -112,37 +122,42 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
         if not chosen:
             return
         chosen_str = str(Path(chosen))
-        for i in range(folder_list.count()):
-            data = folder_list.item(i).data(Qt.ItemDataRole.UserRole)
+        for i in range(folder_list.rowCount()):
+            existing = folder_list.item(i, 0)
+            if existing is None:
+                continue
+            data = existing.data(Qt.ItemDataRole.UserRole)
             if isinstance(data, tuple) and data[1] == chosen_str:
-                folder_list.setCurrentRow(i)
+                folder_list.selectRow(i)
                 return
         item = _add_entry("custom", chosen_str, True)
-        folder_list.setCurrentItem(item)
+        found_row = folder_list.row(item)
+        if found_row >= 0:
+            folder_list.selectRow(found_row)
+        _apply()
 
     def _on_remove_folder() -> None:
         row = folder_list.currentRow()
         if row < 0:
             return
-        cur = folder_list.item(row)
+        cur = folder_list.item(row, 0)
         data = cur.data(Qt.ItemDataRole.UserRole) if cur is not None else None
         if isinstance(data, tuple) and data[0] == "custom":
-            folder_list.takeItem(row)
+            folder_list.removeRow(row)
+            _apply()
 
     btn_add.clicked.connect(_on_add_folder)
     btn_remove.clicked.connect(_on_remove_folder)
 
-    buttons = QDialogButtonBox(
-        QDialogButtonBox.StandardButton.Ok
-        | QDialogButtonBox.StandardButton.Apply
-        | QDialogButtonBox.StandardButton.Cancel
-    )
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
 
     def _apply() -> None:
         new_disabled: list[str] = []
         new_custom: list[dict[str, object]] = []
-        for i in range(folder_list.count()):
-            it = folder_list.item(i)
+        for i in range(folder_list.rowCount()):
+            it = folder_list.item(i, 0)
+            if it is None:
+                continue
             data = it.data(Qt.ItemDataRole.UserRole)
             if not (isinstance(data, tuple) and len(data) == 2):
                 continue
@@ -156,15 +171,8 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
         win._save_scan_folders(new_disabled, new_custom)
         win._refresh_games()
 
-    def _apply_and_accept() -> None:
-        _apply()
-        dlg.accept()
-
-    apply_btn = buttons.button(QDialogButtonBox.StandardButton.Apply)
-    if apply_btn is not None:
-        apply_btn.clicked.connect(_apply)
-    buttons.accepted.connect(_apply_and_accept)
-    buttons.rejected.connect(dlg.reject)
+    folder_list.itemChanged.connect(lambda _item: _apply())
+    buttons.rejected.connect(dlg.accept)
     lay.addWidget(buttons)
 
     dlg.exec()
@@ -189,9 +197,9 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         exe_str = str(obj.exe_path)
         dir_str = str(obj.game_dir)
 
-    dlg = QDialog(win)
+    dlg = QDialog(_dialog_parent(win))
     dlg.setWindowTitle(tr("configure.title", name=title_name))
-    dlg.resize(600, 480)
+    dlg.resize(760, 560)
     dlg_alive = _dialog_guard(dlg)
     root_lay = QVBoxLayout(dlg)
 
@@ -284,19 +292,6 @@ def open_configure_game_dialog(win: MainWindow) -> None:
 
         steam_input_combo.currentIndexChanged.connect(_on_steam_input_changed)
         game_form.addRow(tr("configure.lbl_steam_input"), steam_input_combo)
-
-    if is_external:
-        ext_btn_row = QHBoxLayout()
-        btn_ext_to_steam = QPushButton(tr("library.btn_ext_to_steam"))
-        btn_ext_to_standalone = QPushButton(tr("library.btn_ext_to_standalone"))
-        btn_ext_import_saves = QPushButton(tr("library.btn_ext_import_saves"))
-        btn_ext_to_steam.clicked.connect(win._external_add_to_steam)
-        btn_ext_to_standalone.clicked.connect(win._external_create_standalone)
-        btn_ext_import_saves.clicked.connect(win._external_import_saves)
-        ext_btn_row.addWidget(btn_ext_to_steam)
-        ext_btn_row.addWidget(btn_ext_to_standalone)
-        ext_btn_row.addWidget(btn_ext_import_saves)
-        game_form.addRow(tr("configure.lbl_external_actions"), ext_btn_row)
 
     tabs.addTab(tab_game, tr("configure.tab_game"))
 
@@ -394,6 +389,25 @@ def open_configure_game_dialog(win: MainWindow) -> None:
 
         prefix_lay.addStretch()
     tabs.addTab(tab_prefix, tr("configure.tab_prefix"))
+
+    tab_organization = QWidget()
+    organization_layout = QVBoxLayout(tab_organization)
+    for action in (
+        win.act_migrate, win.act_export_standalone, win.act_import_steam,
+        win.act_ext_to_steam, win.act_ext_to_standalone, win.act_ext_import_saves,
+        win.act_art, win.act_revert_art,
+    ):
+        if action.isVisible() and action.isEnabled():
+            button = QPushButton(action.text())
+            button.setEnabled(action.isEnabled())
+            def run_action(_checked=False, selected_action=action):
+                dlg.accept()
+                selected_action.trigger()
+            button.clicked.connect(run_action)
+            organization_layout.addWidget(button)
+    if organization_layout.count():
+        organization_layout.addStretch()
+        tabs.addTab(tab_organization, tr("configure.tab_organization"))
 
     if not is_native:
         paths_snap = win.paths

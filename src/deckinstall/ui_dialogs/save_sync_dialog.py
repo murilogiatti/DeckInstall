@@ -11,13 +11,14 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
 )
 
@@ -32,7 +33,7 @@ from ..save_sync import (
     pull_game_saves,
     push_game_saves,
 )
-from ..ui_cards import _format_worker_error, _setting_bool
+from ..ui_cards import _dialog_parent, _format_worker_error, _setting_bool
 
 if TYPE_CHECKING:
     from ..ui import MainWindow
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
 
 def open_save_sync_dialog(win: MainWindow) -> None:
     """Open folder-based Save Sync and Auto-Snapshot settings dialog."""
-    dlg = QDialog(win)
+    dlg = QDialog(_dialog_parent(win))
     dlg.setWindowTitle(tr("save_sync.title"))
     dlg.resize(640, 520)
     lay = QVBoxLayout(dlg)
@@ -53,7 +54,14 @@ def open_save_sync_dialog(win: MainWindow) -> None:
 
     folder_row = QHBoxLayout()
     folder_row.addWidget(QLabel(tr("save_sync.folder_label")))
-    saved_dir = str(win.settings.value("save_sync/folder", str(DEFAULT_SYNC_DIR)) or DEFAULT_SYNC_DIR)
+    legacy_default = Path.home() / "Sync" / "DeckInstallSaves"
+    configured_dir = str(
+        win.settings.value("save_sync/folder", str(DEFAULT_SYNC_DIR)) or DEFAULT_SYNC_DIR
+    )
+    if configured_dir == str(legacy_default) and not legacy_default.exists():
+        configured_dir = str(DEFAULT_SYNC_DIR)
+        win.settings.setValue("save_sync/folder", configured_dir)
+    saved_dir = configured_dir
     sync_dir_edit = QLineEdit(saved_dir)
     btn_browse = QPushButton(tr("install.browse"))
     folder_row.addWidget(sync_dir_edit, 1)
@@ -74,7 +82,20 @@ def open_save_sync_dialog(win: MainWindow) -> None:
     plan_top.addWidget(btn_refresh)
     lay.addLayout(plan_top)
 
-    plan_list = QListWidget()
+    plan_list = QTableWidget(0, 3)
+    plan_list.setHorizontalHeaderLabels(
+        [tr("add.detected_name_column"), tr("save_sync.table_action"), tr("save_sync.table_reason")]
+    )
+    plan_list.verticalHeader().setVisible(False)
+    plan_list.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    plan_list.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+    plan_list.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    plan_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+    plan_list.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+    plan_list.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+    plan_list.horizontalHeader().setStretchLastSection(True)
+    plan_list.horizontalHeader().setSectionsClickable(True)
+    plan_list.setSortingEnabled(True)
     lay.addWidget(plan_list, 1)
 
     lbl_status = QLabel(tr("status.ready"))
@@ -137,23 +158,31 @@ def open_save_sync_dialog(win: MainWindow) -> None:
                 self.failed.emit(self._req_id, _format_worker_error(exc))
 
     def _apply_plan_items(items: list[SyncPlanItem]) -> None:
-        plan_list.clear()
+        plan_list.setSortingEnabled(False)
+        plan_list.clearSpans()
+        plan_list.setRowCount(0)
         current_plan.clear()
         current_plan.extend(items)
         if not items:
-            empty = QListWidgetItem(tr("save_sync.no_games"))
+            plan_list.setRowCount(1)
+            plan_list.setSpan(0, 0, 1, 3)
+            empty = QTableWidgetItem(tr("save_sync.no_games"))
             empty.setFlags(Qt.ItemFlag.NoItemFlags)
-            plan_list.addItem(empty)
+            plan_list.setItem(0, 0, empty)
             btn_sync.setEnabled(False)
             btn_preview.setEnabled(False)
             return
         actionable = False
-        for item in items:
+        for row, item in enumerate(items):
             if item.action in ("PUSH", "PULL", "CONFLICT"):
                 actionable = True
-            it = QListWidgetItem(f"[{item.action}] {item.game_name} — {item.reason}")
+            plan_list.insertRow(row)
+            it = QTableWidgetItem(item.game_name)
             it.setData(Qt.ItemDataRole.UserRole, item)
-            plan_list.addItem(it)
+            plan_list.setItem(row, 0, it)
+            plan_list.setItem(row, 1, QTableWidgetItem(item.action))
+            plan_list.setItem(row, 2, QTableWidgetItem(item.reason))
+        plan_list.setSortingEnabled(True)
         btn_sync.setEnabled(actionable)
         btn_preview.setEnabled(bool(items))
 
@@ -307,7 +336,7 @@ def open_save_sync_dialog(win: MainWindow) -> None:
 
     def _on_preview() -> None:
         sync_root = _current_sync_root()
-        cur_item = plan_list.currentItem()
+        cur_item = plan_list.item(plan_list.currentRow(), 0)
         selected_plan = cur_item.data(Qt.ItemDataRole.UserRole) if cur_item is not None else None
         if isinstance(selected_plan, SyncPlanItem):
             targets = [selected_plan]

@@ -17,6 +17,7 @@ from .steam_vdf import (
     _RESTORE_MAX_ENTRIES,
     _RESTORE_MAX_FILE_BYTES,
     _RESTORE_MAX_TOTAL_BYTES,
+    DEFAULT_SAVES_DIR,
     _iter_prefix_save_pairs,
     _iter_programdata_save_pairs,
     _norm_key,
@@ -26,8 +27,8 @@ from .steam_vdf import (
     _write_prefix_saves_to_zip,
 )
 
-DEFAULT_SNAPSHOTS_DIR = Path.home() / "Backups" / "DeckInstall" / "snapshots"
-DEFAULT_SYNC_DIR = Path.home() / "Sync" / "DeckInstallSaves"
+DEFAULT_SNAPSHOTS_DIR = DEFAULT_SAVES_DIR / "snapshots"
+DEFAULT_SYNC_DIR = DEFAULT_SAVES_DIR / "sync"
 DEFAULT_LUDUSAVI_MANIFEST_PATH = (
     Path.home() / ".local" / "share" / "deckinstall" / "ludusavi_manifest.json"
 )
@@ -135,7 +136,9 @@ def _find_child_ci(parent: Path, name_lower: str) -> Path | None:
     return None
 
 
-def _collect_prefix_state_entries(prefix_dir: Path) -> list[tuple[str, Path, Path]]:
+def _collect_prefix_state_entries(
+    prefix_dir: Path, include_system_dlls: bool = True,
+) -> list[tuple[str, Path, Path]]:
     """Collect sorted (kind, src_file, rel_path) tuples for prefix .reg and system DLL files."""
     if not prefix_dir.is_dir() or prefix_dir.is_symlink():
         return []
@@ -150,7 +153,7 @@ def _collect_prefix_state_entries(prefix_dir: Path) -> list[tuple[str, Path, Pat
             pass
 
     drive_c = _resolve_drive_c_target(prefix_dir)
-    windows_dir = _find_child_ci(drive_c, "windows")
+    windows_dir = _find_child_ci(drive_c, "windows") if include_system_dlls else None
     if windows_dir is not None:
         for sys_name in ("system32", "syswow64"):
             sys_dir = _find_child_ci(windows_dir, sys_name)
@@ -806,11 +809,12 @@ def snapshot_prefix_state(
     dest_root: Path | None = None,
     max_keep: int = 5,
     max_total_bytes: int = _PREFIX_STATE_MAX_BYTES,
+    include_system_dlls: bool = True,
 ) -> PrefixStateSnapshot | None:
     """Create a rotated ZIP snapshot of prefix .reg files and system DLLs."""
     if not prefix_dir.is_dir() or prefix_dir.is_symlink():
         return None
-    entries = _collect_prefix_state_entries(prefix_dir)
+    entries = _collect_prefix_state_entries(prefix_dir, include_system_dlls=include_system_dlls)
     if not entries:
         return None
 

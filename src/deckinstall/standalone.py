@@ -53,6 +53,7 @@ PREFIXES_DIR = _DEFAULT_PREFIXES_DIR
 APPLICATIONS_DIR = _DEFAULT_APPLICATIONS_DIR
 UMU_RUN_PATH = Path.home() / ".local" / "share" / "DeckInstall" / "runtime" / "umu" / "umu-run"
 STANDALONE_MANIFEST = ".deckinstall_standalone.json"
+_LIBRARY_INDEX_DIR = ".deckinstall-library"
 
 
 def get_applications_dir() -> Path:
@@ -923,6 +924,21 @@ def _write_manifest(game: StandaloneGame) -> None:
     )
 
 
+def _library_index_path(game_dir: Path) -> Path:
+    key = hashlib.sha256(str(game_dir.resolve()).encode("utf-8")).hexdigest()
+    return get_games_dir() / _LIBRARY_INDEX_DIR / f"{key}.json"
+
+
+def _register_standalone_game(game: StandaloneGame) -> None:
+    """Remember an installed game's manifest even when its files stay outside ~/Games."""
+    index_path = _library_index_path(game.game_dir)
+    if index_path.parent.is_symlink():
+        raise OSError(f"Standalone library index cannot be a symlink: {index_path.parent}")
+    _atomic_write_text(index_path, json.dumps({
+        "manifest": str((game.game_dir / STANDALONE_MANIFEST).resolve()),
+    }) + "\n")
+
+
 def _copy_or_move_dir_contents(src_dir: Path, dst_dir: Path, move: bool) -> None:
     """Copy or move all entries from src_dir into dst_dir."""
     if src_dir.resolve() == dst_dir.resolve():
@@ -1110,6 +1126,7 @@ def install_standalone_game(
             startup_wm_class=startup_wm_class,
         )
     _write_manifest(game)
+    _register_standalone_game(game)
     return game
 
 
@@ -1182,23 +1199,56 @@ def _load_manifest(manifest_path: Path) -> StandaloneGame | None:
 
 
 def list_standalone_games(games_dir: Path | None = None) -> list[StandaloneGame]:
-    """Return all standalone games discovered under ~/Games/*/.deckinstall_standalone.json."""
+    """Load registered games and recover existing manifests from nested game folders."""
     root = games_dir if games_dir is not None else get_games_dir()
     if not root.is_dir():
         return []
     games: list[StandaloneGame] = []
-    try:
-        entries = list(root.iterdir())
-    except OSError:
-        return []
-    for child in entries:
-        if not child.is_dir() or child.name.startswith("."):
+    seen: set[Path] = set()
+
+    def add_manifest(manifest: Path) -> None:
+        if manifest.is_symlink() or not manifest.is_file():
+            return
+        resolved = manifest.resolve()
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        game = _load_manifest(manifest)
+        if game is not None:
+            games.append(game)
+
+    index_dir = root / _LIBRARY_INDEX_DIR
+    if index_dir.is_dir() and not index_dir.is_symlink():
+        for entry in index_dir.glob("*.json"):
+            try:
+                if entry.is_symlink() or entry.stat().st_size > 16384:
+                    continue
+                data = json.loads(entry.read_text(encoding="utf-8"))
+                manifest_name = data.get("manifest") if isinstance(data, dict) else None
+                if isinstance(manifest_name, str):
+                    manifest = Path(manifest_name)
+                    if manifest.is_absolute() and manifest.name == STANDALONE_MANIFEST:
+                        add_manifest(manifest)
+            except (OSError, ValueError):
+                logging.warning("Failed to read standalone library entry %s", entry)
+
+    # Recover pre-index installations such as Games/KIBORG/Kiborg. Avoid
+    # descending into managed games, prefixes, engine files or symlinked trees.
+    skipped = {"engine", "node_modules", "_redist", "drive_c", "compatdata", "shadercache"}
+    for current, dirnames, filenames in os.walk(root, followlinks=False):
+        folder = Path(current)
+        if STANDALONE_MANIFEST in filenames:
+            add_manifest(folder / STANDALONE_MANIFEST)
+            dirnames[:] = []
             continue
-        manifest = child / STANDALONE_MANIFEST
-        if manifest.is_file():
-            game = _load_manifest(manifest)
-            if game is not None:
-                games.append(game)
+        if len(folder.relative_to(root).parts) >= 8:
+            dirnames[:] = []
+            continue
+        dirnames[:] = [
+            name for name in dirnames
+            if not name.startswith(".") and name.lower() not in skipped
+            and not (folder / name).is_symlink()
+        ]
     games.sort(key=lambda g: g.name.lower())
     return games
 
@@ -1391,6 +1441,13 @@ def remove_standalone_game(
                 fpath.unlink()
         except OSError as exc:
             logging.warning("Failed to remove %s: %s", fpath, exc)
+
+    index_path = _library_index_path(game.game_dir)
+    if not index_path.parent.is_symlink() and index_path.exists():
+        try:
+            index_path.unlink()
+        except OSError as exc:
+            logging.warning("Failed to remove standalone library entry %s: %s", index_path, exc)
 
     if delete_files:
         if game.game_dir.is_symlink() or _is_protected_dir(resolved_game_dir):

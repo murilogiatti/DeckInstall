@@ -40,6 +40,7 @@ from .steam_paths import (
     list_steam_users,
 )
 
+DEFAULT_SAVES_DIR = Path.home() / "Games" / "saves"
 _STEAM_LOCK = threading.RLock()
 _THREAD_LOCAL = threading.local()
 
@@ -2804,8 +2805,9 @@ def find_cleanup_candidates(
                     )
                 )
 
-    backups_dir = home / "Backups" / "DeckInstall"
-    if backups_dir.is_dir() and not backups_dir.is_symlink():
+    for backups_dir in (home / "Games" / "saves" / "backups", home / "Backups" / "DeckInstall"):
+        if not (backups_dir.is_dir() and not backups_dir.is_symlink()):
+            continue
         save_zips: list[tuple[float, str, Path, int]] = []
         for child in backups_dir.iterdir():
             if child.is_symlink() or not child.is_file():
@@ -3263,7 +3265,7 @@ def backup_all_saves(
     """Create a timestamped ZIP backup of saves for all active Non-Steam shortcuts and standalone games."""
     from .standalone import list_standalone_games
 
-    out_dir = dest_root or (Path.home() / "Backups" / "DeckInstall")
+    out_dir = dest_root or (DEFAULT_SAVES_DIR / "backups")
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     zip_path = _reserve_unique_backup_zip(out_dir, stamp)
@@ -3323,7 +3325,7 @@ def backup_prefix_candidates_to_zip(
     dest_root: Path | None = None,
 ) -> tuple[Path, int, int]:
     """Create a ZIP backup of saves found inside the given cleanup prefix candidates."""
-    root = dest_root or (Path.home() / "Backups" / "DeckInstall")
+    root = dest_root or (DEFAULT_SAVES_DIR / "backups")
     root.mkdir(parents=True, exist_ok=True)
     zip_path = _reserve_unique_backup_zip(root, "prefix-cleanup-backup")
     manifest: dict[str, str] = {}
@@ -3663,7 +3665,7 @@ _PRESET_ENV_KEYS = (
     "LSFG_PERF_MODE",
     "LSFGVK_PROFILE",
 )
-_HELIXSR_OPTISCALER_DLLS = frozenset(
+_OPTISCALER_PROXY_DLLS = frozenset(
     {"dxgi", "amd_fidelityfx_dx12", "amd_fidelityfx_vk", "winmm", "version", "dbghelp"}
 )
 _SHELL_OPS = {"&&", "||", ";", "|", ">", ">>", "<", "2>&1", "1>&2", "%command%"}
@@ -3842,8 +3844,8 @@ def install_mangohud_topbar_config(config_path: Path | None = None) -> Path:
     return target
 
 
-def detect_helixsr_lsfg_conflict(launch_options: str, winedlloverrides: str = "") -> bool:
-    """Return True if lsfg-vk / ENABLE_LSFG is enabled alongside HelixSR/OptiScaler DLL overrides."""
+def detect_optiscaler_lsfg_conflict(launch_options: str, winedlloverrides: str = "") -> bool:
+    """Return True if lsfg-vk / ENABLE_LSFG is enabled alongside OptiScaler DLL overrides."""
     try:
         tokens = _raw_shell_tokens(launch_options) if launch_options.strip() else []
     except ValueError:
@@ -3884,7 +3886,7 @@ def detect_helixsr_lsfg_conflict(launch_options: str, winedlloverrides: str = ""
                 norm = dll_name.strip().lstrip("*").lower()
                 if norm.endswith(".dll"):
                     norm = norm[:-4]
-                if norm in _HELIXSR_OPTISCALER_DLLS:
+                if norm in _OPTISCALER_PROXY_DLLS:
                     return True
     return False
 

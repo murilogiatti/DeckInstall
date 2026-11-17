@@ -24,10 +24,12 @@ from PySide6.QtGui import (
     QDropEvent,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QFileDialog,
     QFrame,
     QLayout,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -39,11 +41,43 @@ from .steam_paths import is_gamescope_session
 from .steam_vdf import CleanupCandidate, _strip_vdf_quotes
 
 
+def _dialog_parent(win: QWidget) -> QWidget:
+    """Keep nested dialogs above the active modal belonging to this window."""
+    active = QApplication.activeModalWidget()
+    if active is None:
+        return win
+    parent: QWidget | None = active
+    while parent is not None:
+        if parent is win:
+            return active
+        parent = parent.parentWidget()
+    return win
+
+
 def _dialog_guard(dlg: QDialog) -> Callable[[], bool]:
     """Return a callable that stays True while *dlg* has not finished."""
     state = {"open": True}
     dlg.finished.connect(lambda _r: state.__setitem__("open", False))
     return lambda: state["open"]
+
+
+class _SortableTableItem(QTableWidgetItem):
+    """Table item that sorts by a numeric sort_key when provided."""
+
+    def __init__(self, text: str = "", sort_key: int | float | None = None) -> None:
+        super().__init__(text)
+        self._sort_key = sort_key
+
+    def __lt__(self, other: object) -> bool:
+        if (
+            isinstance(other, _SortableTableItem)
+            and self._sort_key is not None
+            and other._sort_key is not None
+        ):
+            return self._sort_key < other._sort_key
+        if isinstance(other, QTableWidgetItem):
+            return super().__lt__(other)
+        return NotImplemented
 
 
 def _start_detached_process(
