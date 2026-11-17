@@ -97,6 +97,10 @@ def import_external_saves_to_target(
     else:
         dst_drive_c = target_prefix / "drive_c"
 
+    if not _safe_parents_within(
+        target_prefix, target_prefix.resolve(), dst_drive_c.relative_to(target_prefix).parts
+    ):
+        raise OSError(f"Unsafe target drive_c path: {dst_drive_c}")
     dst_drive_c.mkdir(parents=True, exist_ok=True)
     dst_drive_c_resolved = dst_drive_c.resolve()
 

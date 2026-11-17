@@ -4,7 +4,7 @@
 
 Non-Steam game installer, Proton prefix migrator, save validator, and official Steam artwork manager for **Steam Deck / SteamOS** (KDE Plasma + Qt6).
 
-**Current version:** `0.12.0`
+**Current version:** `0.12.1`
 
 ## Features
 - **Unified 3-Tab UI (Install / Extract, Games & Library, Maintenance)**: Combines game installation, library management, and per-game configuration into a streamlined 3-tab interface with a unified **Configure Game** dialog.
@@ -22,10 +22,10 @@ Non-Steam game installer, Proton prefix migrator, save validator, and official S
 Download `DeckInstall-<version>-x86_64.AppImage` from [GitHub Releases](https://github.com/murilogiatti/DeckInstall/releases):
 
 ```bash
-chmod +x DeckInstall-0.12.0-x86_64.AppImage
-./DeckInstall-0.12.0-x86_64.AppImage --version
-QT_QPA_PLATFORM=offscreen ./DeckInstall-0.12.0-x86_64.AppImage --smoke-test
-./DeckInstall-0.12.0-x86_64.AppImage
+chmod +x DeckInstall-0.12.1-x86_64.AppImage
+./DeckInstall-0.12.1-x86_64.AppImage --version
+QT_QPA_PLATFORM=offscreen ./DeckInstall-0.12.1-x86_64.AppImage --smoke-test
+./DeckInstall-0.12.1-x86_64.AppImage
 ```
 
 ## Translating DeckInstall
@@ -38,17 +38,19 @@ English (`en`) is the primary language. To add a new translation:
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e '.[dev]'
 python main.py
 ```
 
 Run unit tests (strict `ResourceWarning` + headless Qt):
 ```bash
-QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -W error::ResourceWarning -m unittest discover -s tests -v
+QT_QPA_PLATFORM=offscreen PYTHONPATH=src python3 -W error::ResourceWarning -m pytest -q -W error::ResourceWarning
+ruff check .
+mypy src
 ```
 
 ## Build AppImage (GitHub Actions)
-Push a semantic tag matching `VERSION` (e.g. `v0.12.0`) to automatically run the test suite, compile a standalone binary with Nuitka, smoke-test the packaged `AppDir`, build `DeckInstall-<version>-x86_64.AppImage`, and attach it to the GitHub Release.
+Push a semantic tag matching `VERSION` (e.g. `v0.12.1`) to automatically run the complete test suite on Python 3.10, 3.11, and 3.13, check lint and types, compile a standalone binary with Nuitka, smoke-test the packaged `AppDir`, build `DeckInstall-<version>-x86_64.AppImage`, and attach it plus `SHA256SUMS` to the GitHub Release.
 
 ## License
 Distributed under the [MIT License](LICENSE).

@@ -45,6 +45,55 @@ class ThemeAndI18nTests(unittest.TestCase):
 
 
 class UiLifecycleTests(unittest.TestCase):
+    def test_close_keeps_pending_vdf_edits_when_apply_fails(self) -> None:
+        from types import SimpleNamespace
+
+        from PySide6.QtGui import QCloseEvent
+
+        from deckinstall import ui
+
+        for failure in (RuntimeError("write failed"), SimpleNamespace(errors=["write failed"])):
+            with self.subTest(failure=failure):
+                win = mock.Mock()
+                win._force_closing = False
+                win._vdf_queue.pending_count.return_value = 1
+                if isinstance(failure, Exception):
+                    win._vdf_queue.apply_all.side_effect = failure
+                else:
+                    win._vdf_queue.apply_all.return_value = failure
+                with (
+                    mock.patch.object(ui, "QMessageBox") as box_type,
+                    mock.patch.object(ui, "is_steam_running", return_value=False),
+                ):
+                    box = box_type.return_value
+                    apply_button = object()
+                    box.addButton.side_effect = [apply_button, object(), object()]
+                    box.clickedButton.return_value = apply_button
+                    ev = QCloseEvent()
+                    ui.MainWindow.closeEvent(win, ev)
+                    self.assertFalse(ev.isAccepted())
+                    win._vdf_queue.apply_all.assert_called_once_with(win.paths)
+                    win._update_vdf_queue_banner.assert_called_once()
+
+    def test_close_keeps_pending_vdf_edits_when_steam_is_missing(self) -> None:
+        from PySide6.QtGui import QCloseEvent
+
+        from deckinstall import ui
+
+        win = mock.Mock()
+        win._force_closing = False
+        win.paths = None
+        win._vdf_queue.pending_count.return_value = 1
+        with mock.patch.object(ui, "QMessageBox") as box_type:
+            box = box_type.return_value
+            apply_button = object()
+            box.addButton.side_effect = [apply_button, object(), object()]
+            box.clickedButton.return_value = apply_button
+            ev = QCloseEvent()
+            ui.MainWindow.closeEvent(win, ev)
+            self.assertFalse(ev.isAccepted())
+            win._vdf_queue.apply_all.assert_not_called()
+
     def test_worker_cancel_uses_threading_event(self) -> None:
         from PySide6.QtWidgets import QApplication
 

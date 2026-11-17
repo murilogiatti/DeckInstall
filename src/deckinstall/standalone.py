@@ -925,6 +925,8 @@ def _write_manifest(game: StandaloneGame) -> None:
 
 def _copy_or_move_dir_contents(src_dir: Path, dst_dir: Path, move: bool) -> None:
     """Copy or move all entries from src_dir into dst_dir."""
+    if src_dir.resolve() == dst_dir.resolve():
+        return
     dst_dir.mkdir(parents=True, exist_ok=True)
     for item in src_dir.iterdir():
         target = dst_dir / item.name
@@ -944,8 +946,13 @@ def _copy_or_move_dir_contents(src_dir: Path, dst_dir: Path, move: bool) -> None
                 if not target.exists() and not target.is_symlink():
                     target.symlink_to(item.readlink())
             elif item.is_dir():
-                shutil.copytree(item, target, symlinks=True, dirs_exist_ok=True)
+                if target.is_symlink() or (target.exists() and not target.is_dir()):
+                    _remove_path_or_tree(target)
+                _copy_or_move_dir_contents(item, target, move=False)
+                shutil.copystat(item, target, follow_symlinks=False)
             else:
+                if target.is_symlink() or target.is_dir():
+                    _remove_path_or_tree(target)
                 shutil.copy2(item, target)
 
 
@@ -975,6 +982,12 @@ def install_standalone_game(
 
     src_dir = game_dir.resolve()
     src_exe = exe_path.resolve()
+    if not src_dir.is_dir():
+        raise FileNotFoundError(f"Game directory not found: {game_dir}")
+    if not src_exe.is_file():
+        raise FileNotFoundError(f"Game executable not found: {exe_path}")
+    if not _is_strictly_under_dir(src_exe, src_dir):
+        raise ValueError(f"Game executable must be inside the game directory: {exe_path}")
 
     if keep_in_place:
         target_game_dir = game_dir
@@ -1229,7 +1242,7 @@ def update_standalone_launch_options(
 
 def _remove_path_or_tree(path: Path) -> None:
     """Remove a symlink, file, or directory tree if present."""
-    if path.is_symlink():
+    if path.is_symlink() or path.is_file():
         path.unlink(missing_ok=True)
     elif path.exists():
         shutil.rmtree(path, ignore_errors=True)
@@ -1318,6 +1331,11 @@ def prune_orphan_shader_caches(
     """Delete orphaned shader cache directories safely and return (deleted_count, freed_bytes)."""
     caches_dir = (games_dir / ".caches") if games_dir is not None else get_shader_caches_dir()
     targets = entries if entries is not None else find_orphan_shader_caches(games_dir=games_dir)
+    # A scan may have become stale while a game was installed or reconfigured.
+    current_orphans = {
+        entry.path.resolve()
+        for entry in (find_orphan_shader_caches(games_dir=games_dir) if entries is not None else targets)
+    }
     deleted = 0
     freed = 0
     for entry in targets:
@@ -1328,7 +1346,11 @@ def prune_orphan_shader_caches(
                 entry.path,
             )
             continue
-        if entry.path.is_dir() and not entry.path.is_symlink():
+        if (
+            entry.path.is_dir()
+            and not entry.path.is_symlink()
+            and entry.path.resolve() in current_orphans
+        ):
             _remove_path_or_tree(entry.path)
             if not entry.path.exists():
                 deleted += 1

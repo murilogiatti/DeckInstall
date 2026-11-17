@@ -3225,9 +3225,14 @@ def _write_prefix_saves_to_zip(
             rel = dst_rel.relative_to(dummy_base)
             arcname = f"{key_prefix}/{subfolder}/{rel.as_posix()}"
             sfd = os.open(str(src_file), os.O_RDONLY | os.O_NOFOLLOW)
-            with os.fdopen(sfd, "rb") as sfh:
-                zf.writestr(arcname, sfh.read())
-            total_uncompressed += fsize
+            copied = 0
+            with os.fdopen(sfd, "rb") as sfh, zf.open(arcname, "w") as zout:
+                while chunk := sfh.read(65536):
+                    copied += len(chunk)
+                    total_uncompressed += len(chunk)
+                    if copied > _RESTORE_MAX_FILE_BYTES or total_uncompressed > _RESTORE_MAX_TOTAL_BYTES:
+                        raise RuntimeError(f"Backup size limit exceeded on {src_file.name}")
+                    zout.write(chunk)
             game_files += 1
             files_backed += 1
 
@@ -4220,6 +4225,34 @@ def get_compatdata_migration_state(paths: SteamPaths, appid_u32: int) -> tuple[s
     return "missing", None
 
 
+def _verify_compatdata_copy(source: Path, target: Path) -> None:
+    """Verify every directory, regular file and symlink before removing a prefix's original copy."""
+    def fingerprint(root: Path) -> dict[str, tuple[str, str]]:
+        entries: dict[str, tuple[str, str]] = {}
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=_raise_oserror):
+            for name in dirnames + filenames:
+                path = Path(dirpath) / name
+                rel = path.relative_to(root).as_posix()
+                mode = path.lstat().st_mode
+                if stat.S_ISLNK(mode):
+                    entries[rel] = ("symlink", os.readlink(path))
+                elif stat.S_ISDIR(mode):
+                    entries[rel] = ("dir", "")
+                elif stat.S_ISREG(mode):
+                    entries[rel] = ("file", _file_sha256(path))
+                else:
+                    raise RuntimeError(f"Unsupported prefix file: {path}")
+        return entries
+
+    if fingerprint(source) != fingerprint(target):
+        raise RuntimeError("Prefix copy verification failed; the original prefix was preserved")
+
+
+def _validate_migration_appid(appid_u32: int) -> None:
+    if isinstance(appid_u32, bool) or not isinstance(appid_u32, int) or not 1 <= appid_u32 <= 0xFFFFFFFF:
+        raise ValueError(f"Invalid compatdata AppID: {appid_u32!r}")
+
+
 def migrate_compatdata_to_microsd(
     paths: SteamPaths,
     appid_u32: int,
@@ -4227,12 +4260,16 @@ def migrate_compatdata_to_microsd(
     verify_mounted: bool = True,
 ) -> Path:
     """Move compatdata/<appid_u32> to microSD and symlink it, keeping shadercache on NVMe."""
+    _validate_migration_appid(appid_u32)
+    target_compat_root = target_compat_root.resolve()
     with _steam_transaction_lock(paths.shortcuts_vdf):
         src_compat = paths.compatdata_dir / str(appid_u32)
         if src_compat.is_symlink():
             raise ValueError(f"compatdata/{appid_u32} is already a symlink: {src_compat}")
         if not src_compat.is_dir():
             raise FileNotFoundError(f"compatdata/{appid_u32} does not exist: {src_compat}")
+        if target_compat_root.resolve().is_relative_to(src_compat.resolve()):
+            raise ValueError("Migration destination cannot be inside the source prefix")
         if verify_mounted:
             probe = target_compat_root
             while not probe.exists() and probe != probe.parent:
@@ -4254,6 +4291,7 @@ def migrate_compatdata_to_microsd(
         backup_local = paths.compatdata_dir / f".{appid_u32}.{int(time.time())}.{os.getpid()}.migrate.bak"
         try:
             shutil.copytree(src_compat, staged_compat, symlinks=True)
+            _verify_compatdata_copy(src_compat, staged_compat)
             staged_compat.rename(dst_compat)
         except Exception:
             shutil.rmtree(stage_dir, ignore_errors=True)
@@ -4295,6 +4333,7 @@ def restore_compatdata_from_microsd(
     remove_microsd_copy: bool = True,
 ) -> Path:
     """Restore a symlinked compatdata/<appid_u32> back to local NVMe storage atomically."""
+    _validate_migration_appid(appid_u32)
     with _steam_transaction_lock(paths.shortcuts_vdf):
         compat_link = paths.compatdata_dir / str(appid_u32)
         if not compat_link.is_symlink():
@@ -4302,6 +4341,12 @@ def restore_compatdata_from_microsd(
         src_microsd = Path(os.path.realpath(compat_link))
         if not src_microsd.is_dir():
             raise FileNotFoundError(f"Migrated compatdata target not found: {src_microsd}")
+        if (
+            src_microsd.name != str(appid_u32)
+            or paths.compatdata_dir.resolve().is_relative_to(src_microsd)
+            or not ((src_microsd / "pfx" / "drive_c").is_dir() or (src_microsd / "drive_c").is_dir())
+        ):
+            raise ValueError(f"Symlink target is not a migrated game prefix: {src_microsd}")
 
         needed_bytes = _dir_size_bytes(src_microsd)
         check_disk_space(paths.compatdata_dir, needed_bytes)
@@ -4312,6 +4357,7 @@ def restore_compatdata_from_microsd(
         staged_local = stage_dir / str(appid_u32)
         try:
             shutil.copytree(src_microsd, staged_local, symlinks=True)
+            _verify_compatdata_copy(src_microsd, staged_local)
         except Exception:
             shutil.rmtree(stage_dir, ignore_errors=True)
             raise

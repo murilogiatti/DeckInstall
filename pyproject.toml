@@ -40,6 +40,14 @@ version = {attr = "deckinstall.__version__"}
 [tool.setuptools.package-data]
 deckinstall = ["locales/*.json", "assets/icon.png", "assets/icon.svg"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = [
+    "error::ResourceWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
+]
+
 [tool.mypy]
 python_version = "3.10"
 mypy_path = "src"

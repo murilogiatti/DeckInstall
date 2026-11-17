@@ -367,17 +367,23 @@ class MainWindow(QMainWindow):
             box.setDefaultButton(btn_apply)
             box.exec()
             clicked = box.clickedButton()
-            if clicked == btn_cancel:
+            if clicked == btn_cancel or clicked not in (btn_apply, btn_discard):
                 event.ignore()
                 return
-            if clicked == btn_apply and self.paths is not None:
+            if clicked == btn_apply:
+                if self.paths is None:
+                    QMessageBox.warning(self, __app_name__, tr("add.steam_missing"))
+                    event.ignore()
+                    return
                 was_running = False
+                apply_failed = False
                 try:
                     was_running = is_steam_running()
                     if was_running:
                         shutdown_steam()
                     batch_res = self._vdf_queue.apply_all(self.paths)
                     if batch_res.errors:
+                        apply_failed = True
                         QMessageBox.warning(
                             self,
                             __app_name__,
@@ -388,11 +394,15 @@ class MainWindow(QMainWindow):
                             ),
                         )
                 except Exception as exc:
+                    apply_failed = True
                     QMessageBox.warning(self, __app_name__, str(exc))
                 finally:
                     if was_running:
                         start_steam()
                 self._update_vdf_queue_banner()
+                if apply_failed or self._vdf_queue.pending_count() > 0:
+                    event.ignore()
+                    return
             elif clicked == btn_discard:
                 self._vdf_queue.clear()
                 self._update_vdf_queue_banner()

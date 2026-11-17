@@ -263,6 +263,90 @@ class ScannerTests(unittest.TestCase):
 class StandaloneAndVdfTests(unittest.TestCase):
     """Tests for standalone game lifecycle, launch presets, HelixSR/LSFG conflict, and cleanup."""
 
+    def test_prefix_merge_does_not_follow_destination_symlinks(self) -> None:
+        for move in (False, True):
+            with self.subTest(move=move), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "source"
+                target = root / "target"
+                outside = root / "outside"
+                for folder in (source, target, outside):
+                    folder.mkdir()
+                (source / "users").mkdir()
+                (source / "users" / "save.dat").write_bytes(b"import-save")
+                (source / "user.reg").write_bytes(b"import-registry")
+                (outside / "save.dat").write_bytes(b"outside-save")
+                (outside / "user.reg").write_bytes(b"outside-registry")
+                (target / "users").symlink_to(outside, target_is_directory=True)
+                (target / "user.reg").symlink_to(outside / "user.reg")
+
+                standalone._copy_or_move_dir_contents(source, target, move=move)
+
+                self.assertEqual((target / "users" / "save.dat").read_bytes(), b"import-save")
+                self.assertEqual((target / "user.reg").read_bytes(), b"import-registry")
+                self.assertFalse((target / "users").is_symlink())
+                self.assertFalse((target / "user.reg").is_symlink())
+                self.assertEqual((outside / "save.dat").read_bytes(), b"outside-save")
+                self.assertEqual((outside / "user.reg").read_bytes(), b"outside-registry")
+
+    def test_prefix_merge_accepts_directory_over_file_and_same_directory(self) -> None:
+        for move in (False, True):
+            with self.subTest(move=move), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "source"
+                target = root / "target"
+                (source / "users").mkdir(parents=True)
+                (source / "users" / "save.dat").write_bytes(b"save")
+                target.mkdir()
+                (target / "users").write_bytes(b"old-file")
+                standalone._copy_or_move_dir_contents(source, target, move=move)
+                standalone._copy_or_move_dir_contents(target, target, move=move)
+                self.assertEqual((target / "users" / "save.dat").read_bytes(), b"save")
+
+    def test_standalone_rejects_invalid_executable_before_moving_game(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            games_dir = root / "Games"
+            source = root / "Source"
+            source.mkdir()
+            (source / "save.dat").write_bytes(b"keep-save")
+            outside_exe = root / "outside.exe"
+            outside_exe.write_bytes(b"MZ")
+            with mock.patch.object(standalone, "get_games_dir", return_value=games_dir):
+                with self.assertRaises(ValueError):
+                    standalone.install_standalone_game("Invalid", outside_exe, source)
+                with self.assertRaises(FileNotFoundError):
+                    standalone.install_standalone_game("Missing", source / "missing.exe", source)
+            self.assertEqual((source / "save.dat").read_bytes(), b"keep-save")
+            self.assertFalse(games_dir.exists())
+
+    def test_shader_cache_pruning_revalidates_stale_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            games_dir = root / "Games"
+            apps_dir = root / "applications"
+            source = games_dir / "My Game"
+            source.mkdir(parents=True)
+            exe = source / "game.exe"
+            exe.write_bytes(b"MZ")
+            with (
+                mock.patch.object(standalone, "get_games_dir", return_value=games_dir),
+                mock.patch.object(standalone, "get_applications_dir", return_value=apps_dir),
+                mock.patch.object(standalone, "resolve_game_icon", return_value=None),
+            ):
+                cache = standalone.get_game_cache_dir(source)
+                cache.mkdir(parents=True)
+                (cache / "existing.cache").write_bytes(b"keep-cache")
+                stale_entries = standalone.find_orphan_shader_caches(games_dir)
+                self.assertEqual(len(stale_entries), 1)
+                standalone.install_standalone_game(
+                    "My Game", exe, source, keep_in_place=True, create_menu_shortcut=False
+                )
+                self.assertEqual(
+                    standalone.prune_orphan_shader_caches(stale_entries, games_dir), (0, 0)
+                )
+                self.assertEqual((cache / "existing.cache").read_bytes(), b"keep-cache")
+
     def test_standalone_lifecycle_in_temp_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

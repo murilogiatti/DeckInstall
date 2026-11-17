@@ -703,6 +703,9 @@ def _write_saves_zip_atomic(
     prefix_dir: Path,
     target_zip: Path,
     key_prefix: str,
+    game_name: str = "",
+    game_dir: Path | None = None,
+    steam_appid: int | None = None,
 ) -> int:
     """Write prefix saves to target_zip atomically; return count of backed-up files."""
     target_zip.parent.mkdir(parents=True, exist_ok=True)
@@ -713,9 +716,38 @@ def _write_saves_zip_atomic(
     tmp_zip = Path(tmp_name)
     try:
         with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            game_files, _, _ = _write_prefix_saves_to_zip(
+            game_files, _, total_bytes = _write_prefix_saves_to_zip(
                 zf, prefix_dir, key_prefix, 0, 0
             )
+            written = set(zf.namelist())
+            for section, src_file, rel_path in _collect_prefix_save_entries(
+                prefix_dir, game_name=game_name, game_dir=game_dir, steam_appid=steam_appid
+            ):
+                arcname = f"{key_prefix}/{section}/{rel_path.as_posix()}"
+                if arcname in written:
+                    continue
+                if game_files + 1 > _RESTORE_MAX_ENTRIES:
+                    raise RuntimeError(f"Snapshot exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})")
+                sfd = os.open(str(src_file), os.O_RDONLY | os.O_NOFOLLOW)
+                copied = 0
+                with os.fdopen(sfd, "rb") as src_fh, zf.open(arcname, "w") as dst_fh:
+                    while chunk := src_fh.read(65536):
+                        copied += len(chunk)
+                        total_bytes += len(chunk)
+                        if copied > _RESTORE_MAX_FILE_BYTES or total_bytes > _RESTORE_MAX_TOTAL_BYTES:
+                            raise RuntimeError(f"Snapshot size limit exceeded on {src_file.name}")
+                        dst_fh.write(chunk)
+                game_files += 1
+                written.add(arcname)
+
+            reg_bytes = _extract_manifest_reg_bytes(prefix_dir, game_name, steam_appid)
+            if reg_bytes:
+                if game_files + 1 > _RESTORE_MAX_ENTRIES:
+                    raise RuntimeError(f"Snapshot exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})")
+                if len(reg_bytes) > _RESTORE_MAX_FILE_BYTES or total_bytes + len(reg_bytes) > _RESTORE_MAX_TOTAL_BYTES:
+                    raise RuntimeError("Snapshot size limit exceeded on registry.json")
+                zf.writestr(f"{key_prefix}/registry/registry.json", reg_bytes)
+                game_files += 1
         if game_files == 0:
             try:
                 tmp_zip.unlink()
@@ -739,6 +771,8 @@ def snapshot_prefix_saves(
     key_prefix: str = "snap",
     dest_root: Path | None = None,
     max_keep: int = 5,
+    game_dir: Path | None = None,
+    steam_appid: int | None = None,
 ) -> Path | None:
     """Create a rotated pre-operation ZIP snapshot of prefix saves."""
     if not prefix_dir.is_dir():
@@ -755,7 +789,10 @@ def snapshot_prefix_saves(
             counter += 1
         target_zip = snap_dir / f"{stamp}-{safe_reason}-{counter}.zip"
 
-    written = _write_saves_zip_atomic(prefix_dir, target_zip, key_prefix)
+    written = _write_saves_zip_atomic(
+        prefix_dir, target_zip, key_prefix, game_name=game_name,
+        game_dir=game_dir, steam_appid=steam_appid,
+    )
     if written == 0:
         return None
     _rotate_snapshots(snap_dir, max_keep)
@@ -1203,16 +1240,44 @@ def pull_game_saves(
         game_name,
         "pre-sync-pull",
         dest_root=snapshots_root,
+        game_dir=game_dir,
+        steam_appid=steam_appid,
     )
 
+    restored_files = _restore_saves_archive(latest_zip, prefix_dir, game_dir, remote_updated_at)
+    return restored_files, snap_path
+
+
+def restore_prefix_saves_snapshot(
+    snapshot_zip: Path,
+    prefix_dir: Path,
+    game_dir: Path | None = None,
+) -> int:
+    """Restore a selected pre-operation snapshot, including manifest game files and registry saves."""
+    if snapshot_zip.is_symlink() or not snapshot_zip.is_file():
+        raise FileNotFoundError(f"Save snapshot not found: {snapshot_zip}")
+    return _restore_saves_archive(snapshot_zip, prefix_dir, game_dir)
+
+
+def _restore_saves_archive(
+    archive_path: Path,
+    prefix_dir: Path,
+    game_dir: Path | None,
+    remote_updated_at: float | None = None,
+) -> int:
+    """Extract bounded save entries into explicitly selected prefix and game roots."""
     drive_c = _resolve_drive_c_target(prefix_dir)
+    if not _safe_parents_within(
+        prefix_dir, prefix_dir.resolve(), drive_c.relative_to(prefix_dir).parts
+    ):
+        raise OSError(f"Unsafe target drive_c path: {drive_c}")
     drive_c.mkdir(parents=True, exist_ok=True)
     drive_c_resolved = drive_c.resolve()
     game_dir_resolved = game_dir.resolve() if game_dir is not None and game_dir.is_dir() else None
 
     restored_files = 0
     total_bytes = 0
-    with zipfile.ZipFile(latest_zip, "r") as zf:
+    with zipfile.ZipFile(archive_path, "r") as zf:
         infolist = zf.infolist()
         if len(infolist) > _RESTORE_MAX_ENTRIES:
             raise RuntimeError(
@@ -1224,9 +1289,7 @@ def pull_game_saves(
             # Block symlink entries stored in POSIX zip attributes.
             if stat.S_ISLNK((info.external_attr >> 16) & 0o170000):
                 continue
-            parsed = _parse_sync_zip_entry(
-                info.filename, game_dir=game_dir, steam_appid=steam_appid
-            )
+            parsed = _parse_sync_zip_entry(info.filename, game_dir=game_dir)
             if parsed is None:
                 continue
             section, rel_parts = parsed
@@ -1309,7 +1372,7 @@ def pull_game_saves(
                 raise
             restored_files += 1
 
-    return restored_files, snap_path
+    return restored_files
 
 
 def _read_sync_meta(meta_path: Path) -> dict[str, object] | None:

@@ -17,7 +17,6 @@ import shutil
 import signal
 import stat
 import subprocess
-import sys
 import tarfile
 import tempfile
 import threading
@@ -638,15 +637,20 @@ def _safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:
                     raise RuntimeError("Archive exceeds maximum allowed total uncompressed size.")
             member.mode &= 0o777
             members.append(member)
-        if sys.version_info >= (3, 12):
+        if callable(getattr(tarfile, "data_filter", None)):
             tf.extractall(dest_dir, members=members, filter="data")
         else:
             for member in members:
+                # Earlier archive entries may have introduced links since the
+                # initial inspection. Re-resolve every destination and link
+                # target immediately before extracting on older Python builds.
+                target = (dest_resolved / member.name).resolve()
+                if not target.is_relative_to(dest_resolved):
+                    raise RuntimeError(f"Archive member escapes destination: {member.name}")
                 if member.issym() or member.islnk():
-                    continue
-                parent = (dest_resolved / Path(member.name)).parent
-                if parent.is_symlink():
-                    raise RuntimeError(f"Unsafe symlink parent directory for: {member.name}")
+                    base = target.parent if member.issym() else dest_resolved
+                    if not (base / member.linkname).resolve().is_relative_to(dest_resolved):
+                        raise RuntimeError(f"Unsafe archive link target: {member.linkname}")
                 tf.extract(member, dest_dir)
 
 

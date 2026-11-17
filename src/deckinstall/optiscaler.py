@@ -155,6 +155,8 @@ def inspect_optiscaler_state(exe_path: Path) -> OptiScalerState | None:
         return None
 
     proxy_dll = str(data.get("proxy_dll", "")).strip()
+    if proxy_dll not in OPTISCALER_PROXY_DLLS:
+        return None
     backend = str(data.get("backend", "auto")).strip()
     version = str(data.get("version", "")).strip()
     installed_raw = data.get("installed_files", [])
