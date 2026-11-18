@@ -82,5 +82,9 @@ def test_install_form_has_one_presets_button_with_summary(tmp_path: Path) -> Non
         opts, dll = win._resolve_add_launch_options()
         assert "gamemoderun" in opts and "MANGOHUD=1" in opts and dll == ""
     finally:
-        win._closing_pending = True
+        # Let the window's background workers finish: a QThread alive at interpreter exit segfaults.
+        for w in list(win._active_workers):
+            w.wait(2000)
+        app.processEvents()
+        win._active_workers.clear()
         win.close()
