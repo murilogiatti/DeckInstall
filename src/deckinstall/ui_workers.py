@@ -10,6 +10,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
+from . import classify
+from . import runtime_manager as _rm
 from .app_updater import (
     AppUpdateInfo,
     check_app_update,
@@ -21,10 +23,14 @@ from .artwork import (
     search_steam_games,
 )
 from .extractor import (
+    ToolMissingError,
+    UnarcError,
     extract_archive,
-    is_archive,
+    extract_gog_installer,
+    install_native_sh,
     run_windows_installer,
     sanitize_folder_name,
+    verify_repack_md5,
 )
 from .i18n import tr
 from .library import Library
@@ -42,7 +48,7 @@ from .runtime_manager import (
 )
 from .scanner import (
     DetectedGame,
-    detect_exe_kind,
+    is_native_linux_exe,
     scan_all_games,
 )
 from .standalone import install_standalone_game
@@ -74,11 +80,21 @@ class ExtractWorker(QThread):
     cancelled = Signal()
     failed = Signal(str)
 
-    def __init__(self, source: Path, dest_root: Path, folder_name: str) -> None:
+    def __init__(
+        self,
+        source: Path,
+        dest_root: Path,
+        folder_name: str,
+        silent: bool = False,
+        verify_md5: bool = False,
+    ) -> None:
         super().__init__()
         self.source = source
         self.dest_root = dest_root
         self.folder_name = folder_name
+        self.silent = silent
+        self.verify_md5 = verify_md5
+        self.kind = ""
         self._cancel_event = threading.Event()
 
     def cancel(self) -> None:
@@ -88,31 +104,86 @@ class ExtractWorker(QThread):
     def _is_cancelled(self) -> bool:
         return self._cancel_event.is_set() or self.isInterruptionRequested()
 
+    def _check_md5(self, folder: Path) -> None:
+        self.progress.emit(5, tr("install.md5_checking"))
+        checked, problems = verify_repack_md5(
+            folder, on_progress=lambda p, msg: self.progress.emit(p, msg), cancel_flag=self._is_cancelled
+        )
+        if checked == 0:
+            self.progress.emit(10, tr("install.md5_none"))
+        elif problems:
+            raise RuntimeError(tr("install.md5_failed", count=len(problems), items="\n".join(problems[:10])))
+        else:
+            self.progress.emit(10, tr("install.md5_ok", count=checked))
+
+    def _run_installer(self, installer: Path, repack: bool = False) -> Path:
+        self.progress.emit(20, tr("install.running_installer", name=installer.name))
+        out = run_windows_installer(
+            installer,
+            self.dest_root / sanitize_folder_name(self.folder_name),
+            on_log=lambda msg: self.progress.emit(50, msg),
+            cancel_flag=self._is_cancelled,
+            repack=repack,
+            silent=self.silent,
+        )
+        self.progress.emit(100, tr("install.installer_done", out=out))
+        return out
+
     def run(self) -> None:
         try:
-            if is_archive(self.source):
+            info = classify.classify_source(self.source)
+            self.kind = info.kind
+            on_progress = lambda p, msg: self.progress.emit(p, msg)  # noqa: E731
+            if info.kind == classify.ARCHIVE:
                 out = extract_archive(
                     self.source,
                     self.dest_root,
                     self.folder_name,
-                    on_progress=lambda p, msg: self.progress.emit(p, msg),
+                    on_progress=on_progress,
                     cancel_flag=self._is_cancelled,
                 )
-            elif self.source.suffix.lower() == ".exe":
-                self.progress.emit(20, tr("install.running_installer", name=self.source.name))
-                out = run_windows_installer(
+            elif info.kind == classify.GOG_SETUP and info.installer is not None:
+                try:
+                    out = extract_gog_installer(
+                        info.installer,
+                        self.dest_root,
+                        self.folder_name,
+                        on_progress=on_progress,
+                        cancel_flag=self._is_cancelled,
+                    )
+                except ToolMissingError:
+                    self.progress.emit(10, tr("install.gog_no_innoextract"))
+                    out = self._run_installer(info.installer)
+                except RuntimeError as exc:
+                    if self._is_cancelled():
+                        raise
+                    self.progress.emit(10, tr("install.gog_innoextract_failed", err=str(exc)))
+                    out = self._run_installer(info.installer)
+            elif info.kind == classify.REPACK and info.installer is not None:
+                if self.verify_md5:
+                    self._check_md5(info.installer.parent)
+                out = self._run_installer(info.installer, repack=True)
+            elif info.kind == classify.INSTALLER and info.installer is not None:
+                out = self._run_installer(info.installer)
+            elif info.kind == classify.NATIVE_SH:
+                out = install_native_sh(
                     self.source,
-                    self.dest_root / sanitize_folder_name(self.folder_name),
-                    on_log=lambda msg: self.progress.emit(50, msg),
+                    self.dest_root,
+                    self.folder_name,
+                    on_progress=on_progress,
                     cancel_flag=self._is_cancelled,
                 )
-                self.progress.emit(100, tr("install.installer_done", out=out))
             else:
                 raise RuntimeError(tr("install.unsupported_format", name=self.source.name))
             if self._is_cancelled():
                 self.cancelled.emit()
                 return
             self.finished_ok.emit(str(out))
+        except UnarcError as exc:
+            if self._is_cancelled():
+                self.cancelled.emit()
+            else:
+                self.failed.emit(tr("install.unarc_error", code=exc.code or "?"))
         except Exception as exc:
             if self._is_cancelled():
                 self.cancelled.emit()
@@ -437,6 +508,9 @@ class RuntimeUpdateWorker(QThread):
                 if opti_ver and opti_ver != old_opti_ver:
                     any_updated = True
 
+            self.status.emit(tr("runtime.umu_db_updating"))
+            if _rm.ensure_umu_database(force_update=True) is None:
+                logging.warning("umu-database.csv could not be downloaded")
             bwrap_warn = check_ubuntu_bwrap_userns() or ""
             msg = (
                 tr("runtime.updated", umu=umu_path.name, proton=ge_path.name)
@@ -523,12 +597,14 @@ class StandaloneInstallWorker(QThread):
 
     def run(self) -> None:
         try:
-            is_native = detect_exe_kind(self.exe_path) == "linux_elf"
+            is_native = is_native_linux_exe(self.exe_path)
             if is_native:
                 proton_name = ""
             else:
                 self.status.emit(tr("add.preparing_runtime"))
                 ensure_umu_run(progress_cb=lambda msg, _pct: self.status.emit(msg))
+                # Best effort: GAMEID/STORE lookups (protonfixes) need the umu-database.
+                _rm.ensure_umu_database(timeout=15)
                 ge_dir = ensure_ge_proton11(progress_cb=lambda msg, _pct: self.status.emit(msg))
                 proton_name = ge_dir.name
 

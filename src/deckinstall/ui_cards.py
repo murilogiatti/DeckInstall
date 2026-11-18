@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
 
 from .extractor import InsufficientSpaceError
 from .i18n import tr
-from .scanner import detect_exe_kind
+from .scanner import is_native_linux_exe
 from .steam_paths import is_gamescope_session
 from .steam_vdf import CleanupCandidate, _strip_vdf_quotes
 
@@ -469,7 +469,7 @@ def _is_native_linux_game(kind: str, obj: object) -> bool:
     if kind == "external" and str(getattr(obj, "runner", "")) == "linux":
         return True
     exe_path = _resolve_game_exe_path(kind, obj)
-    return exe_path is not None and exe_path.is_file() and detect_exe_kind(exe_path) == "linux_elf"
+    return exe_path is not None and exe_path.is_file() and is_native_linux_exe(exe_path)
 
 
 def _setting_bool(settings: QSettings, key: str, default: bool = False) -> bool:

@@ -12,7 +12,7 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from deckinstall import library, save_sync, standalone  # noqa: E402
+from deckinstall import library, runtime_manager, save_sync, standalone  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -30,5 +30,8 @@ def _isolated_libraries(tmp_path_factory: pytest.TempPathFactory, monkeypatch: p
     ):
         monkeypatch.setattr(standalone, attr, value)
     monkeypatch.setattr(standalone, "APPLICATIONS_DIR", base / "home" / ".local" / "share" / "applications")
+    # No network in tests, and never read the real umu-database cache.
+    monkeypatch.setattr(runtime_manager, "ensure_umu_database", lambda *a, **k: None)
+    monkeypatch.setattr(runtime_manager, "get_umu_database_path", lambda: base / "runtime" / "umu-database.csv")
     monkeypatch.setattr(save_sync, "DEFAULT_SNAPSHOTS_DIR", base / "home" / "Games" / "saves" / "snapshots")
     yield

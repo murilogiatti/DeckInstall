@@ -47,7 +47,7 @@ from .manifest import (
     read_manifest_fields,
     write_manifest_v2,
 )
-from .scanner import detect_steam_appid
+from .scanner import detect_steam_appid, detect_steam_emulator, gog_product_id
 from .steam_paths import (
     SteamPaths,
     dir_size_bytes,
@@ -310,11 +310,19 @@ def resolve_umu_game_id(
     exe_path: Path | None = None,
     game_title: str = "",
     db_path: Path | None = None,
+    codename: str = "",
 ) -> tuple[str, str]:
-    """Return (GAMEID, STORE) for umu-run given an optional Steam AppID and store name."""
+    """Return (GAMEID, STORE) for umu-run given an optional Steam AppID, store and store id."""
     cleaned_store = store.strip()
     if isinstance(steam_appid, int) and not isinstance(steam_appid, bool) and steam_appid > 0:
         return f"umu-{steam_appid}", cleaned_store or "steam"
+
+    if codename.strip() and cleaned_store:
+        from .runtime_manager import lookup_umu_codename
+
+        by_id = lookup_umu_codename(codename, cleaned_store, db_path=db_path)
+        if by_id is not None and by_id.umu_id.strip():
+            return by_id.umu_id.strip(), cleaned_store
 
     if exe_path is not None or game_title.strip():
         from .runtime_manager import lookup_umu_database
@@ -389,6 +397,37 @@ def _quote_game_arg(arg: str) -> str:
     return shlex.quote(arg)
 
 
+def _store_of(game: StandaloneGame) -> str:
+    return str((game.meta.get("source") or {}).get("store") or "")
+
+
+def _codename_of(game: StandaloneGame) -> str:
+    return str((game.meta.get("source") or {}).get("codename") or "")
+
+
+def merge_dll_overrides(user: str, extra: str) -> str:
+    """Add the extra WINEDLLOVERRIDES entries the user did not set already (user entries win)."""
+    from .steam_vdf import merge_winedlloverride
+
+    def names(spec: str) -> set[str]:
+        out: set[str] = set()
+        for entry in spec.split(";"):
+            part = entry.split("=", 1)[0]
+            out.update(n.strip().lower().removesuffix(".dll") for n in part.split(",") if n.strip())
+        return out
+
+    taken = names(user)
+    merged = user.strip()
+    for entry in extra.split(";"):
+        if not entry.strip():
+            continue
+        dll, _, mode = entry.partition("=")
+        if dll.strip().lower() in taken:
+            continue
+        merged = merge_winedlloverride(merged, dll.strip(), mode.strip() or "n,b")
+    return merged
+
+
 def _write_launch_script(
     script_path: Path,
     exe_path: Path,
@@ -400,6 +439,8 @@ def _write_launch_script(
     steam_appid: int | None = None,
     game_name: str = "",
     cache_dir: Path | None = None,
+    store: str = "",
+    codename: str = "",
 ) -> None:
     """Generate an executable launch.sh script invoking umu-run or a native Linux binary."""
     env_pairs, wrappers, game_args, effective_dll = _parse_launch_tokens(
@@ -417,8 +458,10 @@ def _write_launch_script(
         proton_path = _resolve_proton_path(proton_name)
         game_id, store = resolve_umu_game_id(
             steam_appid,
+            store=store,
             exe_path=exe_path,
             game_title=game_name,
+            codename=codename,
         )
         lines.extend([
             f"export WINEPREFIX={shlex.quote(str(prefix_dir))}",
@@ -945,6 +988,8 @@ def refresh_integration_files(game: StandaloneGame) -> None:
         steam_appid=game.steam_appid,
         game_name=game.name,
         cache_dir=game.cache_dir,
+        store=_store_of(game),
+        codename=_codename_of(game),
     )
     targets = [(game.desktop_file, False)]
     if game.desktop_shortcut is not None:
@@ -963,6 +1008,25 @@ def refresh_integration_files(game: StandaloneGame) -> None:
             executable=executable,
             startup_wm_class=_startup_wm_class(game),
         )
+
+
+def change_standalone_exe(game_dir: Path, new_exe: Path) -> StandaloneGame:
+    """Point a game at another executable inside its folder and rewrite its launchers."""
+    from .scanner import is_native_linux_exe
+
+    manifest = find_manifest(game_dir)
+    game = _load_manifest(manifest) if manifest is not None else None
+    if game is None:
+        raise FileNotFoundError(f"Standalone manifest not found in {game_dir}")
+    if not new_exe.is_file() or not is_within(new_exe, game.game_dir, strict=True):
+        raise ValueError(f"The executable must be a file inside the game folder: {new_exe}")
+    native = is_native_linux_exe(new_exe)
+    if native != game.native_linux:
+        raise ValueError("Switching between a Windows and a Linux executable needs a new install.")
+    game.exe_path = new_exe
+    refresh_integration_files(game)
+    _write_manifest(game)
+    return game
 
 
 def _write_manifest(game: StandaloneGame) -> Path:
@@ -1171,6 +1235,16 @@ def install_standalone_game(
     )
 
     cache_dir = caches_dir / uid if caches_dir is not None else get_game_cache_dir(target_game_dir)
+    source_meta = dict(source or {})
+    emulator = ""
+    if not native_linux:
+        emulator, emu_overrides = detect_steam_emulator(target_exe_path, target_game_dir)
+        if emu_overrides:
+            winedlloverrides = merge_dll_overrides(winedlloverrides, emu_overrides)
+        gog_id = gog_product_id(target_game_dir)
+        if gog_id and not source_meta.get("store"):
+            source_meta["store"] = "gog"
+            source_meta["codename"] = gog_id
     icons: list[Path] = []
     if (
         resolved_icon is not None
@@ -1196,10 +1270,11 @@ def install_standalone_game(
         schema=2,
         meta={
             "created_at": created_at or now_iso(),
-            "source": dict(source or {}),
+            "source": source_meta,
             "proton_mode": "pinned" if (proton_name.strip() and not native_linux) else "default",
             "prefix_location": prefix_location,
             "icons": icons,
+            **({"emulator": emulator} if emulator else {}),
         },
     )
 
@@ -1214,6 +1289,8 @@ def install_standalone_game(
         steam_appid=game.steam_appid,
         game_name=game.name,
         cache_dir=game.cache_dir,
+        store=_store_of(game),
+        codename=_codename_of(game),
     )
     startup_wm_class = _startup_wm_class(game)
 
@@ -1407,6 +1484,8 @@ def update_standalone_launch_options(
         steam_appid=game.steam_appid,
         game_name=game.name,
         cache_dir=game.cache_dir,
+        store=_store_of(game),
+        codename=_codename_of(game),
     )
     _write_manifest(game)
     return game

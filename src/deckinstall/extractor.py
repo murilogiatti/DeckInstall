@@ -16,7 +16,7 @@ from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
 from . import runtime_manager
-from .fsutil import copy_dir_no_symlinks
+from .fsutil import copy_dir_no_symlinks, move_dir_safely
 from .scanner import clean_game_name
 from .steam_paths import find_proton_binary, find_steam_root
 
@@ -80,7 +80,7 @@ def estimate_archive_uncompressed_size(archive: Path) -> int:
             with zipfile.ZipFile(archive, "r") as zf:
                 infos = zf.infolist()
                 if len(infos) > _MAX_ARCHIVE_ENTRIES:
-                    return _MAX_ARCHIVE_TOTAL_BYTES + 1
+                    return archive_set_size(archive) * 2
                 total = sum(info.file_size for info in infos)
                 if total > 0:
                     return total
@@ -89,14 +89,14 @@ def estimate_archive_uncompressed_size(archive: Path) -> int:
                 total = 0
                 for idx, member in enumerate(tf):
                     if idx >= _MAX_ARCHIVE_ENTRIES:
-                        return _MAX_ARCHIVE_TOTAL_BYTES + 1
+                        return archive_set_size(archive) * 2
                     if member.isfile():
                         total += max(0, int(member.size))
                 if total > 0:
                     return total
     except (OSError, zipfile.BadZipFile, tarfile.TarError, EOFError, ValueError):
         pass
-    return archive.stat().st_size * 2
+    return archive_set_size(archive) * 2
 
 
 def is_archive(path: Path) -> bool:
@@ -146,11 +146,52 @@ def _select_extract_cmd(archive: Path, out_dir: Path) -> list[str]:
     raise RuntimeError(f"No extraction tool found for: {archive.name}")
 
 
-_MAX_ZIP_FILE_BYTES = 1024 * 1024 * 1024  # 1 GiB per-file limit
-_MAX_ZIP_TOTAL_BYTES = 4 * 1024 * 1024 * 1024  # 4 GiB total uncompressed limit
 _MAX_ARCHIVE_ENTRIES = 50_000
-_MAX_ARCHIVE_FILE_BYTES = _MAX_ZIP_FILE_BYTES
-_MAX_ARCHIVE_TOTAL_BYTES = _MAX_ZIP_TOTAL_BYTES
+# Zip-bomb guard: the declared uncompressed size may be at most this many times the size of
+# the archive (all its parts). Game data compresses far less; bombs go well past 1000x.
+MAX_COMPRESSION_RATIO = 100
+_MIN_SIZE_BUDGET = 256 * 1024 * 1024
+# Fixed limits (bytes) instead of the ratio; None = derive from the archive. Tests override these.
+_MAX_ARCHIVE_FILE_BYTES: int | None = None
+_MAX_ARCHIVE_TOTAL_BYTES: int | None = None
+_SPLIT_PART_RE = re.compile(r"^(?P<base>.+?)(?:\.part\d+\.rar|\.(?:7z|zip|rar)\.\d{3}|\.\d{3})$", re.IGNORECASE)
+
+
+def archive_parts(archive: Path) -> list[Path]:
+    """All volumes of a split archive (game.part1.rar, game.7z.001, ...), or just the archive."""
+    m = _SPLIT_PART_RE.match(archive.name)
+    if not m:
+        return [archive]
+    base = m.group("base")
+    low = archive.name.lower()
+    if re.search(r"\.part\d+\.rar$", low):
+        pattern = re.compile(re.escape(base) + r"\.part\d+\.rar$", re.IGNORECASE)
+    else:
+        suffix = re.search(r"((?:\.(?:7z|zip|rar))?)\.\d{3}$", archive.name, re.IGNORECASE)
+        ext = suffix.group(1) if suffix else ""
+        pattern = re.compile(re.escape(base + ext) + r"\.\d{3}$", re.IGNORECASE)
+    parts = sorted(p for p in archive.parent.iterdir() if p.is_file() and not p.is_symlink() and pattern.match(p.name))
+    return parts or [archive]
+
+
+def archive_set_size(archive: Path) -> int:
+    """Total size of an archive and all of its split volumes."""
+    return sum(p.stat().st_size for p in archive_parts(archive))
+
+
+def _archive_limits(archive: Path) -> tuple[int, int]:
+    """(per-file limit, total limit) for the uncompressed contents of archive."""
+    ratio_budget = max(archive_set_size(archive) * MAX_COMPRESSION_RATIO, _MIN_SIZE_BUDGET)
+    total = _MAX_ARCHIVE_TOTAL_BYTES if _MAX_ARCHIVE_TOTAL_BYTES is not None else ratio_budget
+    per_file = _MAX_ARCHIVE_FILE_BYTES if _MAX_ARCHIVE_FILE_BYTES is not None else total
+    return per_file, total
+
+
+def _too_big_error(total: int) -> RuntimeError:
+    return RuntimeError(
+        "Archive exceeds maximum allowed total uncompressed size "
+        f"({total / (1024 ** 3):.1f} GiB declared; more than {MAX_COMPRESSION_RATIO}x the archive size)."
+    )
 _TAR_SUFFIXES = (".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.zst", ".tar.bz2", ".tar")
 
 
@@ -163,12 +204,14 @@ def _extract_zip_safe(
     """Extract a .zip archive using Python zipfile with strict path-traversal and size limits."""
     dest_resolved = dest_dir.resolve()
     total_written = 0
+    max_file, max_total = _archive_limits(archive)
     with zipfile.ZipFile(archive, "r") as zf:
         infos = zf.infolist()
         if len(infos) > _MAX_ARCHIVE_ENTRIES:
             raise RuntimeError("Archive exceeds maximum allowed entry count.")
-        if sum(max(0, info.file_size) for info in infos) > _MAX_ZIP_TOTAL_BYTES:
-            raise RuntimeError("Archive exceeds maximum allowed total uncompressed size.")
+        declared = sum(max(0, info.file_size) for info in infos)
+        if declared > max_total:
+            raise _too_big_error(declared)
         total_entries = max(len(infos), 1)
         for idx, info in enumerate(infos):
             if cancel_flag and cancel_flag():
@@ -192,7 +235,7 @@ def _extract_zip_safe(
                     raise RuntimeError(f"Unsafe symlink at destination directory: {info.filename}")
                 target_path.mkdir(parents=True, exist_ok=True)
             else:
-                if info.file_size > _MAX_ZIP_FILE_BYTES:
+                if info.file_size > max_file:
                     raise RuntimeError(f"Archive member exceeds maximum allowed size: {info.filename}")
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 if target_path.is_symlink():
@@ -207,14 +250,12 @@ def _extract_zip_safe(
                             break
                         file_written += len(chunk)
                         total_written += len(chunk)
-                        if file_written > _MAX_ZIP_FILE_BYTES:
+                        if file_written > max_file or file_written > info.file_size:
                             raise RuntimeError(
                                 f"Archive member exceeds maximum allowed size: {info.filename}"
                             )
-                        if total_written > _MAX_ZIP_TOTAL_BYTES:
-                            raise RuntimeError(
-                                "Archive exceeds maximum allowed total uncompressed size."
-                            )
+                        if total_written > max_total:
+                            raise _too_big_error(total_written)
                         dst.write(chunk)
             if on_progress:
                 pct = min(95, 10 + int(((idx + 1) * 85) / total_entries))
@@ -234,6 +275,7 @@ def _extract_tar_safe(
     """Extract a tar archive streamingly with size/count limits, skipping symlinks/hardlinks/specials."""
     dest_resolved = dest_dir.resolve()
     total_bytes = 0
+    max_file, max_total = _archive_limits(archive)
     has_data_filter = hasattr(tarfile, "data_filter")
     with tarfile.open(archive, "r:*") as tf:
         for idx, member in enumerate(tf):
@@ -258,11 +300,11 @@ def _extract_tar_safe(
             ):
                 continue
             if member.isfile():
-                if member.size > _MAX_ARCHIVE_FILE_BYTES:
+                if member.size > max_file:
                     raise RuntimeError(f"Archive member exceeds maximum allowed size: {member.name}")
                 total_bytes += max(0, int(member.size))
-                if total_bytes > _MAX_ARCHIVE_TOTAL_BYTES:
-                    raise RuntimeError("Archive exceeds maximum allowed total uncompressed size.")
+                if total_bytes > max_total:
+                    raise _too_big_error(total_bytes)
             if has_data_filter:
                 tf.extract(member, dest_dir, filter="data")
             else:
@@ -283,8 +325,9 @@ def _check_unsafe_member_path(raw_path: str) -> None:
         raise RuntimeError(f"Unsafe archive member path: {raw_path}")
 
 
-def _precheck_7z_archive(seven_z_bin: str, archive: Path) -> None:
+def _precheck_7z_archive(seven_z_bin: str, archive: Path) -> int:
     """List .7z/.rar archive via 7z l -slt and abort if symlinks or traversal paths are present."""
+    max_file, max_total = _archive_limits(archive)
     try:
         proc = subprocess.run(
             [seven_z_bin, "l", "-slt", "-p-", "--", str(archive)],
@@ -322,11 +365,11 @@ def _precheck_7z_archive(seven_z_bin: str, archive: Path) -> None:
             _check_unsafe_member_path(val_str)
         elif key_low == "size" and val_str.isdigit():
             size = int(val_str)
-            if size > _MAX_ARCHIVE_FILE_BYTES:
+            if size > max_file:
                 raise RuntimeError(f"Archive member exceeds maximum allowed size: {size}")
             total_bytes += size
-            if total_bytes > _MAX_ARCHIVE_TOTAL_BYTES:
-                raise RuntimeError("Archive exceeds maximum allowed total uncompressed size.")
+            if total_bytes > max_total:
+                raise _too_big_error(total_bytes)
         elif key_low in ("symbolic link", "hard link") and val_str:
             raise RuntimeError(f"Unsafe link in archive {archive.name}: {val_str}")
         elif key_low == "mode" and val_str.startswith("l"):
@@ -338,10 +381,12 @@ def _precheck_7z_archive(seven_z_bin: str, archive: Path) -> None:
                 for tok in tokens
             ):
                 raise RuntimeError(f"Unsafe symlink attribute in archive {archive.name}.")
+    return total_bytes
 
 
-def _precheck_unrar_archive(unrar_bin: str, archive: Path) -> None:
+def _precheck_unrar_archive(unrar_bin: str, archive: Path) -> int:
     """List .rar archive via unrar vt and abort if symlinks or traversal paths are present."""
+    max_file, max_total = _archive_limits(archive)
     try:
         proc = subprocess.run(
             [unrar_bin, "vt", "-p-", "--", str(archive)],
@@ -374,21 +419,23 @@ def _precheck_unrar_archive(unrar_bin: str, archive: Path) -> None:
             _check_unsafe_member_path(val_str)
         elif key_low == "size" and val_str.isdigit():
             size = int(val_str)
-            if size > _MAX_ARCHIVE_FILE_BYTES:
+            if size > max_file:
                 raise RuntimeError(f"Archive member exceeds maximum allowed size: {size}")
             total_bytes += size
-            if total_bytes > _MAX_ARCHIVE_TOTAL_BYTES:
-                raise RuntimeError("Archive exceeds maximum allowed total uncompressed size.")
+            if total_bytes > max_total:
+                raise _too_big_error(total_bytes)
         elif key_low == "type" and ("link" in val_str.lower()):
             raise RuntimeError(f"Unsafe link in archive {archive.name}: {val_str}")
         elif key_low == "target" and val_str:
             raise RuntimeError(f"Unsafe link target in archive {archive.name}: {val_str}")
         elif key_low == "attributes" and val_str.startswith("l"):
             raise RuntimeError(f"Unsafe symlink in archive {archive.name}.")
+    return total_bytes
 
 
-def _precheck_tar_cli_archive(tar_bin: str, archive: Path) -> None:
+def _precheck_tar_cli_archive(tar_bin: str, archive: Path) -> int:
     """List tar archive via `tar -tvf` and abort if symlinks, hardlinks, specials, or traversal exist."""
+    max_file, max_total = _archive_limits(archive)
     try:
         proc = subprocess.run(
             [tar_bin, "-tvf", str(archive)],
@@ -421,19 +468,21 @@ def _precheck_tar_cli_archive(tar_bin: str, archive: Path) -> None:
             continue
         if type_ch != "d" and parts[2].isdigit():
             size = int(parts[2])
-            if size > _MAX_ARCHIVE_FILE_BYTES:
+            if size > max_file:
                 raise RuntimeError(f"Archive member exceeds maximum allowed size: {parts[5]}")
             total_bytes += size
-            if total_bytes > _MAX_ARCHIVE_TOTAL_BYTES:
-                raise RuntimeError("Archive exceeds maximum allowed total uncompressed size.")
+            if total_bytes > max_total:
+                raise _too_big_error(total_bytes)
         entry_part = parts[5]
         if " -> " in entry_part or " link to " in entry_part:
             raise RuntimeError(f"Unsafe link in archive {archive.name}: {entry_part[:120]}")
         _check_unsafe_member_path(entry_part)
+    return total_bytes
 
 
-def _precheck_unzip_archive(unzip_bin: str, archive: Path) -> None:
+def _precheck_unzip_archive(unzip_bin: str, archive: Path) -> int:
     """List zip archive via `unzip -Z -l` (or `-Z -1`) and reject symlinks, oversized entries, and traversal."""
+    max_file, max_total = _archive_limits(archive)
     if zipfile.is_zipfile(archive):
         try:
             with zipfile.ZipFile(archive, "r") as zf:
@@ -441,15 +490,15 @@ def _precheck_unzip_archive(unzip_bin: str, archive: Path) -> None:
                 if len(infos) > _MAX_ARCHIVE_ENTRIES:
                     raise RuntimeError("Archive exceeds maximum allowed entry count.")
                 total_bytes = sum(max(0, info.file_size) for info in infos)
-                if total_bytes > _MAX_ARCHIVE_TOTAL_BYTES:
-                    raise RuntimeError("Archive exceeds maximum allowed total uncompressed size.")
+                if total_bytes > max_total:
+                    raise _too_big_error(total_bytes)
                 for info in infos:
-                    if info.file_size > _MAX_ARCHIVE_FILE_BYTES:
+                    if info.file_size > max_file:
                         raise RuntimeError(f"Archive member exceeds maximum allowed size: {info.filename}")
                     if stat.S_ISLNK(info.external_attr >> 16):
                         raise RuntimeError(f"Unsafe symlink in archive {archive.name}: {info.filename}")
                     _check_unsafe_member_path(info.filename)
-            return
+            return total_bytes
         except zipfile.BadZipFile:
             pass
     try:
@@ -479,18 +528,18 @@ def _precheck_unzip_archive(unzip_bin: str, archive: Path) -> None:
                 if entry_count > _MAX_ARCHIVE_ENTRIES:
                     raise RuntimeError("Archive exceeds maximum allowed entry count.")
                 size = int(parts[3])
-                if size > _MAX_ARCHIVE_FILE_BYTES:
+                if size > max_file:
                     raise RuntimeError(f"Archive member exceeds maximum allowed size: {parts[8]}")
                 total_bytes += size
-                if total_bytes > _MAX_ARCHIVE_TOTAL_BYTES:
-                    raise RuntimeError("Archive exceeds maximum allowed total uncompressed size.")
+                if total_bytes > max_total:
+                    raise _too_big_error(total_bytes)
                 _check_unsafe_member_path(parts[8])
             elif len(parts) == 1:
                 entry_count += 1
                 if entry_count > _MAX_ARCHIVE_ENTRIES:
                     raise RuntimeError("Archive exceeds maximum allowed entry count.")
                 _check_unsafe_member_path(parts[0])
-        return
+        return total_bytes
 
     try:
         proc = subprocess.run(
@@ -513,19 +562,24 @@ def _precheck_unzip_archive(unzip_bin: str, archive: Path) -> None:
         if idx >= _MAX_ARCHIVE_ENTRIES:
             raise RuntimeError("Archive exceeds maximum allowed entry count.")
         _check_unsafe_member_path(raw_line)
+    return 0
 
 
-def _precheck_cli_archive(cmd_bin: str, archive: Path) -> None:
-    """Pre-list CLI-extracted archives to reject symlinks, hardlinks, and path traversal."""
+def _precheck_cli_archive(cmd_bin: str, archive: Path) -> int:
+    """Pre-list CLI-extracted archives to reject symlinks, hardlinks, and path traversal.
+
+    Returns the declared uncompressed size (0 when the listing does not show sizes).
+    """
     bin_name = Path(cmd_bin).name.lower()
     if bin_name.startswith("7z"):
-        _precheck_7z_archive(cmd_bin, archive)
-    elif bin_name == "unrar":
-        _precheck_unrar_archive(cmd_bin, archive)
-    elif bin_name == "tar":
-        _precheck_tar_cli_archive(cmd_bin, archive)
-    elif bin_name == "unzip":
-        _precheck_unzip_archive(cmd_bin, archive)
+        return _precheck_7z_archive(cmd_bin, archive)
+    if bin_name == "unrar":
+        return _precheck_unrar_archive(cmd_bin, archive)
+    if bin_name == "tar":
+        return _precheck_tar_cli_archive(cmd_bin, archive)
+    if bin_name == "unzip":
+        return _precheck_unzip_archive(cmd_bin, archive)
+    return 0
 
 
 def _merge_staging_dir(stage_dir: Path, dest_dir: Path) -> None:
@@ -720,8 +774,14 @@ def extract_archive(
     on_progress: Callable[[int, str], None] | None = None,
     cancel_flag: Callable[[], bool] | None = None,
 ) -> Path:
-    """Extract an archive into dest_root/<game_folder_name> and return the target path."""
-    check_disk_space(dest_root, estimate_archive_uncompressed_size(archive))
+    """Extract an archive into dest_root/<game_folder_name> and return the target path.
+
+    Free space is checked against the uncompressed size the archive declares (zip/tar headers,
+    or the 7z/unrar/tar/unzip listing), falling back to twice the archive size.
+    """
+    low_name = archive.name.lower()
+    if low_name.endswith(".zip") or _is_tar_archive(low_name):
+        check_disk_space(dest_root, estimate_archive_uncompressed_size(archive))
     folder_name = sanitize_folder_name(game_folder_name or suggest_target_name(archive))
     final_dir = dest_root / folder_name
     dest_root.mkdir(parents=True, exist_ok=True)
@@ -746,7 +806,8 @@ def extract_archive(
 
         if not used_python_extractor:
             cmd = _select_extract_cmd(archive, tmp_path)
-            _precheck_cli_archive(cmd[0], archive)
+            declared = _precheck_cli_archive(cmd[0], archive)
+            check_disk_space(dest_root, declared if declared > 0 else archive_set_size(archive) * 2)
 
             proc = subprocess.Popen(
                 cmd,
@@ -815,54 +876,173 @@ def _is_non_game_helper_exe(path: Path) -> bool:
     return any(stem.startswith(prefix) for prefix in _NON_GAME_EXE_PREFIXES)
 
 
+class UnarcError(RuntimeError):
+    """A repack's unarc.dll / ISDone.dll failed while unpacking its data."""
+
+    def __init__(self, code: str, detail: str = "") -> None:
+        self.code = code
+        self.detail = detail
+        super().__init__(f"unarc.dll failed (code {code or '?'}): {detail}".strip())
+
+
+_UNARC_RE = re.compile(r"(unarc\.dll|isdone\.dll).*?(error|failed|returned)", re.IGNORECASE)
+_UNARC_CODE_RE = re.compile(r"code\s*:?\s*(-?\d+)", re.IGNORECASE)
+_SYSTEM_DIRS = {"common files", "internet explorer", "windows media player", "windows nt", "uninstall information"}
+
+
+def to_wine_path(path: Path) -> str:
+    """Map a Linux path to the Z: drive Wine exposes for the filesystem root."""
+    return "Z:" + str(path.resolve()).replace("/", "\\")
+
+
+def installer_arguments(installer_exe: Path, target_dir: Path, silent: bool = False) -> list[str]:
+    """Command-line switches for the installer: Inno Setup gets /DIR= (and /SILENT when asked)."""
+    from .classify import is_inno_setup
+
+    if not is_inno_setup(installer_exe):
+        return []
+    args = [f"/DIR={to_wine_path(target_dir)}"]
+    if silent:
+        args += ["/SP-", "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
+    return args
+
+
+def _installer_prefix_parent(target_dir: Path) -> Path:
+    """Folder for the throwaway installer prefix; never on exFAT/FAT/NTFS, where Wine cannot run."""
+    from .library import NON_UNIX_FS, PREFIXES, fs_type_of, internal_library_root
+
+    parent = target_dir.parent
+    if fs_type_of(parent).lower() in NON_UNIX_FS:
+        parent = internal_library_root() / PREFIXES
+    parent.mkdir(parents=True, exist_ok=True)
+    return parent
+
+
+def _repack_data_size(installer_exe: Path) -> int:
+    total = 0
+    for p in installer_exe.parent.iterdir():
+        if p.is_file() and not p.is_symlink():
+            total += p.stat().st_size
+    return total
+
+
+def _installer_command(
+    installer_exe: Path,
+    args: list[str],
+    tmp_pfx: Path,
+    on_log: Callable[[str], None] | None,
+    cancel_flag: Callable[[], bool] | None,
+) -> tuple[list[str], dict[str, str], Path]:
+    """Return (command, env, wine prefix): Steam Proton, else umu-run + GE-Proton, else system wine."""
+    steam_root = find_steam_root()
+    proton = find_proton_binary(steam_root) if steam_root is not None else None
+    if steam_root is not None and proton is not None:
+        env = os.environ.copy()
+        env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_root)
+        env["STEAM_COMPAT_DATA_PATH"] = str(tmp_pfx)
+        if on_log:
+            on_log(f"Starting {installer_exe.name} via Proton.")
+        return [str(proton), "run", str(installer_exe), *args], env, tmp_pfx / "pfx"
+    if cancel_flag and cancel_flag():
+        raise RuntimeError("Installer cancelled by user.")
+    try:
+        umu_run = runtime_manager.ensure_umu_run()
+        resolved_proton = runtime_manager.ensure_ge_proton11()
+        runtime_manager.validate_steamrt4_integrity()
+        env = runtime_manager.build_umu_env(tmp_pfx, resolved_proton)
+        if on_log:
+            on_log(f"Starting {installer_exe.name} via umu-run.")
+        return [str(umu_run), str(installer_exe), *args], env, tmp_pfx
+    except Exception as exc:
+        wine = shutil.which("wine")
+        if wine is None:
+            raise
+        logging.warning("umu-run/GE-Proton unavailable (%s); using system wine", exc)
+        env = os.environ.copy()
+        env["WINEPREFIX"] = str(tmp_pfx)
+        if on_log:
+            on_log(f"umu-run is unavailable ({exc}); starting {installer_exe.name} with the system wine.")
+        return [wine, str(installer_exe), *args], env, tmp_pfx
+
+
+def _adopt_from_drive_c(drive_c: Path, target_dir: Path) -> bool:
+    """Move a game the installer put inside the prefix (ignoring /DIR=) into target_dir."""
+    picked: list[Path] = []
+    fallback: list[Path] = []
+    for sub in ("Games", "GOG Games", "Program Files", "Program Files (x86)"):
+        base = drive_c / sub
+        if not base.is_dir() or base.is_symlink():
+            continue
+        for cand in base.iterdir():
+            if cand.is_symlink() or not cand.is_dir() or cand.name.lower() in _SYSTEM_DIRS:
+                continue
+            new_exes = [p for p in _collect_regular_files(cand) if p.suffix.lower() == ".exe"]
+            if not new_exes:
+                continue
+            if any(not _is_non_game_helper_exe(p) for p in new_exes):
+                picked.append(cand)
+            else:
+                fallback.append(cand)
+    for cand in picked or fallback:
+        dest = target_dir / cand.name
+        if dest.exists() or dest.is_symlink():
+            copy_dir_no_symlinks(cand, dest)
+        else:
+            move_dir_safely(cand, dest)
+    return bool(picked or fallback)
+
+
 def run_windows_installer(
     installer_exe: Path,
     target_dir: Path,
     on_log: Callable[[str], None] | None = None,
     cancel_flag: Callable[[], bool] | None = None,
+    *,
+    repack: bool = False,
+    silent: bool = False,
+    keep_prefix: bool | None = None,
 ) -> Path:
-    """Run a Windows setup.exe using Steam's Proton or umu-run in a disposable prefix."""
-    check_disk_space(target_dir, max(installer_exe.stat().st_size * 2, 512 * 1024 * 1024))
-    steam_root = find_steam_root()
-    proton = find_proton_binary(steam_root) if steam_root is not None else None
-    use_steam_proton = steam_root is not None and proton is not None
+    """Run a Windows installer in a throwaway prefix and return the folder holding the game.
+
+    Inno Setup installers (GOG, FitGirl/DODI repacks) get /DIR= pointing at target_dir, so the
+    game lands in the library directly; if the installer ignores it, the game is moved out of
+    the prefix's drive_c. Repacks get twice their size checked, WINE_LARGE_ADDRESS_AWARE=0 while
+    installing, a specific error when unarc.dll fails, and their installer prefix is discarded.
+    Other installers keep it as .deckinstall_installer_pfx (adopted when added to Steam).
+    """
+    data_size = _repack_data_size(installer_exe) if repack else installer_exe.stat().st_size
+    check_disk_space(target_dir, max(data_size * 2, 512 * 1024 * 1024))
+    keep = (not repack) if keep_prefix is None else keep_prefix
+    args = installer_arguments(installer_exe, target_dir, silent=silent)
 
     target_dir.mkdir(parents=True, exist_ok=True)
     pre_existing = _collect_regular_files(target_dir)
-    with tempfile.TemporaryDirectory(prefix="deckinstall_pfx_", dir=str(target_dir.parent)) as tmp_pfx:
-        def _handle_inst_line(line: str) -> None:
-            if on_log and line.strip():
-                on_log(line.strip()[:140])
+    with tempfile.TemporaryDirectory(prefix="deckinstall_pfx_", dir=str(_installer_prefix_parent(target_dir))) as tmp:
+        tmp_pfx = Path(tmp)
+        cmd, env, inst_pfx = _installer_command(installer_exe, args, tmp_pfx, on_log, cancel_flag)
+        if repack:
+            env["WINE_LARGE_ADDRESS_AWARE"] = "0"
+        if on_log:
+            on_log(
+                f"Destination: {to_wine_path(target_dir)}"
+                if args
+                else f"Tip: in the installer, set destination to {to_wine_path(target_dir)}"
+            )
+        unarc_hits: list[str] = []
 
-        if use_steam_proton:
-            env = os.environ.copy()
-            env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_root)
-            env["STEAM_COMPAT_DATA_PATH"] = tmp_pfx
+        def _handle_inst_line(line: str) -> None:
+            text = line.strip()
+            if not text:
+                return
+            if _UNARC_RE.search(text):
+                code = _UNARC_CODE_RE.search(text)
+                unarc_hits.append(code.group(1) if code else "")
             if on_log:
-                on_log(
-                    f"Starting {installer_exe.name} via Proton.\n"
-                    f"Tip: in the installer, set destination to Z:{target_dir}"
-                )
-            cmd = [str(proton), "run", str(installer_exe)]
-            inst_pfx = Path(tmp_pfx) / "pfx"
-        else:
-            if cancel_flag and cancel_flag():
-                raise RuntimeError("Installer cancelled by user.")
-            umu_run = runtime_manager.ensure_umu_run()
-            resolved_proton = runtime_manager.ensure_ge_proton11()
-            runtime_manager.validate_steamrt4_integrity()
-            env = runtime_manager.build_umu_env(Path(tmp_pfx), resolved_proton)
-            if on_log:
-                on_log(
-                    f"Starting {installer_exe.name} via umu-run.\n"
-                    f"Tip: in the installer, set destination to Z:{target_dir}"
-                )
-            cmd = [str(umu_run), str(installer_exe)]
-            inst_pfx = Path(tmp_pfx)
+                on_log(text[:140])
 
         proc = subprocess.Popen(
             cmd,
-            cwd=str(tmp_pfx),
+            cwd=str(installer_exe.parent),
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -870,53 +1050,255 @@ def run_windows_installer(
             start_new_session=True,
         )
         rc = _drain_stream_lines(proc, cancel_flag, _handle_inst_line, "Installer cancelled by user.")
+        if unarc_hits:
+            code = next((c for c in unarc_hits if c), "")
+            raise UnarcError(code, f"installer exit code {rc}")
         if rc != 0:
+            if repack:
+                raise UnarcError("", f"installer exit code {rc}")
             raise RuntimeError(f"Installer exited with code {rc}.")
 
-        has_installed = bool(_collect_regular_files(target_dir) - pre_existing)
-        if not has_installed:
-            drive_c = inst_pfx / "drive_c"
-            copied_any = False
-            fallback_candidates: list[Path] = []
-            for sub in ("Games", "GOG Games", "Program Files", "Program Files (x86)"):
-                base = drive_c / sub
-                if not base.is_dir() or base.is_symlink():
-                    continue
-                for cand in base.iterdir():
-                    if cand.is_symlink() or not cand.is_dir() or cand.name.lower() in {
-                        "common files",
-                        "internet explorer",
-                        "windows media player",
-                        "windows nt",
-                        "uninstall information",
-                    }:
-                        continue
-                    new_exes = [
-                        p for p in _collect_regular_files(cand) if p.suffix.lower() == ".exe"
-                    ]
-                    if not new_exes:
-                        continue
-                    game_exes = [p for p in new_exes if not _is_non_game_helper_exe(p)]
-                    if game_exes:
-                        copy_dir_no_symlinks(cand, target_dir / cand.name)
-                        copied_any = True
-                    else:
-                        fallback_candidates.append(cand)
-            if not copied_any and fallback_candidates:
-                for cand in fallback_candidates:
-                    copy_dir_no_symlinks(cand, target_dir / cand.name)
-                copied_any = True
-            if not copied_any:
+        if not (_collect_regular_files(target_dir) - pre_existing):
+            if not _adopt_from_drive_c(inst_pfx / "drive_c", target_dir):
                 raise RuntimeError(
                     f"No files were installed in {target_dir}. "
-                    "Point the installer to Z:" + str(target_dir)
+                    f"Point the installer to {to_wine_path(target_dir)}"
                 )
-        if (inst_pfx / "drive_c").is_dir() and not inst_pfx.is_symlink():
-            saved_pfx = target_dir / ".deckinstall_installer_pfx"
+        game_root = game_root_from_new_files(target_dir, _collect_regular_files(target_dir) - pre_existing)
+        saved_pfx = target_dir / ".deckinstall_installer_pfx"
+        if keep and (inst_pfx / "drive_c").is_dir() and not inst_pfx.is_symlink():
             if saved_pfx.is_symlink():
                 saved_pfx.unlink()
             elif saved_pfx.exists():
                 shutil.rmtree(saved_pfx, ignore_errors=True)
             if not saved_pfx.exists() and not saved_pfx.is_symlink():
                 copy_dir_no_symlinks(inst_pfx, saved_pfx)
+    return game_root
+
+
+def game_root_from_new_files(target_dir: Path, new_files: set[Path]) -> Path:
+    """Folder holding what an installer just wrote: target_dir, or its only new subfolder."""
+    tops: set[str] = set()
+    for f in new_files:
+        try:
+            parts = f.relative_to(target_dir).parts
+        except ValueError:
+            continue
+        if len(parts) == 1:
+            return target_dir  # files at the top level: target_dir is the game folder
+        tops.add(parts[0])
+    if len(tops) == 1:
+        only = target_dir / next(iter(tops))
+        if only.is_dir() and not only.is_symlink():
+            return only
     return target_dir
+
+
+def _native_install_roots() -> list[Path]:
+    """Folders where Linux .sh installers usually put games when run without a destination."""
+    home = Path.home()
+    return [home / "GOG Games", home / "Games", home]
+
+
+def _child_dirs(roots: list[Path]) -> set[Path]:
+    out: set[Path] = set()
+    for root in roots:
+        try:
+            out.update(p for p in root.iterdir() if p.is_dir() and not p.is_symlink())
+        except OSError:
+            continue
+    return out
+
+
+def verify_repack_md5(
+    folder: Path,
+    on_progress: Callable[[int, str], None] | None = None,
+    cancel_flag: Callable[[], bool] | None = None,
+) -> tuple[int, list[str]]:
+    """Check a repack against its .md5 lists (FitGirl ships MD5/*.md5). Returns (checked, problems).
+
+    Paths in the lists may be relative to the list or to the repack folder and use backslashes;
+    entries pointing outside the repack folder are ignored.
+    """
+    import hashlib
+
+    root = folder.resolve()
+    lists = [p for p in (*folder.glob("*.md5"), *folder.glob("MD5/*.md5")) if p.is_file() and not p.is_symlink()]
+    entries: list[tuple[str, Path, str]] = []
+    for md5_file in lists:
+        for raw in md5_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if not line or line.startswith(";"):
+                continue
+            m = re.match(r"^([0-9a-fA-F]{32})\s+\*?(.+)$", line)
+            if not m:
+                continue
+            rel = m.group(2).strip().replace("\\", "/")
+            target: Path | None = None
+            for base in (md5_file.parent, folder):
+                cand = (base / rel).resolve()
+                if cand.is_file() and (cand == root or root in cand.parents):
+                    target = cand
+                    break
+            entries.append((m.group(1).lower(), target or (folder / rel), rel))
+    total = sum(t.stat().st_size for _, t, _ in entries if t.is_file()) or 1
+    done = 0
+    problems: list[str] = []
+    for expected, target, rel in entries:
+        if not target.is_file():
+            problems.append(f"{rel}: missing")
+            continue
+        h = hashlib.md5()
+        with target.open("rb") as fh:
+            while chunk := fh.read(4 * 1024 * 1024):
+                if cancel_flag and cancel_flag():
+                    raise RuntimeError("Verification cancelled by user.")
+                h.update(chunk)
+                done += len(chunk)
+                if on_progress:
+                    on_progress(min(99, int(done * 100 / total)), f"MD5 {rel}")
+        if h.hexdigest() != expected:
+            problems.append(f"{rel}: checksum mismatch")
+    return len(entries), problems
+
+
+class ToolMissingError(RuntimeError):
+    """Raised when an optional external tool (e.g. innoextract) is not installed."""
+
+
+def _installer_data_size(installer: Path) -> int:
+    """Size of an installer plus the setup-N.bin parts that ship next to it."""
+    total = installer.stat().st_size
+    stem = installer.stem.lower()
+    for part in installer.parent.glob("*.bin"):
+        if part.is_file() and not part.is_symlink() and part.name.lower().startswith(stem):
+            total += part.stat().st_size
+    return total
+
+
+def extract_gog_installer(
+    installer: Path,
+    dest_root: Path,
+    game_folder_name: str,
+    on_progress: Callable[[int, str], None] | None = None,
+    cancel_flag: Callable[[], bool] | None = None,
+) -> Path:
+    """Unpack a GOG Inno Setup installer with innoextract (no Wine needed) into dest_root/<name>."""
+    tool = shutil.which("innoextract")
+    if tool is None:
+        raise ToolMissingError("innoextract is not installed")
+    check_disk_space(dest_root, _installer_data_size(installer) * 2)
+    final_dir = dest_root / sanitize_folder_name(game_folder_name)
+    dest_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="deckinstall_gog_", dir=str(dest_root)) as tmp:
+        tmp_path = Path(tmp)
+        if on_progress:
+            on_progress(5, f"Unpacking {installer.name} with innoextract...")
+        cmd = [tool, "--gog", "--exclude-temp", "--silent", "--output-dir", str(tmp_path), str(installer)]
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(installer.parent),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+
+        def _line(line: str) -> None:
+            if on_progress and line.strip():
+                on_progress(50, line.strip()[:120])
+
+        rc = _drain_stream_lines(proc, cancel_flag, _line, "Extraction cancelled by user.")
+        if rc != 0:
+            raise RuntimeError(f"innoextract failed for {installer.name} (code {rc}).")
+        root = tmp_path / "app" if (tmp_path / "app").is_dir() else tmp_path
+        for junk in ("tmp", "__redist", "commonappdata"):
+            junk_dir = root / junk
+            if junk_dir.is_dir() and not junk_dir.is_symlink():
+                shutil.rmtree(junk_dir, ignore_errors=True)
+        if not any(root.iterdir()):
+            raise RuntimeError(f"innoextract produced no files for {installer.name}.")
+        if on_progress:
+            on_progress(96, "Organizing files...")
+        _strip_symlinks_and_specials(root)
+        _unwrap_single_folder(root, final_dir)
+    if on_progress:
+        on_progress(100, f"Completed in {final_dir}")
+    return final_dir
+
+
+def _is_gog_linux_installer(script: Path) -> bool:
+    try:
+        return zipfile.is_zipfile(script) and any(
+            n.startswith("data/noarch/") for n in zipfile.ZipFile(script).namelist()[:2000]
+        )
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
+def install_native_sh(
+    script: Path,
+    dest_root: Path,
+    game_folder_name: str,
+    on_progress: Callable[[int, str], None] | None = None,
+    cancel_flag: Callable[[], bool] | None = None,
+) -> Path:
+    """Install a Linux .sh installer into dest_root/<name>.
+
+    GOG Linux installers (makeself + MojoSetup) carry a zip with the game under data/noarch:
+    that is unpacked directly, with no GUI. Any other .sh is run with dest_root/<name> as its
+    working directory.
+    """
+    final_dir = dest_root / sanitize_folder_name(game_folder_name)
+    dest_root.mkdir(parents=True, exist_ok=True)
+    if _is_gog_linux_installer(script):
+        check_disk_space(dest_root, script.stat().st_size * 2)
+        with tempfile.TemporaryDirectory(prefix="deckinstall_sh_", dir=str(dest_root)) as tmp:
+            tmp_path = Path(tmp)
+            _extract_zip_safe(script, tmp_path, on_progress=on_progress, cancel_flag=cancel_flag)
+            root = tmp_path / "data" / "noarch"
+            if on_progress:
+                on_progress(96, "Organizing files...")
+            _strip_symlinks_and_specials(root)
+            _unwrap_single_folder(root, final_dir)
+        start = final_dir / "start.sh"
+        if start.is_file():
+            start.chmod(start.stat().st_mode | stat.S_IXUSR)
+        if on_progress:
+            on_progress(100, f"Completed in {final_dir}")
+        return final_dir
+
+    final_dir.mkdir(parents=True, exist_ok=True)
+    roots = _native_install_roots()
+    dirs_before = _child_dirs(roots)
+    if on_progress:
+        on_progress(10, f"Running {script.name}...")
+    proc = subprocess.Popen(
+        ["sh", str(script.resolve())],
+        cwd=str(final_dir),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+
+    def _line(line: str) -> None:
+        if on_progress and line.strip():
+            on_progress(50, line.strip()[:140])
+
+    rc = _drain_stream_lines(proc, cancel_flag, _line, "Installer cancelled by user.")
+    if rc != 0:
+        raise RuntimeError(f"{script.name} exited with code {rc}.")
+    result = final_dir
+    if not _collect_regular_files(final_dir):
+        # The installer chose its own folder (e.g. ~/GOG Games/<game>): find the one it created.
+        created = sorted(_child_dirs(roots) - dirs_before - {final_dir})
+        if len(created) == 1:
+            result = created[0]
+            try:
+                final_dir.rmdir()
+            except OSError:
+                pass
+    if on_progress:
+        on_progress(100, f"Completed in {result}")
+    return result

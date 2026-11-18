@@ -63,13 +63,9 @@ _ALLOWED_URL_HOSTS = frozenset(
         "github-releases.githubusercontent.com",
     }
 )
-_ALLOWED_UMU_DB_HOSTS = frozenset(
-    {
-        "umu.openwinecomponents.org",
-        "raw.githubusercontent.com",
-    }
-)
-UMU_DATABASE_URL = "https://umu.openwinecomponents.org/umu-database.csv"
+_ALLOWED_UMU_DB_HOSTS = frozenset({"raw.githubusercontent.com"})
+# umu.openwinecomponents.org/umu-database.csv serves an HTML page, not the CSV.
+UMU_DATABASE_URL = "https://raw.githubusercontent.com/Open-Wine-Components/umu-database/main/umu-database.csv"
 UMU_DATABASE_TTL_SECONDS = 7 * 24 * 60 * 60
 _VERSIONS_LOCK = threading.Lock()
 _OPTISCALER_LOCK = threading.Lock()
@@ -2290,6 +2286,90 @@ def _get_umu_db_index(db_path: Path) -> _UmuDbIndex | None:
     with _UMU_DB_CACHE_LOCK:
         _UMU_DB_CACHE = (cache_key, index)
     return index
+
+
+def _ensure_umu_database_impl(
+    force_update: bool = False,
+    progress_cb: ProgressCallback | None = None,
+    timeout: float = 20.0,
+) -> Path | None:
+    """Download umu-database.csv when missing or older than a week; keep the cached copy on failure."""
+    db_path = get_umu_database_path()
+    has_cached = db_path.is_file() and db_path.stat().st_size > 0
+    if not force_update and has_cached:
+        try:
+            last_check = int(_load_versions().get("umu_db_last_check", 0) or 0)
+        except (TypeError, ValueError):
+            last_check = 0
+        if (time.time() - last_check) < UMU_DATABASE_TTL_SECONDS:
+            return db_path
+
+    tmp_path: Path | None = None
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        _emit_progress(progress_cb, "Downloading umu-database.csv...", 0)
+        with _request_with_validated_redirects(
+            UMU_DATABASE_URL,
+            allowed_hosts=_ALLOWED_UMU_DB_HOSTS,
+            headers={"User-Agent": USER_AGENT},
+            timeout=timeout,
+            stream=True,
+            label="umu-database.csv",
+        ) as resp:
+            resp.raise_for_status()
+            fd, tmp_name = tempfile.mkstemp(prefix=".umu-database_", suffix=".csv", dir=str(db_path.parent))
+            tmp_path = Path(tmp_name)
+            with os.fdopen(fd, "wb") as handle:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if chunk:
+                        handle.write(chunk)
+        _validate_umu_csv_header(tmp_path)
+        os.replace(tmp_path, db_path)
+        tmp_path = None
+
+        def _set_umu_db(versions: dict[str, Any]) -> None:
+            versions["umu_db_last_check"] = int(time.time())
+
+        _update_versions(_set_umu_db)
+        _emit_progress(progress_cb, "umu-database.csv ready.", 100)
+        return db_path
+    except Exception as exc:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        if has_cached:
+            logging.warning("Failed to update umu-database.csv (%s); using the cached copy.", exc)
+            return db_path
+        logging.warning("Failed to fetch umu-database.csv and no local cache exists: %s", exc)
+        return None
+
+
+ensure_umu_database = _ensure_umu_database_impl
+
+
+def lookup_umu_codename(codename: str, store: str, db_path: Path | None = None) -> UmuDbLookupResult | None:
+    """Look up a game by its store id (e.g. the GOG product id) in umu-database.csv."""
+    cleaned = codename.strip().lower()
+    if not cleaned:
+        return None
+    index = _get_umu_db_index(db_path if db_path is not None else get_umu_database_path())
+    if index is None:
+        return None
+    rows = index.by_codename.get(cleaned)
+    if not rows:
+        return None
+    store_low = store.strip().lower()
+    matching = tuple(i for i in rows if not store_low or index.stores[i].lower() == store_low)
+    if not matching:
+        return None
+    idx = matching[0]
+    return UmuDbLookupResult(
+        umu_id=index.umu_ids[idx],
+        store=index.stores[idx],
+        title=index.titles[idx],
+        common_redist=index.common_redists[idx],
+        note=index.notes[idx],
+        match_source="codename",
+    )
 
 
 def _pick_store_row(

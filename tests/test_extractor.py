@@ -126,8 +126,8 @@ class TestExtractZipSafe(unittest.TestCase):
             dest = tmp_path / "out"
             dest.mkdir()
             with (
-                mock.patch.object(extractor, "_MAX_ZIP_FILE_BYTES", 10),
-                mock.patch.object(extractor, "_MAX_ZIP_TOTAL_BYTES", 100),
+                mock.patch.object(extractor, "_MAX_ARCHIVE_FILE_BYTES", 10),
+                mock.patch.object(extractor, "_MAX_ARCHIVE_TOTAL_BYTES", 100),
             ):
                 with self.assertRaisesRegex(RuntimeError, "exceeds maximum allowed size"):
                     extractor._extract_zip_safe(archive, dest)
@@ -143,8 +143,8 @@ class TestExtractZipSafe(unittest.TestCase):
             dest = tmp_path / "out"
             dest.mkdir()
             with (
-                mock.patch.object(extractor, "_MAX_ZIP_FILE_BYTES", 10),
-                mock.patch.object(extractor, "_MAX_ZIP_TOTAL_BYTES", 12),
+                mock.patch.object(extractor, "_MAX_ARCHIVE_FILE_BYTES", 10),
+                mock.patch.object(extractor, "_MAX_ARCHIVE_TOTAL_BYTES", 12),
             ):
                 with self.assertRaisesRegex(RuntimeError, "total uncompressed size"):
                     extractor._extract_zip_safe(archive, dest)

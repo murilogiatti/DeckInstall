@@ -31,14 +31,14 @@ FASE 1 - Manifesto e biblioteca (Opus)
 4. [FEITO] Migracao automatica dos jogos atuais, com snapshot e caminho de volta.
 
 FASE 2 - Instalar
-1. Classificar: arquivo -> extrair; setup GOG -> innoextract (fallback setup); repack (fg-*.bin, unarc.dll, ISDone.dll)
+1. [FEITO] Classificar: arquivo -> extrair; setup GOG -> innoextract (fallback setup); repack (fg-*.bin, unarc.dll, ISDone.dll)
    -> instalador; .sh nativo -> executar; pasta pronta -> escolher exe.
-2. Repack: achar setup.exe como o Hydra (pular redist/DLC/patch); MD5 opcional; espaco 2x; prefixo descartavel;
+2. [FEITO] Repack: achar setup.exe como o Hydra (pular redist/DLC/patch); MD5 opcional; espaco 2x; prefixo descartavel;
    /DIR= na biblioteca (testar se repacks respeitam); WINE_LARGE_ADDRESS_AWARE=0 so na instalacao; silencioso opcional;
    fallback wine do sistema; mensagem especifica para erro unarc; apagar prefixo do instalador no fim.
-3. Exe: goggame playTasks -> pastas novas desde inicio do instalador -> ranking; troca em 1 clique.
-4. Deteccao: OnlineFix/Goldberg/CODEX (overrides de DLL), STORE=gog; fazer download do umu-database funcionar.
-5. Remover limite de 4 GiB (usar razao de compressao + espaco livre).
+3. [FEITO] Exe: goggame playTasks -> pastas novas desde inicio do instalador -> ranking; troca em 1 clique.
+4. [FEITO] Deteccao: OnlineFix/Goldberg/CODEX (overrides de DLL), STORE=gog; fazer download do umu-database funcionar.
+5. [FEITO] Remover limite de 4 GiB (usar razao de compressao + espaco livre).
 
 FASE 3 - Jogar e Proton
 1. Proton "Padrao (mais recente)" ou fixado por jogo; "Usar versao anterior"; atualizar move os "Padrao";

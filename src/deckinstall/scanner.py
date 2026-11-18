@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from collections import deque
@@ -165,6 +166,103 @@ def detect_exe_kind(exe_path: Path) -> str:
     return "unknown"
 
 
+def is_native_linux_exe(path: Path) -> bool:
+    """True for Linux ELF binaries and shebang scripts (e.g. GOG's start.sh)."""
+    if detect_exe_kind(path) == "linux_elf":
+        return True
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(2) == b"#!"
+    except OSError:
+        return False
+
+
+def gog_primary_exe(game_dir: Path) -> Path | None:
+    """Return the primary executable declared in a GOG goggame-*.info file (playTasks), if any."""
+    infos: list[Path] = []
+    for pattern in ("goggame-*.info", "*/goggame-*.info"):
+        infos.extend(p for p in sorted(game_dir.glob(pattern)) if p.is_file() and not p.is_symlink())
+    for info in infos:
+        try:
+            if info.stat().st_size > 1024 * 1024:
+                continue
+            data = json.loads(info.read_text(encoding="utf-8-sig", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        tasks = data.get("playTasks") if isinstance(data, dict) else None
+        if not isinstance(tasks, list):
+            continue
+        ordered = sorted(
+            (t for t in tasks if isinstance(t, dict) and t.get("type", "FileTask") == "FileTask"),
+            key=lambda t: (not t.get("isPrimary", False), t.get("category", "game") != "game"),
+        )
+        for task in ordered:
+            raw = str(task.get("path") or "").replace("\\", "/").strip()
+            if not raw or raw.startswith("/") or ".." in Path(raw).parts:
+                continue
+            cand = info.parent / raw
+            try:
+                if cand.is_file() and not cand.is_symlink() and cand.resolve().is_relative_to(game_dir.resolve()):
+                    return cand
+            except OSError:
+                continue
+    return None
+
+
+def gog_product_id(game_dir: Path) -> str:
+    """Return the GOG product id from goggame-<id>.info (used as STORE=gog GAMEID lookup key)."""
+    for pattern in ("goggame-*.info", "*/goggame-*.info"):
+        for info in sorted(game_dir.glob(pattern)):
+            if not info.is_file() or info.is_symlink():
+                continue
+            m = re.fullmatch(r"goggame-(\d+)\.info", info.name)
+            if m:
+                return m.group(1)
+    return ""
+
+
+# DRM-free emulators/cracks that need DLL overrides under Wine/Proton.
+_ONLINEFIX_OVERRIDES = "OnlineFix64=n;SteamOverlay64=n;winmm=n,b;dnet=n;steam_api64=n;winhttp=n,b"
+_STEAM_API_OVERRIDES = "steam_api64=n;steam_api=n"
+_STEAMCLIENT_OVERRIDES = "steamclient64=n;steamclient=n"
+
+
+def _lower_names(folder: Path) -> set[str]:
+    try:
+        return {p.name.lower() for p in folder.iterdir()}
+    except OSError:
+        return set()
+
+
+def detect_steam_emulator(exe_path: Path, game_dir: Path) -> tuple[str, str]:
+    """Return (kind, WINEDLLOVERRIDES) for OnlineFix, Goldberg or CODEX found next to the game exe.
+
+    kind is "onlinefix", "goldberg", "codex" or "". Goldberg's experimental steamclient(64).dll
+    must be loaded as native, otherwise Proton's built-in lsteamclient replaces it.
+    """
+    folders = [exe_path.parent]
+    if game_dir != exe_path.parent:
+        folders.append(game_dir)
+    names: set[str] = set()
+    for folder in folders:
+        names |= _lower_names(folder)
+    if "onlinefix.ini" in names or "onlinefix64.dll" in names or "onlinefix.dll" in names:
+        return "onlinefix", _ONLINEFIX_OVERRIDES
+    has_api = "steam_api64.dll" in names or "steam_api.dll" in names
+    goldberg_markers = {"steam_settings", "coldclientloader.ini", "steam_interfaces.txt", "local_save.txt"}
+    if names & goldberg_markers and (has_api or "steamclient64.dll" in names):
+        overrides = _STEAM_API_OVERRIDES
+        if "steamclient64.dll" in names or "steamclient.dll" in names:
+            overrides = f"{overrides};{_STEAMCLIENT_OVERRIDES}"
+        return "goldberg", overrides
+    if has_api and names & {"steam_emu.ini", "codex64.dll", "codex.ini"}:
+        return "codex", _STEAM_API_OVERRIDES
+    return "", ""
+
+
+_NATIVE_SUFFIXES = (".x86_64", ".x86", ".amd64")
+
+
 def detect_pe_arch(exe_path: Path) -> str:
     """Inspect executable header and return 'x64', 'x86', 'linux_elf', or 'unknown'."""
     try:
@@ -273,7 +371,17 @@ def _scan_game_tree_scandir(
                         continue
 
                     low = name.lower()
-                    if collect_exes and low.endswith(".exe"):
+                    if collect_exes and dir_depth < 2 and (
+                        low == "start.sh" or low.endswith(_NATIVE_SUFFIXES)
+                    ):
+                        try:
+                            size_neg = -entry.stat(follow_symlinks=False).st_size
+                        except OSError:
+                            size_neg = 0
+                        # Native launchers rank after Windows executables of the same folder.
+                        native_rank = 0 if low == "start.sh" else 1
+                        exe_scored.append(((2, native_rank, 0, rel_depth, size_neg), Path(entry.path)))
+                    elif collect_exes and low.endswith(".exe"):
                         if not any(pat in low for pat in IGNORED_EXE_PATTERNS):
                             try:
                                 size_neg = -entry.stat(follow_symlinks=False).st_size
@@ -308,6 +416,9 @@ def scan_game_folder(game_dir: Path) -> DetectedGame | None:
     if not game_dir.is_dir():
         return None
     exes, steam_appid = _scan_game_tree_scandir(game_dir)
+    gog_exe = gog_primary_exe(game_dir)
+    if gog_exe is not None:
+        exes = [gog_exe, *(e for e in exes if e != gog_exe)]
     if not exes:
         return None
     return DetectedGame(

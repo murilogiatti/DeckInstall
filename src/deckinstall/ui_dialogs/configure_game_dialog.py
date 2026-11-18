@@ -38,7 +38,8 @@ from ..runtime_manager import (
     list_installed_compat_tools,
     resolve_game_prefix,
 )
-from ..standalone import StandaloneGame, update_standalone_launch_options
+from ..scanner import scan_game_folder
+from ..standalone import StandaloneGame, change_standalone_exe, update_standalone_launch_options
 from ..steam_paths import list_installed_protons
 from ..steam_vdf import (
     ShortcutEntry,
@@ -232,7 +233,41 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     lbl_exe.setWordWrap(True)
     lbl_dir = QLabel(dir_str)
     lbl_dir.setWordWrap(True)
-    game_form.addRow(tr("configure.lbl_exe"), lbl_exe)
+    if isinstance(obj, StandaloneGame):
+        # One click switches the game to another executable found in its folder.
+        exe_combo = QComboBox()
+        exe_combo.setToolTip(tr("configure.exe_switch_tooltip"))
+        detected = scan_game_folder(obj.game_dir)
+        candidates = [obj.exe_path, *(e for e in (detected.executables if detected else []) if e != obj.exe_path)]
+        for cand in candidates[:40]:
+            try:
+                label = str(cand.relative_to(obj.game_dir))
+            except ValueError:
+                label = str(cand)
+            exe_combo.addItem(label, str(cand))
+        game_obj = obj
+
+        def _on_exe_activated(idx: int) -> None:
+            new_exe = Path(str(exe_combo.itemData(idx)))
+            if new_exe == game_obj.exe_path:
+                return
+            try:
+                updated = change_standalone_exe(game_obj.game_dir, new_exe)
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(dlg, __app_name__, tr("configure.exe_switch_failed", err=str(exc)))
+                exe_combo.setCurrentIndex(exe_combo.findData(str(game_obj.exe_path)))
+                return
+            game_obj.exe_path = updated.exe_path
+            msg = tr("configure.exe_switched", name=new_exe.name)
+            if updated.meta.get("steam"):
+                msg += " " + tr("configure.exe_switched_steam_note")
+            win.status_label.setText(msg)
+            win._refresh_shortcuts()
+
+        exe_combo.activated.connect(_on_exe_activated)
+        game_form.addRow(tr("configure.lbl_exe"), exe_combo)
+    else:
+        game_form.addRow(tr("configure.lbl_exe"), lbl_exe)
     game_form.addRow(tr("configure.lbl_dir"), lbl_dir)
 
     initial_opts_text = (

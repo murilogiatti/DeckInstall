@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __app_name__, __version__
+from . import __app_name__, __version__, classify
 from .app_updater import (
     GITHUB_RELEASES_URL,
     AppUpdateInfo,
@@ -71,7 +71,6 @@ from .external_actions import (
     load_external_launch_presets,
 )
 from .extractor import (
-    is_archive,
     suggest_target_name,
 )
 from .i18n import available_languages, set_language, tr
@@ -111,6 +110,7 @@ from .scanner import (
     DetectedGame,
     clean_game_name,
     detect_exe_kind,
+    is_native_linux_exe,
     scan_all_games,
     scan_game_folder,
 )
@@ -775,12 +775,21 @@ class MainWindow(QMainWindow):
         form.addRow(tr("install.folder_label"), self.extract_name)
 
         dst_row = QHBoxLayout()
-        self.extract_dst_root = QLineEdit(str(Path.home() / "Games"))
+        self.extract_dst_root = QLineEdit()
+        self.extract_dst_root.setPlaceholderText(
+            tr("install.dest_library_placeholder") if uses_library_layout() else str(Path.home() / "Games")
+        )
         btn_dst = QPushButton(tr("install.choose_folder"))
         btn_dst.clicked.connect(self._pick_dest_root)
         dst_row.addWidget(self.extract_dst_root, 1)
         dst_row.addWidget(btn_dst)
         form.addRow(tr("install.dest_label"), dst_row)
+        self.chk_install_silent = QCheckBox(tr("install.silent"))
+        self.chk_install_silent.setToolTip(tr("install.silent_tooltip"))
+        self.chk_verify_md5 = QCheckBox(tr("install.verify_md5"))
+        self.chk_verify_md5.setToolTip(tr("install.verify_md5_tooltip"))
+        form.addRow("", self.chk_install_silent)
+        form.addRow("", self.chk_verify_md5)
         details_lay.addLayout(form)
 
         self.extract_progress = QProgressBar()
@@ -1814,6 +1823,14 @@ class MainWindow(QMainWindow):
 
     def _set_extract_source(self, path_str: str) -> None:
         p = Path(path_str)
+        info = classify.classify_source(p)
+        if info.needs_install and info.installer is not None:
+            self.extract_src.setText(str(info.installer if info.kind != classify.ARCHIVE else p))
+            self.extract_name.setText(classify.suggest_install_name(info))
+            self.extract_details_box.setVisible(True)
+            self.btn_toggle_extract_details.setChecked(True)
+            self.status_label.setText(self._detected_kind_text(info))
+            return
         if p.is_dir():
             game = scan_game_folder(p)
             if game is not None:
@@ -1823,21 +1840,19 @@ class MainWindow(QMainWindow):
                 self.add_name.setFocus()
             return
         if p.is_file():
-            stem_l = p.stem.lower()
-            looks_installer = is_archive(p) or (
-                p.suffix.lower() == ".exe"
-                and any(k in stem_l for k in ("setup", "install", "patch", "update"))
-            )
-            if looks_installer:
-                self.extract_src.setText(str(p))
-                if not self.extract_name.text().strip():
-                    self.extract_name.setText(suggest_target_name(p))
-                self.extract_details_box.setVisible(True)
-                self.btn_toggle_extract_details.setChecked(True)
-            else:
-                self._on_manual_exe_picked(str(p))
-                self._nav_buttons[0].setChecked(True)
-                self.stack.setCurrentIndex(0)
+            self._on_manual_exe_picked(str(p))
+            self._nav_buttons[0].setChecked(True)
+            self.stack.setCurrentIndex(0)
+
+    def _detected_kind_text(self, info: classify.SourceInfo) -> str:
+        texts = {
+            classify.ARCHIVE: tr("install.detected_archive"),
+            classify.GOG_SETUP: tr("install.detected_gog"),
+            classify.REPACK: tr("install.detected_repack", name=info.installer.name if info.installer else ""),
+            classify.INSTALLER: tr("install.detected_installer"),
+            classify.NATIVE_SH: tr("install.detected_native_sh"),
+        }
+        return texts.get(info.kind, "")
 
     def _pick_archive_or_installer(self) -> None:
         _pick_file_async(
@@ -1848,8 +1863,20 @@ class MainWindow(QMainWindow):
             lambda path: self._set_extract_source(path) if path else None,
         )
 
+    def _default_extract_root(self) -> Path:
+        """Games folder of the library picked in the install form (or ~/Games in the old layout)."""
+        if not uses_library_layout():
+            return Path.home() / "Games"
+        data = str(self.add_library_combo.currentData() or "") if hasattr(self, "add_library_combo") else ""
+        kind, _, raw = data.partition(":")
+        if kind == "lib" and raw:
+            return Path(raw) / "Games"
+        if kind == "disk" and raw:
+            return Path(raw) / "DeckInstall" / "Games"
+        return internal_library_root() / "Games"
+
     def _pick_dest_root(self) -> None:
-        start = Path(self.extract_dst_root.text().strip() or str(Path.home() / "Games"))
+        start = Path(self.extract_dst_root.text().strip() or str(self._default_extract_root()))
         _pick_dir_async(
             self,
             tr("install.pick_dest_title"),
@@ -1863,7 +1890,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(_dialog_parent(self), __app_name__, tr("install.invalid_file"))
             return
         name = self.extract_name.text().strip() or suggest_target_name(src)
-        dst = Path(self.extract_dst_root.text().strip() or str(Path.home() / "Games"))
+        typed_dst = self.extract_dst_root.text().strip()
+        if typed_dst:
+            dst = Path(typed_dst)
+        else:
+            lib_ok, lib = self._selected_library()
+            if not lib_ok:
+                return
+            dst = lib.games_dir if lib is not None else Path.home() / "Games"
 
         self.extract_details_box.setVisible(True)
         self.btn_toggle_extract_details.setChecked(True)
@@ -1873,7 +1907,14 @@ class MainWindow(QMainWindow):
         self.btn_cancel_extract.setEnabled(True)
         self.btn_use_extracted.setEnabled(False)
 
-        self._extract_worker = ExtractWorker(src, dst, name)
+        self._extract_source_kind = classify.classify_source(src).kind
+        self._extract_worker = ExtractWorker(
+            src,
+            dst,
+            name,
+            silent=self.chk_install_silent.isChecked(),
+            verify_md5=self.chk_verify_md5.isChecked(),
+        )
         self._track_worker(self._extract_worker)
         self._extract_worker.progress.connect(self._on_extract_progress)
         self._extract_worker.finished_ok.connect(self._on_extract_done)
@@ -1906,6 +1947,14 @@ class MainWindow(QMainWindow):
         self._last_extracted_dir = Path(out_dir)
         self.status_label.setText(tr("install.done_prefix", path=out_dir))
         self._refresh_games()
+        if getattr(self, "_extract_source_kind", "") == classify.ARCHIVE:
+            inner = classify.classify_source(Path(out_dir))
+            if inner.kind in (classify.REPACK, classify.GOG_SETUP, classify.INSTALLER) and inner.installer:
+                # The archive held an installer: offer to run it instead of picking an exe.
+                self.extract_src.setText(str(inner.installer))
+                self.extract_log.append(tr("install.archive_has_installer", name=inner.installer.name))
+                self.status_label.setText(tr("install.archive_has_installer", name=inner.installer.name))
+                return
         if not self._closing_pending and self.isVisible():
             self._send_extracted_to_add_tab()
 
@@ -2095,7 +2144,7 @@ class MainWindow(QMainWindow):
         if not exe_text:
             return False
         exe_path = Path(exe_text)
-        return exe_path.is_file() and detect_exe_kind(exe_path) == "linux_elf"
+        return exe_path.is_file() and is_native_linux_exe(exe_path)
 
     def _resolve_add_launch_options(self) -> tuple[str, str]:
         is_native = self._is_add_exe_native()
@@ -2221,7 +2270,7 @@ class MainWindow(QMainWindow):
         is_elf = False
         if cleaned:
             exe_path = Path(cleaned)
-            is_elf = exe_path.is_file() and detect_exe_kind(exe_path) == "linux_elf"
+            is_elf = exe_path.is_file() and is_native_linux_exe(exe_path)
         if is_elf:
             self.chk_proton.setChecked(False)
             self.chk_proton.setEnabled(False)

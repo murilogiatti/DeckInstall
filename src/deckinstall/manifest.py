@@ -210,6 +210,7 @@ def _v2_fields(raw: dict[str, Any], game_dir: Path) -> dict[str, Any]:
             "app_version": _str(raw.get("app_version")),
             "source": {k: v for k, v in source.items() if k != "steam_appid"},
             "proton_mode": _str(proton.get("mode")) or "pinned",
+            **({"emulator": _str(runtime.get("emulator"))} if _str(runtime.get("emulator")) else {}),
             "prefix_location": _str(prefix.get("location")) or "library",
             "icons": _paths(created.get("icons"), root),
             "steam": _section(created, "steam"),
@@ -278,6 +279,7 @@ def build_manifest_v2(fields: dict[str, Any], library_root: Path | None) -> dict
             },
             "winedlloverrides": str(fields.get("winedlloverrides") or ""),
             "launch_options": str(fields.get("launch_options") or ""),
+            **({"emulator": str(meta["emulator"])} if meta.get("emulator") else {}),
         },
         "prefix": {
             "path": enc(fields["prefix_dir"]),
