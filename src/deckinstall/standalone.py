@@ -38,6 +38,8 @@ from .library import (
 from .manifest import (
     MANIFEST_V1,
     MANIFEST_V2,
+    decode_path,
+    encode_path,
     find_manifest,
     is_manifest_name,
     new_uid,
@@ -1548,6 +1550,7 @@ def remove_standalone_game(
         else:
             remove_path_or_tree(game.game_dir)
     if (delete_files or delete_prefix) and not _prefix_used_by_other_game(game.prefix_dir, game.game_dir):
+        _unlink_steam_compatdata(game)
         _safe_remove_prefix_dir(game.prefix_dir)
     elif delete_files or delete_prefix:
         logging.warning("Keeping prefix %s: it is shared with another standalone game", game.prefix_dir)
@@ -1562,7 +1565,7 @@ def _unlink_prefix_symlinks_for_compat(
     preferred_name: str,
 ) -> None:
     """Remove any Shortix-style symlinks in prefixes_dir pointing to compat_dir and update manifest."""
-    prefixes_dir = get_prefixes_dir()
+    prefixes_dir = get_legacy_prefixes_dir()  # where sync_prefix_symlinks keeps them
     if not prefixes_dir.is_dir():
         return
     manifest_file = prefixes_dir / ".deckinstall_links.json"
@@ -1711,6 +1714,112 @@ def export_steam_to_standalone(
     return game
 
 
+def _has_drive_c(prefix: Path) -> bool:
+    """True when prefix holds a Wine prefix, either umu-style (drive_c) or Steam-style (pfx/drive_c)."""
+    return (prefix / "drive_c").is_dir() or (
+        (prefix / "pfx").is_dir() and not (prefix / "pfx").is_symlink() and (prefix / "pfx" / "drive_c").is_dir()
+    )
+
+
+def _ensure_umu_pfx_link(prefix_dir: Path) -> None:
+    """Make prefix_dir usable as a Steam compatdata folder: Proton opens <compatdata>/pfx."""
+    pfx = prefix_dir / "pfx"
+    if not pfx.exists() and not pfx.is_symlink():
+        prefix_dir.mkdir(parents=True, exist_ok=True)
+        pfx.symlink_to(".")
+
+
+def _adopt_steam_prefix(src_compat: Path, prefix_dir: Path) -> None:
+    """Move a Steam compatdata folder into an empty game prefix, converting it to the umu layout."""
+    inner = src_compat / "pfx"
+    if inner.is_dir() and not inner.is_symlink():
+        copy_or_move_dir_contents(inner, prefix_dir, move=True)
+        inner.rmdir()
+    for item in list(src_compat.iterdir()):
+        if item.name == "pfx":
+            continue
+        target = prefix_dir / item.name
+        if target.exists() or target.is_symlink():
+            continue
+        shutil.move(str(item), str(target))
+    remaining = list(src_compat.iterdir())
+    if remaining:
+        raise RuntimeError(f"Could not fully adopt {src_compat}: {[p.name for p in remaining]}")
+    src_compat.rmdir()
+
+
+def _compatdata_backup_path(compat: Path) -> Path:
+    candidate = compat.with_name(f"{compat.name}.deckinstall.bak")
+    idx = 2
+    while candidate.exists() or candidate.is_symlink():
+        candidate = compat.with_name(f"{compat.name}.{idx}.deckinstall.bak")
+        idx += 1
+    return candidate
+
+
+def link_compatdata_to_prefix(compat: Path, prefix_dir: Path) -> Path | None:
+    """Point Steam's compatdata/<appid> at the game's own prefix (one game, one prefix).
+
+    An existing compatdata folder is adopted when the game prefix is still empty; otherwise it
+    is kept as <appid>.deckinstall.bak (listed under Backups in Maintenance). Nothing is deleted.
+    Returns the backup path, if one was made.
+    """
+    if prefix_dir.is_symlink():
+        raise ValueError(f"Game prefix cannot be a symlink: {prefix_dir}")
+    prefix_dir.mkdir(parents=True, exist_ok=True)
+    backup: Path | None = None
+    if compat.is_symlink():
+        try:
+            if compat.resolve() == prefix_dir.resolve():
+                _ensure_umu_pfx_link(prefix_dir)
+                return None
+        except OSError:
+            pass
+        if compat.exists():
+            raise RuntimeError(
+                f"{compat} already points to another prefix ({os.readlink(compat)}); "
+                "restore it from microSD before linking."
+            )
+        compat.unlink()  # dangling link left by a removed prefix
+    elif compat.is_dir():
+        if _has_drive_c(compat) and not _has_drive_c(prefix_dir):
+            _adopt_steam_prefix(compat, prefix_dir)
+        else:
+            backup = _compatdata_backup_path(compat)
+            os.replace(compat, backup)
+    elif compat.exists():
+        raise RuntimeError(f"{compat} is not a directory")
+    _ensure_umu_pfx_link(prefix_dir)
+    compat.parent.mkdir(parents=True, exist_ok=True)
+    compat.symlink_to(prefix_dir)
+    return backup
+
+
+def _unlink_steam_compatdata(game: StandaloneGame) -> None:
+    """Remove the compatdata link recorded for game, only if it still points at its prefix."""
+    raw = str((game.meta.get("steam") or {}).get("compatdata_link") or "")
+    if not raw:
+        return
+    try:
+        link = decode_path(raw, None)
+    except ValueError:
+        return
+    if not link.is_symlink():
+        return
+    try:
+        target = Path(os.readlink(link))
+        if not target.is_absolute():
+            target = link.parent / target
+        if os.path.abspath(target) != os.path.abspath(game.prefix_dir):
+            return
+    except OSError:
+        return
+    try:
+        link.unlink()
+    except OSError as exc:
+        logging.warning("Failed to remove Steam compatdata link %s: %s", link, exc)
+
+
 def import_standalone_to_steam(
     paths: SteamPaths,
     game: StandaloneGame,
@@ -1763,7 +1872,24 @@ def import_standalone_to_steam(
 
     target_compat = paths.compatdata_dir / str(appid_u32)
     target_pfx = target_compat / "pfx"
-    if game.prefix_dir.is_dir() and not game.prefix_dir.is_symlink():
+    if game.schema >= 2 and not game.native_linux and not remove_standalone_files:
+        # One game, one prefix: Steam runs the same prefix the launcher uses.
+        backup = link_compatdata_to_prefix(target_compat, game.prefix_dir)
+        steam_meta: dict[str, Any] = {
+            "user_id": paths.user_id,
+            "shortcut_appid": appid_u32,
+            "compatdata_link": encode_path(target_compat, None),
+        }
+        if target_tool:
+            steam_meta["compat_tool"] = target_tool
+        if backup is not None:
+            steam_meta["compatdata_backup"] = encode_path(backup, None)
+        game.meta["steam"] = steam_meta
+        _write_manifest(game)
+    elif game.prefix_dir.is_dir() and not game.prefix_dir.is_symlink():
+        if target_compat.is_symlink():
+            # Converting a linked game to Steam-only: give Steam a real folder again.
+            target_compat.unlink()
         copy_or_move_dir_contents(game.prefix_dir, target_pfx, move=remove_standalone_files)
         if remove_standalone_files:
             _safe_remove_prefix_dir(game.prefix_dir)

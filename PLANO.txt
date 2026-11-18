@@ -27,7 +27,7 @@ FASE 1 - Manifesto e biblioteca (Opus)
 2. [FEITO] Biblioteca por disco: <disco>/DeckInstall/{Games,Prefixes,Caches} + library.json.
    Deteccao ao montar (/run/media/$USER/*, /media/*, /mnt/*); jogos de disco ausente = "indisponivel".
    exFAT/NTFS: prefixo vai para o disco interno, com aviso.
-3. Um jogo, um prefixo; Steam via link do compatdata.
+3. [FEITO] Um jogo, um prefixo; Steam via link do compatdata.
 4. Migracao automatica dos jogos atuais, com snapshot e caminho de volta.
 
 FASE 2 - Instalar
