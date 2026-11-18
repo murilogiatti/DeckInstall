@@ -36,7 +36,6 @@ from deckinstall.extractor import (  # noqa: E402
 from deckinstall.scanner import (  # noqa: E402
     clean_game_name,
     detect_steam_appid,
-    rank_executables,
     scan_all_games,
     scan_game_folder,
 )
@@ -48,7 +47,6 @@ from deckinstall.steam_vdf import (  # noqa: E402
     compute_shortcut_appid,
     find_cleanup_candidates,
     import_external_prefix_saves,
-    import_hydra_umu_saves,
     infer_game_root_from_exe,
     migrate_shortcut_to_games,
     plan_bulk_migration,
@@ -157,8 +155,6 @@ class CoreTests(unittest.TestCase):
                 games = scan_all_games([root, root / "missing_root"])
                 self.assertEqual(len(games), 1)
                 self.assertEqual(games[0].name, "ValidGame")
-                exes = rank_executables(valid)
-                self.assertEqual(exes, [valid / "Game.exe"])
             finally:
                 os.chmod(locked, 0o755)
 
@@ -300,52 +296,6 @@ class CoreTests(unittest.TestCase):
             with mock.patch("vdf.loads", return_value=fake_login):
                 ordered = list_steam_users(steam_root)
             self.assertEqual(ordered[0], "200")
-
-    def test_import_hydra_umu_saves_merges_only_newer_and_skips_junk(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            hydra_root = root / "hydra" / "wine-prefixes"
-            src_users = hydra_root / "4423270" / "drive_c" / "users"
-            (src_users / "steamuser" / "AppData" / "LocalLow" / "Game").mkdir(parents=True)
-            (src_users / "steamuser" / "AppData" / "Local" / "Temp").mkdir(parents=True)
-            (src_users / "Public" / "Documents" / "Steam" / "RUNE").mkdir(parents=True)
-
-            save_src = src_users / "steamuser" / "AppData" / "LocalLow" / "Game" / "save.dat"
-            save_src.write_bytes(b"hydra-save")
-            rune_src = src_users / "Public" / "Documents" / "Steam" / "RUNE" / "stats.bin"
-            rune_src.write_bytes(b"rune")
-            junk_src = src_users / "steamuser" / "AppData" / "Local" / "Temp" / "junk.tmp"
-            junk_src.write_bytes(b"junk")
-
-            compat_dir = root / "Steam" / "steamapps" / "compatdata"
-            dst_existing = (
-                compat_dir / "3387715067" / "pfx" / "drive_c" / "users" / "Public" / "Documents" / "Steam" / "RUNE" / "stats.bin"
-            )
-            dst_existing.parent.mkdir(parents=True)
-            dst_existing.write_bytes(b"newer-steam-save")
-            os.utime(save_src, (1000, 1000))
-            os.utime(rune_src, (1000, 1000))
-            os.utime(dst_existing, (2000, 2000))
-
-            paths = SteamPaths(
-                steam_root=root / "Steam",
-                user_id="1",
-                userdata_dir=root / "Steam" / "userdata" / "1",
-                shortcuts_vdf=root / "shortcuts.vdf",
-                grid_dir=root / "grid",
-                config_vdf=root / "config.vdf",
-                compatdata_dir=compat_dir,
-            )
-            copied = import_hydra_umu_saves(paths, 3387715067, 4423270, hydra_prefixes_root=hydra_root)
-            self.assertEqual(copied, 1)
-            self.assertEqual(
-                (compat_dir / "3387715067" / "pfx" / "drive_c" / "users" / "steamuser" / "AppData" / "LocalLow" / "Game" / "save.dat").read_bytes(),
-                b"hydra-save",
-            )
-            self.assertEqual(dst_existing.read_bytes(), b"newer-steam-save")
-            self.assertFalse(
-                (compat_dir / "3387715067" / "pfx" / "drive_c" / "users" / "steamuser" / "AppData" / "Local" / "Temp" / "junk.tmp").exists()
-            )
 
     def test_heroic_lutris_prefix_import_and_plan_detects_pending_saves(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -749,12 +699,12 @@ class CoreTests(unittest.TestCase):
 
     def test_v073_audit_regressions(self) -> None:
         from deckinstall.artwork import backup_steam_artwork
+        from deckinstall.fsutil import file_sha256
         from deckinstall.scanner import clean_game_name
         from deckinstall.steam_paths import SteamPaths
         from deckinstall.steam_vdf import (
             CleanupCandidate,
             ShortcutEntry,
-            _file_sha256,
             apply_launch_presets,
             backup_all_saves,
             delete_cleanup_candidates_checked,
@@ -796,12 +746,12 @@ class CoreTests(unittest.TestCase):
             f1.write_bytes(b"AAAA")
             ts_ns = 1_700_000_000_000_000_000
             os.utime(f1, ns=(ts_ns, ts_ns))
-            h1 = _file_sha256(f1)
+            h1 = file_sha256(f1)
             f2 = root / "save.dat.new"
             f2.write_bytes(b"BBBB")
             os.utime(f2, ns=(ts_ns, ts_ns))
             os.replace(f2, f1)
-            h2 = _file_sha256(f1)
+            h2 = file_sha256(f1)
             self.assertNotEqual(h1, h2)
 
             # 4) backup_steam_artwork preserves original backup on repeated runs
@@ -1236,7 +1186,7 @@ class CoreTests(unittest.TestCase):
 
         from deckinstall.artwork import _is_valid_image_bytes, _validate_appid, fetch_header_preview
         from deckinstall.i18n import tr, tr_plural
-        from deckinstall.scanner import default_scan_roots, rank_executables
+        from deckinstall.scanner import default_scan_roots
         from deckinstall.steam_paths import _proton_version_key
         from deckinstall.steam_vdf import (
             _iter_prefix_save_pairs,
@@ -1270,16 +1220,9 @@ class CoreTests(unittest.TestCase):
             self.assertTrue((out / "ok.txt").is_file())
             self.assertFalse((out / "evil_link").exists() or (out / "evil_link").is_symlink())
 
-        # 2) Launcher.exe ranked above utility executables + /run/media steamapps skipped
+        # 2) /run/media steamapps skipped
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            l_exe = root / "Launcher.exe"
-            c_exe = root / "CrashHandler.exe"
-            l_exe.write_bytes(b"MZ" + b"\x00" * 100)
-            c_exe.write_bytes(b"MZ" + b"\x00" * 100)
-            ranked = rank_executables(root)
-            self.assertEqual(ranked[0], l_exe)
-
             media_mnt = root / "card1"
             (media_mnt / "steamapps").mkdir(parents=True)
             (media_mnt / "Games").mkdir(parents=True)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -192,6 +193,28 @@ def resolve_steam_paths(user_id: str | None = None) -> SteamPaths | None:
     )
 
 
+def read_library_paths(steam_root: Path) -> list[Path]:
+    """Return raw library paths declared in steamapps/libraryfolders.vdf (not filtered or deduplicated)."""
+    lib_vdf = steam_root / "steamapps" / "libraryfolders.vdf"
+    if not lib_vdf.is_file():
+        return []
+    try:
+        import vdf
+
+        data = vdf.loads(lib_vdf.read_text(encoding="utf-8", errors="replace"))
+    except _VDF_READ_ERRORS:
+        return []
+    folders = data.get("libraryfolders") or data.get("LibraryFolders") or {}
+    if not isinstance(folders, dict):
+        return []
+    out: list[Path] = []
+    for val in folders.values():
+        raw_path = val.get("path") if isinstance(val, dict) else (val if isinstance(val, str) else None)
+        if raw_path:
+            out.append(Path(str(raw_path)))
+    return out
+
+
 def _list_steam_library_roots(steam_root: Path) -> list[Path]:
     """Return all Steam library root directories (main steam_root + libraryfolders.vdf)."""
     roots: list[Path] = [steam_root]
@@ -200,30 +223,14 @@ def _list_steam_library_roots(steam_root: Path) -> list[Path]:
         seen.add(steam_root.resolve())
     except OSError:
         seen.add(steam_root)
-
-    lib_vdf = steam_root / "steamapps" / "libraryfolders.vdf"
-    if not lib_vdf.is_file():
-        return roots
-    try:
-        import vdf
-
-        data = vdf.loads(lib_vdf.read_text(encoding="utf-8", errors="replace"))
-    except _VDF_READ_ERRORS:
-        return roots
-    folders = data.get("libraryfolders") or data.get("LibraryFolders") or {}
-    if isinstance(folders, dict):
-        for val in folders.values():
-            raw_path = val.get("path") if isinstance(val, dict) else (val if isinstance(val, str) else None)
-            if not raw_path:
-                continue
-            cand = Path(str(raw_path))
-            try:
-                res = cand.resolve()
-            except OSError:
-                res = cand
-            if cand.is_dir() and res not in seen:
-                seen.add(res)
-                roots.append(cand)
+    for cand in read_library_paths(steam_root):
+        try:
+            res = cand.resolve()
+        except OSError:
+            res = cand
+        if cand.is_dir() and res not in seen:
+            seen.add(res)
+            roots.append(cand)
     return roots
 
 
@@ -339,6 +346,79 @@ def find_proton_binary(steam_root: Path) -> Path | None:
             if entry.is_dir() and proton.is_file():
                 return proton
     return None
+
+
+def resolve_compat_tool_dir(name: str, compat_dirs: Iterable[Path]) -> Path | None:
+    """Find a custom Proton by folder name or by its compatibilitytool.vdf internal id."""
+    seen: set[Path] = set()
+    for compat_dir in compat_dirs:
+        if not compat_dir.is_dir():
+            continue
+        try:
+            res_dir = compat_dir.resolve()
+        except OSError:
+            res_dir = compat_dir
+        if res_dir in seen:
+            continue
+        seen.add(res_dir)
+        direct = compat_dir / name
+        if direct.is_dir() and (direct / "proton").is_file():
+            return direct
+        for entry in _safe_iterdir(compat_dir):
+            if not entry.is_dir() or not (entry / "proton").is_file():
+                continue
+            vdf_file = entry / "compatibilitytool.vdf"
+            if vdf_file.is_file() and _read_compat_tool_id(vdf_file, entry.name) == name:
+                return entry
+    return None
+
+
+def resolve_builtin_proton(name: str, steam_root: Path) -> Path | None:
+    """Resolve a built-in Steam Proton tool name (proton_9, proton_experimental...) to its directory."""
+    cleaned = name.strip()
+    if not cleaned:
+        return None
+    low = cleaned.lower()
+    candidates: list[str] = [cleaned]
+    if low == "proton_experimental":
+        candidates.append("Proton - Experimental")
+    elif low == "proton_hotfix":
+        candidates.append("Proton - Hotfix")
+    else:
+        m = re.fullmatch(r"proton_(\d+)", low)
+        if m:
+            candidates.extend([f"Proton {m.group(1)}.0", f"Proton {m.group(1)}"])
+    for lib in _list_steam_library_roots(steam_root):
+        common_dir = lib / "steamapps" / "common"
+        if not common_dir.is_dir():
+            continue
+        for cand_name in candidates:
+            cand = common_dir / cand_name
+            if cand.is_dir() and (cand / "proton").is_file():
+                return cand
+    return None
+
+
+def resolve_proton_dir(
+    name: str,
+    steam_root: Path | None = None,
+    extra_compat_dirs: Iterable[Path] = (),
+) -> Path | None:
+    """Resolve a Proton name or path to its directory: explicit path, custom tools, then built-ins."""
+    cleaned = name.strip()
+    if not cleaned:
+        return None
+    as_path = Path(cleaned)
+    if as_path.is_dir() and (as_path / "proton").is_file():
+        return as_path
+    root = steam_root if steam_root is not None else find_steam_root()
+    compat_dirs = list(extra_compat_dirs)
+    if root is not None:
+        compat_dirs.extend(_iter_compat_tool_dirs(root))
+    found = resolve_compat_tool_dir(cleaned, compat_dirs)
+    if found is not None:
+        return found
+    return resolve_builtin_proton(cleaned, root) if root is not None else None
 
 
 def list_installed_protons(steam_root: Path) -> list[tuple[str, str]]:

@@ -16,6 +16,7 @@ from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
 from . import runtime_manager
+from .fsutil import copy_dir_no_symlinks
 from .scanner import clean_game_name
 from .steam_paths import find_proton_binary, find_steam_root
 
@@ -702,11 +703,6 @@ def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
         shutil.move(str(item), str(dest))
 
 
-def _kill_proc_group(proc: subprocess.Popen[bytes], sig: int) -> None:
-    """Signal the subprocess group when start_new_session=True, falling back to proc."""
-    runtime_manager.kill_proc_group(proc, sig)
-
-
 def _drain_stream_lines(
     proc: subprocess.Popen[bytes],
     cancel_flag: Callable[[], bool] | None,
@@ -783,22 +779,6 @@ def extract_archive(
     if on_progress:
         on_progress(100, f"Completed in {final_dir}")
     return final_dir
-
-
-def _copy_dir_no_symlinks(src_dir: Path, dst_dir: Path) -> None:
-    """Copy a directory tree skipping symlinks."""
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    for root_s, dirs_s, files_s in os.walk(src_dir, followlinks=False):
-        rel = Path(root_s).relative_to(src_dir)
-        target_sub = dst_dir / rel
-        target_sub.mkdir(parents=True, exist_ok=True)
-        for d in list(dirs_s):
-            if (Path(root_s) / d).is_symlink():
-                dirs_s.remove(d)
-        for f in files_s:
-            sf = Path(root_s) / f
-            if not sf.is_symlink() and sf.is_file():
-                shutil.copy2(sf, target_sub / f)
 
 
 def _collect_regular_files(root: Path) -> set[Path]:
@@ -918,13 +898,13 @@ def run_windows_installer(
                         continue
                     game_exes = [p for p in new_exes if not _is_non_game_helper_exe(p)]
                     if game_exes:
-                        _copy_dir_no_symlinks(cand, target_dir / cand.name)
+                        copy_dir_no_symlinks(cand, target_dir / cand.name)
                         copied_any = True
                     else:
                         fallback_candidates.append(cand)
             if not copied_any and fallback_candidates:
                 for cand in fallback_candidates:
-                    _copy_dir_no_symlinks(cand, target_dir / cand.name)
+                    copy_dir_no_symlinks(cand, target_dir / cand.name)
                 copied_any = True
             if not copied_any:
                 raise RuntimeError(
@@ -938,5 +918,5 @@ def run_windows_installer(
             elif saved_pfx.exists():
                 shutil.rmtree(saved_pfx, ignore_errors=True)
             if not saved_pfx.exists() and not saved_pfx.is_symlink():
-                _copy_dir_no_symlinks(inst_pfx, saved_pfx)
+                copy_dir_no_symlinks(inst_pfx, saved_pfx)
     return target_dir

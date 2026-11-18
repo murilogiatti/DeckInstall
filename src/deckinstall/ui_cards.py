@@ -427,34 +427,9 @@ def _parse_launch_preset_state(opts: str) -> dict[str, object]:
                         pass
 
     winedll_from_tokens = ""
-    lsfg_enabled = "lsfg-vk" in tokens_now
-    lsfg_multiplier = 2
-    lsfg_flow_scale: float | None = None
-    lsfg_perf_mode = False
-    lsfg_profile = ""
     for tok in tokens_list:
         if tok.startswith("WINEDLLOVERRIDES="):
             winedll_from_tokens = tok.split("=", 1)[1]
-        elif tok.startswith("ENABLE_LSFG="):
-            val = tok.split("=", 1)[1].strip().lower()
-            lsfg_enabled = val not in ("", "0", "false", "no", "off")
-        elif tok.startswith("LSFG_MULTIPLIER="):
-            try:
-                parsed_mult = int(tok.split("=", 1)[1].strip())
-                if parsed_mult in (2, 3, 4):
-                    lsfg_multiplier = parsed_mult
-            except ValueError:
-                pass
-        elif tok.startswith("LSFG_FLOW_SCALE="):
-            try:
-                lsfg_flow_scale = float(tok.split("=", 1)[1].strip())
-            except ValueError:
-                pass
-        elif tok.startswith("LSFG_PERF_MODE="):
-            val = tok.split("=", 1)[1].strip().lower()
-            lsfg_perf_mode = val not in ("", "0", "false", "no", "off")
-        elif tok.startswith("LSFGVK_PROFILE="):
-            lsfg_profile = tok.split("=", 1)[1].strip()
 
     return {
         "tokens_list": tokens_list,
@@ -474,11 +449,6 @@ def _parse_launch_preset_state(opts: str) -> dict[str, object]:
         "wined3d": "PROTON_USE_WINED3D=1" in tokens_now,
         "no_esync": "PROTON_NO_ESYNC=1" in tokens_now,
         "no_fsync": "PROTON_NO_FSYNC=1" in tokens_now,
-        "lsfg": lsfg_enabled,
-        "lsfg_multiplier": lsfg_multiplier,
-        "lsfg_flow_scale": lsfg_flow_scale,
-        "lsfg_perf_mode": lsfg_perf_mode,
-        "lsfg_profile": lsfg_profile,
         "winedll": winedll_from_tokens,
     }
 

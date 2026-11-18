@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any
 import requests
 
 from . import __version__
+from .fsutil import atomic_write_text, file_sha256
 from .steam_paths import dir_size_bytes as _dir_size_bytes
 
 if TYPE_CHECKING:
@@ -304,6 +305,18 @@ def get_compat_tools_dir() -> Path:
     return xdg_data_home / "Steam" / "compatibilitytools.d"
 
 
+def _all_compat_tool_dirs(steam_root: Path | None = None) -> list[Path]:
+    """Return every compatibilitytools.d directory to search (writable one first, may contain duplicates)."""
+    from .steam_paths import _iter_compat_tool_dirs, find_steam_root
+
+    root = steam_root if steam_root is not None else find_steam_root()
+    dirs: list[Path] = [get_compat_tools_dir()]
+    if root is not None:
+        dirs.extend(_iter_compat_tool_dirs(root))
+    dirs.extend(_iter_extra_compat_tool_dirs())
+    return dirs
+
+
 def get_steamrt4_dir() -> Path:
     """Return the umu steamrt4 runtime directory."""
     xdg_data = os.environ.get("XDG_DATA_HOME", "").strip()
@@ -348,13 +361,7 @@ def list_ge_proton_dirs(
     min_major: int = 11, max_major: int | None = None
 ) -> list[Path]:
     """List installed GE-Proton directories within [min_major, max_major] sorted newest first."""
-    from .steam_paths import _iter_compat_tool_dirs, find_steam_root
-
-    steam_root = find_steam_root()
-    candidate_dirs: list[Path] = [get_compat_tools_dir()]
-    if steam_root is not None:
-        candidate_dirs.extend(_iter_compat_tool_dirs(steam_root))
-    candidate_dirs.extend(_iter_extra_compat_tool_dirs())
+    candidate_dirs = _all_compat_tool_dirs()
 
     seen_dirs: set[Path] = set()
     seen_entries: set[Path] = set()
@@ -432,28 +439,12 @@ def _read_versions_unlocked() -> dict[str, Any]:
 
 def _write_versions_unlocked(data: dict[str, Any]) -> None:
     path = get_versions_file()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=".versions_", suffix=".json", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, sort_keys=True)
-        os.replace(tmp_name, path)
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+    atomic_write_text(path, json.dumps(data, indent=2, sort_keys=True))
 
 
 def _load_versions() -> dict[str, Any]:
     with _versions_lock():
         return _read_versions_unlocked()
-
-
-def _save_versions(data: dict[str, Any]) -> None:
-    with _versions_lock():
-        _write_versions_unlocked(data)
 
 
 def _update_versions(mutator: Callable[[dict[str, Any]], None]) -> dict[str, Any]:
@@ -755,14 +746,7 @@ def _verify_sha256(file_path: Path, checksum_text_or_hex: str) -> None:
                 raise RuntimeError(f"No SHA-256 entry matching {file_path.name!r}.")
         expected = expected_opt
 
-    with open(file_path, "rb") as fh:
-        if hasattr(hashlib, "file_digest"):
-            actual = hashlib.file_digest(fh, "sha256").hexdigest().lower()
-        else:
-            digest = hashlib.sha256()
-            for chunk in iter(lambda: fh.read(65536), b""):
-                digest.update(chunk)
-            actual = digest.hexdigest().lower()
+    actual = file_sha256(file_path).lower()
     if actual != expected:
         raise RuntimeError(
             f"SHA-256 checksum mismatch for {file_path.name}: expected {expected}, got {actual}"
@@ -1456,13 +1440,9 @@ def fetch_available_proton_releases(
 
 def list_installed_compat_tools() -> list[InstalledCompatTool]:
     """List all custom compatibility tools with compatibilitytool.vdf installed."""
-    from .steam_paths import _iter_compat_tool_dirs, _read_compat_tool_id, find_steam_root
+    from .steam_paths import _read_compat_tool_id
 
-    steam_root = find_steam_root()
-    candidate_dirs: list[Path] = [get_compat_tools_dir()]
-    if steam_root is not None:
-        candidate_dirs.extend(_iter_compat_tool_dirs(steam_root))
-    candidate_dirs.extend(_iter_extra_compat_tool_dirs())
+    candidate_dirs = _all_compat_tool_dirs()
 
     seen_dirs: set[Path] = set()
     seen_entries: set[Path] = set()
@@ -1947,79 +1927,15 @@ def _resolve_proton_name_in_compat_dirs(
     proton_name: str, steam_root: Path | None = None
 ) -> Path | None:
     """Resolve a Proton/compat tool name or path across all compatibility tool directories."""
+    from .steam_paths import resolve_compat_tool_dir
+
     cleaned = proton_name.strip()
     if not cleaned:
         return None
     as_path = Path(cleaned)
     if as_path.is_dir() and (as_path / "proton").is_file():
         return as_path
-
-    from .steam_paths import _iter_compat_tool_dirs, _read_compat_tool_id, find_steam_root
-
-    effective_steam_root = steam_root if steam_root is not None else find_steam_root()
-    candidate_dirs: list[Path] = [get_compat_tools_dir()]
-    if effective_steam_root is not None:
-        candidate_dirs.extend(_iter_compat_tool_dirs(effective_steam_root))
-    candidate_dirs.extend(_iter_extra_compat_tool_dirs())
-
-    seen_dirs: set[Path] = set()
-    for compat_dir in candidate_dirs:
-        if not compat_dir.is_dir():
-            continue
-        try:
-            resolved_dir = compat_dir.resolve()
-        except OSError:
-            resolved_dir = compat_dir
-        if resolved_dir in seen_dirs:
-            continue
-        seen_dirs.add(resolved_dir)
-
-        direct = compat_dir / cleaned
-        if direct.is_dir() and (direct / "proton").is_file():
-            return direct
-
-        try:
-            entries = list(compat_dir.iterdir())
-        except OSError:
-            continue
-        for entry in entries:
-            if not entry.is_dir() or not (entry / "proton").is_file():
-                continue
-            vdf_file = entry / "compatibilitytool.vdf"
-            if vdf_file.is_file() and _read_compat_tool_id(vdf_file, entry.name) == cleaned:
-                return entry
-    return None
-
-
-def _resolve_builtin_steam_proton(proton_name: str, steam_root: Path) -> Path | None:
-    """Resolve a built-in Steam Proton tool name across Steam library common/ directories."""
-    from .steam_paths import _list_steam_library_roots
-
-    cleaned = proton_name.strip()
-    if not cleaned:
-        return None
-    low = cleaned.lower()
-    candidates: list[str] = []
-    if low == "proton_experimental":
-        candidates.append("Proton - Experimental")
-    elif low == "proton_hotfix":
-        candidates.append("Proton - Hotfix")
-    else:
-        m = re.fullmatch(r"proton_(\d+)", low)
-        if m:
-            num = m.group(1)
-            candidates.extend([f"Proton {num}.0", f"Proton {num}"])
-    candidates.append(cleaned)
-
-    for lib in _list_steam_library_roots(steam_root):
-        common_dir = lib / "steamapps" / "common"
-        if not common_dir.is_dir():
-            continue
-        for cand_name in candidates:
-            cand = common_dir / cand_name
-            if cand.is_dir() and (cand / "proton").is_file():
-                return cand
-    return None
+    return resolve_compat_tool_dir(cleaned, _all_compat_tool_dirs(steam_root))
 
 
 def resolve_game_prefix(
@@ -2036,7 +1952,7 @@ def resolve_game_prefix(
         if not isinstance(appid, int):
             raise ValueError(f"Expected integer appid or ShortcutEntry, got {type(obj).__name__}.")
         prefix_dir = paths.compatdata_dir / str(appid) / "pfx"
-        from .steam_paths import find_proton_binary
+        from .steam_paths import find_proton_binary, resolve_builtin_proton
         from .steam_vdf import get_shortcut_proton
 
         proton_dir: Path | None = None
@@ -2044,7 +1960,7 @@ def resolve_game_prefix(
         if proton_name:
             proton_dir = _resolve_proton_name_in_compat_dirs(proton_name, paths.steam_root)
             if proton_dir is None:
-                proton_dir = _resolve_builtin_steam_proton(proton_name, paths.steam_root)
+                proton_dir = resolve_builtin_proton(proton_name, paths.steam_root)
         if proton_dir is None:
             proton_bin = find_proton_binary(paths.steam_root)
             proton_dir = proton_bin.parent if proton_bin is not None else None
@@ -2176,44 +2092,6 @@ def build_umu_env(
     if extra_env:
         env.update(extra_env)
     return env
-
-
-def run_with_umu(
-    exe_path: Path,
-    prefix_dir: Path,
-    proton_dir: Path | None = None,
-    args: list[str] | None = None,
-    cwd: Path | None = None,
-    extra_env: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[bytes]:
-    """Ensure umu-run, GE-Proton11+, and steamrt4 integrity, then execute exe_path."""
-    umu_run = ensure_umu_run()
-    if proton_dir is not None:
-        report = validate_ge_proton_integrity(proton_dir)
-        if report.valid:
-            resolved_proton = proton_dir
-        else:
-            logging.warning(
-                "Provided Proton directory %s failed integrity check (%s); attempting repair/fallback.",
-                proton_dir,
-                report.error,
-            )
-            try:
-                resolved_proton = repair_ge_proton(proton_dir)
-            except Exception:
-                resolved_proton = ensure_ge_proton11()
-    else:
-        resolved_proton = ensure_ge_proton11()
-    validate_steamrt4_integrity()
-    prefix_dir.mkdir(parents=True, exist_ok=True)
-    env = build_umu_env(prefix_dir, resolved_proton, extra_env=extra_env)
-    cmd = [str(umu_run), str(exe_path), *(args or [])]
-    return subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd is not None else None,
-        env=env,
-        check=False,
-    )
 
 
 def is_win32_prefix(prefix_dir: Path) -> bool:
@@ -2412,73 +2290,6 @@ def _get_umu_db_index(db_path: Path) -> _UmuDbIndex | None:
     with _UMU_DB_CACHE_LOCK:
         _UMU_DB_CACHE = (cache_key, index)
     return index
-
-
-def ensure_umu_database(
-    force_update: bool = False,
-    progress_cb: ProgressCallback | None = None,
-) -> Path | None:
-    """Ensure umu-database.csv is cached locally, refreshing when TTL expires."""
-    db_path = get_umu_database_path()
-    has_cached = db_path.is_file() and db_path.stat().st_size > 0
-    if not force_update and has_cached:
-        versions = _load_versions()
-        try:
-            last_check = int(versions.get("umu_db_last_check", 0) or 0)
-        except (TypeError, ValueError):
-            last_check = 0
-        if (time.time() - last_check) < UMU_DATABASE_TTL_SECONDS:
-            return db_path
-
-    tmp_path: Path | None = None
-    try:
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        _emit_progress(progress_cb, "Downloading umu-database.csv...", 0)
-        with _request_with_validated_redirects(
-            UMU_DATABASE_URL,
-            allowed_hosts=_ALLOWED_UMU_DB_HOSTS,
-            headers={"User-Agent": USER_AGENT},
-            timeout=30,
-            stream=True,
-            label="umu-database.csv",
-        ) as resp:
-            resp.raise_for_status()
-            fd, tmp_name = tempfile.mkstemp(
-                prefix=".umu-database_",
-                suffix=".csv",
-                dir=str(db_path.parent),
-            )
-            tmp_path = Path(tmp_name)
-            with os.fdopen(fd, "wb") as handle:
-                for chunk in resp.iter_content(chunk_size=65536):
-                    if chunk:
-                        handle.write(chunk)
-
-        _validate_umu_csv_header(tmp_path)
-        os.replace(tmp_path, db_path)
-        tmp_path = None
-
-        def _set_umu_db(versions: dict[str, Any]) -> None:
-            versions["umu_db_last_check"] = int(time.time())
-
-        _update_versions(_set_umu_db)
-        _emit_progress(progress_cb, "umu-database.csv ready.", 100)
-        return db_path
-    except Exception as exc:
-        if tmp_path is not None:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-        if has_cached:
-            logging.warning(
-                "Failed to update umu-database.csv (%s); using cached copy at %s.",
-                exc,
-                db_path,
-            )
-            return db_path
-        logging.warning("Failed to fetch umu-database.csv and no local cache exists: %s", exc)
-        return None
 
 
 def _pick_store_row(

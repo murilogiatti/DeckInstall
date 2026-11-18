@@ -198,49 +198,6 @@ def _is_ignored_exe(exe: Path) -> bool:
     return any(pat in low for pat in IGNORED_EXE_PATTERNS)
 
 
-def rank_executables(game_dir: Path) -> list[Path]:
-    """Find and rank candidate Windows executables inside a game folder."""
-    candidates: list[Path] = []
-    root_depth_limit = 4
-    base_parts = len(game_dir.parts)
-    for dirpath, dirnames, filenames in os.walk(game_dir, followlinks=False):
-        cur = Path(dirpath)
-        depth = len(cur.parts) - base_parts
-        if depth >= root_depth_limit - 1:
-            dirnames[:] = []
-        else:
-            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-        if depth + 1 > root_depth_limit:
-            continue
-        for fname in filenames:
-            if not fname.lower().endswith(".exe"):
-                continue
-            path = cur / fname
-            try:
-                if not path.is_file():
-                    continue
-            except OSError:
-                continue
-            if _is_ignored_exe(path):
-                continue
-            candidates.append(path)
-
-    def score(exe: Path) -> tuple[int, int, int, int, int]:
-        name_low = exe.name.lower()
-        rel_depth = len(exe.relative_to(game_dir).parts)
-        is_utility = 1 if any(pat in name_low for pat in UTILITY_EXE_PATTERNS) else 0
-        is_shipping = 0 if "win64-shipping.exe" in name_low else 1
-        is_root = 0 if rel_depth == 1 else 1
-        try:
-            size_neg = -exe.stat().st_size
-        except OSError:
-            size_neg = 0
-        return (is_utility, is_shipping, is_root, rel_depth, size_neg)
-
-    candidates.sort(key=score)
-    return candidates
-
-
 def _extract_steam_appid(
     appid_files: list[Path],
     ini_files: dict[str, list[Path]],

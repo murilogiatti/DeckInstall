@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import errno
 import fcntl
 import glob
 import hashlib
@@ -30,6 +29,8 @@ from typing import Any
 import vdf
 
 from .extractor import check_disk_space
+from .fsutil import atomic_write_bytes, file_sha256, move_dir_safely
+from .manifest import find_manifest, read_manifest_fields
 from .scanner import clean_game_name, detect_steam_appid
 from .steam_paths import (
     SteamPaths,
@@ -39,6 +40,7 @@ from .steam_paths import (
     is_flatpak_steam,
     is_steam_running,
     list_steam_users,
+    read_library_paths,
 )
 
 DEFAULT_SAVES_DIR = Path.home() / "Games" / "saves"
@@ -150,31 +152,9 @@ def _quote_path(path: str) -> str:
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Write bytes to a unique temp file in the same directory and atomically replace target."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    """Atomically write bytes to path while holding the global Steam lock."""
     with _STEAM_LOCK:
-        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
-        tmp = Path(tmp_name)
-        try:
-            with os.fdopen(fd, "wb") as fh:
-                fh.write(data)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, path)
-            try:
-                dir_fd = os.open(str(path.parent), os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-            except OSError:
-                pass
-        except Exception:
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
-            raise
+        atomic_write_bytes(path, data)
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -339,27 +319,6 @@ def start_steam(steam_root: Path | None = None) -> None:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-
-
-def move_dir_safely(src: Path, dst: Path) -> None:
-    """Move a directory without ever leaving the only full copy at risk.
-
-    Same filesystem: atomic rename. Across filesystems: copy everything first, and only
-    then delete the source. A failure while copying raises (source untouched, partial
-    destination may remain). A failure while deleting the source is only logged: the
-    destination is already complete, so leftovers are preferable to data loss.
-    """
-    try:
-        os.rename(src, dst)
-        return
-    except OSError as exc:
-        if exc.errno != errno.EXDEV:
-            raise
-    shutil.copytree(src, dst, symlinks=True)
-    try:
-        shutil.rmtree(src)
-    except OSError:
-        logging.warning("Moved %s to %s but could not fully remove the source", src, dst, exc_info=True)
 
 
 def _is_same_game_entry(item: dict, exe_path: Path, start_dir: Path) -> bool:
@@ -708,16 +667,7 @@ def _installed_steam_app_names(steam_root: Path) -> dict[int, str]:
     """Return {appid: name} for installed Steam games across all library folders."""
     names: dict[int, str] = {}
     steamapps_dirs = [steam_root / "steamapps"]
-    lib_vdf = steam_root / "steamapps" / "libraryfolders.vdf"
-    if lib_vdf.is_file():
-        try:
-            data = vdf.loads(lib_vdf.read_text(encoding="utf-8", errors="replace"))
-            folders = data.get("libraryfolders") or data.get("LibraryFolders") or {}
-            for val in folders.values():
-                if isinstance(val, dict) and val.get("path"):
-                    steamapps_dirs.append(Path(str(val["path"])) / "steamapps")
-        except Exception:
-            pass
+    steamapps_dirs.extend(lib / "steamapps" for lib in read_library_paths(steam_root))
     for sa in steamapps_dirs:
         if not sa.is_dir():
             continue
@@ -1613,18 +1563,6 @@ def _iter_programdata_save_pairs(
             yield src_file, dst_progdata / rel_dir / fname
 
 
-def _file_sha256(path: Path) -> str:
-    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd, "rb") as fh:
-        file_digest = getattr(hashlib, "file_digest", None)
-        if file_digest is not None:
-            return file_digest(fh, "sha256").hexdigest()
-        h = hashlib.sha256()
-        while chunk := fh.read(65536):
-            h.update(chunk)
-        return h.hexdigest()
-
-
 def _strip_vdf_quotes(val: str) -> str:
     return val.strip().strip('"').strip()
 
@@ -1654,7 +1592,7 @@ def _copy_save_pair_if_newer(
             return 0
         if dst_file.exists() and (
             dst_file.stat().st_size != src_file.stat().st_size
-            or _file_sha256(dst_file) != _file_sha256(src_file)
+            or file_sha256(dst_file) != file_sha256(src_file)
         ):
             _backup_file(dst_file, keep=3, backup_dir=dst_root_resolved / ".deckinstall_bak")
         fd, tmp_name = tempfile.mkstemp(
@@ -1770,25 +1708,6 @@ def import_external_prefix_saves(
     if errors:
         raise RuntimeError(f"Falha ao importar {len(errors)} save(s): {errors[0]}")
     return copied
-
-
-def import_hydra_umu_saves(
-    paths: SteamPaths,
-    shortcut_appid_u32: int,
-    steam_appid: int | None,
-    hydra_prefixes_root: Path | None = None,
-) -> int:
-    """Import newer/missing save files from Hydra UMU wine-prefixes into Steam compatdata."""
-    if not steam_appid:
-        return 0
-    roots = [hydra_prefixes_root] if hydra_prefixes_root else None
-    return import_external_prefix_saves(
-        paths=paths,
-        shortcut_appid_u32=shortcut_appid_u32,
-        game_name="",
-        steam_appid=steam_appid,
-        search_roots=roots,
-    )
 
 
 def _has_pending_external_saves(
@@ -1987,31 +1906,6 @@ def _prefix_has_unconventional_saves(prefix_dir: Path, src_users: Path | None = 
     return False
 
 
-def _prefix_has_saves(prefix_dir: Path) -> bool:
-    src_users = _prefix_users_dir(prefix_dir)
-    if src_users is None:
-        return True
-    dummy_dst = prefix_dir / "__unused__"
-    try:
-        for src_file, _ in _iter_prefix_save_pairs(
-            src_users, dummy_dst, raise_on_error=True
-        ):
-            if src_file.stat().st_size > 0:
-                return True
-        prog_data = _prefix_programdata_dir(prefix_dir)
-        if prog_data is not None:
-            for src_file, _ in _iter_programdata_save_pairs(
-                prog_data, dummy_dst, raise_on_error=True
-            ):
-                if src_file.stat().st_size > 0:
-                    return True
-        if _prefix_has_unconventional_saves(prefix_dir, src_users):
-            return True
-    except OSError:
-        return True
-    return False
-
-
 _GENERIC_GAME_HINT_DIRS = _PREFIX_SKIP_DIRS | {
     "unrealengine",
     "unity",
@@ -2094,7 +1988,7 @@ def _verify_save_pair_exact(
     dst_stat = dst_file.stat()
     if dst_stat.st_size == 0 or dst_stat.st_size != src_stat.st_size:
         return False
-    return _file_sha256(src_file) == _file_sha256(dst_file)
+    return file_sha256(src_file) == file_sha256(dst_file)
 
 
 def _prefix_saves_verified_in_target(src_prefix: Path, dst_compatdata: Path) -> bool:
@@ -2195,20 +2089,22 @@ def sync_all_external_saves(
     return checked, copied
 
 
+def _add_manifest_prefix(manifest: Path, out: set[Path]) -> None:
+    """Add the prefix recorded in a v1/v2 game manifest to out (best effort)."""
+    fields = read_manifest_fields(manifest)
+    if fields is None:
+        return
+    try:
+        out.add(Path(fields["prefix_dir"]).resolve())
+    except OSError:
+        pass
+
+
 def _installed_steam_appids(steam_root: Path) -> set[int]:
     """Return installed Steam AppIDs and core runtime IDs from appmanifest_*.acf files."""
     appids: set[int] = {0, 228980, 1070560, 1391110, 1493710, 1628350, 1887720}
     steamapps_dirs = [steam_root / "steamapps"]
-    lib_vdf = steam_root / "steamapps" / "libraryfolders.vdf"
-    if lib_vdf.is_file():
-        try:
-            data = vdf.loads(lib_vdf.read_text(encoding="utf-8", errors="replace"))
-            folders = data.get("libraryfolders") or data.get("LibraryFolders") or {}
-            for val in folders.values():
-                if isinstance(val, dict) and val.get("path"):
-                    steamapps_dirs.append(Path(str(val["path"])) / "steamapps")
-        except Exception:
-            pass
+    steamapps_dirs.extend(lib / "steamapps" for lib in read_library_paths(steam_root))
     for sa in steamapps_dirs:
         if not sa.is_dir():
             continue
@@ -2419,7 +2315,7 @@ def find_cleanup_candidates(
     home_dir: Path | None = None,
 ) -> list[CleanupCandidate]:
     """Find old external prefixes, orphan Steam compatdata/shadercache, backups, and optional system caches."""
-    from .standalone import get_games_dir, list_standalone_games
+    from .standalone import get_legacy_games_dir, list_standalone_games
 
     candidates: list[CleanupCandidate] = []
     seen: set[Path] = set()
@@ -2453,10 +2349,11 @@ def find_cleanup_candidates(
         if home_dir is not None
         else Path(os.environ.get("XDG_CACHE_HOME", "").strip() or (home / ".cache")).expanduser()
     )
-    games_dir = (home_dir / "Games") if home_dir is not None else get_games_dir()
+    games_dir = (home_dir / "Games") if home_dir is not None else get_legacy_games_dir()
     standalone_prefixes_dir = games_dir / ".prefixes"
     standalone_prefix_paths: set[Path] = set()
-    for game in list_standalone_games(games_dir):
+    # Protect the prefixes of every library game, not only the ones under games_dir.
+    for game in [*list_standalone_games(games_dir), *list_standalone_games()]:
         try:
             standalone_prefix_paths.add(game.prefix_dir.resolve())
         except OSError:
@@ -2466,15 +2363,9 @@ def find_cleanup_candidates(
             for gdir in games_dir.iterdir():
                 if not gdir.is_dir() or gdir.name.startswith("."):
                     continue
-                manifest = gdir / ".deckinstall_standalone.json"
-                if manifest.is_file():
-                    try:
-                        mdata = json.loads(manifest.read_text(encoding="utf-8", errors="replace"))
-                        p_raw = mdata.get("prefix_dir")
-                        if p_raw:
-                            standalone_prefix_paths.add(Path(str(p_raw)).resolve())
-                    except Exception:
-                        pass
+                manifest = find_manifest(gdir)
+                if manifest is not None:
+                    _add_manifest_prefix(manifest, standalone_prefix_paths)
                     if standalone_prefixes_dir.is_dir():
                         try:
                             standalone_prefix_paths.add((standalone_prefixes_dir / gdir.name).resolve())
@@ -2492,12 +2383,9 @@ def find_cleanup_candidates(
                     for line in desktop_file.read_text(encoding="utf-8", errors="replace").splitlines():
                         if line.startswith("Path="):
                             gdir_path = Path(line.split("=", 1)[1].strip().strip('"')).expanduser()
-                            manifest = gdir_path / ".deckinstall_standalone.json"
-                            if manifest.is_file():
-                                mdata = json.loads(manifest.read_text(encoding="utf-8", errors="replace"))
-                                p_raw = mdata.get("prefix_dir")
-                                if p_raw:
-                                    standalone_prefix_paths.add(Path(str(p_raw)).resolve())
+                            manifest = find_manifest(gdir_path)
+                            if manifest is not None:
+                                _add_manifest_prefix(manifest, standalone_prefix_paths)
                             break
                 except Exception:
                     pass
@@ -2516,7 +2404,7 @@ def find_cleanup_candidates(
             cached = sha256_cache.get(file_path)
             if cached is not None and cached[0] == key[0] and cached[1] == key[1]:
                 return cached[2]
-        digest = _file_sha256(file_path)
+        digest = file_sha256(file_path)
         with cache_lock:
             sha256_cache[file_path] = (key[0], key[1], digest)
         return digest
@@ -2666,7 +2554,7 @@ def find_cleanup_candidates(
             if resolved in standalone_prefix_paths:
                 continue
             if is_standalone_prefixes_root and (
-                (games_dir / child.name / ".deckinstall_standalone.json").is_file()
+                find_manifest(games_dir / child.name) is not None
                 or (games_dir / child.name).is_dir()
             ):
                 continue
@@ -3621,9 +3509,9 @@ def sync_prefix_symlinks(
     links_root: Path | None = None,
 ) -> tuple[int, int]:
     """Create Shortix-style named symlinks in ~/Games/.prefixes/<Game> -> compatdata/<appid>."""
-    from .standalone import get_prefixes_dir
+    from .standalone import get_legacy_prefixes_dir
 
-    root = links_root or get_prefixes_dir()
+    root = links_root or get_legacy_prefixes_dir()
     root.mkdir(parents=True, exist_ok=True)
     manifest_file = root / ".deckinstall_links.json"
     managed_prev: set[str] = set()
@@ -3732,11 +3620,6 @@ _PRESET_ENV_KEYS = (
     "__GLX_VENDOR_LIBRARY_NAME",
     "PROTON_ENABLE_WAYLAND",
     "WINEDLLOVERRIDES",
-    "ENABLE_LSFG",
-    "LSFG_MULTIPLIER",
-    "LSFG_FLOW_SCALE",
-    "LSFG_PERF_MODE",
-    "LSFGVK_PROFILE",
 )
 _OPTISCALER_PROXY_DLLS = frozenset(
     {"dxgi", "amd_fidelityfx_dx12", "amd_fidelityfx_vk", "winmm", "version", "dbghelp"}
@@ -3881,89 +3764,6 @@ def remove_winedlloverride(existing: str, dll_name: str) -> str:
     return ";".join(_strip_dll_from_overrides(existing, norm))
 
 
-def install_mangohud_topbar_config(config_path: Path | None = None) -> Path:
-    """Write a Steam-Deck-style horizontal top-bar MangoHud.conf (backing up any existing file)."""
-    xdg_config_home = Path(
-        os.environ.get("XDG_CONFIG_HOME", "").strip() or (Path.home() / ".config")
-    ).expanduser()
-    target = config_path or (xdg_config_home / "MangoHud" / "MangoHud.conf")
-    target.parent.mkdir(parents=True, exist_ok=True)
-    content = (
-        "# DeckInstall — Steam Deck style horizontal top-bar\n"
-        "legacy_layout=0\n"
-        "horizontal\n"
-        "position=top-center\n"
-        "hud_compact\n"
-        "background_alpha=0.35\n"
-        "font_size=19\n"
-        "fps\n"
-        "frametime\n"
-        "gpu_stats\n"
-        "gpu_temp\n"
-        "cpu_stats\n"
-        "cpu_temp\n"
-        "vram\n"
-        "ram\n"
-    )
-    if target.exists() and not target.is_symlink():
-        try:
-            if target.read_text(encoding="utf-8", errors="replace") != content:
-                backup = target.with_name(f"{target.name}.deckinstall.bak")
-                if not backup.exists():
-                    shutil.copy2(target, backup)
-        except OSError:
-            pass
-    _atomic_write_bytes(target, content.encode("utf-8"))
-    return target
-
-
-def detect_optiscaler_lsfg_conflict(launch_options: str, winedlloverrides: str = "") -> bool:
-    """Return True if lsfg-vk / ENABLE_LSFG is enabled alongside OptiScaler DLL overrides."""
-    try:
-        tokens = _raw_shell_tokens(launch_options) if launch_options.strip() else []
-    except ValueError:
-        tokens = launch_options.split()
-
-    lsfg_enabled = False
-    dll_strings: list[str] = []
-    if winedlloverrides.strip():
-        dll_strings.append(winedlloverrides.strip())
-
-    for tok in tokens:
-        stripped = tok.strip("\"'")
-        if stripped.lower() == "lsfg-vk":
-            lsfg_enabled = True
-        if _is_env_assignment(tok):
-            k, v = tok.split("=", 1)
-            v_clean = v.strip("\"'").strip()
-            if k == "ENABLE_LSFG" and v_clean.lower() not in ("", "0", "false", "no", "off"):
-                lsfg_enabled = True
-            elif k == "WINEDLLOVERRIDES" and v_clean:
-                dll_strings.append(v_clean)
-
-    if not lsfg_enabled or not dll_strings:
-        return False
-
-    for dll_str in dll_strings:
-        for entry in dll_str.split(";"):
-            entry = entry.strip()
-            if not entry:
-                continue
-            if "=" in entry:
-                names_part, mode_part = entry.split("=", 1)
-                if mode_part.strip().lower() == "d":
-                    continue
-            else:
-                names_part = entry
-            for dll_name in names_part.split(","):
-                norm = dll_name.strip().lstrip("*").lower()
-                if norm.endswith(".dll"):
-                    norm = norm[:-4]
-                if norm in _OPTISCALER_PROXY_DLLS:
-                    return True
-    return False
-
-
 def _is_managed_mangohud_config(value: str) -> bool:
     cleaned = value.strip("\"'").strip()
     if "preset=" in cleaned or (
@@ -4026,18 +3826,11 @@ def apply_launch_presets(
     proton_wayland: bool = False,
     mangohud_position: str = "",
     mangohud_fps_limit: int | None = None,
-    lsfg: bool = False,
-    lsfg_multiplier: int = 2,
-    lsfg_flow_scale: float | None = None,
-    lsfg_perf_mode: bool = False,
-    lsfg_profile: str = "",
 ) -> str:
     """Toggle common SteamOS/Proton launch presets while preserving existing custom options."""
     _validate_launch_options(launch_options)
     if winedlloverrides is not None:
         _validate_launch_options(winedlloverrides)
-    if lsfg_profile:
-        _validate_launch_options(lsfg_profile)
     try:
         tokens = _raw_shell_tokens(launch_options) if launch_options.strip() else []
     except ValueError:
@@ -4104,15 +3897,6 @@ def apply_launch_presets(
         preset_envs.append("__GLX_VENDOR_LIBRARY_NAME=nvidia")
     if proton_wayland:
         preset_envs.append("PROTON_ENABLE_WAYLAND=1")
-    if lsfg:
-        preset_envs.append("ENABLE_LSFG=1")
-        preset_envs.append(f"LSFG_MULTIPLIER={int(lsfg_multiplier)}")
-        if lsfg_flow_scale is not None:
-            preset_envs.append(f"LSFG_FLOW_SCALE={float(lsfg_flow_scale):g}")
-        if lsfg_perf_mode:
-            preset_envs.append("LSFG_PERF_MODE=1")
-        if lsfg_profile.strip():
-            preset_envs.append(f"LSFGVK_PROFILE={lsfg_profile.strip()}")
     if winedlloverrides is not None and winedlloverrides.strip():
         preset_envs.append(_format_winedlloverrides_token(winedlloverrides))
 
@@ -4244,28 +4028,25 @@ def list_microsd_compatdata_targets(
                     volume_roots.append(sub)
 
     if steam_root is not None:
-        lib_vdf = steam_root / "steamapps" / "libraryfolders.vdf"
-        if lib_vdf.is_file():
+        steam_dev: int | None
+        try:
+            steam_dev = steam_root.stat().st_dev
+        except OSError:
+            steam_dev = None
+        for lib_path in read_library_paths(steam_root):
             try:
-                data = vdf.loads(lib_vdf.read_text(encoding="utf-8", errors="replace"))
-                folders = data.get("libraryfolders") or data.get("LibraryFolders") or {}
-                for val in folders.values():
-                    if isinstance(val, dict) and val.get("path"):
-                        lib_path = Path(str(val["path"]))
-                        try:
-                            lib_dev = lib_path.stat().st_dev
-                            steam_dev = steam_root.stat().st_dev
-                        except OSError:
-                            continue
-                        if (
-                            lib_path.is_dir()
-                            and not lib_path.is_symlink()
-                            and lib_dev != steam_dev
-                            and _is_path_on_mounted_volume(lib_path)
-                        ):
-                            volume_roots.append(lib_path)
-            except Exception:
-                pass
+                lib_dev = lib_path.stat().st_dev
+            except OSError:
+                continue
+            if steam_dev is None:
+                continue
+            if (
+                lib_path.is_dir()
+                and not lib_path.is_symlink()
+                and lib_dev != steam_dev
+                and _is_path_on_mounted_volume(lib_path)
+            ):
+                volume_roots.append(lib_path)
 
     targets: list[Path] = []
     seen: set[Path] = set()
@@ -4314,7 +4095,7 @@ def _verify_compatdata_copy(source: Path, target: Path) -> None:
                 elif stat.S_ISDIR(mode):
                     entries[rel] = ("dir", "")
                 elif stat.S_ISREG(mode):
-                    entries[rel] = ("file", _file_sha256(path))
+                    entries[rel] = ("file", file_sha256(path))
                 else:
                     raise RuntimeError(f"Unsupported prefix file: {path}")
         return entries

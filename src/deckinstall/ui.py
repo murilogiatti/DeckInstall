@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import TypedDict, cast
 
 from PySide6.QtCore import (
-    QPoint,
+    QFileSystemWatcher,
     QSettings,
     Qt,
     QThread,
@@ -76,6 +76,15 @@ from .extractor import (
 )
 from .i18n import available_languages, set_language, tr
 from .launcher_scan import ExternalLauncherGame, scan_external_launcher_games
+from .library import (
+    Library,
+    default_mount_search_roots,
+    discover_libraries,
+    disks_without_library,
+    ensure_library,
+    internal_library_root,
+    list_unavailable_games,
+)
 from .runtime_manager import (
     detect_gpu_profile,
     ensure_ge_proton11,
@@ -105,6 +114,7 @@ from .standalone import (
     import_standalone_to_steam,
     list_standalone_games,
     update_standalone_launch_options,
+    uses_library_layout,
 )
 from .steam_paths import (
     SteamPaths,
@@ -163,21 +173,10 @@ from .ui_dialogs import (
     run_exe_in_prefix_dialog,
 )
 from .ui_maintenance import (
-    _apply_maint_scan_results,
-    _populate_maint_list,
     _update_maint_summary,
-    _visible_maint_candidates,
     build_maintenance_page,
-    maint_clean_safe,
-    maint_delete_selected,
-    on_maint_filter_changed,
-    on_maint_item_changed,
     open_maintenance_page,
     refresh_maintenance_health,
-    revalidate_maintenance_cleanup,
-    scan_maintenance_cleanup,
-    show_maint_context_menu,
-    toggle_maint_filter_selection,
 )
 from .ui_workers import (  # noqa: F401
     AddToSteamWorker,
@@ -232,11 +231,6 @@ class LaunchPresetState(TypedDict):
     wined3d: bool
     no_esync: bool
     no_fsync: bool
-    lsfg: bool
-    lsfg_multiplier: int
-    lsfg_flow_scale: float | None
-    lsfg_perf_mode: bool
-    lsfg_profile: str
     winedll: str
 
 
@@ -325,6 +319,8 @@ class MainWindow(QMainWindow):
         self.resize(1080, 700)
         self.setMinimumSize(840, 560)
         self._build_ui()
+        self._setup_mount_watcher()
+        self._refresh_libraries()
         self._apply_saved_theme()
         self._refresh_games()
         self._redetect_steam()
@@ -989,6 +985,16 @@ class MainWindow(QMainWindow):
         self._update_standalone_install_label()
         adv_form.addRow("", self.chk_keep_in_place)
 
+        self.add_library_combo = QComboBox()
+        self.add_library_combo.setToolTip(tr("add.library_tooltip"))
+        self.add_library_combo.currentIndexChanged.connect(self._remember_library_choice)
+        adv_form.addRow(tr("add.library"), self.add_library_combo)
+        if not uses_library_layout():
+            self.add_library_combo.setVisible(False)
+            label_item = adv_form.labelForField(self.add_library_combo)
+            if label_item is not None:
+                label_item.setVisible(False)
+
         self._add_launch_options = ""
         self._add_winedlloverrides = ""
         lbl_launch_opts_group = QLabel(tr("add.group_launch_opts"))
@@ -1046,6 +1052,94 @@ class MainWindow(QMainWindow):
         layout.addWidget(add_vsplit, 1)
         return page
 
+    def _setup_mount_watcher(self) -> None:
+        """Refresh libraries when a disk is mounted or removed."""
+        self._mount_refresh_timer = QTimer(self)
+        self._mount_refresh_timer.setSingleShot(True)
+        self._mount_refresh_timer.setInterval(1500)
+        self._mount_refresh_timer.timeout.connect(self._refresh_shortcuts)
+        self._mount_watcher = QFileSystemWatcher(self)
+        dirs = [str(d) for d in default_mount_search_roots() if d.is_dir()]
+        if dirs:
+            self._mount_watcher.addPaths(dirs)
+        self._mount_watcher.directoryChanged.connect(lambda _p: self._mount_refresh_timer.start())
+
+    def _refresh_libraries(self) -> None:
+        """Rebuild the install-target library list and the absent-disk banner."""
+        if not hasattr(self, "add_library_combo"):
+            return
+        try:
+            libs = discover_libraries()
+            disks = disks_without_library()
+            unavailable = list_unavailable_games(libs)
+        except Exception as exc:
+            logging.warning("Library discovery failed: %s", exc)
+            libs, disks, unavailable = [], [], []
+
+        combo = self.add_library_combo
+        wanted = str(self.settings.value("install/library", "") or "")
+        combo.blockSignals(True)
+        combo.clear()
+        internal_root = internal_library_root()
+        if not any(lib.internal and lib.available for lib in libs):
+            combo.addItem(tr("add.library_internal", path=str(internal_root)), f"lib:{internal_root}")
+        for lib in libs:
+            if not lib.available:
+                continue
+            if lib.internal:
+                text = tr("add.library_internal", path=str(lib.root))
+            elif lib.unix_fs:
+                text = tr("add.library_disk", label=lib.label, path=str(lib.root))
+            else:
+                text = tr("add.library_disk_nounix", label=lib.label, path=str(lib.root))
+            combo.addItem(text, f"lib:{lib.root}")
+        for mount in disks:
+            combo.addItem(tr("add.library_create", label=mount.name, path=str(mount)), f"disk:{mount}")
+        idx = combo.findData(wanted) if wanted else -1
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+        combo.blockSignals(False)
+
+        if unavailable:
+            names = ", ".join(f"{g['name']} ({g['library']})" for g in unavailable[:8])
+            if len(unavailable) > 8:
+                names += ", ..."
+            self.unavailable_banner.setText(tr("library.unavailable_banner", count=len(unavailable), names=names))
+            self.unavailable_banner.show()
+        else:
+            self.unavailable_banner.hide()
+
+    def _remember_library_choice(self, _idx: int) -> None:
+        data = self.add_library_combo.currentData()
+        if isinstance(data, str) and data:
+            self.settings.setValue("install/library", data)
+
+    def _selected_library(self) -> tuple[bool, Library | None]:
+        """Return (ok, library) for the install target; creates the library folder when needed."""
+        if not uses_library_layout():
+            return True, None
+        data = str(self.add_library_combo.currentData() or "")
+        kind, _, raw = data.partition(":")
+        try:
+            if kind == "disk" and raw:
+                lib = ensure_library(Path(raw) / "DeckInstall", label=Path(raw).name)
+            elif kind == "lib" and raw:
+                root = Path(raw)
+                lib = ensure_library(root, internal=root == internal_library_root())
+            else:
+                lib = ensure_library(internal_library_root(), internal=True)
+        except OSError as exc:
+            QMessageBox.critical(_dialog_parent(self), __app_name__, tr("add.library_error", err=str(exc)))
+            return False, None
+        if kind == "disk":
+            self.settings.setValue("install/library", f"lib:{lib.root}")
+        if not lib.unix_fs:
+            QMessageBox.warning(
+                _dialog_parent(self),
+                __app_name__,
+                tr("add.library_nounix_warn", label=lib.label, fs=lib.fs_type or "?"),
+            )
+        return True, lib
+
     def _update_standalone_install_label(self) -> None:
         text = (
             tr("install.btn_add_standalone_in_place")
@@ -1102,6 +1196,15 @@ class MainWindow(QMainWindow):
         )
         self.vdf_error_banner.setVisible(False)
         lib_layout.addWidget(self.vdf_error_banner)
+
+        self.unavailable_banner = QLabel()
+        self.unavailable_banner.setWordWrap(True)
+        self.unavailable_banner.setStyleSheet(
+            "color: #ffd180; background-color: rgba(180, 110, 20, 0.18); "
+            "border: 1px solid #c77c1a; border-radius: 6px; padding: 8px;"
+        )
+        self.unavailable_banner.setVisible(False)
+        lib_layout.addWidget(self.unavailable_banner)
 
         self.vdf_queue_banner = QFrame()
         self.vdf_queue_banner.setStyleSheet(
@@ -1448,42 +1551,6 @@ class MainWindow(QMainWindow):
 
     def _refresh_maintenance_health(self) -> None:
         refresh_maintenance_health(self)
-
-    def _on_maint_filter_changed(self, key: str) -> None:
-        on_maint_filter_changed(self, key)
-
-    def _on_maint_item_changed(self, item: QTableWidgetItem) -> None:
-        on_maint_item_changed(self, item)
-
-    def _visible_maint_candidates(self) -> list[CleanupCandidate]:
-        return _visible_maint_candidates(self)
-
-    def _toggle_maint_filter_selection(self) -> None:
-        toggle_maint_filter_selection(self)
-
-    def _populate_maint_list(self) -> None:
-        _populate_maint_list(self)
-
-    def _update_maint_summary(self) -> None:
-        _update_maint_summary(self)
-
-    def _apply_maint_scan_results(self, candidates: list[CleanupCandidate]) -> None:
-        _apply_maint_scan_results(self, candidates)
-
-    def _scan_maintenance_cleanup(self) -> None:
-        scan_maintenance_cleanup(self)
-
-    def _revalidate_maintenance_cleanup(self) -> None:
-        revalidate_maintenance_cleanup(self)
-
-    def _maint_clean_safe(self) -> None:
-        maint_clean_safe(self)
-
-    def _maint_delete_selected(self) -> None:
-        maint_delete_selected(self)
-
-    def _show_maint_context_menu(self, pos: QPoint) -> None:
-        show_maint_context_menu(self, pos)
 
     def _apply_saved_theme(self) -> None:
         saved = str(self.settings.value("theme", "auto"))
@@ -1974,15 +2041,6 @@ class MainWindow(QMainWindow):
         self.settings.setValue("last_launch_opts/wined3d", bool(st["wined3d"]))
         self.settings.setValue("last_launch_opts/no_esync", bool(st["no_esync"]))
         self.settings.setValue("last_launch_opts/no_fsync", bool(st["no_fsync"]))
-        self.settings.setValue("last_launch_opts/lsfg", bool(st.get("lsfg", False)))
-        self.settings.setValue("last_launch_opts/lsfg_multiplier", int(st.get("lsfg_multiplier", 2) or 2))
-        flow_val = st.get("lsfg_flow_scale")
-        self.settings.setValue(
-            "last_launch_opts/lsfg_flow_scale",
-            "" if flow_val is None else f"{float(flow_val):g}",
-        )
-        self.settings.setValue("last_launch_opts/lsfg_perf_mode", bool(st.get("lsfg_perf_mode", False)))
-        self.settings.setValue("last_launch_opts/lsfg_profile", str(st.get("lsfg_profile") or ""))
         self.settings.setValue("last_launch_opts/winedll", winedll.strip())
 
     def _load_last_launch_prefs(self) -> tuple[str, str]:
@@ -1991,14 +2049,6 @@ class MainWindow(QMainWindow):
             return "", ""
         mh_level = _setting_int(self.settings, "last_launch_opts/mh_level", 0)
         mh_fps = _setting_int(self.settings, "last_launch_opts/mh_fps_limit", 0)
-        lsfg_mult = _setting_int(self.settings, "last_launch_opts/lsfg_multiplier", 2)
-        raw_flow = str(self.settings.value("last_launch_opts/lsfg_flow_scale", "") or "").strip()
-        lsfg_flow: float | None = None
-        if raw_flow:
-            try:
-                lsfg_flow = float(raw_flow)
-            except ValueError:
-                lsfg_flow = None
         try:
             opts = apply_launch_presets(
                 "",
@@ -2015,11 +2065,6 @@ class MainWindow(QMainWindow):
                 proton_wayland=_setting_bool(self.settings, "last_launch_opts/wayland", False),
                 mangohud_position=str(self.settings.value("last_launch_opts/mh_position", "") or ""),
                 mangohud_fps_limit=mh_fps if mh_fps > 0 else None,
-                lsfg=_setting_bool(self.settings, "last_launch_opts/lsfg", False),
-                lsfg_multiplier=lsfg_mult if lsfg_mult in (2, 3, 4) else 2,
-                lsfg_flow_scale=lsfg_flow,
-                lsfg_perf_mode=_setting_bool(self.settings, "last_launch_opts/lsfg_perf_mode", False),
-                lsfg_profile=str(self.settings.value("last_launch_opts/lsfg_profile", "") or ""),
             )
         except ValueError:
             opts = ""
@@ -2061,15 +2106,6 @@ class MainWindow(QMainWindow):
                 proton_wayland=bool(st["wayland"]),
                 mangohud_position=str(st.get("mh_position") or ""),
                 mangohud_fps_limit=int(st.get("mh_fps_limit") or 0) or None,
-                lsfg=bool(st.get("lsfg", False)),
-                lsfg_multiplier=int(st.get("lsfg_multiplier", 2) or 2),
-                lsfg_flow_scale=(
-                    st.get("lsfg_flow_scale")
-                    if isinstance(st.get("lsfg_flow_scale"), (int, float))
-                    else None
-                ),
-                lsfg_perf_mode=bool(st.get("lsfg_perf_mode", False)),
-                lsfg_profile=str(st.get("lsfg_profile") or ""),
             )
         except ValueError:
             merged_opts = self._add_launch_options.strip()
@@ -2417,7 +2453,10 @@ class MainWindow(QMainWindow):
             if not keep_in_place:
                 single_exe_only = True
 
-        games_dir = get_games_dir()
+        lib_ok, target_library = self._selected_library()
+        if not lib_ok:
+            return
+        games_dir = target_library.games_dir if target_library is not None else get_games_dir()
         try:
             game_dir.resolve().relative_to(games_dir.resolve())
             inside_games_dir = True
@@ -2438,6 +2477,7 @@ class MainWindow(QMainWindow):
                 winedlloverrides=winedll,
                 game_dir=game_dir,
                 single_exe_only=final_single_exe_only,
+                library=target_library,
             )
             self._track_worker(worker)
             worker.status.connect(self.status_label.setText)
@@ -2618,6 +2658,7 @@ class MainWindow(QMainWindow):
                 self.stack.setCurrentIndex(1)
 
     def _refresh_shortcuts(self) -> None:
+        self._refresh_libraries()
         self._shortcuts_req_id += 1
         req_id = self._shortcuts_req_id
         paths_snapshot = self.paths
@@ -3096,7 +3137,7 @@ class MainWindow(QMainWindow):
         self._set_vdf_write_enabled(enabled and bool(self.paths) and not self._vdf_corrupt)
         if enabled:
             self._update_library_action_states()
-            self._update_maint_summary()
+            _update_maint_summary(self)
             self._update_saves_action_states()
         self._update_remove_existing_state()
 

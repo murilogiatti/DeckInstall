@@ -47,7 +47,6 @@ from ..standalone import StandaloneGame, update_standalone_launch_options
 from ..steam_vdf import (
     ShortcutEntry,
     apply_launch_presets,
-    detect_optiscaler_lsfg_conflict,
     merge_winedlloverride,
     remove_winedlloverride,
     update_shortcut_launch_options,
@@ -543,8 +542,6 @@ def open_optiscaler_dialog(
         st = _parse_launch_preset_state(cur_opts)
         mh_lvl = st["mh_level"]
         mh_fps = st["mh_fps_limit"]
-        raw_mult = st.get("lsfg_multiplier", 2)
-        raw_flow = st.get("lsfg_flow_scale")
         return apply_launch_presets(
             cur_opts,
             gamemode=bool(st["gamemode"]),
@@ -560,20 +557,11 @@ def open_optiscaler_dialog(
             proton_wayland=bool(st["wayland"]),
             mangohud_position=str(st.get("mh_position") or ""),
             mangohud_fps_limit=mh_fps if isinstance(mh_fps, int) and mh_fps > 0 else None,
-            lsfg=bool(st.get("lsfg", False)),
-            lsfg_multiplier=(
-                int(raw_mult) if isinstance(raw_mult, (int, float, str)) and str(raw_mult) else 2
-            ),
-            lsfg_flow_scale=float(raw_flow) if isinstance(raw_flow, (int, float)) else None,
-            lsfg_perf_mode=bool(st.get("lsfg_perf_mode", False)),
-            lsfg_profile=str(st.get("lsfg_profile") or ""),
         )
 
     def _apply_winedll_update(
         new_winedll: str,
         done_msg: str,
-        *,
-        check_conflict: bool,
     ) -> None:
         parent_win = dlg if dlg_alive() else win
         if kind == "standalone" and isinstance(obj, StandaloneGame):
@@ -594,8 +582,6 @@ def open_optiscaler_dialog(
             _set_busy(False)
             win.status_label.setText(done_msg)
             if not win._closing_pending:
-                if check_conflict and detect_optiscaler_lsfg_conflict(cur_opts, new_winedll):
-                    QMessageBox.warning(parent_win, __app_name__, tr("optiscaler.lsfg_warn"))
                 QMessageBox.information(parent_win, __app_name__, done_msg)
             return
 
@@ -618,8 +604,6 @@ def open_optiscaler_dialog(
             _set_busy(False)
             win.status_label.setText(done_msg)
             if not win._closing_pending:
-                if check_conflict and detect_optiscaler_lsfg_conflict(new_opts, new_winedll):
-                    QMessageBox.warning(parent_win, __app_name__, tr("optiscaler.lsfg_warn"))
                 QMessageBox.information(parent_win, __app_name__, done_msg)
             return
 
@@ -648,8 +632,6 @@ def open_optiscaler_dialog(
                 win.status_label.setText(tr("vdf_queue.enqueued", name=entry.app_name))
                 p_win = dlg if dlg_alive() else win
                 if not win._closing_pending:
-                    if check_conflict and detect_optiscaler_lsfg_conflict(new_opts, new_winedll):
-                        QMessageBox.warning(p_win, __app_name__, tr("optiscaler.lsfg_warn"))
                     QMessageBox.information(p_win, __app_name__, tr("vdf_queue.enqueued", name=entry.app_name))
                 return
 
@@ -668,8 +650,6 @@ def open_optiscaler_dialog(
                 win.status_label.setText(done_msg)
                 p_win = dlg if dlg_alive() else win
                 if not win._closing_pending:
-                    if check_conflict and detect_optiscaler_lsfg_conflict(new_opts, new_winedll):
-                        QMessageBox.warning(p_win, __app_name__, tr("optiscaler.lsfg_warn"))
                     QMessageBox.information(p_win, __app_name__, done_msg)
 
             def _steam_err(err: str) -> None:
@@ -809,7 +789,7 @@ def open_optiscaler_dialog(
                 backend=state.backend,
                 version=state.version or "-",
             )
-            _apply_winedll_update(new_winedll, done_msg, check_conflict=True)
+            _apply_winedll_update(new_winedll, done_msg)
 
         def _on_err(err: str) -> None:
             win.status_label.setText(tr("status.ready"))
@@ -850,7 +830,7 @@ def open_optiscaler_dialog(
                 if state is not None and state.proxy_dll
                 else cur_winedll
             )
-            _apply_winedll_update(new_winedll, tr("optiscaler.remove_done"), check_conflict=False)
+            _apply_winedll_update(new_winedll, tr("optiscaler.remove_done"))
 
         def _on_err(err: str) -> None:
             win.status_label.setText(tr("status.ready"))

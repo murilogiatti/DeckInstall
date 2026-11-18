@@ -14,6 +14,7 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .fsutil import atomic_write_bytes, file_sha256, is_within
 from .steam_vdf import (
     _RESTORE_MAX_ENTRIES,
     _RESTORE_MAX_FILE_BYTES,
@@ -106,14 +107,6 @@ def _slugify(value: str, fallback: str = "game") -> str:
     if not stripped.isascii():
         return f"{cleaned.lower()}-{digest}"
     return cleaned.lower()
-
-
-def _is_within_root(path: Path, root_resolved: Path) -> bool:
-    """Return True if path resolves inside root_resolved."""
-    try:
-        return path.resolve().is_relative_to(root_resolved)
-    except OSError:
-        return False
 
 
 def _resolve_wine_root(prefix_dir: Path) -> Path:
@@ -351,7 +344,7 @@ def _resolve_manifest_save_paths(
                     matched_paths = [target_pat]
 
                 for cand in matched_paths:
-                    if cand.is_symlink() or not _is_within_root(cand, section_root_resolved):
+                    if cand.is_symlink() or not is_within(cand, section_root_resolved):
                         continue
                     if cand.is_file():
                         rel = cand.relative_to(section_root)
@@ -370,7 +363,7 @@ def _resolve_manifest_save_paths(
                                 if (
                                     src_file.is_symlink()
                                     or not src_file.is_file()
-                                    or not _is_within_root(src_file, section_root_resolved)
+                                    or not is_within(src_file, section_root_resolved)
                                 ):
                                     continue
                                 rel = src_file.relative_to(section_root)
@@ -600,7 +593,7 @@ def _restore_registry_saves(prefix_dir: Path, reg_json_bytes: bytes) -> int:
             out_lines.append("")
             restored_count += 1
 
-        _atomic_write_bytes(reg_file, ("\n".join(out_lines).rstrip() + "\n").encode("utf-8"))
+        atomic_write_bytes(reg_file, ("\n".join(out_lines).rstrip() + "\n").encode("utf-8"))
 
     return restored_count
 
@@ -647,39 +640,6 @@ def _collect_prefix_save_entries(
 
     entries.sort(key=lambda item: (item[0], item[2].as_posix()))
     return entries
-
-
-def _atomic_write_bytes(target: Path, data: bytes) -> None:
-    """Atomically write bytes to target using a temp file in the same directory."""
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
-    )
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp_path, target)
-    except Exception:
-        try:
-            tmp_path.unlink()
-        except OSError:
-            pass
-        raise
-
-
-def _sha256_file(path: Path) -> str:
-    """Compute hex SHA-256 digest of a file."""
-    with path.open("rb") as fh:
-        file_digest = getattr(hashlib, "file_digest", None)
-        if file_digest is not None:
-            return str(file_digest(fh, "sha256").hexdigest())
-        h = hashlib.sha256()
-        while chunk := fh.read(65536):
-            h.update(chunk)
-        return h.hexdigest()
 
 
 def _rotate_snapshots(snap_dir: Path, max_keep: int) -> None:
@@ -950,7 +910,7 @@ def restore_prefix_state_snapshot(snapshot_zip: Path, prefix_dir: Path) -> tuple
 
             target = base_dir.joinpath(*rel_parts)
             target.parent.mkdir(parents=True, exist_ok=True)
-            if not _is_within_root(target.parent, base_resolved) or target.is_symlink():
+            if not is_within(target.parent, base_resolved) or target.is_symlink():
                 continue
 
             fd, tmp_name = tempfile.mkstemp(
@@ -1101,7 +1061,7 @@ def _record_sync_base(prefix_dir: Path, sync_root: Path, slug: str, digest: str)
             except ValueError:
                 data = {}
         data[_sync_base_key(sync_root, slug)] = digest
-        _atomic_write_bytes(state_path, json.dumps(data, indent=2).encode("utf-8"))
+        atomic_write_bytes(state_path, json.dumps(data, indent=2).encode("utf-8"))
     except OSError:
         logging.warning("Could not record sync base for %s in %s", slug, prefix_dir, exc_info=True)
 
@@ -1212,12 +1172,12 @@ def push_game_saves(
         "game_name": game_name,
         "slug": slug,
         "updated_at": time.time(),
-        "sha256": _sha256_file(latest_zip),
+        "sha256": file_sha256(latest_zip),
         "file_count": file_count,
         "fingerprint_digest": h.hexdigest(),
     }
     meta_bytes = json.dumps(meta, indent=2, ensure_ascii=False).encode("utf-8")
-    _atomic_write_bytes(game_sync_dir / "meta.json", meta_bytes)
+    atomic_write_bytes(game_sync_dir / "meta.json", meta_bytes)
     _record_sync_base(prefix_dir, sync_root, slug, str(meta["fingerprint_digest"]))
     return latest_zip
 
@@ -1269,7 +1229,7 @@ def pull_game_saves(
     meta = _read_sync_meta(sync_root / slug / "meta.json")
     expected_sha = meta.get("sha256") if meta is not None else None
     if isinstance(expected_sha, str) and expected_sha.strip():
-        actual_sha = _sha256_file(latest_zip)
+        actual_sha = file_sha256(latest_zip)
         if actual_sha.lower() != expected_sha.strip().lower():
             raise RuntimeError(
                 f"Sync archive checksum mismatch for {game_name}: "
@@ -1387,7 +1347,7 @@ def _restore_saves_archive(
                 continue
 
             target.parent.mkdir(parents=True, exist_ok=True)
-            if not _is_within_root(target.parent, base_resolved):
+            if not is_within(target.parent, base_resolved):
                 continue
             if target.is_symlink():
                 continue

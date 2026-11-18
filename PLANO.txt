@@ -15,16 +15,16 @@ Desinstalar NAO apaga o prefixo. "UMU-Proton 10" = apenas o mais recente do umu 
 
 FASE 0 - Arrumar a casa (Sonnet, sem mudar comportamento)
 1. [FEITO] ARM64 em scanner.detect_pe_arch corrigido.
-2. Remover LSFG inteiro (~220 referencias em 11 arquivos); launch.sh antigos devem continuar funcionando.
-3. Remover codigo morto: ensure_umu_database, run_with_umu, _save_versions, import_hydra_umu_saves,
+2. [FEITO] Remover LSFG inteiro (~220 referencias em 11 arquivos); launch.sh antigos devem continuar funcionando.
+3. [FEITO] Remover codigo morto: ensure_umu_database, run_with_umu, _save_versions, import_hydra_umu_saves,
    _prefix_has_saves, install_mangohud_topbar_config, BatchVdfApplyWorker, wrappers de manutencao em ui.py:1446-1487,
    rank_executables, _kill_proc_group.
-4. fsutil.py: unificar escrita atomica (6x), SHA-256 (3x), slug/sanitize, "esta dentro de", copiar/mover.
+4. [FEITO] fsutil.py: unificar escrita atomica (6x), SHA-256 (3x), slug/sanitize, "esta dentro de", copiar/mover.
    Unificar leitura de libraryfolders.vdf (4x) e resolucao de Proton (4x) em steam_paths.
 
 FASE 1 - Manifesto e biblioteca (Opus)
-1. Manifesto v2 com caminhos relativos e registro de tudo que foi criado.
-2. Biblioteca por disco: <disco>/DeckInstall/{Games,Prefixes,Caches} + library.json.
+1. [FEITO] Manifesto v2 com caminhos relativos e registro de tudo que foi criado.
+2. [FEITO] Biblioteca por disco: <disco>/DeckInstall/{Games,Prefixes,Caches} + library.json.
    Deteccao ao montar (/run/media/$USER/*, /media/*, /mnt/*); jogos de disco ausente = "indisponivel".
    exFAT/NTFS: prefixo vai para o disco interno, com aviso.
 3. Um jogo, um prefixo; Steam via link do compatdata.

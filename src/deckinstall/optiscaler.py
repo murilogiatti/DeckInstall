@@ -5,11 +5,10 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .fsutil import atomic_copy_file, atomic_write_text
 from .runtime_manager import ProgressCb, _load_versions, ensure_optiscaler
 from .scanner import detect_exe_kind, detect_pe_arch
 
@@ -217,35 +216,6 @@ def scan_optiscaler_compatibility_batch(
 ) -> list[OptiScalerCompatibility]:
     """Assess OptiScaler compatibility for a flat batch of (exe_path, game_dir) pairs."""
     return [check_optiscaler_compatibility(exe_path, game_dir) for exe_path, game_dir in entries]
-
-
-def _atomic_write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, path)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
-
-
-def _atomic_copy_file(src: Path, dst: Path) -> None:
-    """Atomically copy src to dst via a temporary file in dst.parent."""
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=str(dst.parent))
-    os.close(fd)
-    tmp = Path(tmp_name)
-    try:
-        shutil.copy2(src, tmp)
-        os.replace(tmp, dst)
-    except Exception:
-        tmp.unlink(missing_ok=True)
-        raise
 
 
 def _resolve_manifest_path(exe_dir: Path, raw: str) -> Path | None:
@@ -547,7 +517,7 @@ def _write_patched_ini(
         spoof_mode=spoof_mode,
         overlay_menu=overlay_menu,
     )
-    _atomic_write_text(dst_ini, patched_ini)
+    atomic_write_text(dst_ini, patched_ini)
     return dst_ini
 
 
@@ -676,7 +646,7 @@ def install_optiscaler_for_game(
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
                 if dst_file.is_symlink():
                     dst_file.unlink()
-                _atomic_copy_file(src_file, dst_file)
+                atomic_copy_file(src_file, dst_file)
                 installed_files.append(dst_file)
                 continue
 
@@ -709,7 +679,7 @@ def install_optiscaler_for_game(
             _backup_if_needed(dst_file, managed_paths, backed_up_files)
             if dst_file.is_symlink():
                 dst_file.unlink()
-            _atomic_copy_file(src_file, dst_file)
+            atomic_copy_file(src_file, dst_file)
             installed_files.append(dst_file)
 
     if not saw_ini:
@@ -758,7 +728,7 @@ def install_optiscaler_for_game(
         "overlay_menu": state.overlay_menu,
         "prefix_snapshot": str(state.prefix_snapshot) if state.prefix_snapshot is not None else None,
     }
-    _atomic_write_text(
+    atomic_write_text(
         exe_dir / OPTISCALER_MANIFEST,
         json.dumps(manifest_data, indent=2, sort_keys=True) + "\n",
     )

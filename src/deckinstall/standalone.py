@@ -6,25 +6,52 @@ import hashlib
 import json
 import logging
 import os
-import re
 import shlex
 import shutil
 import struct
 import subprocess
-import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
+from . import library as _lib
 from .extractor import check_disk_space
+from .fsutil import (
+    atomic_write_bytes,
+    copy_or_move_dir_contents,
+    is_within,
+    move_dir_safely,
+    remove_path_or_tree,
+    sanitize_dir_name,
+    slugify,
+)
+from .library import (
+    Library,
+    ensure_library,
+    find_library_root,
+    forget_game,
+    internal_library_root,
+    list_mount_points,
+    read_library_file,
+    record_game,
+)
+from .manifest import (
+    MANIFEST_V1,
+    MANIFEST_V2,
+    find_manifest,
+    is_manifest_name,
+    new_uid,
+    now_iso,
+    read_manifest_fields,
+    write_manifest_v2,
+)
 from .scanner import detect_steam_appid
 from .steam_paths import (
     SteamPaths,
-    _iter_compat_tool_dirs,
-    _list_steam_library_roots,
-    _read_compat_tool_id,
     dir_size_bytes,
     find_steam_root,
     list_steam_users,
+    resolve_proton_dir,
 )
 from .steam_vdf import (
     _SHELL_OPS,
@@ -39,7 +66,6 @@ from .steam_vdf import (
     get_shortcut_proton,
     infer_game_root_from_exe,
     load_shortcuts,
-    move_dir_safely,
     remove_shortcut,
     set_shortcut_proton,
     sync_prefix_symlinks,
@@ -53,7 +79,7 @@ GAMES_DIR = _DEFAULT_GAMES_DIR
 PREFIXES_DIR = _DEFAULT_PREFIXES_DIR
 APPLICATIONS_DIR = _DEFAULT_APPLICATIONS_DIR
 UMU_RUN_PATH = Path.home() / ".local" / "share" / "DeckInstall" / "runtime" / "umu" / "umu-run"
-STANDALONE_MANIFEST = ".deckinstall_standalone.json"
+STANDALONE_MANIFEST = MANIFEST_V1  # legacy (schema v1) manifest filename
 _LIBRARY_INDEX_DIR = ".deckinstall-library"
 
 
@@ -67,34 +93,94 @@ def get_applications_dir() -> Path:
     return Path.home() / ".local" / "share" / "applications"
 
 
+def _legacy_layout() -> bool:
+    """True when the games folder is overridden (DECKINSTALL_GAMES_DIR, GAMES_DIR or a patched
+    get_games_dir): the old ~/Games layout (<dir>, <dir>/.prefixes, <dir>/.caches) is used then."""
+    return get_games_dir() != internal_library_root() / _lib.GAMES
+
+
+def uses_library_layout() -> bool:
+    """True when new installs go to a DeckInstall library (not to an overridden games folder)."""
+    return not _legacy_layout()
+
+
 def get_games_dir() -> Path:
-    """Return the standalone games directory (respecting DECKINSTALL_GAMES_DIR)."""
+    """Return the games directory of the internal library (~/DeckInstall/Games).
+
+    DECKINSTALL_GAMES_DIR or a patched GAMES_DIR selects the old layout (<dir>, <dir>/.prefixes).
+    """
     env_dir = os.environ.get("DECKINSTALL_GAMES_DIR", "").strip()
     if env_dir:
         return Path(env_dir).expanduser().resolve()
     if GAMES_DIR != _DEFAULT_GAMES_DIR:
         return GAMES_DIR
-    return Path.home() / "Games"
+    return internal_library_root() / _lib.GAMES
 
 
 def get_prefixes_dir() -> Path:
-    """Return the standalone Wine prefixes directory."""
+    """Return the Wine prefixes directory of the internal library."""
     env_dir = os.environ.get("DECKINSTALL_GAMES_DIR", "").strip()
     if env_dir:
         return get_games_dir() / ".prefixes"
     if PREFIXES_DIR != _DEFAULT_PREFIXES_DIR:
         return PREFIXES_DIR
-    return get_games_dir() / ".prefixes"
+    if _legacy_layout():
+        return get_games_dir() / ".prefixes"
+    return internal_library_root() / _lib.PREFIXES
 
 
 def get_shader_caches_dir() -> Path:
-    """Return the centralized shader caches directory under the standalone games directory."""
-    return get_games_dir() / ".caches"
+    """Return the shader caches directory of the internal library."""
+    if _legacy_layout():
+        return get_games_dir() / ".caches"
+    return internal_library_root() / _lib.CACHES
+
+
+def get_legacy_games_dir() -> Path:
+    """Return the pre-library games folder (~/Games), still scanned until games are migrated."""
+    return get_games_dir() if _legacy_layout() else _DEFAULT_GAMES_DIR
+
+
+def get_legacy_prefixes_dir() -> Path:
+    """Return the pre-library prefixes folder (~/Games/.prefixes), also used for Steam prefix links."""
+    return get_prefixes_dir() if _legacy_layout() else _DEFAULT_PREFIXES_DIR
+
+
+def _library_roots_on_disks() -> list[Path]:
+    """Return library roots on mounted disks (not the internal one)."""
+    roots: list[Path] = []
+    if _legacy_layout():
+        return roots
+    for mount in list_mount_points():
+        root = mount / _lib.LIBRARY_DIRNAME
+        if read_library_file(root) is not None:
+            roots.append(root)
+    return roots
+
+
+def _managed_roots(sub: str, game_dir: Path | None = None) -> list[Path]:
+    """Folders where DeckInstall may keep prefixes (sub=Prefixes) or caches (sub=Caches)."""
+    if sub == _lib.PREFIXES:
+        roots = [get_prefixes_dir(), get_legacy_prefixes_dir()]
+    else:
+        roots = [get_shader_caches_dir(), get_legacy_games_dir() / ".caches"]
+    if not _legacy_layout():
+        roots.append(internal_library_root() / sub)
+        roots.extend(r / sub for r in _library_roots_on_disks())
+    if game_dir is not None:
+        lib_root = find_library_root(game_dir)
+        if lib_root is not None:
+            roots.append(lib_root / sub)
+    out: list[Path] = []
+    for r in roots:
+        if r not in out:
+            out.append(r)
+    return out
 
 
 def get_game_cache_dir(game_dir: Path) -> Path:
     """Return the centralized shader cache directory for a standalone game directory."""
-    safe_name = _sanitize_dir_name(game_dir.name)
+    safe_name = sanitize_dir_name(game_dir.name)
     try:
         resolved = str(game_dir.resolve())
     except OSError:
@@ -103,6 +189,7 @@ def get_game_cache_dir(game_dir: Path) -> Path:
     return get_shader_caches_dir() / f"{safe_name}-{dir_hash}"
 
 
+# "lsfg-vk" is no longer managed by the app, but legacy launch.sh files may still contain it.
 _KNOWN_WRAPPERS = frozenset({"gamemoderun", "lsfg-vk", "mangohud"})
 
 
@@ -123,6 +210,9 @@ class StandaloneGame:
     desktop_shortcut: Path | None = None
     native_linux: bool = False
     cache_dir: Path | None = None
+    uid: str = ""
+    schema: int = 1
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -132,38 +222,6 @@ class OrphanCacheEntry:
     path: Path
     size_bytes: int
     name: str = ""
-
-
-def _sanitize_dir_name(name: str) -> str:
-    """Return a filesystem-safe folder name."""
-    return re.sub(r'[\\/:*?"<>|]+', " ", name).strip() or "Game"
-
-
-def _slugify(name: str) -> str:
-    """Return a lowercase hyphenated slug for .desktop filenames."""
-    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "game"
-
-
-def _is_under_dir(path: Path, parent: Path) -> bool:
-    """Return True if path resolves inside parent (or equals parent)."""
-    try:
-        path.resolve().relative_to(parent.resolve())
-        return True
-    except (OSError, ValueError):
-        return False
-
-
-def _is_strictly_under_dir(path: Path, parent: Path) -> bool:
-    """Return True if path resolves strictly inside parent (and is not a symlink)."""
-    if path.is_symlink():
-        return False
-    try:
-        resolved_path = path.resolve()
-        resolved_parent = parent.resolve()
-        resolved_path.relative_to(resolved_parent)
-        return resolved_path != resolved_parent
-    except (OSError, ValueError):
-        return False
 
 
 def _strip_control_chars(value: str) -> str:
@@ -222,49 +280,9 @@ def _resolve_proton_path(proton_name: str) -> str:
     name = proton_name.strip()
     if not name:
         return "GE-Proton"
-    as_path = Path(name)
-    if as_path.is_dir() and (as_path / "proton").is_file():
-        return str(as_path)
-
     steam_root = find_steam_root() or (Path.home() / ".local" / "share" / "Steam")
-    for compat_dir in _iter_compat_tool_dirs(steam_root):
-        direct = compat_dir / name
-        if direct.is_dir() and (direct / "proton").is_file():
-            return str(direct)
-        try:
-            for entry in compat_dir.iterdir():
-                vdf_file = entry / "compatibilitytool.vdf"
-                if entry.is_dir() and vdf_file.is_file() and (entry / "proton").is_file():
-                    if _read_compat_tool_id(vdf_file, entry.name) == name:
-                        return str(entry)
-        except OSError:
-            continue
-
-    for lib in _list_steam_library_roots(steam_root):
-        common = lib / "steamapps" / "common"
-        if not common.is_dir():
-            continue
-        direct = common / name
-        if direct.is_dir() and (direct / "proton").is_file():
-            return str(direct)
-        if name == "proton_experimental":
-            cand = common / "Proton - Experimental"
-            if (cand / "proton").is_file():
-                return str(cand)
-        elif name == "proton_hotfix":
-            cand = common / "Proton - Hotfix"
-            if (cand / "proton").is_file():
-                return str(cand)
-        else:
-            m = re.fullmatch(r"proton_(\d+)", name)
-            if m:
-                ver = m.group(1)
-                for folder in (f"Proton {ver}.0", f"Proton {ver}"):
-                    cand = common / folder
-                    if (cand / "proton").is_file():
-                        return str(cand)
-
-    return name
+    resolved = resolve_proton_dir(name, steam_root)
+    return str(resolved) if resolved is not None else name
 
 
 def resolve_standalone_proton_fallback(game: StandaloneGame) -> tuple[Path | None, str | None]:
@@ -480,7 +498,7 @@ def _desktop_points_to_game_dir(desktop_path: Path, target_game_dir: Path) -> bo
 def _resolve_desktop_file_path(clean_name: str, target_game_dir: Path) -> Path:
     """Return a unique .desktop path, disambiguating if slug collides with another game_dir."""
     apps_dir = get_applications_dir()
-    slug = _slugify(clean_name)
+    slug = slugify(clean_name)
     candidate = apps_dir / f"deckinstall-{slug}.desktop"
     if not candidate.exists() or _desktop_points_to_game_dir(candidate, target_game_dir):
         return candidate
@@ -563,24 +581,6 @@ def _parse_rsrc_entries(data: bytes, rsrc_off: int, dir_off: int) -> list[tuple[
 _MAX_PE_SECTIONS = 96
 _MAX_PE_OPT_SIZE = 4096
 _MAX_PE_RSRC_BYTES = 16 * 1024 * 1024
-
-
-def _atomic_write_bytes(dest: Path, payload: bytes) -> None:
-    """Atomically write bytes to dest via a temp file in dest.parent + os.replace."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            dir=dest.parent, prefix=f".{dest.name}.", suffix=".tmp", delete=False
-        ) as tf:
-            tmp_path = Path(tf.name)
-            tf.write(payload)
-            tf.flush()
-        os.replace(tmp_path, dest)
-    except Exception:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
-        raise
 
 
 def extract_pe_icon(exe_path: Path, out_ico: Path) -> Path | None:
@@ -719,7 +719,7 @@ def extract_pe_icon(exe_path: Path, out_ico: Path) -> Path | None:
             img_data.extend(blob)
             offset += len(blob)
 
-        _atomic_write_bytes(out_ico, header + bytes(dir_table) + bytes(img_data))
+        atomic_write_bytes(out_ico, header + bytes(dir_table) + bytes(img_data))
         return out_ico
     except Exception as exc:
         logging.debug("PE icon extraction skipped for %s: %s", exe_path, exc)
@@ -785,7 +785,7 @@ def resolve_game_icon(
     """Resolve or extract a local icon file for a standalone game's .desktop launcher."""
     if explicit_icon is not None and not explicit_icon.is_symlink() and explicit_icon.is_file():
         try:
-            if _is_under_dir(explicit_icon.resolve(), target_game_dir.resolve()):
+            if is_within(explicit_icon.resolve(), target_game_dir.resolve()):
                 return explicit_icon
         except OSError:
             pass
@@ -794,7 +794,7 @@ def resolve_game_icon(
             try:
                 target_game_dir.mkdir(parents=True, exist_ok=True)
                 if explicit_icon.resolve() != dest.resolve():
-                    _atomic_write_bytes(dest, explicit_icon.read_bytes())
+                    atomic_write_bytes(dest, explicit_icon.read_bytes())
                 return dest
             except OSError:
                 return explicit_icon
@@ -847,7 +847,7 @@ def resolve_game_icon(
                 out_img = target_game_dir / ".deckinstall_icon.jpg"
                 if out_img.is_symlink():
                     return None
-                _atomic_write_bytes(out_img, raw)
+                atomic_write_bytes(out_img, raw)
                 return out_img
         except Exception as exc:
             logging.debug("Steam header icon fallback failed for %s: %s", steam_appid, exc)
@@ -902,8 +902,34 @@ def _write_desktop_file(
                 pass
 
 
-def _write_manifest(game: StandaloneGame) -> None:
-    """Persist .deckinstall_standalone.json inside game.game_dir."""
+def _game_fields(game: StandaloneGame) -> dict[str, Any]:
+    return {
+        "uid": game.uid,
+        "name": game.name,
+        "game_dir": game.game_dir,
+        "exe_path": game.exe_path,
+        "prefix_dir": game.prefix_dir,
+        "proton_name": game.proton_name,
+        "steam_appid": game.steam_appid,
+        "winedlloverrides": game.winedlloverrides,
+        "launch_options": game.launch_options,
+        "launch_script": game.launch_script,
+        "desktop_file": game.desktop_file if game.desktop_file.is_file() else None,
+        "desktop_shortcut": game.desktop_shortcut,
+        "native_linux": game.native_linux,
+        "cache_dir": game.cache_dir,
+        "meta": game.meta,
+    }
+
+
+def _write_manifest(game: StandaloneGame) -> Path:
+    """Persist the game's manifest, keeping its schema (v1 games are only upgraded by migration)."""
+    if game.schema >= 2:
+        root = find_library_root(game.game_dir) or get_games_dir()
+        path, payload = write_manifest_v2(_game_fields(game), root)
+        game.uid = str(payload["id"])
+        game.meta["created_at"] = payload["created_at"]
+        return path
     payload = {
         "name": game.name,
         "game_dir": str(game.game_dir),
@@ -919,10 +945,9 @@ def _write_manifest(game: StandaloneGame) -> None:
         "native_linux": bool(game.native_linux),
         "cache_dir": str(game.cache_dir) if game.cache_dir else "",
     }
-    _atomic_write_text(
-        game.game_dir / STANDALONE_MANIFEST,
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-    )
+    path = game.game_dir / MANIFEST_V1
+    _atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+    return path
 
 
 def _library_index_path(game_dir: Path) -> Path:
@@ -930,47 +955,14 @@ def _library_index_path(game_dir: Path) -> Path:
     return get_games_dir() / _LIBRARY_INDEX_DIR / f"{key}.json"
 
 
-def _register_standalone_game(game: StandaloneGame) -> None:
+def _register_standalone_game(game: StandaloneGame, manifest_path: Path) -> None:
     """Remember an installed game's manifest even when its files stay outside ~/Games."""
     index_path = _library_index_path(game.game_dir)
     if index_path.parent.is_symlink():
         raise OSError(f"Standalone library index cannot be a symlink: {index_path.parent}")
     _atomic_write_text(index_path, json.dumps({
-        "manifest": str((game.game_dir / STANDALONE_MANIFEST).resolve()),
+        "manifest": str(manifest_path.resolve()),
     }) + "\n")
-
-
-def _copy_or_move_dir_contents(src_dir: Path, dst_dir: Path, move: bool) -> None:
-    """Copy or move all entries from src_dir into dst_dir."""
-    if src_dir.resolve() == dst_dir.resolve():
-        return
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    for item in src_dir.iterdir():
-        target = dst_dir / item.name
-        if move:
-            if target.exists() or target.is_symlink():
-                if item.is_dir() and not item.is_symlink() and target.is_dir() and not target.is_symlink():
-                    _copy_or_move_dir_contents(item, target, move=True)
-                    try:
-                        item.rmdir()
-                    except OSError:
-                        pass
-                    continue
-                _remove_path_or_tree(target)
-            shutil.move(str(item), str(target))
-        else:
-            if item.is_symlink():
-                if not target.exists() and not target.is_symlink():
-                    target.symlink_to(item.readlink())
-            elif item.is_dir():
-                if target.is_symlink() or (target.exists() and not target.is_dir()):
-                    _remove_path_or_tree(target)
-                _copy_or_move_dir_contents(item, target, move=False)
-                shutil.copystat(item, target, follow_symlinks=False)
-            else:
-                if target.is_symlink() or target.is_dir():
-                    _remove_path_or_tree(target)
-                shutil.copy2(item, target)
 
 
 def _prefix_used_by_other_game(prefix_dir: Path, game_dir: Path) -> bool:
@@ -989,14 +981,21 @@ def _prefix_used_by_other_game(prefix_dir: Path, game_dir: Path) -> bool:
     return False
 
 
-def _choose_prefix_dir(target_game_dir: Path, prefixes_dir: Path, keep_in_place: bool) -> Path:
-    """Reuse the game's existing prefix, else pick one not shared with another game."""
-    manifest = target_game_dir / STANDALONE_MANIFEST
-    if manifest.is_file():
+def _choose_prefix_dir(
+    target_game_dir: Path, prefixes_dir: Path, keep_in_place: bool, uid: str = ""
+) -> Path:
+    """Reuse the game's existing prefix, else pick one not shared with another game.
+
+    In a library (uid given) a new prefix is named after the game's stable id.
+    """
+    manifest = find_manifest(target_game_dir)
+    if manifest is not None:
         existing = _load_manifest(manifest)
-        if existing is not None and _is_strictly_under_dir(existing.prefix_dir, prefixes_dir):
+        if existing is not None and is_within(existing.prefix_dir, prefixes_dir, strict=True):
             return existing.prefix_dir
-    base_pfx_name = _sanitize_dir_name(target_game_dir.name)
+    if uid:
+        return prefixes_dir / uid
+    base_pfx_name = sanitize_dir_name(target_game_dir.name)
     dir_hash = hashlib.sha256(str(target_game_dir.resolve()).encode("utf-8")).hexdigest()[:8]
     if keep_in_place:
         return prefixes_dir / f"{base_pfx_name}-{dir_hash}"
@@ -1020,15 +1019,33 @@ def install_standalone_game(
     keep_in_place: bool = False,
     native_linux: bool = False,
     single_exe_only: bool = False,
+    source: dict[str, Any] | None = None,
+    library: Library | None = None,
 ) -> StandaloneGame:
     """Standardize a game in ~/Games/<name>/ (or keep in place), create launch.sh + .desktop + manifest."""
     _validate_launch_options(launch_options)
     _validate_launch_options(winedlloverrides)
 
-    games_dir = get_games_dir()
-    prefixes_dir = get_prefixes_dir()
+    if library is None and not _legacy_layout():
+        library = ensure_library(internal_library_root(), internal=True)
+    if library is not None and not library.available:
+        raise FileNotFoundError(f"Library disk is not mounted: {library.label}")
+    prefix_location = "library"
+    if library is None:
+        games_dir = get_games_dir()
+        prefixes_dir = get_prefixes_dir()
+        caches_dir: Path | None = None
+    else:
+        games_dir = library.games_dir
+        if library.unix_fs:
+            prefixes_dir, caches_dir = library.prefixes_dir, library.caches_dir
+        else:
+            # exFAT/FAT/NTFS cannot hold a Wine prefix: keep it on the internal disk.
+            internal = ensure_library(internal_library_root(), internal=True)
+            prefixes_dir, caches_dir = internal.prefixes_dir, internal.caches_dir
+            prefix_location = "internal"
     clean_name = game_name.strip() or game_dir.name
-    safe_dir_name = _sanitize_dir_name(clean_name)
+    safe_dir_name = sanitize_dir_name(clean_name)
 
     src_dir = game_dir.resolve()
     src_exe = exe_path.resolve()
@@ -1036,7 +1053,7 @@ def install_standalone_game(
         raise FileNotFoundError(f"Game directory not found: {game_dir}")
     if not src_exe.is_file():
         raise FileNotFoundError(f"Game executable not found: {exe_path}")
-    if not _is_strictly_under_dir(src_exe, src_dir):
+    if not is_within(src_exe, src_dir, strict=True):
         raise ValueError(f"Game executable must be inside the game directory: {exe_path}")
 
     if keep_in_place:
@@ -1044,7 +1061,7 @@ def install_standalone_game(
         target_exe_path = exe_path
     else:
         games_dir.mkdir(parents=True, exist_ok=True)
-        if _is_under_dir(src_dir, games_dir) and src_dir != games_dir.resolve():
+        if is_within(src_dir, games_dir) and src_dir != games_dir.resolve():
             target_game_dir = game_dir
             target_exe_path = exe_path
         else:
@@ -1075,7 +1092,18 @@ def install_standalone_game(
             else:
                 target_exe_path = exe_path
 
-    prefix_dir = _choose_prefix_dir(target_game_dir, prefixes_dir, keep_in_place)
+    uid = ""
+    created_at = ""
+    previous = find_manifest(target_game_dir)
+    if previous is not None:
+        prev_game = _load_manifest(previous)
+        if prev_game is not None and prev_game.schema >= 2:
+            uid = prev_game.uid
+            created_at = str(prev_game.meta.get("created_at") or "")
+    uid = uid or new_uid()
+    prefix_dir = _choose_prefix_dir(
+        target_game_dir, prefixes_dir, keep_in_place, uid=uid if library is not None else ""
+    )
     if not native_linux:
         prefixes_dir.mkdir(parents=True, exist_ok=True)
         if prefix_dir.is_symlink():
@@ -1099,7 +1127,14 @@ def install_standalone_game(
         explicit_icon=icon_path,
     )
 
-    cache_dir = get_game_cache_dir(target_game_dir)
+    cache_dir = caches_dir / uid if caches_dir is not None else get_game_cache_dir(target_game_dir)
+    icons: list[Path] = []
+    if (
+        resolved_icon is not None
+        and resolved_icon.name.startswith(".deckinstall_icon")
+        and is_within(resolved_icon, target_game_dir, strict=True)
+    ):
+        icons.append(resolved_icon)
     game = StandaloneGame(
         name=clean_name,
         game_dir=target_game_dir,
@@ -1114,6 +1149,15 @@ def install_standalone_game(
         desktop_shortcut=desktop_shortcut,
         native_linux=native_linux,
         cache_dir=cache_dir,
+        uid=uid,
+        schema=2,
+        meta={
+            "created_at": created_at or now_iso(),
+            "source": dict(source or {}),
+            "proton_mode": "pinned" if (proton_name.strip() and not native_linux) else "default",
+            "prefix_location": prefix_location,
+            "icons": icons,
+        },
     )
 
     _write_launch_script(
@@ -1154,56 +1198,46 @@ def install_standalone_game(
             executable=True,
             startup_wm_class=startup_wm_class,
         )
-    _write_manifest(game)
-    _register_standalone_game(game)
+    manifest_path = _write_manifest(game)
+    legacy = target_game_dir / MANIFEST_V1
+    if legacy.is_file() and not legacy.is_symlink():
+        legacy.unlink()
+    _register_standalone_game(game, manifest_path)
+    lib_root = find_library_root(game.game_dir)
+    if lib_root is not None:
+        record_game(lib_root, game.uid, game.name, game.game_dir)
     return game
 
 
 def _load_manifest(manifest_path: Path) -> StandaloneGame | None:
-    """Load a StandaloneGame from a .deckinstall_standalone.json file."""
+    """Load a StandaloneGame from a v1 or v2 manifest, rejecting out-of-bounds paths."""
+    fields = read_manifest_fields(manifest_path)
+    if fields is None:
+        return None
     try:
-        if manifest_path.is_symlink() or manifest_path.parent.is_symlink():
-            logging.warning("Refusing to load symlinked standalone manifest %s", manifest_path)
-            return None
-        raw = json.loads(manifest_path.read_text(encoding="utf-8", errors="replace"))
-        if not isinstance(raw, dict):
-            return None
-        game_dir = manifest_path.parent.resolve()
-        name = str(raw.get("name") or game_dir.name)
-        exe_path = Path(str(raw["exe_path"]))
-        prefix_dir = Path(str(raw["prefix_dir"]))
-        proton_name = str(raw.get("proton_name") or "")
-        sa_raw = raw.get("steam_appid")
-        steam_appid = int(sa_raw) if isinstance(sa_raw, int) and not isinstance(sa_raw, bool) else None
-        winedlloverrides = str(raw.get("winedlloverrides") or "")
-        launch_options = str(raw.get("launch_options") or "")
-        launch_script = Path(str(raw.get("launch_script") or (game_dir / "launch.sh")))
-        if not _is_strictly_under_dir(exe_path, game_dir):
+        game_dir: Path = fields["game_dir"]
+        name = str(fields["name"])
+        exe_path: Path = fields["exe_path"]
+        prefix_dir: Path = fields["prefix_dir"]
+        launch_script: Path = fields["launch_script"]
+        if not is_within(exe_path, game_dir, strict=True):
             logging.warning("Manifest exe_path %s escapes game_dir %s", exe_path, game_dir)
             return None
-        if not _is_strictly_under_dir(launch_script, game_dir):
+        if not is_within(launch_script, game_dir, strict=True):
             logging.warning("Manifest launch_script %s escapes game_dir %s", launch_script, game_dir)
             return None
-        if prefix_dir.is_symlink() or not (
-            _is_under_dir(prefix_dir, get_prefixes_dir())
-            or _is_under_dir(prefix_dir, game_dir.parent / ".prefixes")
-            or _is_under_dir(prefix_dir, game_dir)
-        ):
+        prefix_roots = [*_managed_roots(_lib.PREFIXES, game_dir), game_dir.parent / ".prefixes", game_dir]
+        if prefix_dir.is_symlink() or not any(is_within(prefix_dir, r) for r in prefix_roots):
             logging.warning("Manifest prefix_dir %s is invalid or out of bounds", prefix_dir)
             return None
-        desktop_file = Path(
-            str(raw.get("desktop_file") or (get_applications_dir() / f"deckinstall-{_slugify(name)}.desktop"))
+        desktop_file = fields["desktop_file"] or (
+            get_applications_dir() / f"deckinstall-{slugify(name)}.desktop"
         )
-        ds_raw = str(raw.get("desktop_shortcut") or "").strip()
-        desktop_shortcut = Path(ds_raw) if ds_raw else None
-        native_linux = bool(raw.get("native_linux", False))
-        cd_raw = str(raw.get("cache_dir") or "").strip()
         cache_dir: Path | None = None
-        if cd_raw:
-            cand_cache = Path(cd_raw)
-            if _is_strictly_under_dir(cand_cache, get_shader_caches_dir()) or _is_strictly_under_dir(
-                cand_cache, game_dir.parent / ".caches"
-            ):
+        cand_cache = fields["cache_dir"]
+        if cand_cache is not None:
+            cache_roots = [*_managed_roots(_lib.CACHES, game_dir), game_dir.parent / ".caches"]
+            if any(is_within(cand_cache, r, strict=True) for r in cache_roots):
                 cache_dir = cand_cache
             else:
                 logging.warning("Manifest cache_dir %s is invalid or out of bounds", cand_cache)
@@ -1212,15 +1246,18 @@ def _load_manifest(manifest_path: Path) -> StandaloneGame | None:
             game_dir=game_dir,
             exe_path=exe_path,
             prefix_dir=prefix_dir,
-            proton_name=proton_name,
-            steam_appid=steam_appid,
-            winedlloverrides=winedlloverrides,
-            launch_options=launch_options,
+            proton_name=str(fields["proton_name"]),
+            steam_appid=fields["steam_appid"],
+            winedlloverrides=str(fields["winedlloverrides"]),
+            launch_options=str(fields["launch_options"]),
             launch_script=launch_script,
             desktop_file=desktop_file,
-            desktop_shortcut=desktop_shortcut,
-            native_linux=native_linux,
+            desktop_shortcut=fields["desktop_shortcut"],
+            native_linux=bool(fields["native_linux"]),
             cache_dir=cache_dir,
+            uid=str(fields["uid"]),
+            schema=int(fields["schema"]),
+            meta=dict(fields["meta"]),
         )
     except Exception as exc:
         logging.warning("Failed to load standalone manifest %s: %s", manifest_path, exc)
@@ -1228,17 +1265,34 @@ def _load_manifest(manifest_path: Path) -> StandaloneGame | None:
 
 
 def list_standalone_games(games_dir: Path | None = None) -> list[StandaloneGame]:
-    """Load registered games and recover existing manifests from nested game folders."""
-    root = games_dir if games_dir is not None else get_games_dir()
+    """Load games from games_dir, or by default from every library plus the legacy ~/Games."""
+    if games_dir is not None:
+        return _list_games_in(games_dir, set())
+    roots = [get_games_dir(), get_legacy_games_dir(), *(r / _lib.GAMES for r in _library_roots_on_disks())]
+    seen: set[Path] = set()
+    games: list[StandaloneGame] = []
+    done: list[Path] = []
+    for root in roots:
+        if root in done:
+            continue
+        done.append(root)
+        games.extend(_list_games_in(root, seen))
+    games.sort(key=lambda g: g.name.lower())
+    return games
+
+
+def _list_games_in(root: Path, seen: set[Path]) -> list[StandaloneGame]:
+    """Load registered games and recover existing manifests from nested game folders under root."""
     if not root.is_dir():
         return []
     games: list[StandaloneGame] = []
-    seen: set[Path] = set()
 
     def add_manifest(manifest: Path) -> None:
+        # An index entry may still point at a v1 file after the game got a v2 manifest.
+        manifest = find_manifest(manifest.parent) or manifest
         if manifest.is_symlink() or not manifest.is_file():
             return
-        resolved = manifest.resolve()
+        resolved = manifest.parent.resolve()
         if resolved in seen:
             return
         seen.add(resolved)
@@ -1256,7 +1310,7 @@ def list_standalone_games(games_dir: Path | None = None) -> list[StandaloneGame]
                 manifest_name = data.get("manifest") if isinstance(data, dict) else None
                 if isinstance(manifest_name, str):
                     manifest = Path(manifest_name)
-                    if manifest.is_absolute() and manifest.name == STANDALONE_MANIFEST:
+                    if manifest.is_absolute() and is_manifest_name(manifest.name):
                         add_manifest(manifest)
             except (OSError, ValueError):
                 logging.warning("Failed to read standalone library entry %s", entry)
@@ -1266,8 +1320,9 @@ def list_standalone_games(games_dir: Path | None = None) -> list[StandaloneGame]
     skipped = {"engine", "node_modules", "_redist", "drive_c", "compatdata", "shadercache"}
     for current, dirnames, filenames in os.walk(root, followlinks=False):
         folder = Path(current)
-        if STANDALONE_MANIFEST in filenames:
-            add_manifest(folder / STANDALONE_MANIFEST)
+        found = next((n for n in (MANIFEST_V2, MANIFEST_V1) if n in filenames), None)
+        if found is not None:
+            add_manifest(folder / found)
             dirnames[:] = []
             continue
         if len(folder.relative_to(root).parts) >= 8:
@@ -1291,8 +1346,8 @@ def update_standalone_launch_options(
     """Update launch options, WINEDLLOVERRIDES, and optionally Proton for a standalone game."""
     _validate_launch_options(launch_options)
     _validate_launch_options(winedlloverrides)
-    manifest = game_dir / STANDALONE_MANIFEST
-    game = _load_manifest(manifest)
+    manifest = find_manifest(game_dir)
+    game = _load_manifest(manifest) if manifest is not None else None
     if game is None:
         raise FileNotFoundError(f"Standalone manifest not found in {game_dir}")
 
@@ -1319,42 +1374,40 @@ def update_standalone_launch_options(
     return game
 
 
-def _remove_path_or_tree(path: Path) -> None:
-    """Remove a symlink, file, or directory tree if present."""
-    if path.is_symlink() or path.is_file():
-        path.unlink(missing_ok=True)
-    elif path.exists():
-        shutil.rmtree(path, ignore_errors=True)
-
-
 def _safe_remove_prefix_dir(prefix_dir: Path) -> None:
-    """Remove prefix_dir only if it is a non-symlink strictly inside get_prefixes_dir()."""
-    if not _is_strictly_under_dir(prefix_dir, get_prefixes_dir()):
+    """Remove prefix_dir only if it is a non-symlink strictly inside a managed prefixes folder."""
+    if not any(is_within(prefix_dir, r, strict=True) for r in _managed_roots(_lib.PREFIXES)):
         logging.warning(
             "Refusing to remove prefix_dir outside prefixes directory: %s",
             prefix_dir,
         )
         return
-    _remove_path_or_tree(prefix_dir)
+    remove_path_or_tree(prefix_dir)
 
 
 def _safe_remove_cache_dir(cache_dir: Path | None) -> None:
     """Remove cache_dir only if it is a non-symlink strictly inside get_shader_caches_dir()."""
     if cache_dir is None:
         return
-    if not _is_strictly_under_dir(cache_dir, get_shader_caches_dir()):
+    if not any(is_within(cache_dir, r, strict=True) for r in _managed_roots(_lib.CACHES)):
         logging.warning(
             "Refusing to remove cache_dir outside shader caches directory: %s",
             cache_dir,
         )
         return
-    _remove_path_or_tree(cache_dir)
+    remove_path_or_tree(cache_dir)
+
+
+def _orphan_cache_roots(games_dir: Path | None) -> list[Path]:
+    if games_dir is not None:
+        return [games_dir / ".caches"]
+    return _managed_roots(_lib.CACHES)
 
 
 def find_orphan_shader_caches(games_dir: Path | None = None) -> list[OrphanCacheEntry]:
-    """Return shader cache directories under get_shader_caches_dir() with no active standalone game."""
-    caches_dir = (games_dir / ".caches") if games_dir is not None else get_shader_caches_dir()
-    if caches_dir.is_symlink() or not caches_dir.is_dir():
+    """Return shader cache directories (in every library by default) with no known game."""
+    caches_dirs = [d for d in _orphan_cache_roots(games_dir) if d.is_dir() and not d.is_symlink()]
+    if not caches_dirs:
         return []
 
     active_games = list_standalone_games(games_dir=games_dir)
@@ -1372,33 +1425,38 @@ def find_orphan_shader_caches(games_dir: Path | None = None) -> list[OrphanCache
             except OSError:
                 pass
         else:
-            try:
-                fallback_name = get_game_cache_dir(game.game_dir).name
-                active_caches.add((caches_dir / fallback_name).resolve())
-            except OSError:
-                pass
+            fallback_name = get_game_cache_dir(game.game_dir).name
+            for caches_dir in caches_dirs:
+                try:
+                    active_caches.add((caches_dir / fallback_name).resolve())
+                except OSError:
+                    pass
+    # Games on an unmounted disk may keep their cache on the internal disk (exFAT/NTFS).
+    absent_uids = {g["id"] for g in _lib.list_unavailable_games() if g.get("id")} if games_dir is None else set()
 
     orphans: list[OrphanCacheEntry] = []
-    try:
-        entries = list(caches_dir.iterdir())
-    except OSError:
-        return []
-
-    for entry in entries:
-        if entry.is_symlink() or not entry.is_dir() or entry.name.startswith("."):
-            continue
+    for caches_dir in caches_dirs:
         try:
-            resolved_entry = entry.resolve()
+            entries = list(caches_dir.iterdir())
         except OSError:
             continue
-        if resolved_entry not in active_caches:
-            orphans.append(
-                OrphanCacheEntry(
-                    path=entry,
-                    size_bytes=dir_size_bytes(entry),
-                    name=entry.name,
+        for entry in entries:
+            if entry.is_symlink() or not entry.is_dir() or entry.name.startswith("."):
+                continue
+            if entry.name in absent_uids:
+                continue
+            try:
+                resolved_entry = entry.resolve()
+            except OSError:
+                continue
+            if resolved_entry not in active_caches:
+                orphans.append(
+                    OrphanCacheEntry(
+                        path=entry,
+                        size_bytes=dir_size_bytes(entry),
+                        name=entry.name,
+                    )
                 )
-            )
     orphans.sort(key=lambda e: e.name.lower())
     return orphans
 
@@ -1408,7 +1466,7 @@ def prune_orphan_shader_caches(
     games_dir: Path | None = None,
 ) -> tuple[int, int]:
     """Delete orphaned shader cache directories safely and return (deleted_count, freed_bytes)."""
-    caches_dir = (games_dir / ".caches") if games_dir is not None else get_shader_caches_dir()
+    caches_roots = _orphan_cache_roots(games_dir)
     targets = entries if entries is not None else find_orphan_shader_caches(games_dir=games_dir)
     # A scan may have become stale while a game was installed or reconfigured.
     current_orphans = {
@@ -1418,19 +1476,15 @@ def prune_orphan_shader_caches(
     deleted = 0
     freed = 0
     for entry in targets:
-        if not _is_strictly_under_dir(entry.path, caches_dir):
-            logging.warning(
-                "Refusing to prune cache directory outside %s: %s",
-                caches_dir,
-                entry.path,
-            )
+        if not any(is_within(entry.path, d, strict=True) for d in caches_roots):
+            logging.warning("Refusing to prune cache directory outside the caches folders: %s", entry.path)
             continue
         if (
             entry.path.is_dir()
             and not entry.path.is_symlink()
             and entry.path.resolve() in current_orphans
         ):
-            _remove_path_or_tree(entry.path)
+            remove_path_or_tree(entry.path)
             if not entry.path.exists():
                 deleted += 1
                 freed += entry.size_bytes
@@ -1452,13 +1506,14 @@ def remove_standalone_game(
     validated_targets: list[tuple[Path, Path]] = [
         (game.desktop_file, get_applications_dir()),
         (game.launch_script, resolved_game_dir),
-        (game.game_dir / STANDALONE_MANIFEST, resolved_game_dir),
+        (game.game_dir / MANIFEST_V1, resolved_game_dir),
+        (game.game_dir / MANIFEST_V2, resolved_game_dir),
     ]
     if game.desktop_shortcut is not None:
         validated_targets.append((game.desktop_shortcut, get_desktop_dir()))
 
     for fpath, allowed_parent in validated_targets:
-        if not _is_strictly_under_dir(fpath, allowed_parent):
+        if not is_within(fpath, allowed_parent, strict=True):
             logging.warning(
                 "Skipping out-of-bounds or symlink integration file %s (expected inside %s)",
                 fpath,
@@ -1471,6 +1526,12 @@ def remove_standalone_game(
         except OSError as exc:
             logging.warning("Failed to remove %s: %s", fpath, exc)
 
+    lib_root = find_library_root(game.game_dir)
+    if lib_root is not None:
+        try:
+            forget_game(lib_root, game.uid)
+        except OSError as exc:
+            logging.warning("Failed to update library list for %s: %s", game.name, exc)
     index_path = _library_index_path(game.game_dir)
     if not index_path.parent.is_symlink() and index_path.exists():
         try:
@@ -1485,7 +1546,7 @@ def remove_standalone_game(
                 game.game_dir,
             )
         else:
-            _remove_path_or_tree(game.game_dir)
+            remove_path_or_tree(game.game_dir)
     if (delete_files or delete_prefix) and not _prefix_used_by_other_game(game.prefix_dir, game.game_dir):
         _safe_remove_prefix_dir(game.prefix_dir)
     elif delete_files or delete_prefix:
@@ -1588,7 +1649,7 @@ def export_steam_to_standalone(
         )
 
     game_name = shortcut.app_name.strip() or game_dir.name or f"Game {shortcut.appid_u32}"
-    safe_name = _sanitize_dir_name(game_name)
+    safe_name = sanitize_dir_name(game_name)
     src_compat = paths.compatdata_dir / str(shortcut.appid_u32)
     src_pfx = src_compat / "pfx"
 
@@ -1621,11 +1682,12 @@ def export_steam_to_standalone(
         winedlloverrides=dll_overrides,
         launch_options=clean_launch_options,
         icon_path=icon_path,
+        source={"kind": "adopted", "origin": "steam", "shortcut_appid": shortcut.appid_u32},
     )
 
     moved_prefix = False
     if src_pfx.is_dir() and not src_pfx.is_symlink():
-        _copy_or_move_dir_contents(src_pfx, game.prefix_dir, move=not should_copy)
+        copy_or_move_dir_contents(src_pfx, game.prefix_dir, move=not should_copy)
         moved_prefix = not should_copy
 
     if remove_from_steam:
@@ -1635,7 +1697,7 @@ def export_steam_to_standalone(
                 raise RuntimeError(f"Shortcut {shortcut.appid_u32} could not be removed from Steam.")
         except Exception:
             if moved_prefix and game.prefix_dir.is_dir() and not game.prefix_dir.is_symlink():
-                _copy_or_move_dir_contents(game.prefix_dir, src_pfx, move=True)
+                copy_or_move_dir_contents(game.prefix_dir, src_pfx, move=True)
             try:
                 remove_standalone_game(game, delete_files=False, delete_prefix=not moved_prefix)
             except Exception:
@@ -1702,7 +1764,7 @@ def import_standalone_to_steam(
     target_compat = paths.compatdata_dir / str(appid_u32)
     target_pfx = target_compat / "pfx"
     if game.prefix_dir.is_dir() and not game.prefix_dir.is_symlink():
-        _copy_or_move_dir_contents(game.prefix_dir, target_pfx, move=remove_standalone_files)
+        copy_or_move_dir_contents(game.prefix_dir, target_pfx, move=remove_standalone_files)
         if remove_standalone_files:
             _safe_remove_prefix_dir(game.prefix_dir)
 

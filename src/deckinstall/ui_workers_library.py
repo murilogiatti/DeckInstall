@@ -57,7 +57,6 @@ from .steam_vdf import (
     sync_all_external_saves,
 )
 from .ui_cards import _format_worker_error, _is_wine_game_running
-from .vdf_queue import VdfEditQueue
 
 
 def compute_library_runner_labels(
@@ -609,47 +608,6 @@ class RuntimePreflightWorker(QThread):
             not get_umu_run_path().is_file() or not list_ge_proton11_dirs()
         )
         self.ready.emit(needs_confirm)
-
-
-class BatchVdfApplyWorker(QThread):
-    """Apply all queued VDF edits under a single Steam shutdown/relaunch cycle."""
-
-    status = Signal(str)
-    done = Signal(object)
-    failed = Signal(str)
-
-    def __init__(
-        self,
-        queue: VdfEditQueue,
-        paths: SteamPaths,
-        *,
-        restart_if_was_running: bool = True,
-    ) -> None:
-        super().__init__()
-        self._queue = queue
-        self._paths = paths
-        self._restart_if_was_running = restart_if_was_running
-
-    def run(self) -> None:
-        was_running = False
-        try:
-            was_running = is_steam_running()
-            if was_running:
-                self.status.emit(tr("add.closing_steam"))
-                if not shutdown_steam():
-                    raise RuntimeError(tr("add.close_steam_timeout"))
-            result = self._queue.apply_all(self._paths)
-            if was_running and self._restart_if_was_running:
-                self.status.emit(tr("add.restarting_steam"))
-                start_steam()
-            self.done.emit(result)
-        except Exception as exc:
-            if was_running and self._restart_if_was_running and not is_steam_running():
-                try:
-                    start_steam()
-                except Exception:
-                    pass
-            self.failed.emit(_format_worker_error(exc))
 
 
 class ExtStandaloneWorker(QThread):

@@ -26,11 +26,11 @@ except ImportError:
     sys.modules["vdf"] = fake_vdf
 
 from deckinstall import runtime_manager, standalone  # noqa: E402
+from deckinstall.fsutil import copy_or_move_dir_contents  # noqa: E402
 from deckinstall.scanner import detect_exe_kind, detect_steam_appid  # noqa: E402
 from deckinstall.steam_paths import SteamPaths  # noqa: E402
 from deckinstall.steam_vdf import (  # noqa: E402
     apply_launch_presets,
-    detect_optiscaler_lsfg_conflict,
     find_cleanup_candidates,
 )
 
@@ -261,7 +261,7 @@ class ScannerTests(unittest.TestCase):
 
 
 class StandaloneAndVdfTests(unittest.TestCase):
-    """Tests for standalone game lifecycle, launch presets, OptiScaler/LSFG conflict, and cleanup."""
+    """Tests for standalone game lifecycle, launch presets, and cleanup."""
 
     def test_prefix_merge_does_not_follow_destination_symlinks(self) -> None:
         for move in (False, True):
@@ -280,7 +280,7 @@ class StandaloneAndVdfTests(unittest.TestCase):
                 (target / "users").symlink_to(outside, target_is_directory=True)
                 (target / "user.reg").symlink_to(outside / "user.reg")
 
-                standalone._copy_or_move_dir_contents(source, target, move=move)
+                copy_or_move_dir_contents(source, target, move=move)
 
                 self.assertEqual((target / "users" / "save.dat").read_bytes(), b"import-save")
                 self.assertEqual((target / "user.reg").read_bytes(), b"import-registry")
@@ -299,8 +299,8 @@ class StandaloneAndVdfTests(unittest.TestCase):
                 (source / "users" / "save.dat").write_bytes(b"save")
                 target.mkdir()
                 (target / "users").write_bytes(b"old-file")
-                standalone._copy_or_move_dir_contents(source, target, move=move)
-                standalone._copy_or_move_dir_contents(target, target, move=move)
+                copy_or_move_dir_contents(source, target, move=move)
+                copy_or_move_dir_contents(target, target, move=move)
                 self.assertEqual((target / "users" / "save.dat").read_bytes(), b"save")
 
     def test_standalone_rejects_invalid_executable_before_moving_game(self) -> None:
@@ -410,7 +410,7 @@ class StandaloneAndVdfTests(unittest.TestCase):
                 self.assertFalse(installed.game_dir.exists())
                 self.assertFalse(installed.prefix_dir.exists())
 
-    def test_apply_launch_presets_and_optiscaler_lsfg_conflict(self) -> None:
+    def test_apply_launch_presets_with_winedlloverrides(self) -> None:
         opts = apply_launch_presets(
             launch_options="",
             gamemode=True,
@@ -423,12 +423,6 @@ class StandaloneAndVdfTests(unittest.TestCase):
         self.assertIn('WINEDLLOVERRIDES="dxgi=n,b"', opts)
         self.assertIn("gamemoderun", opts)
         self.assertIn("%command%", opts)
-
-        # Only dxgi=n,b without lsfg-vk -> False
-        self.assertFalse(detect_optiscaler_lsfg_conflict(opts, winedlloverrides="dxgi=n,b"))
-        # lsfg-vk + dxgi=n,b -> True
-        self.assertTrue(detect_optiscaler_lsfg_conflict("lsfg-vk %command%", winedlloverrides="dxgi=n,b"))
-        self.assertTrue(detect_optiscaler_lsfg_conflict('WINEDLLOVERRIDES="dxgi=n,b" lsfg-vk %command%'))
 
     def test_find_cleanup_candidates_protects_active_standalone_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

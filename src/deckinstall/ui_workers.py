@@ -27,6 +27,7 @@ from .extractor import (
     sanitize_folder_name,
 )
 from .i18n import tr
+from .library import Library
 from .runtime_manager import (
     _has_optiscaler_dll,
     _load_versions,
@@ -504,8 +505,10 @@ class StandaloneInstallWorker(QThread):
         winedlloverrides: str = "",
         game_dir: Path | None = None,
         single_exe_only: bool = False,
+        library: Library | None = None,
     ) -> None:
         super().__init__()
+        self.library = library
         self.app_name = app_name
         self.exe_path = exe_path
         self.steam_appid = steam_appid
@@ -555,6 +558,8 @@ class StandaloneInstallWorker(QThread):
                 keep_in_place=self.keep_in_place,
                 native_linux=is_native,
                 single_exe_only=single_exe_only,
+                source={"kind": "folder", "origin": str(game_dir)},
+                library=self.library,
             )
             bwrap_warn = "" if is_native else (check_ubuntu_bwrap_userns() or "")
             self.finished_ok.emit(game, bwrap_warn)
@@ -745,7 +750,6 @@ from .ui_workers_library import (  # noqa: E402, F401
     ArtDownloadWorker,
     ArtSearchWorker,
     BackupWorker,
-    BatchVdfApplyWorker,
     BulkPlanWorker,
     DirStatsWorker,
     ExtImportSavesWorker,

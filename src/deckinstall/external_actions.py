@@ -189,6 +189,7 @@ def create_standalone_from_external(
         create_desktop_shortcut=create_desktop_shortcut,
         keep_in_place=True,
         native_linux=(ext.runner == "linux"),
+        source={"kind": "adopted", "origin": str(ext.source)},
     )
     if ext.prefix_dir is not None and ext.prefix_dir.is_dir():
         import_external_saves_to_target(ext, game.prefix_dir, game.name)

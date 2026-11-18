@@ -322,18 +322,6 @@ class MaintenanceTests(unittest.TestCase):
         self.assertIn("MANGOHUD=1", opts)
         self.assertIn("gamemoderun", opts)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg = Path(tmp) / "MangoHud" / "MangoHud.conf"
-            cfg.parent.mkdir(parents=True)
-            cfg.write_text("fps_limit=60\n", encoding="utf-8")
-            written = steam_vdf.install_mangohud_topbar_config(cfg)
-            self.assertEqual(written, cfg)
-            self.assertTrue(cfg.with_name("MangoHud.conf.deckinstall.bak").is_file())
-            text = cfg.read_text(encoding="utf-8")
-            self.assertIn("horizontal", text)
-            self.assertIn("hud_compact", text)
-            self.assertIn("position=top-center", text)
-
     def test_format_size_bytes_mb_and_gb(self) -> None:
         try:
             from deckinstall.ui import format_size_bytes

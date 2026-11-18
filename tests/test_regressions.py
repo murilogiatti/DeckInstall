@@ -18,6 +18,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from deckinstall.extractor import _is_non_game_helper_exe  # noqa: E402
+from deckinstall.fsutil import file_sha256  # noqa: E402
 from deckinstall.optiscaler import (  # noqa: E402
     OPTISCALER_MANIFEST,
     inspect_optiscaler_state,
@@ -707,7 +708,7 @@ class Phase1SecurityAndCoreTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 save_sync.pull_game_saves("MyGame", pfx, sync_root, snapshots_root=root / "snaps")
 
-            sha = save_sync._sha256_file(zpath)
+            sha = file_sha256(zpath)
             target_ts = 1700000123.0
             (game_sync / "meta.json").write_text(
                 json.dumps({"sha256": sha, "updated_at": target_ts}),

@@ -33,7 +33,6 @@ from ..standalone import StandaloneGame, update_standalone_launch_options
 from ..steam_vdf import (
     ShortcutEntry,
     apply_launch_presets,
-    detect_optiscaler_lsfg_conflict,
     merge_winedlloverride,
     remove_winedlloverride,
     update_shortcut_launch_options,
@@ -165,58 +164,6 @@ def open_launch_presets_dialog(
     chk_dlss = QCheckBox(tr("launch.dlss_upgrade"))
     chk_dlss.setChecked(bool(st["dlss_upgrade"]))
 
-    chk_lsfg = QCheckBox(tr("launch.lsfg"))
-    chk_lsfg.setChecked(bool(st.get("lsfg", False)))
-
-    lsfg_opts_col = QVBoxLayout()
-    lsfg_opts_col.setContentsMargins(0, 0, 0, 0)
-    lsfg_opts_col.setSpacing(2)
-
-    lsfg_row1 = QHBoxLayout()
-    lsfg_row1.setContentsMargins(20, 0, 0, 4)
-    lsfg_mult_lbl = QLabel(tr("launch.lsfg_mult_label"))
-    lsfg_mult_combo = QComboBox()
-    for mult_val in (2, 3, 4):
-        lsfg_mult_combo.addItem(f"{mult_val}x", mult_val)
-    lsfg_m_idx = lsfg_mult_combo.findData(st.get("lsfg_multiplier", 2))
-    if lsfg_m_idx >= 0:
-        lsfg_mult_combo.setCurrentIndex(lsfg_m_idx)
-    lsfg_mult_combo.setEnabled(chk_lsfg.isChecked())
-
-    lsfg_flow_lbl = QLabel(tr("launch.lsfg_flow_label"))
-    lsfg_flow_combo = QComboBox()
-    lsfg_flow_combo.addItem(tr("launch.lsfg_flow_auto"), None)
-    for flow_val in (1.0, 0.85, 0.75, 0.50):
-        lsfg_flow_combo.addItem(f"{flow_val:g}", flow_val)
-    cur_flow = st.get("lsfg_flow_scale")
-    lsfg_f_idx = lsfg_flow_combo.findData(cur_flow)
-    if lsfg_f_idx >= 0:
-        lsfg_flow_combo.setCurrentIndex(lsfg_f_idx)
-    lsfg_flow_combo.setEnabled(chk_lsfg.isChecked())
-
-    lsfg_row1.addWidget(lsfg_mult_lbl)
-    lsfg_row1.addWidget(lsfg_mult_combo)
-    lsfg_row1.addSpacing(8)
-    lsfg_row1.addWidget(lsfg_flow_lbl)
-    lsfg_row1.addWidget(lsfg_flow_combo, 1)
-
-    lsfg_row2 = QHBoxLayout()
-    lsfg_row2.setContentsMargins(20, 0, 0, 4)
-    chk_lsfg_perf = QCheckBox(tr("launch.lsfg_perf_mode"))
-    chk_lsfg_perf.setChecked(bool(st.get("lsfg_perf_mode", False)))
-    chk_lsfg_perf.setEnabled(chk_lsfg.isChecked())
-    lsfg_profile_lbl = QLabel(tr("launch.lsfg_profile_label"))
-    lsfg_profile_edit = QLineEdit(str(st.get("lsfg_profile") or ""))
-    lsfg_profile_edit.setPlaceholderText(tr("launch.lsfg_profile_placeholder"))
-    lsfg_profile_edit.setEnabled(chk_lsfg.isChecked())
-    lsfg_row2.addWidget(chk_lsfg_perf)
-    lsfg_row2.addSpacing(8)
-    lsfg_row2.addWidget(lsfg_profile_lbl)
-    lsfg_row2.addWidget(lsfg_profile_edit, 1)
-
-    lsfg_opts_col.addLayout(lsfg_row1)
-    lsfg_opts_col.addLayout(lsfg_row2)
-
     chk_w3d = QCheckBox(tr("launch.wined3d"))
     chk_w3d.setChecked(bool(st["wined3d"]))
     chk_esync = QCheckBox(tr("launch.no_esync"))
@@ -228,14 +175,6 @@ def open_launch_presets_dialog(
 
     winedll_lbl = QLabel(tr("launch.winedlloverrides_label"))
     winedll_edit = QLineEdit(winedll_now)
-
-    conflict_warn = QLabel(tr("launch.optiscaler_lsfg_warn"))
-    conflict_warn.setWordWrap(True)
-    conflict_warn.setStyleSheet(
-        "color: #ffd180; background-color: rgba(180, 110, 20, 0.22); "
-        "border: 1px solid #c77c1a; border-radius: 6px; padding: 6px;"
-    )
-    conflict_warn.setVisible(False)
 
     wined3d_warn = QLabel(tr("launch.wined3d_vulkan_warn"))
     wined3d_warn.setWordWrap(True)
@@ -250,24 +189,11 @@ def open_launch_presets_dialog(
 
     syncing = {"active": False}
 
-    def _update_conflict_warning() -> None:
-        has_conflict = (not is_native_linux) and detect_optiscaler_lsfg_conflict(
-            raw_edit.text(), winedll_edit.text()
-        )
-        conflict_warn.setVisible(has_conflict)
-
     def _update_wined3d_warning() -> None:
         if is_native_linux or not chk_w3d.isChecked():
             wined3d_warn.setVisible(False)
             return
-        raw_low = raw_edit.text().lower()
-        has_lsfg = "lsfg-vk" in raw_low or "enable_lsfg" in raw_low
-        has_vulkan_feat = (
-            chk_dlss.isChecked()
-            or chk_nvapi.isChecked()
-            or chk_dxgi.isChecked()
-            or has_lsfg
-        )
+        has_vulkan_feat = chk_dlss.isChecked() or chk_nvapi.isChecked() or chk_dxgi.isChecked()
         wined3d_warn.setVisible(has_vulkan_feat)
 
     def _apply_optiscaler_dxgi_guard(opt_st: object | None) -> None:
@@ -307,11 +233,6 @@ def open_launch_presets_dialog(
         mh_level_combo.setEnabled(mh_enabled)
         mh_pos_combo.setEnabled(mh_enabled)
         mh_fps_combo.setEnabled(mh_enabled)
-        lsfg_enabled = chk_lsfg.isChecked()
-        lsfg_mult_combo.setEnabled(lsfg_enabled)
-        lsfg_flow_combo.setEnabled(lsfg_enabled)
-        chk_lsfg_perf.setEnabled(lsfg_enabled)
-        lsfg_profile_edit.setEnabled(lsfg_enabled)
         if syncing["active"]:
             return
         syncing["active"] = True
@@ -324,8 +245,6 @@ def open_launch_presets_dialog(
             mh_lvl = mh_level_combo.currentData()
             mh_pos = str(mh_pos_combo.currentData() or "")
             mh_fps = mh_fps_combo.currentData()
-            lsfg_mult = lsfg_mult_combo.currentData()
-            lsfg_flow = lsfg_flow_combo.currentData()
             updated = apply_launch_presets(
                 raw_edit.text(),
                 gamemode=chk_gm.isChecked(),
@@ -341,18 +260,12 @@ def open_launch_presets_dialog(
                 proton_wayland=False if is_native_linux else chk_wayland.isChecked(),
                 mangohud_position=mh_pos,
                 mangohud_fps_limit=int(mh_fps) if isinstance(mh_fps, int) and mh_fps > 0 else None,
-                lsfg=lsfg_enabled,
-                lsfg_multiplier=int(lsfg_mult) if isinstance(lsfg_mult, int) else 2,
-                lsfg_flow_scale=float(lsfg_flow) if isinstance(lsfg_flow, (int, float)) else None,
-                lsfg_perf_mode=chk_lsfg_perf.isChecked(),
-                lsfg_profile=lsfg_profile_edit.text().strip(),
             )
             raw_edit.setText(updated)
         except ValueError:
             pass
         finally:
             syncing["active"] = False
-        _update_conflict_warning()
         _update_wined3d_warning()
 
     def _on_dxgi_toggled(checked: bool) -> None:
@@ -378,7 +291,6 @@ def open_launch_presets_dialog(
         _sync_preview()
 
     def _on_raw_text_changed() -> None:
-        _update_conflict_warning()
         _update_wined3d_warning()
 
     dlg_alive = _dialog_guard(dlg)
@@ -471,15 +383,6 @@ def open_launch_presets_dialog(
     mh_pos_combo.currentIndexChanged.connect(_sync_preview)
     mh_fps_combo.currentIndexChanged.connect(_sync_preview)
 
-    chk_lsfg.toggled.connect(_sync_preview)
-    lay.addWidget(chk_lsfg)
-    lay.addWidget(_muted_hint(tr("launch.lsfg_hint")))
-    lay.addLayout(lsfg_opts_col)
-    lsfg_mult_combo.currentIndexChanged.connect(_sync_preview)
-    lsfg_flow_combo.currentIndexChanged.connect(_sync_preview)
-    chk_lsfg_perf.toggled.connect(_sync_preview)
-    lsfg_profile_edit.textChanged.connect(_sync_preview)
-
     if (not is_native_linux) and (gpu.has_nvidia or nvapi_active):
         chk_nvapi.toggled.connect(_sync_preview)
         lay.addWidget(chk_nvapi)
@@ -542,7 +445,6 @@ def open_launch_presets_dialog(
             ext_note.setWordWrap(True)
             lay.addWidget(ext_note)
 
-    lay.addWidget(conflict_warn)
     lay.addWidget(wined3d_warn)
     lay.addWidget(raw_lbl)
     lay.addWidget(raw_edit)
@@ -550,7 +452,6 @@ def open_launch_presets_dialog(
     winedll_edit.textChanged.connect(_on_winedll_text_changed)
     raw_edit.textChanged.connect(_on_raw_text_changed)
     _update_optiscaler_dxgi_guard()
-    _update_conflict_warning()
     _update_wined3d_warning()
 
     scroll.setWidget(body)

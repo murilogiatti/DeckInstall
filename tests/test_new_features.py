@@ -259,29 +259,8 @@ class TestNewFeatures(unittest.TestCase):
                     any(f.operation == "PULL" and f.rel_path.endswith("save.bin") for f in pull_preview.files)
                 )
 
-    # 5. apply_launch_presets with lsfg=True and preserving lsfg-vk when lsfg=False
-    def test_apply_launch_presets_lsfg_and_preserve_lsfg_vk(self) -> None:
-        opts = apply_launch_presets(
-            "",
-            gamemode=True,
-            mangohud=False,
-            wined3d=False,
-            no_esync=False,
-            no_fsync=False,
-            lsfg=True,
-            lsfg_multiplier=3,
-            lsfg_flow_scale=0.75,
-            lsfg_perf_mode=True,
-            lsfg_profile="my-profile",
-        )
-        self.assertIn("ENABLE_LSFG=1", opts)
-        self.assertIn("LSFG_MULTIPLIER=3", opts)
-        self.assertIn("LSFG_FLOW_SCALE=0.75", opts)
-        self.assertIn("LSFG_PERF_MODE=1", opts)
-        self.assertIn("LSFGVK_PROFILE=my-profile", opts)
-        self.assertIn("gamemoderun %command%", opts)
-
-        # When lsfg=False, lsfg-vk wrapper in existing options must be preserved
+    # 5. legacy LSFG tokens in existing launch options are preserved untouched
+    def test_apply_launch_presets_preserves_legacy_lsfg_tokens(self) -> None:
         preserved = apply_launch_presets(
             "ENABLE_LSFG=1 LSFG_MULTIPLIER=2 lsfg-vk %command% -dx11",
             gamemode=False,
@@ -289,10 +268,9 @@ class TestNewFeatures(unittest.TestCase):
             wined3d=False,
             no_esync=False,
             no_fsync=False,
-            lsfg=False,
         )
-        self.assertNotIn("ENABLE_LSFG=", preserved)
-        self.assertNotIn("LSFG_MULTIPLIER=", preserved)
+        self.assertIn("ENABLE_LSFG=1", preserved)
+        self.assertIn("LSFG_MULTIPLIER=2", preserved)
         self.assertIn("lsfg-vk", preserved)
         self.assertIn("MANGOHUD=1", preserved)
         self.assertTrue(preserved.endswith("%command% -dx11"))
