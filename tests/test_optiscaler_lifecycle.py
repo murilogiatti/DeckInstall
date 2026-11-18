@@ -162,13 +162,14 @@ def test_bulk_dialog_lists_compatibility(tmp_path: Path) -> None:
 
     from deckinstall.ui_dialogs import optiscaler_bulk_dialog as bd
 
-    QApplication.instance() or QApplication([])
+    app = QApplication.instance() or QApplication([])
     game = _installed_game(tmp_path, "Alpha")
     (game.game_dir / "nvngx_dlss.dll").write_bytes(b"x")
     rows = bd._scan()
     seen: list[tuple[str, bool, str]] = []
 
     def fake_exec(dlg: QDialog) -> int:
+        dlg.deleteLater()  # parentless dialog: delete it while Qt is still up
         tbl = dlg.findChild(QTableWidget)
         assert tbl is not None
         item = tbl.item(0, 0)
@@ -177,4 +178,8 @@ def test_bulk_dialog_lists_compatibility(tmp_path: Path) -> None:
 
     with mock.patch.object(bd, "_dialog_parent", return_value=None), mock.patch.object(QDialog, "exec", fake_exec):
         bd._show(mock.Mock(), rows)
+    from PySide6.QtCore import QEvent
+
+    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
     assert seen and seen[0][0] == "Alpha" and seen[0][1] is True and "DLSS" in seen[0][2]

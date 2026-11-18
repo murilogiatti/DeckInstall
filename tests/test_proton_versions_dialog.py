@@ -23,7 +23,7 @@ PE = b"MZ" + b"\x00" * 58 + (64).to_bytes(4, "little") + b"PE\x00\x00"
 
 
 def test_dialog_lists_games_with_mode_and_versions(tmp_path: Path) -> None:
-    QApplication.instance() or QApplication([])
+    app = QApplication.instance() or QApplication([])
     tool = runtime_manager.get_compat_tools_dir() / "GE-Proton11-2"
     tool.mkdir(parents=True)
     (tool / "proton").write_text("#!/bin/sh\n", encoding="utf-8")
@@ -36,6 +36,7 @@ def test_dialog_lists_games_with_mode_and_versions(tmp_path: Path) -> None:
     rows: list[tuple[str, str, str, str]] = []
 
     def fake_exec(dlg: QDialog) -> int:
+        dlg.deleteLater()  # parentless dialog: delete it while Qt is still up
         tbl = dlg.findChild(QTableWidget)
         assert tbl is not None
         for r in range(tbl.rowCount()):
@@ -47,4 +48,8 @@ def test_dialog_lists_games_with_mode_and_versions(tmp_path: Path) -> None:
         mock.patch.object(QDialog, "exec", fake_exec),
     ):
         proton_dialogs.game_proton_versions_dialog(mock.Mock())
+    from PySide6.QtCore import QEvent
+
+    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
     assert rows == [("Alpha", tr("proton_games.mode_default"), "GE-Proton11-2", "-")]
