@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import shlex
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -36,6 +35,7 @@ from PySide6.QtWidgets import (
 
 from .extractor import InsufficientSpaceError
 from .i18n import tr
+from .launch_presets import parse_presets
 from .scanner import is_native_linux_exe
 from .steam_paths import is_gamescope_session
 from .steam_vdf import CleanupCandidate, _strip_vdf_quotes
@@ -395,62 +395,7 @@ def _make_card() -> tuple[QFrame, QVBoxLayout]:
 
 def _parse_launch_preset_state(opts: str) -> dict[str, object]:
     """Parse known launch preset flags and values from a LaunchOptions string."""
-    try:
-        tokens_list = shlex.split(opts) if opts.strip() else []
-    except ValueError:
-        tokens_list = opts.split()
-    tokens_now = set(tokens_list)
-
-    mh_level = 0
-    mh_position = ""
-    mh_fps_limit = 0
-    for tok in tokens_now:
-        if tok.startswith("MANGOHUD_CONFIG="):
-            val = tok.split("=", 1)[1]
-            if "horizontal" in val and ("hud_compact" in val or "position=top-center" in val):
-                mh_level = 2
-            else:
-                for lv in (1, 2, 3, 4):
-                    if f"preset={lv}" in val:
-                        mh_level = lv
-                        break
-            for part in val.split(","):
-                part_s = part.strip()
-                if part_s.startswith("position="):
-                    mh_position = part_s.split("=", 1)[1].strip()
-                elif part_s.startswith("fps_limit="):
-                    try:
-                        parsed_fps = int(part_s.split("=", 1)[1].strip())
-                        if parsed_fps > 0:
-                            mh_fps_limit = parsed_fps
-                    except ValueError:
-                        pass
-
-    winedll_from_tokens = ""
-    for tok in tokens_list:
-        if tok.startswith("WINEDLLOVERRIDES="):
-            winedll_from_tokens = tok.split("=", 1)[1]
-
-    return {
-        "tokens_list": tokens_list,
-        "tokens_now": tokens_now,
-        "gamemode": "gamemoderun" in tokens_now,
-        "mangohud": "MANGOHUD=1" in tokens_now,
-        "mh_level": mh_level,
-        "mh_position": mh_position,
-        "mh_fps_limit": mh_fps_limit,
-        "nvapi": "PROTON_ENABLE_NVAPI=1" in tokens_now or "DXVK_ENABLE_NVAPI=1" in tokens_now,
-        "prime": (
-            "__NV_PRIME_RENDER_OFFLOAD=1" in tokens_now
-            or "__GLX_VENDOR_LIBRARY_NAME=nvidia" in tokens_now
-        ),
-        "wayland": "PROTON_ENABLE_WAYLAND=1" in tokens_now,
-        "dlss_upgrade": "PROTON_DLSS_UPGRADE=1" in tokens_now,
-        "wined3d": "PROTON_USE_WINED3D=1" in tokens_now,
-        "no_esync": "PROTON_NO_ESYNC=1" in tokens_now,
-        "no_fsync": "PROTON_NO_FSYNC=1" in tokens_now,
-        "winedll": winedll_from_tokens,
-    }
+    return parse_presets(opts)
 
 
 def _resolve_game_exe_path(kind: str, obj: object) -> Path | None:

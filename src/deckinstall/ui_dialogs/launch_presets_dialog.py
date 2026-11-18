@@ -26,13 +26,13 @@ from PySide6.QtWidgets import (
 from .. import __app_name__
 from ..external_actions import load_external_launch_presets, save_external_launch_presets
 from ..i18n import tr
+from ..launch_presets import apply_presets
 from ..launcher_scan import ExternalLauncherGame
 from ..optiscaler import inspect_optiscaler_state
 from ..runtime_manager import get_system_package_install_cmd, install_system_package
 from ..standalone import StandaloneGame, update_standalone_launch_options
 from ..steam_vdf import (
     ShortcutEntry,
-    apply_launch_presets,
     merge_winedlloverride,
     remove_winedlloverride,
     update_shortcut_launch_options,
@@ -242,24 +242,24 @@ def open_launch_presets_dialog(
                 if (kind in ("steam", "external") and not is_native_linux)
                 else ""
             )
-            mh_lvl = mh_level_combo.currentData()
-            mh_pos = str(mh_pos_combo.currentData() or "")
-            mh_fps = mh_fps_combo.currentData()
-            updated = apply_launch_presets(
+            updated = apply_presets(
                 raw_edit.text(),
-                gamemode=chk_gm.isChecked(),
-                mangohud=mh_enabled,
-                wined3d=False if is_native_linux else chk_w3d.isChecked(),
-                no_esync=False if is_native_linux else chk_esync.isChecked(),
-                no_fsync=False if is_native_linux else chk_fsync.isChecked(),
+                {
+                    "gamemode": chk_gm.isChecked(),
+                    "mangohud": mh_enabled,
+                    "wined3d": chk_w3d.isChecked(),
+                    "no_esync": chk_esync.isChecked(),
+                    "no_fsync": chk_fsync.isChecked(),
+                    "dlss_upgrade": chk_dlss.isChecked(),
+                    "nvapi": chk_nvapi.isChecked(),
+                    "prime": chk_prime.isChecked(),
+                    "wayland": chk_wayland.isChecked(),
+                    "mh_level": mh_level_combo.currentData(),
+                    "mh_position": str(mh_pos_combo.currentData() or ""),
+                    "mh_fps_limit": mh_fps_combo.currentData(),
+                },
                 winedlloverrides=dll_val,
-                dlss_upgrade=False if is_native_linux else chk_dlss.isChecked(),
-                mangohud_level=int(mh_lvl) if isinstance(mh_lvl, int) and mh_lvl in (1, 2, 3, 4) else None,
-                nvidia_nvapi=False if is_native_linux else chk_nvapi.isChecked(),
-                prime_offload=chk_prime.isChecked(),
-                proton_wayland=False if is_native_linux else chk_wayland.isChecked(),
-                mangohud_position=mh_pos,
-                mangohud_fps_limit=int(mh_fps) if isinstance(mh_fps, int) and mh_fps > 0 else None,
+                native_linux=is_native_linux,
             )
             raw_edit.setText(updated)
         except ValueError:

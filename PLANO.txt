@@ -41,11 +41,11 @@ FASE 2 - Instalar
 5. [FEITO] Remover limite de 4 GiB (usar razao de compressao + espaco livre).
 
 FASE 3 - Jogar e Proton
-1. Proton "Padrao (mais recente)" ou fixado por jogo; "Usar versao anterior"; atualizar move os "Padrao";
+1. [FEITO] Proton "Padrao (mais recente)" ou fixado por jogo; "Usar versao anterior"; atualizar move os "Padrao";
    manter atual + anterior; visao de versoes com fixar/desafixar em lote.
-2. Um so dialogo de presets (MangoHud, gamemode, DLSS, NVAPI, wined3d, esync/fsync). Sem LSFG.
-3. OptiScaler: compatibilidade + instalacao em massa; corrigir instalacao pela metade; registrar no manifesto.
-4. Logs de execucao no manifesto.
+2. [FEITO] Um so dialogo de presets (MangoHud, gamemode, DLSS, NVAPI, wined3d, esync/fsync). Sem LSFG.
+3. [FEITO] OptiScaler: compatibilidade + instalacao em massa; corrigir instalacao pela metade; registrar no manifesto.
+4. [FEITO] Logs de execucao no manifesto.
 
 FASE 4 - Desinstalar e limpar
 1. Dialogo Desinstalar guiado pelo manifesto (jogo, prefixo, saves com snapshot, atalhos, artes, cache, logs);

@@ -465,9 +465,39 @@ class RuntimeUpdateWorker(QThread):
     finished_ok = Signal(str, str)
     failed = Signal(str)
 
+    def __init__(self, paths: SteamPaths | None = None) -> None:
+        super().__init__()
+        self.paths = paths
+
+    def _after_ge_update(self, previous: str) -> str:
+        """Move "Default" games to the new GE-Proton and keep only the current + previous versions."""
+        from .proton_policy import newest_ge_proton, protected_tool_names, prune_ge_proton, retarget_default_games
+        from .steam_vdf import list_compat_tool_usage
+
+        newest = newest_ge_proton()
+        if newest is None or newest.name == previous:
+            return ""
+        moved = retarget_default_games(previous)
+        msg = tr("runtime.default_moved", count=moved, proton=newest.name)
+        if self.paths is None:
+            return msg  # Steam's own mappings are unknown: never delete a version it may use.
+        try:
+            steam_tools = [u.tool_name for u in list_compat_tool_usage(self.paths)]
+        except Exception:
+            logging.exception("Could not read Steam compat-tool mappings; skipping GE-Proton cleanup")
+            return msg
+        removed = prune_ge_proton(keep=2, protected=protected_tool_names(extra=steam_tools))
+        if removed:
+            msg = f"{msg} | {tr('runtime.ge_pruned', names=', '.join(p.name for p in removed))}"
+        return msg
+
     def run(self) -> None:
         try:
             self.status.emit(tr("runtime.checking"))
+            from .proton_policy import newest_ge_proton
+
+            before = newest_ge_proton()
+            previous_ge = before.name if before is not None else ""
             info = check_runtime_updates(force=True)
             umu_info = info.get("umu", {})
             ge_info = info.get("ge_proton", {})
@@ -497,6 +527,8 @@ class RuntimeUpdateWorker(QThread):
                     progress_cb=lambda msg, _pct: self.status.emit(msg),
                 )
 
+            policy_msg = self._after_ge_update(previous_ge)
+
             opti_ver = ""
             if _has_optiscaler_dll(get_optiscaler_dir()):
                 old_opti_ver = str(_load_versions().get("optiscaler_installed_version") or "").strip()
@@ -519,6 +551,8 @@ class RuntimeUpdateWorker(QThread):
             )
             if opti_ver:
                 msg = f"{msg} | OptiScaler {opti_ver}"
+            if policy_msg:
+                msg = f"{msg} | {policy_msg}"
             self.finished_ok.emit(msg, bwrap_warn)
         except Exception as exc:
             self.failed.emit(_format_worker_error(exc))

@@ -32,6 +32,13 @@ from .. import __app_name__
 from ..external_actions import load_external_launch_presets
 from ..i18n import tr
 from ..launcher_scan import ExternalLauncherGame
+from ..proton_policy import (
+    DEFAULT_PROTON_ID,
+    newest_ge_proton,
+    previous_proton_name,
+    set_game_proton,
+    use_previous_proton,
+)
 from ..runtime_manager import (
     get_umu_protonfix_status,
     is_win32_prefix,
@@ -39,7 +46,7 @@ from ..runtime_manager import (
     resolve_game_prefix,
 )
 from ..scanner import scan_game_folder
-from ..standalone import StandaloneGame, change_standalone_exe, update_standalone_launch_options
+from ..standalone import StandaloneGame, change_standalone_exe, game_run_logs
 from ..steam_paths import list_installed_protons
 from ..steam_vdf import (
     ShortcutEntry,
@@ -295,29 +302,52 @@ def open_configure_game_dialog(win: MainWindow) -> None:
 
     btn_edit_opts.clicked.connect(_on_edit_opts)
 
-    log_path = get_game_log_path(title_name)
+    legacy_log = get_game_log_path(title_name)
+    run_logs = (
+        game_run_logs(obj)
+        if isinstance(obj, StandaloneGame)
+        else ([legacy_log] if legacy_log.is_file() else [])
+    )
+    if isinstance(obj, StandaloneGame) and legacy_log.is_file():
+        run_logs.append(legacy_log)  # last run started before logs moved into launch.sh
     btn_view_log = QPushButton(tr("configure.btn_view_log"))
-    btn_view_log.setEnabled(log_path.is_file())
+    btn_view_log.setEnabled(bool(run_logs))
 
-    def _on_view_log() -> None:
+    def _read_tail(path: Path) -> str:
         try:
-            with log_path.open("rb") as fh:
+            with path.open("rb") as fh:
                 fh.seek(0, 2)
                 size = fh.tell()
-                if size > 65536:
-                    fh.seek(size - 65536)
-                else:
-                    fh.seek(0)
-                content = fh.read().decode("utf-8", errors="replace")
+                fh.seek(max(0, size - 65536))
+                return fh.read().decode("utf-8", errors="replace")
         except OSError as exc:
-            content = str(exc)
+            return str(exc)
+
+    def _on_view_log() -> None:
         log_dlg = QDialog(dlg)
         log_dlg.setWindowTitle(tr("configure.log_title", name=title_name))
-        log_dlg.resize(640, 440)
+        log_dlg.resize(700, 480)
         log_lay = QVBoxLayout(log_dlg)
+        run_combo = QComboBox()
+        for i, path in enumerate(run_logs):
+            label = tr("configure.log_run_last") if i == 0 else tr("configure.log_run_older", n=i)
+            run_combo.addItem(label, str(path))
         viewer = QPlainTextEdit()
         viewer.setReadOnly(True)
-        viewer.setPlainText(content)
+
+        def _show_run(_idx: int = 0) -> None:
+            viewer.setPlainText(_read_tail(Path(str(run_combo.currentData()))))
+
+        run_combo.currentIndexChanged.connect(_show_run)
+        _show_run()
+        top = QHBoxLayout()
+        top.addWidget(run_combo, 1)
+        btn_folder = QPushButton(tr("configure.btn_open_log_folder"))
+        btn_folder.clicked.connect(
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(str(run_combo.currentData())).parent)))
+        )
+        top.addWidget(btn_folder)
+        log_lay.addLayout(top)
         log_lay.addWidget(viewer, 1)
         close_btn = QPushButton(tr("configure.btn_close"))
         close_btn.clicked.connect(log_dlg.accept)
@@ -393,6 +423,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     proton_combo: QComboBox | None = None
     btn_change_proton: QPushButton | None = None
     btn_fallback10: QPushButton | None = None
+    btn_previous_proton: QPushButton | None = None
     active_proton_ref: list[str] = [""]
 
     if is_native:
@@ -423,6 +454,10 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         btn_fallback10.clicked.connect(win._fallback_selected_proton10)
         proton_btns.addWidget(btn_change_proton)
         proton_btns.addWidget(btn_fallback10)
+        if is_standalone:
+            btn_previous_proton = QPushButton(tr("configure.btn_previous_proton"))
+            btn_previous_proton.setEnabled(False)
+            proton_btns.addWidget(btn_previous_proton)
         proton_btns.addStretch()
         game_tab_lay.addLayout(proton_btns)
 
@@ -544,8 +579,14 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                             seen_ids.add(tid)
                             tools.append((tid, disp))
                 elif isinstance(obj, StandaloneGame) and is_standalone:
-                    raw_proton = obj.proton_name or ""
-                    proton_text = raw_proton or tr("proton.default_label")
+                    newest = newest_ge_proton()
+                    raw_proton = obj.proton_name or DEFAULT_PROTON_ID
+                    proton_text = obj.proton_name or tr("proton.default_label")
+                    tools.append((
+                        DEFAULT_PROTON_ID,
+                        tr("proton.default_newest", name=newest.name if newest else "GE-Proton"),
+                    ))
+                    seen_ids.add(DEFAULT_PROTON_ID)
                     for ct in list_installed_compat_tools():
                         if ct.tool_id not in seen_ids:
                             seen_ids.add(ct.tool_id)
@@ -645,6 +686,12 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                 btn_fallback10.setEnabled(
                     not win32_flag and ((is_steam and bool(win.paths)) or is_standalone)
                 )
+            if btn_previous_proton is not None and isinstance(obj, StandaloneGame):
+                previous = previous_proton_name(obj)
+                btn_previous_proton.setEnabled(bool(previous) and not win32_flag)
+                btn_previous_proton.setToolTip(
+                    tr("configure.previous_proton_tip", name=previous) if previous else ""
+                )
             if lbl_umu_badge is not None:
                 lbl_umu_badge.setText(umu_text or "-")
             if pfx_label is not None:
@@ -701,9 +748,13 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                     btn_change_proton.setEnabled(enabled)
                 if btn_fallback10 is not None:
                     btn_fallback10.setEnabled(enabled)
+                if btn_previous_proton is not None:
+                    btn_previous_proton.setEnabled(enabled)
 
-            def _on_proton_combo_activated(idx: int) -> None:
-                tool_id = str(proton_combo.itemData(idx) or "")
+            def _on_proton_combo_activated(idx: int, use_previous: bool = False) -> None:
+                tool_id = "" if use_previous else str(proton_combo.itemData(idx) or "")
+                if use_previous and isinstance(obj, StandaloneGame):
+                    tool_id = previous_proton_name(obj)
                 if not tool_id or tool_id == active_proton_ref[0]:
                     return
                 auto_snap_enabled = win._is_auto_snapshot_enabled()
@@ -720,22 +771,26 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                             "proton",
                             enabled=auto_snap_enabled,
                         )
-                        update_standalone_launch_options(
-                            sa.game_dir,
-                            winedlloverrides=sa.winedlloverrides,
-                            launch_options=sa.launch_options,
-                            proton_name=tool_id,
+                        changed = (
+                            use_previous_proton(sa.game_dir)
+                            if use_previous
+                            else set_game_proton(sa.game_dir, "" if tool_id == DEFAULT_PROTON_ID else tool_id)
                         )
+                        sa.proton_name = changed.proton_name
+                        sa.meta = changed.meta
 
                     worker = SteamOpWorker(_do_sa, need_steam_closed=False)
                     win._track_worker(worker)
                     worker.status.connect(win.status_label.setText)
 
                     def _sa_ok(_res: object) -> None:
-                        sa.proton_name = tool_id
-                        active_proton_ref[0] = tool_id
+                        active_proton_ref[0] = sa.proton_name or DEFAULT_PROTON_ID
                         win._refresh_shortcuts()
-                        msg = tr("proton.updated_standalone", name=sa.name, tool=tool_id)
+                        msg = tr(
+                            "proton.updated_standalone",
+                            name=sa.name,
+                            tool=sa.proton_name or tr("proton.default_label"),
+                        )
                         win.status_label.setText(msg)
                         if dlg_alive():
                             _set_proton_controls_enabled(True)
@@ -810,6 +865,10 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                     )
 
             proton_combo.activated.connect(_on_proton_combo_activated)
+            if btn_previous_proton is not None:
+                btn_previous_proton.clicked.connect(
+                    lambda: _on_proton_combo_activated(proton_combo.currentIndex(), use_previous=True)
+                )
 
         if btn_compat_migrate is not None and isinstance(obj, ShortcutEntry) and paths_snap is not None:
             paths_local = paths_snap

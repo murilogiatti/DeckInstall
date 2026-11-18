@@ -74,6 +74,7 @@ from .extractor import (
     suggest_target_name,
 )
 from .i18n import available_languages, set_language, tr
+from .launch_presets import active_flags, apply_presets
 from .launcher_scan import ExternalLauncherGame, scan_external_launcher_games
 from .library import (
     Library,
@@ -135,7 +136,6 @@ from .steam_vdf import (
     CleanupCandidate,
     MigrationPlanItem,
     ShortcutEntry,
-    apply_launch_presets,
     infer_game_root_from_exe,
     load_shortcuts,
     set_shortcut_proton,
@@ -241,6 +241,20 @@ class LaunchPresetState(TypedDict):
     winedll: str
 
 
+# Boolean presets remembered for the next install: preset key -> QSettings name.
+_LAST_PREFS_FLAGS = {
+    "gamemode": "gamemode",
+    "mangohud": "mangohud",
+    "nvapi": "nvapi",
+    "prime": "prime",
+    "wayland": "wayland",
+    "dlss_upgrade": "dlss_upgrade",
+    "wined3d": "wined3d",
+    "no_esync": "no_esync",
+    "no_fsync": "no_fsync",
+}
+
+
 def _parse_launch_preset_state(opts: str) -> LaunchPresetState:
     return cast(LaunchPresetState, _raw_parse_launch_preset_state(opts))
 
@@ -270,6 +284,8 @@ class MainWindow(QMainWindow):
     maint_batch_card: QFrame
     maint_list: QTableWidget
     btn_maint_protons: QPushButton
+    btn_maint_game_protons: QPushButton
+    btn_maint_bulk_opti: QPushButton
     btn_migrate_legacy: QPushButton
     btn_undo_migration: QPushButton
     btn_maint_refresh_health: QPushButton
@@ -1021,29 +1037,17 @@ class MainWindow(QMainWindow):
         lbl_launch_opts_group.setStyleSheet("font-weight: 700; margin-top: 6px;")
         adv_form.addRow(lbl_launch_opts_group)
 
-        launch_opts_box = QVBoxLayout()
-        launch_opts_box.setSpacing(4)
-        launch_row1 = QHBoxLayout()
-        launch_row1.setSpacing(10)
-        self.chk_add_gamemode = QCheckBox(tr("launch.gamemode"))
-        self.chk_add_mangohud = QCheckBox(tr("launch.mangohud"))
-        launch_row1.addWidget(self.chk_add_gamemode)
-        launch_row1.addWidget(self.chk_add_mangohud)
-        launch_row1.addStretch()
-
-        launch_row2 = QHBoxLayout()
-        launch_row2.setSpacing(10)
-        self.chk_add_dlss = QCheckBox(tr("launch.dlss_upgrade"))
-        self.chk_add_dlss.setVisible(self._get_gpu_profile().has_nvidia)
-        self.btn_add_launch_adv = QPushButton(tr("add.btn_launch_advanced"))
+        # One presets dialog for everything; the form only shows what is on.
+        launch_row = QHBoxLayout()
+        launch_row.setSpacing(10)
+        self.btn_add_launch_adv = QPushButton(tr("add.btn_launch_presets"))
         self.btn_add_launch_adv.clicked.connect(self._open_add_launch_advanced)
-        launch_row2.addWidget(self.chk_add_dlss)
-        launch_row2.addWidget(self.btn_add_launch_adv)
-        launch_row2.addStretch()
-
-        launch_opts_box.addLayout(launch_row1)
-        launch_opts_box.addLayout(launch_row2)
-        adv_form.addRow("", launch_opts_box)
+        self.lbl_add_presets = QLabel()
+        self.lbl_add_presets.setObjectName("MutedText")
+        self.lbl_add_presets.setWordWrap(True)
+        launch_row.addWidget(self.btn_add_launch_adv)
+        launch_row.addWidget(self.lbl_add_presets, 1)
+        adv_form.addRow("", launch_row)
         self._reset_add_launch_options()
 
         lbl_standalone_icon = QLabel(tr("add.group_standalone_icon"))
@@ -1674,7 +1678,7 @@ class MainWindow(QMainWindow):
                     self.status_label.setText(tr("status.ready"))
                     return
 
-            worker = RuntimeUpdateWorker()
+            worker = RuntimeUpdateWorker(self.paths)
             self._track_worker(worker)
             worker.status.connect(self.status_label.setText)
 
@@ -2106,25 +2110,15 @@ class MainWindow(QMainWindow):
         """Load last-used launch option preferences from QSettings."""
         if not _setting_bool(self.settings, "last_launch_opts/has_saved", False):
             return "", ""
-        mh_level = _setting_int(self.settings, "last_launch_opts/mh_level", 0)
-        mh_fps = _setting_int(self.settings, "last_launch_opts/mh_fps_limit", 0)
+        state: dict[str, object] = {
+            key: _setting_bool(self.settings, f"last_launch_opts/{setting}", False)
+            for key, setting in _LAST_PREFS_FLAGS.items()
+        }
+        state["mh_level"] = _setting_int(self.settings, "last_launch_opts/mh_level", 0)
+        state["mh_fps_limit"] = _setting_int(self.settings, "last_launch_opts/mh_fps_limit", 0)
+        state["mh_position"] = str(self.settings.value("last_launch_opts/mh_position", "") or "")
         try:
-            opts = apply_launch_presets(
-                "",
-                gamemode=_setting_bool(self.settings, "last_launch_opts/gamemode", False),
-                mangohud=_setting_bool(self.settings, "last_launch_opts/mangohud", False),
-                wined3d=_setting_bool(self.settings, "last_launch_opts/wined3d", False),
-                no_esync=_setting_bool(self.settings, "last_launch_opts/no_esync", False),
-                no_fsync=_setting_bool(self.settings, "last_launch_opts/no_fsync", False),
-                winedlloverrides="",
-                dlss_upgrade=_setting_bool(self.settings, "last_launch_opts/dlss_upgrade", False),
-                mangohud_level=mh_level if mh_level in (1, 2, 3, 4) else None,
-                nvidia_nvapi=_setting_bool(self.settings, "last_launch_opts/nvapi", False),
-                prime_offload=_setting_bool(self.settings, "last_launch_opts/prime", False),
-                proton_wayland=_setting_bool(self.settings, "last_launch_opts/wayland", False),
-                mangohud_position=str(self.settings.value("last_launch_opts/mh_position", "") or ""),
-                mangohud_fps_limit=mh_fps if mh_fps > 0 else None,
-            )
+            opts = apply_presets("", state, winedlloverrides="")
         except ValueError:
             opts = ""
         winedll = str(self.settings.value("last_launch_opts/winedll", "") or "").strip()
@@ -2134,10 +2128,24 @@ class MainWindow(QMainWindow):
         opts, winedll = self._load_last_launch_prefs()
         self._add_launch_options = opts
         self._add_winedlloverrides = winedll
-        st = _parse_launch_preset_state(opts)
-        self.chk_add_gamemode.setChecked(bool(st["gamemode"]))
-        self.chk_add_mangohud.setChecked(bool(st["mangohud"]))
-        self.chk_add_dlss.setChecked(bool(st["dlss_upgrade"]))
+        self._update_add_presets_summary()
+
+    def _update_add_presets_summary(self) -> None:
+        names = {
+            "gamemode": tr("presets.short_gamemode"),
+            "mangohud": tr("presets.short_mangohud"),
+            "dlss_upgrade": tr("presets.short_dlss"),
+            "nvapi": tr("presets.short_nvapi"),
+            "prime": tr("presets.short_prime"),
+            "wayland": tr("presets.short_wayland"),
+            "wined3d": tr("presets.short_wined3d"),
+            "no_esync": tr("presets.short_no_esync"),
+            "no_fsync": tr("presets.short_no_fsync"),
+        }
+        active = [names[k] for k in active_flags(self._add_launch_options) if k in names]
+        if self._add_winedlloverrides.strip():
+            active.append(tr("presets.short_dll"))
+        self.lbl_add_presets.setText(", ".join(active) if active else tr("presets.none"))
 
     def _is_add_exe_native(self) -> bool:
         exe_text = self.add_exe_combo.currentText().strip()
@@ -2148,24 +2156,8 @@ class MainWindow(QMainWindow):
 
     def _resolve_add_launch_options(self) -> tuple[str, str]:
         is_native = self._is_add_exe_native()
-        st = _parse_launch_preset_state(self._add_launch_options)
         try:
-            merged_opts = apply_launch_presets(
-                self._add_launch_options,
-                gamemode=self.chk_add_gamemode.isChecked(),
-                mangohud=self.chk_add_mangohud.isChecked(),
-                wined3d=bool(st["wined3d"]),
-                no_esync=bool(st["no_esync"]),
-                no_fsync=bool(st["no_fsync"]),
-                winedlloverrides="",
-                dlss_upgrade=False if is_native else self.chk_add_dlss.isChecked(),
-                mangohud_level=st["mh_level"] if st["mh_level"] in (1, 2, 3, 4) else None,
-                nvidia_nvapi=bool(st["nvapi"]),
-                prime_offload=bool(st["prime"]),
-                proton_wayland=bool(st["wayland"]),
-                mangohud_position=str(st.get("mh_position") or ""),
-                mangohud_fps_limit=int(st.get("mh_fps_limit") or 0) or None,
-            )
+            merged_opts = apply_presets(self._add_launch_options, winedlloverrides="", native_linux=is_native)
         except ValueError:
             merged_opts = self._add_launch_options.strip()
         winedll = "" if is_native else self._add_winedlloverrides.strip()
@@ -2187,10 +2179,7 @@ class MainWindow(QMainWindow):
         new_opts, new_winedll = res
         self._add_launch_options = new_opts
         self._add_winedlloverrides = new_winedll
-        st = _parse_launch_preset_state(new_opts)
-        self.chk_add_gamemode.setChecked(bool(st["gamemode"]))
-        self.chk_add_mangohud.setChecked(bool(st["mangohud"]))
-        self.chk_add_dlss.setChecked(bool(st["dlss_upgrade"]))
+        self._update_add_presets_summary()
 
     def _auto_search_steam_art(self) -> None:
         """Auto-fetch Steam artwork in the background when the Add form is active."""
@@ -2274,11 +2263,8 @@ class MainWindow(QMainWindow):
         if is_elf:
             self.chk_proton.setChecked(False)
             self.chk_proton.setEnabled(False)
-            self.chk_add_dlss.setChecked(False)
-            self.chk_add_dlss.setEnabled(False)
         else:
             self.chk_proton.setEnabled(True)
-            self.chk_add_dlss.setEnabled(True)
         self._update_remove_existing_state()
 
     def _pick_custom_icon(self) -> None:
@@ -3275,9 +3261,9 @@ class MainWindow(QMainWindow):
                 self.status_label.setText(fb_msg)
                 QMessageBox.information(_dialog_parent(self), __app_name__, fb_msg)
             try:
-                _start_detached_process(
-                    cmd, cwd=cwd, env=env, log_file=get_game_log_path(title_name)
-                )
+                # DeckInstall games log every run from their own launch.sh (any launcher).
+                log_file = None if isinstance(obj, StandaloneGame) else get_game_log_path(title_name)
+                _start_detached_process(cmd, cwd=cwd, env=env, log_file=log_file)
                 self.status_label.setText(tr("play.launched", name=title_name))
             except Exception as exc:
                 QMessageBox.critical(_dialog_parent(self), __app_name__, tr("play.error", err=str(exc)))
@@ -3319,6 +3305,8 @@ class MainWindow(QMainWindow):
             self.act_revert_art,
             self.act_export_standalone,
             self.btn_maint_protons,
+            self.btn_maint_game_protons,
+            self.btn_maint_bulk_opti,
             self.btn_maint_scan,
             self.btn_maint_clean_safe,
             self.btn_maint_delete_selected,

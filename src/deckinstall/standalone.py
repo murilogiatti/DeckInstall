@@ -281,9 +281,16 @@ def _resolve_proton_path(proton_name: str) -> str:
     """Resolve a Proton/GE-Proton tool name to a filesystem path for PROTONPATH when possible."""
     name = proton_name.strip()
     if not name:
-        return "GE-Proton"
+        # "Default (newest)": bake the newest installed GE-Proton into the launcher; updating
+        # GE-Proton rewrites these launchers (proton_policy.retarget_default_games).
+        from .runtime_manager import list_ge_proton10_dirs, list_ge_proton11_dirs
+
+        newest = list_ge_proton11_dirs() or list_ge_proton10_dirs()
+        return str(newest[0]) if newest else "GE-Proton"
+    from .runtime_manager import get_compat_tools_dir
+
     steam_root = find_steam_root() or (Path.home() / ".local" / "share" / "Steam")
-    resolved = resolve_proton_dir(name, steam_root)
+    resolved = resolve_proton_dir(name, steam_root, extra_compat_dirs=[get_compat_tools_dir()])
     return str(resolved) if resolved is not None else name
 
 
@@ -441,8 +448,13 @@ def _write_launch_script(
     cache_dir: Path | None = None,
     store: str = "",
     codename: str = "",
+    log_dir: Path | None = None,
 ) -> None:
-    """Generate an executable launch.sh script invoking umu-run or a native Linux binary."""
+    """Generate an executable launch.sh script invoking umu-run or a native Linux binary.
+
+    With log_dir, every run (from the app, Steam, the menu or the desktop) writes its output to
+    log_dir/run.log, keeping the previous runs as run.1.log ... and the exit code.
+    """
     env_pairs, wrappers, game_args, effective_dll = _parse_launch_tokens(
         launch_options, "" if native_linux else winedlloverrides
     )
@@ -496,10 +508,78 @@ def _write_launch_script(
         cmd_parts.append(shlex.quote(str(UMU_RUN_PATH)))
     cmd_parts.append(shlex.quote(str(exe_path)))
     cmd_parts.extend(_quote_game_arg(arg) for arg in game_args)
-    lines.append("exec " + " ".join(cmd_parts))
+    command = " ".join(cmd_parts)
+    if log_dir is None:
+        lines.append("exec " + command)
+    else:
+        lines.extend(_log_lines(log_dir, game_name or exe_path.stem))
+        lines.extend([
+            "rc=0",
+            f"{command} || rc=$?",
+            'echo "== DeckInstall: exit code $rc at $(date -Is)"',
+            'exit "$rc"',
+        ])
 
     _atomic_write_text(script_path, "\n".join(lines) + "\n")
     script_path.chmod(0o755)
+
+
+LOG_KEEP = 5
+
+
+def game_logs_root() -> Path:
+    """Where per-game run logs live (one folder per game, on the internal disk)."""
+    return Path.home() / ".local" / "share" / "DeckInstall" / "logs"
+
+
+def game_log_dir(game: StandaloneGame) -> Path:
+    """The game's run-log folder: by stable id for library games, by name for older ones."""
+    return game_logs_root() / (game.uid or sanitize_dir_name(game.name) or "game")
+
+
+def game_run_logs(game: StandaloneGame) -> list[Path]:
+    """Existing run logs, newest first."""
+    folder = game_log_dir(game)
+    logs = [folder / "run.log", *(folder / f"run.{i}.log" for i in range(1, LOG_KEEP))]
+    return [p for p in logs if p.is_file()]
+
+
+def _log_lines(log_dir: Path, title: str) -> list[str]:
+    """Bash lines that rotate run.log and send this run's output to it."""
+    rotate = " ".join(str(i) for i in range(LOG_KEEP - 2, 0, -1))
+    safe_title = "".join(c for c in title if c.isprintable() and c not in '"$`\\')
+    return [
+        f"LOG_DIR={shlex.quote(str(log_dir))}",
+        'if mkdir -p "$LOG_DIR" 2>/dev/null; then',
+        f'  for i in {rotate}; do',
+        '    if [ -f "$LOG_DIR/run.$i.log" ]; then mv -f "$LOG_DIR/run.$i.log" "$LOG_DIR/run.$((i + 1)).log"; fi',
+        "  done",
+        '  if [ -f "$LOG_DIR/run.log" ]; then mv -f "$LOG_DIR/run.log" "$LOG_DIR/run.1.log"; fi',
+        '  exec >"$LOG_DIR/run.log" 2>&1',
+        f'  echo "== DeckInstall: starting {safe_title} at $(date -Is)"',
+        "fi",
+    ]
+
+
+def _write_game_launcher(game: StandaloneGame) -> None:
+    """Write the game's launch.sh (with run logs) and note the log folder in its manifest data."""
+    log_dir = game_log_dir(game)
+    _write_launch_script(
+        game.launch_script,
+        game.exe_path,
+        game.prefix_dir,
+        game.proton_name,
+        game.winedlloverrides,
+        game.launch_options,
+        native_linux=game.native_linux,
+        steam_appid=game.steam_appid,
+        game_name=game.name,
+        cache_dir=game.cache_dir,
+        store=_store_of(game),
+        codename=_codename_of(game),
+        log_dir=log_dir,
+    )
+    game.meta["logs"] = {"dir": encode_path(log_dir, None), "keep": LOG_KEEP}
 
 
 def _desktop_quote(path: Path) -> str:
@@ -977,20 +1057,7 @@ def _startup_wm_class(game: StandaloneGame) -> str:
 
 def refresh_integration_files(game: StandaloneGame) -> None:
     """Rewrite launch.sh and the existing .desktop launchers after the game's paths changed."""
-    _write_launch_script(
-        game.launch_script,
-        game.exe_path,
-        game.prefix_dir,
-        game.proton_name,
-        game.winedlloverrides,
-        game.launch_options,
-        native_linux=game.native_linux,
-        steam_appid=game.steam_appid,
-        game_name=game.name,
-        cache_dir=game.cache_dir,
-        store=_store_of(game),
-        codename=_codename_of(game),
-    )
+    _write_game_launcher(game)
     targets = [(game.desktop_file, False)]
     if game.desktop_shortcut is not None:
         targets.append((game.desktop_shortcut, True))
@@ -1278,20 +1345,7 @@ def install_standalone_game(
         },
     )
 
-    _write_launch_script(
-        launch_script,
-        game.exe_path,
-        game.prefix_dir,
-        game.proton_name,
-        game.winedlloverrides,
-        game.launch_options,
-        native_linux=game.native_linux,
-        steam_appid=game.steam_appid,
-        game_name=game.name,
-        cache_dir=game.cache_dir,
-        store=_store_of(game),
-        codename=_codename_of(game),
-    )
+    _write_game_launcher(game)
     startup_wm_class = _startup_wm_class(game)
 
     if create_menu_shortcut:
@@ -1473,20 +1527,7 @@ def update_standalone_launch_options(
     if game.cache_dir is None:
         game.cache_dir = get_game_cache_dir(game.game_dir)
 
-    _write_launch_script(
-        game.launch_script,
-        game.exe_path,
-        game.prefix_dir,
-        game.proton_name,
-        game.winedlloverrides,
-        game.launch_options,
-        native_linux=game.native_linux,
-        steam_appid=game.steam_appid,
-        game_name=game.name,
-        cache_dir=game.cache_dir,
-        store=_store_of(game),
-        codename=_codename_of(game),
-    )
+    _write_game_launcher(game)
     _write_manifest(game)
     return game
 

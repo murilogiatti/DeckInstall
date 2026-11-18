@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -781,4 +782,150 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
     btn_install.clicked.connect(_on_install)
     btn_remove_inst.clicked.connect(_on_remove)
     _refresh_installed()
+    dlg.exec()
+
+
+def game_proton_versions_dialog(win: MainWindow) -> None:
+    """Show each DeckInstall game's Proton (Default or pinned) and pin/unpin them in batch."""
+    from ..proton_policy import (
+        DEFAULT_PROTON_ID,
+        effective_proton_name,
+        is_default,
+        newest_ge_proton,
+        previous_proton_name,
+        set_games_proton,
+        use_previous_proton,
+    )
+
+    games = [g for g in list_standalone_games() if not g.native_linux]
+    if not games:
+        QMessageBox.information(win, __app_name__, tr("proton_games.empty"))
+        return
+
+    dlg = QDialog(_dialog_parent(win))
+    dlg.setWindowTitle(tr("proton_games.title"))
+    dlg.resize(780, 520)
+    lay = QVBoxLayout(dlg)
+    hint = QLabel(tr("proton_games.hint"))
+    hint.setWordWrap(True)
+    lay.addWidget(hint)
+
+    tbl = QTableWidget(0, 4)
+    tbl.setHorizontalHeaderLabels([
+        tr("table.name"), tr("proton_games.col_mode"), tr("proton_games.col_current"), tr("proton_games.col_previous"),
+    ])
+    tbl.verticalHeader().setVisible(False)
+    tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+    lay.addWidget(tbl, 1)
+
+    def _populate() -> None:
+        tbl.setRowCount(0)
+        for game in sorted(list_standalone_games(), key=lambda g: g.name.lower()):
+            if game.native_linux:
+                continue
+            row = tbl.rowCount()
+            tbl.insertRow(row)
+            it = QTableWidgetItem(game.name)
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Unchecked)
+            it.setData(Qt.ItemDataRole.UserRole, str(game.game_dir))
+            tbl.setItem(row, 0, it)
+            mode = tr("proton_games.mode_default") if is_default(game) else tr("proton_games.mode_pinned")
+            tbl.setItem(row, 1, QTableWidgetItem(mode))
+            tbl.setItem(row, 2, QTableWidgetItem(effective_proton_name(game) or "-"))
+            tbl.setItem(row, 3, QTableWidgetItem(previous_proton_name(game) or "-"))
+
+    _populate()
+
+    target_row = QHBoxLayout()
+    target_row.addWidget(QLabel(tr("proton_bulk.target_label")))
+    target_combo = QComboBox()
+    newest = newest_ge_proton()
+    target_combo.addItem(tr("proton.default_newest", name=newest.name if newest else "GE-Proton"), DEFAULT_PROTON_ID)
+    for ct in list_installed_compat_tools():
+        target_combo.addItem(ct.folder_name or ct.tool_id, ct.folder_name or ct.tool_id)
+    target_row.addWidget(target_combo, 1)
+    lay.addLayout(target_row)
+
+    btn_row = QHBoxLayout()
+    btn_all = QPushButton(tr("proton_games.btn_check_all"))
+    btn_apply = QPushButton(tr("proton_games.btn_apply"))
+    btn_apply.setObjectName("primaryBtn")
+    btn_previous = QPushButton(tr("configure.btn_previous_proton"))
+    btn_close = QPushButton(tr("proton_bulk.btn_close"))
+    for b in (btn_all, btn_apply, btn_previous):
+        btn_row.addWidget(b)
+    btn_row.addStretch()
+    btn_row.addWidget(btn_close)
+    lay.addLayout(btn_row)
+    btn_close.clicked.connect(dlg.accept)
+
+    def _checked() -> list[Path]:
+        out: list[Path] = []
+        for i in range(tbl.rowCount()):
+            it = tbl.item(i, 0)
+            if it is not None and it.checkState() == Qt.CheckState.Checked:
+                out.append(Path(str(it.data(Qt.ItemDataRole.UserRole))))
+        return out
+
+    def _check_all() -> None:
+        state = Qt.CheckState.Checked if not _checked() else Qt.CheckState.Unchecked
+        for i in range(tbl.rowCount()):
+            it = tbl.item(i, 0)
+            if it is not None:
+                it.setCheckState(state)
+
+    def _run(job: Callable[[list[Path]], tuple[int, list[str]]]) -> None:
+        dirs = _checked()
+        if not dirs:
+            QMessageBox.information(dlg, __app_name__, tr("proton_bulk.none_selected"))
+            return
+        for b in (btn_apply, btn_previous):
+            b.setEnabled(False)
+        worker = SteamOpWorker(lambda: job(dirs), need_steam_closed=False)
+        win._track_worker(worker)
+
+        def _done(result: object) -> None:
+            changed, errors = result if isinstance(result, tuple) else (0, [])
+            win._refresh_shortcuts()
+            if dlg.isVisible():
+                for b in (btn_apply, btn_previous):
+                    b.setEnabled(True)
+                _populate()
+            msg = tr("proton_games.changed", count=changed)
+            if errors:
+                msg = f"{msg}\n\n" + "\n".join(errors)
+            win.status_label.setText(tr("proton_games.changed", count=changed))
+            QMessageBox.information(dlg, __app_name__, msg)
+
+        def _fail(err: str) -> None:
+            for b in (btn_apply, btn_previous):
+                b.setEnabled(True)
+            QMessageBox.critical(dlg, __app_name__, tr("proton.error", err=err))
+
+        worker.finished_ok.connect(_done)
+        worker.failed.connect(_fail)
+        worker.start()
+
+    def _apply() -> None:
+        target = str(target_combo.currentData() or "")
+        tool = "" if target == DEFAULT_PROTON_ID else target
+        _run(lambda dirs: set_games_proton(dirs, tool))
+
+    def _previous_all(dirs: list[Path]) -> tuple[int, list[str]]:
+        changed = 0
+        errors: list[str] = []
+        for d in dirs:
+            try:
+                use_previous_proton(d)
+                changed += 1
+            except (OSError, ValueError) as exc:
+                errors.append(f"{d.name}: {exc}")
+        return changed, errors
+
+    btn_all.clicked.connect(_check_all)
+    btn_apply.clicked.connect(_apply)
+    btn_previous.clicked.connect(lambda: _run(_previous_all))
     dlg.exec()

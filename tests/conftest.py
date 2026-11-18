@@ -29,9 +29,21 @@ def _isolated_libraries(tmp_path_factory: pytest.TempPathFactory, monkeypatch: p
         ("PREFIXES_DIR", legacy_games / ".prefixes"),
     ):
         monkeypatch.setattr(standalone, attr, value)
+    monkeypatch.setattr(standalone, "game_logs_root", lambda: base / "home" / ".local" / "share" / "DeckInstall" / "logs")
     monkeypatch.setattr(standalone, "APPLICATIONS_DIR", base / "home" / ".local" / "share" / "applications")
     # No network in tests, and never read the real umu-database cache.
     monkeypatch.setattr(runtime_manager, "ensure_umu_database", lambda *a, **k: None)
     monkeypatch.setattr(runtime_manager, "get_umu_database_path", lambda: base / "runtime" / "umu-database.csv")
+    # Never see (or prune) the user's real Proton installs.
+    compat = base / "compatibilitytools.d"
+    monkeypatch.setattr(runtime_manager, "get_compat_tools_dir", lambda: compat)
+    monkeypatch.setattr(
+        runtime_manager,
+        "_all_compat_tool_dirs",
+        lambda steam_root=None: [
+            runtime_manager.get_compat_tools_dir(),
+            *runtime_manager._iter_extra_compat_tool_dirs(),
+        ],
+    )
     monkeypatch.setattr(save_sync, "DEFAULT_SNAPSHOTS_DIR", base / "home" / "Games" / "saves" / "snapshots")
     yield

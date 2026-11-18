@@ -5,7 +5,7 @@ from __future__ import annotations
 import shutil
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 
 from .. import __app_name__
 from ..i18n import tr
+from ..launch_presets import apply_presets
 from ..optiscaler import (
     OPTISCALER_BACKENDS,
     OPTISCALER_FG_MODES,
@@ -35,6 +36,7 @@ from ..optiscaler import (
     OptiScalerState,
     inspect_optiscaler_state,
     install_optiscaler_for_game,
+    recommend_proxy,
     uninstall_optiscaler_for_game,
 )
 from ..runtime_manager import (
@@ -46,7 +48,6 @@ from ..runtime_manager import (
 from ..standalone import StandaloneGame, update_standalone_launch_options
 from ..steam_vdf import (
     ShortcutEntry,
-    apply_launch_presets,
     merge_winedlloverride,
     remove_winedlloverride,
     update_shortcut_launch_options,
@@ -456,13 +457,17 @@ def open_optiscaler_dialog(
 
     operation = {"busy": False, "refresh_id": 0}
 
-    def _on_state_refreshed(req_id: int, st_now: object) -> None:
+    def _on_state_refreshed(req_id: int, st_now: object, recommended: str = "") -> None:
         if (
             not dlg_alive() or win._closing_pending or operation["busy"]
             or req_id != operation["refresh_id"]
         ):
             return
-        if isinstance(st_now, OptiScalerState):
+        if isinstance(st_now, OptiScalerState) and not st_now.complete:
+            # A crash/kill left a half-done install: "Remove" undoes it and restores the originals.
+            lbl_state.setText(tr("optiscaler.state_incomplete"))
+            btn_remove.setEnabled(True)
+        elif isinstance(st_now, OptiScalerState):
             lbl_state.setText(
                 tr(
                     "optiscaler.state_installed",
@@ -490,6 +495,10 @@ def open_optiscaler_dialog(
         else:
             lbl_state.setText(tr("optiscaler.state_not_installed"))
             btn_remove.setEnabled(False)
+            r_idx = combo_proxy.findData(recommended) if recommended else -1
+            if r_idx >= 0:
+                combo_proxy.setCurrentIndex(r_idx)
+                combo_proxy.setToolTip(tr("optiscaler.proxy_recommended", proxy=f"{recommended}.dll"))
 
     def _refresh_state_ui() -> None:
         game_exe = exe_path
@@ -498,10 +507,12 @@ def open_optiscaler_dialog(
         req_id = operation["refresh_id"]
 
         class _OptiRefreshWorker(QThread):
-            ready = Signal(int, object)
+            ready = Signal(int, object, str)
 
             def run(self) -> None:
-                self.ready.emit(req_id, inspect_optiscaler_state(game_exe))
+                state = inspect_optiscaler_state(game_exe)
+                proxy, _notes = recommend_proxy(game_exe, None, state)
+                self.ready.emit(req_id, state, proxy)
 
         refresh_worker = _OptiRefreshWorker()
         win._track_worker(refresh_worker)
@@ -539,25 +550,8 @@ def open_optiscaler_dialog(
         return str(_parse_launch_preset_state(str(getattr(obj, "launch_options", "") or ""))["winedll"])
 
     def _apply_winedll_to_opts(cur_opts: str, winedll: str, *, allow_dlss_upgrade: bool = False) -> str:
-        st = _parse_launch_preset_state(cur_opts)
-        mh_lvl = st["mh_level"]
-        mh_fps = st["mh_fps_limit"]
-        return apply_launch_presets(
-            cur_opts,
-            gamemode=bool(st["gamemode"]),
-            mangohud=bool(st["mangohud"]),
-            wined3d=bool(st["wined3d"]),
-            no_esync=bool(st["no_esync"]),
-            no_fsync=bool(st["no_fsync"]),
-            winedlloverrides=winedll,
-            dlss_upgrade=bool(st["dlss_upgrade"]) if allow_dlss_upgrade else False,
-            mangohud_level=mh_lvl if isinstance(mh_lvl, int) and mh_lvl in (1, 2, 3, 4) else None,
-            nvidia_nvapi=bool(st["nvapi"]),
-            prime_offload=bool(st["prime"]),
-            proton_wayland=bool(st["wayland"]),
-            mangohud_position=str(st.get("mh_position") or ""),
-            mangohud_fps_limit=mh_fps if isinstance(mh_fps, int) and mh_fps > 0 else None,
-        )
+        extra: dict[str, Any] = {} if allow_dlss_upgrade else {"dlss_upgrade": False}
+        return apply_presets(cur_opts, winedlloverrides=winedll, **extra)
 
     def _apply_winedll_update(
         new_winedll: str,

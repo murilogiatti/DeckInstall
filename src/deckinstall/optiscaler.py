@@ -94,6 +94,8 @@ class OptiScalerState:
     spoof_mode: str = "auto"
     overlay_menu: bool = True
     prefix_snapshot: Path | None = None
+    # False while files are being copied: a crash leaves a journal that "remove" can undo.
+    complete: bool = True
 
 
 @dataclass(frozen=True)
@@ -114,6 +116,8 @@ class OptiScalerCompatibility:
     pe_arch: str
     upscalers: tuple[str, ...]
     installed_state: OptiScalerState | None = None
+    recommended_proxy: str = "dxgi"
+    notes: tuple[str, ...] = ()
 
 
 def _resolve_upscaler_scan_root(exe_path: Path, game_dir: Path | None) -> Path:
@@ -202,13 +206,49 @@ def check_optiscaler_compatibility(
     upscalers = tuple(found)
     tier = "verified" if upscalers else "likely"
     installed_state = inspect_optiscaler_state(exe_path)
+    proxy, notes = recommend_proxy(exe_path, game_dir, installed_state)
     return OptiScalerCompatibility(
         compatible=True,
         tier=tier,
         pe_arch=pe_arch,
         upscalers=upscalers,
         installed_state=installed_state,
+        recommended_proxy=proxy,
+        notes=notes,
     )
+
+
+def recommend_proxy(
+    exe_path: Path,
+    game_dir: Path | None = None,
+    installed_state: OptiScalerState | None = None,
+) -> tuple[str, tuple[str, ...]]:
+    """Pick the proxy DLL least likely to clash with what the game already ships.
+
+    Returns (proxy, notes). Notes are short machine keys: "dxgi_taken", "winmm_onlinefix",
+    "winmm_taken", "version_taken", "dbghelp_taken", "all_taken".
+    """
+    if installed_state is not None:
+        return installed_state.proxy_dll, ()
+    from .scanner import detect_steam_emulator
+
+    exe_dir = exe_path.parent
+    try:
+        present = {p.name.lower() for p in exe_dir.iterdir() if p.is_file() or p.is_symlink()}
+    except OSError:
+        present = set()
+    emulator, _ = detect_steam_emulator(exe_path, game_dir or exe_dir)
+    notes: list[str] = []
+    for proxy in OPTISCALER_PROXY_DLLS:
+        if proxy == "winmm" and emulator == "onlinefix":
+            notes.append("winmm_onlinefix")  # OnlineFix loads itself through winmm.dll
+            continue
+        if f"{proxy}.dll" in present:
+            notes.append(f"{proxy}_taken")  # e.g. ReShade/DXVK/another mod already uses it
+            continue
+        return proxy, tuple(notes)
+    notes.append("all_taken")
+    return "dxgi", tuple(notes)
 
 
 def scan_optiscaler_compatibility_batch(
@@ -317,6 +357,29 @@ def inspect_optiscaler_state(exe_path: Path) -> OptiScalerState | None:
         spoof_mode=spoof_mode,
         overlay_menu=overlay_menu,
         prefix_snapshot=prefix_snapshot,
+        complete=data.get("complete", True) is not False,
+    )
+
+
+def _write_state_manifest(state: OptiScalerState) -> None:
+    exe_dir = state.exe_dir
+    manifest_data = {
+        "proxy_dll": state.proxy_dll,
+        "backend": state.backend,
+        "version": state.version,
+        "exe_dir": str(exe_dir),
+        "installed_files": [_serialize_manifest_path(exe_dir, p) for p in state.installed_files],
+        "backed_up_files": [_serialize_manifest_path(exe_dir, p) for p in state.backed_up_files],
+        "added_override": state.added_override,
+        "fg_mode": state.fg_mode,
+        "spoof_mode": state.spoof_mode,
+        "overlay_menu": state.overlay_menu,
+        "prefix_snapshot": str(state.prefix_snapshot) if state.prefix_snapshot is not None else None,
+        "complete": state.complete,
+    }
+    atomic_write_text(
+        exe_dir / OPTISCALER_MANIFEST,
+        json.dumps(manifest_data, indent=2, sort_keys=True) + "\n",
     )
 
 
@@ -604,134 +667,146 @@ def install_optiscaler_for_game(
 
     # Complete the snapshot before moving any existing game DLL. OptiScaler
     # modifies game-folder files, so system DLLs do not belong in its snapshot.
-    _backup_if_needed(target_proxy_path, managed_paths, backed_up_files)
-
-    # Remove stale files from a previous DeckInstall OptiScaler install (e.g. proxy DLL change)
-    if existing_state is not None:
-        for old_file in existing_state.installed_files:
-            if old_file.is_file() or old_file.is_symlink():
-                old_file.unlink(missing_ok=True)
-        if existing_state.proxy_dll != proxy_dll:
-            prior_proxy_path = exe_dir / f"{existing_state.proxy_dll}.dll"
-            prior_backup = prior_proxy_path.with_name(f"{prior_proxy_path.name}.deckinstall.bak")
-            if (
-                prior_backup.is_file()
-                and not prior_backup.is_symlink()
-                and not prior_proxy_path.exists()
-                and not prior_proxy_path.is_symlink()
-            ):
-                os.replace(prior_backup, prior_proxy_path)
-                backed_up_files = [p for p in backed_up_files if p != prior_proxy_path]
-
+    version = ""
+    if payload_dir is None:
+        version = str(_load_versions().get("optiscaler_installed_version", "")).strip()
+    added_override = f"{proxy_dll}=n,b"
     installed_files: list[Path] = []
-    saw_ini = False
+    # Files of the previous install are still on disk until they are replaced: track them too,
+    # so an interrupted reinstall can still be undone.
+    if existing_state is not None:
+        installed_files.extend(p for p in existing_state.installed_files if p not in installed_files)
 
-    for root_s, dirs_s, files_s in os.walk(source_dir, followlinks=False):
-        root_p = Path(root_s)
-        rel_dir = root_p.relative_to(source_dir)
-        is_payload_root = rel_dir == Path(".")
-        for d in list(dirs_s):
-            if (root_p / d).is_symlink():
-                dirs_s.remove(d)
-        for fname in files_s:
-            src_file = root_p / fname
-            if src_file.is_symlink() or not src_file.is_file():
-                continue
-            low_name = fname.lower()
-            if src_file.suffix.lower() in _SKIPPED_SCRIPT_SUFFIXES:
-                continue
+    def _state(complete: bool) -> OptiScalerState:
+        return OptiScalerState(
+            proxy_dll=proxy_dll,
+            backend=backend,
+            version=version,
+            exe_dir=exe_dir,
+            installed_files=list(installed_files),
+            backed_up_files=list(backed_up_files),
+            added_override=added_override,
+            fg_mode=fg_mode,
+            spoof_mode=spoof_mode,
+            overlay_menu=overlay_menu,
+            prefix_snapshot=prefix_snapshot,
+            complete=complete,
+        )
 
-            if is_payload_root and low_name == "optiscaler.dll":
-                dst_file = target_proxy_path
+    def _journal() -> None:
+        _write_state_manifest(_state(False))
+
+    try:
+        _journal()
+        _backup_if_needed(target_proxy_path, managed_paths, backed_up_files)
+        _journal()
+
+        # Remove stale files from a previous DeckInstall OptiScaler install (e.g. proxy DLL change)
+        if existing_state is not None:
+            for old_file in existing_state.installed_files:
+                if old_file.is_file() or old_file.is_symlink():
+                    old_file.unlink(missing_ok=True)
+            installed_files.clear()
+            _journal()
+            if existing_state.proxy_dll != proxy_dll:
+                prior_proxy_path = exe_dir / f"{existing_state.proxy_dll}.dll"
+                prior_backup = prior_proxy_path.with_name(f"{prior_proxy_path.name}.deckinstall.bak")
+                if (
+                    prior_backup.is_file()
+                    and not prior_backup.is_symlink()
+                    and not prior_proxy_path.exists()
+                    and not prior_proxy_path.is_symlink()
+                ):
+                    os.replace(prior_backup, prior_proxy_path)
+                    backed_up_files = [p for p in backed_up_files if p != prior_proxy_path]
+
+        saw_ini = False
+
+        for root_s, dirs_s, files_s in os.walk(source_dir, followlinks=False):
+            root_p = Path(root_s)
+            rel_dir = root_p.relative_to(source_dir)
+            is_payload_root = rel_dir == Path(".")
+            for d in list(dirs_s):
+                if (root_p / d).is_symlink():
+                    dirs_s.remove(d)
+            for fname in files_s:
+                src_file = root_p / fname
+                if src_file.is_symlink() or not src_file.is_file():
+                    continue
+                low_name = fname.lower()
+                if src_file.suffix.lower() in _SKIPPED_SCRIPT_SUFFIXES:
+                    continue
+
+                if is_payload_root and low_name == "optiscaler.dll":
+                    dst_file = target_proxy_path
+                    dst_file.parent.mkdir(parents=True, exist_ok=True)
+                    if dst_file.is_symlink():
+                        dst_file.unlink()
+                    atomic_copy_file(src_file, dst_file)
+                    installed_files.append(dst_file)
+                    _journal()
+                    continue
+
+                if is_payload_root and low_name == "optiscaler.ini":
+                    saw_ini = True
+                    ini_raw = src_file.read_text(encoding="utf-8", errors="replace")
+                    dst_ini = _write_patched_ini(
+                        exe_dir,
+                        ini_raw,
+                        backend=backend,
+                        fg_mode=fg_mode,
+                        spoof_mode=spoof_mode,
+                        overlay_menu=overlay_menu,
+                        managed_paths=managed_paths,
+                        backed_up_files=backed_up_files,
+                    )
+                    installed_files.append(dst_ini)
+                    _journal()
+                    continue
+
+                cur = exe_dir
+                for part in rel_dir.parts:
+                    cur = cur / part
+                    if cur.is_symlink():
+                        raise RuntimeError(f"Unsafe symlink in destination path: {cur}")
+                target_dir = (exe_dir / rel_dir).resolve()
+                if not target_dir.is_relative_to(exe_dir):
+                    raise RuntimeError(f"Destination directory escapes game folder: {target_dir}")
+                dst_file = exe_dir / rel_dir / fname
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
+                _backup_if_needed(dst_file, managed_paths, backed_up_files)
+                _journal()
                 if dst_file.is_symlink():
                     dst_file.unlink()
                 atomic_copy_file(src_file, dst_file)
                 installed_files.append(dst_file)
-                continue
+                _journal()
 
-            if is_payload_root and low_name == "optiscaler.ini":
-                saw_ini = True
-                ini_raw = src_file.read_text(encoding="utf-8", errors="replace")
-                dst_ini = _write_patched_ini(
-                    exe_dir,
-                    ini_raw,
-                    backend=backend,
-                    fg_mode=fg_mode,
-                    spoof_mode=spoof_mode,
-                    overlay_menu=overlay_menu,
-                    managed_paths=managed_paths,
-                    backed_up_files=backed_up_files,
-                )
-                installed_files.append(dst_ini)
-                continue
+        if not saw_ini:
+            dst_ini = _write_patched_ini(
+                exe_dir,
+                "",
+                backend=backend,
+                fg_mode=fg_mode,
+                spoof_mode=spoof_mode,
+                overlay_menu=overlay_menu,
+                managed_paths=managed_paths,
+                backed_up_files=backed_up_files,
+            )
+            installed_files.append(dst_ini)
+            _journal()
 
-            cur = exe_dir
-            for part in rel_dir.parts:
-                cur = cur / part
-                if cur.is_symlink():
-                    raise RuntimeError(f"Unsafe symlink in destination path: {cur}")
-            target_dir = (exe_dir / rel_dir).resolve()
-            if not target_dir.is_relative_to(exe_dir):
-                raise RuntimeError(f"Destination directory escapes game folder: {target_dir}")
-            dst_file = exe_dir / rel_dir / fname
-            dst_file.parent.mkdir(parents=True, exist_ok=True)
-            _backup_if_needed(dst_file, managed_paths, backed_up_files)
-            if dst_file.is_symlink():
-                dst_file.unlink()
-            atomic_copy_file(src_file, dst_file)
-            installed_files.append(dst_file)
+    except BaseException:
+        # Leave the game as it was: drop what was copied and put the originals back.
+        try:
+            uninstall_optiscaler_for_game(exe_path)
+        except Exception:
+            logging.exception("OptiScaler rollback failed for %s; its journal is kept", exe_dir)
+        raise
 
-    if not saw_ini:
-        dst_ini = _write_patched_ini(
-            exe_dir,
-            "",
-            backend=backend,
-            fg_mode=fg_mode,
-            spoof_mode=spoof_mode,
-            overlay_menu=overlay_menu,
-            managed_paths=managed_paths,
-            backed_up_files=backed_up_files,
-        )
-        installed_files.append(dst_ini)
-
-    version = ""
-    if payload_dir is None:
-        versions = _load_versions()
-        version = str(versions.get("optiscaler_installed_version", "")).strip()
-
-    added_override = f"{proxy_dll}=n,b"
-    state = OptiScalerState(
-        proxy_dll=proxy_dll,
-        backend=backend,
-        version=version,
-        exe_dir=exe_dir,
-        installed_files=installed_files,
-        backed_up_files=backed_up_files,
-        added_override=added_override,
-        fg_mode=fg_mode,
-        spoof_mode=spoof_mode,
-        overlay_menu=overlay_menu,
-        prefix_snapshot=prefix_snapshot,
-    )
-
-    manifest_data = {
-        "proxy_dll": state.proxy_dll,
-        "backend": state.backend,
-        "version": state.version,
-        "exe_dir": str(state.exe_dir),
-        "installed_files": [_serialize_manifest_path(exe_dir, p) for p in state.installed_files],
-        "backed_up_files": [_serialize_manifest_path(exe_dir, p) for p in state.backed_up_files],
-        "added_override": state.added_override,
-        "fg_mode": state.fg_mode,
-        "spoof_mode": state.spoof_mode,
-        "overlay_menu": state.overlay_menu,
-        "prefix_snapshot": str(state.prefix_snapshot) if state.prefix_snapshot is not None else None,
-    }
-    atomic_write_text(
-        exe_dir / OPTISCALER_MANIFEST,
-        json.dumps(manifest_data, indent=2, sort_keys=True) + "\n",
-    )
+    state = _state(True)
+    _write_state_manifest(state)
+    _record_in_game_manifest(exe_dir, state)
     return state
 
 
@@ -755,11 +830,157 @@ def uninstall_optiscaler_for_game(exe_path: Path) -> OptiScalerResult:
             os.replace(backup, orig)
             restored_count += 1
 
+    if not state.complete:
+        restored_count += _restore_untracked_backups(state.exe_dir)
+
     manifest_path = state.exe_dir / OPTISCALER_MANIFEST
     manifest_path.unlink(missing_ok=True)
+    _record_in_game_manifest(state.exe_dir, None)
 
     return OptiScalerResult(
         state=state,
         removed_count=removed_count,
         restored_count=restored_count,
     )
+
+
+def _restore_untracked_backups(exe_dir: Path, max_depth: int = 4) -> int:
+    """Put back `<name>.deckinstall.bak` files whose original is missing (crash between move and journal)."""
+    restored = 0
+    base = len(exe_dir.parts)
+    for dirpath, dirnames, filenames in os.walk(exe_dir, followlinks=False):
+        cur = Path(dirpath)
+        if len(cur.parts) - base >= max_depth:
+            dirnames[:] = []
+        for fname in filenames:
+            if not fname.endswith(".deckinstall.bak"):
+                continue
+            backup = cur / fname
+            orig = cur / fname[: -len(".deckinstall.bak")]
+            if backup.is_symlink() or orig.exists() or orig.is_symlink():
+                continue
+            os.replace(backup, orig)
+            restored += 1
+    return restored
+
+
+def _record_in_game_manifest(exe_dir: Path, state: OptiScalerState | None) -> None:
+    """Mirror the OptiScaler install (or its removal) into the DeckInstall game manifest, if any."""
+    try:
+        from .manifest import find_manifest
+        from .standalone import _load_manifest, _write_manifest
+
+        game = None
+        for folder in (exe_dir, *exe_dir.parents):
+            if folder == Path.home() or folder == Path(folder.anchor):
+                break
+            found = find_manifest(folder)
+            if found is not None:
+                game = _load_manifest(found)
+                break
+        if game is None or game.schema < 2:
+            return
+
+        def rel(path: Path) -> str:
+            try:
+                return str(path.relative_to(game.game_dir))
+            except ValueError:
+                return str(path)
+
+        if state is None:
+            if not game.meta.get("optiscaler"):
+                return
+            game.meta["optiscaler"] = {}
+        else:
+            game.meta["optiscaler"] = {
+                "manifest": rel(state.exe_dir / OPTISCALER_MANIFEST),
+                "proxy_dll": state.proxy_dll,
+                "backend": state.backend,
+                "version": state.version,
+                "override": state.added_override,
+                "files": [rel(p) for p in state.installed_files],
+                "backups": [rel(p) for p in state.backed_up_files],
+            }
+        _write_manifest(game)
+    except Exception:
+        logging.exception("Could not record OptiScaler in the game manifest for %s", exe_dir)
+
+
+@dataclass(frozen=True)
+class BulkOutcome:
+    """Result for one game in a bulk OptiScaler run."""
+
+    name: str
+    status: str  # "installed" | "removed" | "skipped" | "conflict" | "failed"
+    detail: str = ""
+
+
+def bulk_optiscaler(
+    games: list[object],
+    *,
+    remove: bool = False,
+    backend: str = "auto",
+    fg_mode: str = "auto",
+    spoof_mode: str = "auto",
+    overlay_menu: bool = True,
+    progress_cb: ProgressCb | None = None,
+) -> list[BulkOutcome]:
+    """Install (or remove) OptiScaler on several DeckInstall games and update their DLL overrides.
+
+    Each game gets its recommended proxy DLL; games whose proxy slot is taken by an unmanaged DLL
+    are reported as "conflict" and left untouched (nothing is overwritten in bulk).
+    """
+    from .standalone import StandaloneGame, update_standalone_launch_options
+    from .steam_vdf import merge_winedlloverride, remove_winedlloverride
+
+    outcomes: list[BulkOutcome] = []
+    for index, game in enumerate(games):
+        if not isinstance(game, StandaloneGame):
+            continue
+        if progress_cb is not None:
+            progress_cb(game.name, int(index * 100 / max(1, len(games))))
+        try:
+            if remove:
+                result = uninstall_optiscaler_for_game(game.exe_path)
+                if result.state is None:
+                    outcomes.append(BulkOutcome(game.name, "skipped", "not_installed"))
+                    continue
+                dll = remove_winedlloverride(game.winedlloverrides, result.state.proxy_dll)
+                update_standalone_launch_options(
+                    game.game_dir, winedlloverrides=dll, launch_options=game.launch_options
+                )
+                outcomes.append(BulkOutcome(game.name, "removed"))
+                continue
+
+            compat = check_optiscaler_compatibility(game.exe_path, game.game_dir)
+            if not compat.compatible or game.native_linux:
+                outcomes.append(BulkOutcome(game.name, "skipped", compat.pe_arch))
+                continue
+            if "all_taken" in compat.notes:
+                outcomes.append(BulkOutcome(game.name, "conflict", "all_taken"))
+                continue
+            prev = compat.installed_state
+            state = install_optiscaler_for_game(
+                game.exe_path,
+                proxy_dll=compat.recommended_proxy,
+                backend=backend,
+                fg_mode=fg_mode,
+                spoof_mode=spoof_mode,
+                overlay_menu=overlay_menu,
+                prefix_dir=game.prefix_dir,
+                game_name=game.name,
+            )
+            dll = game.winedlloverrides
+            if prev is not None and prev.proxy_dll != state.proxy_dll:
+                dll = remove_winedlloverride(dll, prev.proxy_dll)
+            dll = merge_winedlloverride(dll, state.proxy_dll, "n,b")
+            update_standalone_launch_options(
+                game.game_dir, winedlloverrides=dll, launch_options=game.launch_options
+            )
+            outcomes.append(BulkOutcome(game.name, "installed", f"{state.proxy_dll}.dll"))
+        except OptiScalerConflictError as exc:
+            outcomes.append(BulkOutcome(game.name, "conflict", exc.existing_path.name))
+        except Exception as exc:
+            logging.exception("Bulk OptiScaler failed for %s", game.name)
+            outcomes.append(BulkOutcome(game.name, "failed", str(exc)))
+    return outcomes

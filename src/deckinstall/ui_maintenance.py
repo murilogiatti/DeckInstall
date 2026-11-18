@@ -87,11 +87,17 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     health_lbl.setObjectName("SectionTitle")
     win.btn_maint_protons = QPushButton(tr("maint.btn_manage_protons"))
     win.btn_maint_protons.clicked.connect(win._open_proton_manager_dialog)
+    win.btn_maint_game_protons = QPushButton(tr("maint.btn_game_protons"))
+    win.btn_maint_game_protons.clicked.connect(lambda: _open_game_protons(win))
+    win.btn_maint_bulk_opti = QPushButton(tr("maint.btn_bulk_optiscaler"))
+    win.btn_maint_bulk_opti.clicked.connect(lambda: _open_bulk_optiscaler(win))
     win.btn_maint_refresh_health = QPushButton(tr("maint.btn_refresh_health"))
     win.btn_maint_refresh_health.clicked.connect(lambda: refresh_maintenance_health(win))
     health_top.addWidget(health_lbl)
     health_top.addStretch()
     health_top.addWidget(win.btn_maint_protons)
+    health_top.addWidget(win.btn_maint_game_protons)
+    health_top.addWidget(win.btn_maint_bulk_opti)
     health_top.addWidget(win.btn_maint_refresh_health)
     health_layout.addLayout(health_top)
 
@@ -658,3 +664,15 @@ def show_maint_context_menu(win: MainWindow, pos: QPoint) -> None:
         worker.done.connect(_on_backup_done)
         worker.failed.connect(_on_backup_failed)
         worker.start()
+
+
+def _open_game_protons(win: MainWindow) -> None:
+    from .ui_dialogs.proton_dialogs import game_proton_versions_dialog
+
+    game_proton_versions_dialog(win)
+
+
+def _open_bulk_optiscaler(win: MainWindow) -> None:
+    from .ui_dialogs.optiscaler_bulk_dialog import bulk_optiscaler_dialog
+
+    bulk_optiscaler_dialog(win)
