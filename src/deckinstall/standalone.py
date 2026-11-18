@@ -924,6 +924,47 @@ def _game_fields(game: StandaloneGame) -> dict[str, Any]:
     }
 
 
+def _startup_wm_class(game: StandaloneGame) -> str:
+    if game.native_linux:
+        return game.exe_path.name
+    if game.steam_appid and game.steam_appid > 0:
+        return f"steam_app_{game.steam_appid}"
+    return "steam_app_0"
+
+
+def refresh_integration_files(game: StandaloneGame) -> None:
+    """Rewrite launch.sh and the existing .desktop launchers after the game's paths changed."""
+    _write_launch_script(
+        game.launch_script,
+        game.exe_path,
+        game.prefix_dir,
+        game.proton_name,
+        game.winedlloverrides,
+        game.launch_options,
+        native_linux=game.native_linux,
+        steam_appid=game.steam_appid,
+        game_name=game.name,
+        cache_dir=game.cache_dir,
+    )
+    targets = [(game.desktop_file, False)]
+    if game.desktop_shortcut is not None:
+        targets.append((game.desktop_shortcut, True))
+    existing = [(p, ex) for p, ex in targets if p.is_file() and not p.is_symlink()]
+    if not existing:
+        return
+    icon = resolve_game_icon(game.exe_path, game.game_dir, steam_appid=game.steam_appid)
+    for path, executable in existing:
+        _write_desktop_file(
+            path,
+            game.name,
+            game.launch_script,
+            game.game_dir,
+            icon_path=icon,
+            executable=executable,
+            startup_wm_class=_startup_wm_class(game),
+        )
+
+
 def _write_manifest(game: StandaloneGame) -> Path:
     """Persist the game's manifest, keeping its schema (v1 games are only upgraded by migration)."""
     if game.schema >= 2:
@@ -1174,12 +1215,7 @@ def install_standalone_game(
         game_name=game.name,
         cache_dir=game.cache_dir,
     )
-    if native_linux:
-        startup_wm_class = target_exe_path.name
-    elif steam_appid and steam_appid > 0:
-        startup_wm_class = f"steam_app_{steam_appid}"
-    else:
-        startup_wm_class = "steam_app_0"
+    startup_wm_class = _startup_wm_class(game)
 
     if create_menu_shortcut:
         _write_desktop_file(

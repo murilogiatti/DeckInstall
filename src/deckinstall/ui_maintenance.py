@@ -129,6 +129,13 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
         action.changed.connect(lambda a=action, b=button: b.setEnabled(a.isEnabled()))
         button.clicked.connect(lambda _checked=False, a=action: a.trigger())
         batch_layout.addWidget(button)
+    win.btn_migrate_legacy = QPushButton(tr("maint.btn_migrate_legacy"))
+    win.btn_migrate_legacy.setToolTip(tr("maint.migrate_legacy_tooltip"))
+    win.btn_migrate_legacy.clicked.connect(lambda: win._start_legacy_migration())
+    win.btn_undo_migration = QPushButton(tr("maint.btn_undo_migration"))
+    win.btn_undo_migration.clicked.connect(lambda: win._undo_last_migration())
+    batch_layout.addWidget(win.btn_migrate_legacy)
+    batch_layout.addWidget(win.btn_undo_migration)
     layout.addWidget(batch_card)
 
     clean_card, clean_layout = _make_card()

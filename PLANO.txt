@@ -28,7 +28,7 @@ FASE 1 - Manifesto e biblioteca (Opus)
    Deteccao ao montar (/run/media/$USER/*, /media/*, /mnt/*); jogos de disco ausente = "indisponivel".
    exFAT/NTFS: prefixo vai para o disco interno, com aviso.
 3. [FEITO] Um jogo, um prefixo; Steam via link do compatdata.
-4. Migracao automatica dos jogos atuais, com snapshot e caminho de volta.
+4. [FEITO] Migracao automatica dos jogos atuais, com snapshot e caminho de volta.
 
 FASE 2 - Instalar
 1. Classificar: arquivo -> extrair; setup GOG -> innoextract (fallback setup); repack (fg-*.bin, unarc.dll, ISDone.dll)

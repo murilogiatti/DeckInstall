@@ -85,6 +85,13 @@ from .library import (
     internal_library_root,
     list_unavailable_games,
 )
+from .migrate import (
+    MigrationResult,
+    latest_undoable_journal,
+    migrate_legacy_games,
+    plan_migration,
+    undo_migration,
+)
 from .runtime_manager import (
     detect_gpu_profile,
     ensure_ge_proton11,
@@ -263,6 +270,8 @@ class MainWindow(QMainWindow):
     maint_batch_card: QFrame
     maint_list: QTableWidget
     btn_maint_protons: QPushButton
+    btn_migrate_legacy: QPushButton
+    btn_undo_migration: QPushButton
     btn_maint_refresh_health: QPushButton
     btn_maint_scan: QPushButton
     btn_maint_revalidate: QPushButton
@@ -298,6 +307,7 @@ class MainWindow(QMainWindow):
         self._steam_busy = False
         self._vdf_corrupt = False
         self._initial_tab_decided = False
+        self._migration_prompted = False
         self._vdf_queue = VdfEditQueue()
         self._auto_art_timer = QTimer(self)
         self._auto_art_timer.setSingleShot(True)
@@ -2656,6 +2666,139 @@ class MainWindow(QMainWindow):
             ):
                 self._nav_buttons[1].setChecked(True)
                 self.stack.setCurrentIndex(1)
+        self._maybe_prompt_migration(standalone_games)
+
+    def _maybe_prompt_migration(self, standalone_games: list[StandaloneGame]) -> None:
+        """Offer once per session to move v1 games (~/Games) into the internal library."""
+        if self._migration_prompted or self._closing_pending:
+            return
+        if not any(g.schema < 2 for g in standalone_games):
+            return
+        self._migration_prompted = True
+        if _setting_bool(self.settings, "migration/dont_ask", False):
+            return
+        QTimer.singleShot(0, lambda: self._start_legacy_migration(from_startup=True))
+
+    def _start_legacy_migration(self, from_startup: bool = False) -> None:
+        """Plan, confirm and run the migration of v1 games into ~/DeckInstall."""
+        if self._closing_pending:
+            return
+        if not uses_library_layout():
+            return
+        if _is_wine_game_running():
+            if not from_startup:
+                QMessageBox.warning(_dialog_parent(self), __app_name__, tr("migrate.game_running"))
+            return
+        try:
+            plan = plan_migration(self.paths)
+        except Exception as exc:
+            QMessageBox.critical(_dialog_parent(self), __app_name__, tr("migrate.failed", err=str(exc)))
+            return
+        todo = [i for i in plan if i.action == "migrate"]
+        skipped = [i for i in plan if i.action != "migrate"]
+        reasons = {
+            "steam_shortcut": tr("migrate.reason_steam_shortcut"),
+            "symlink": tr("migrate.reason_symlink"),
+        }
+        skipped_text = "\n".join(f"• {i.game.name}: {reasons.get(i.reason, i.reason)}" for i in skipped)
+        if not todo:
+            if not from_startup:
+                text = tr("migrate.nothing")
+                if skipped_text:
+                    text += "\n\n" + tr("migrate.skipped", items=skipped_text)
+                QMessageBox.information(_dialog_parent(self), __app_name__, text)
+            return
+        names = "\n".join(f"• {i.game.name}" for i in todo)
+        text = tr("migrate.confirm", count=len(todo), dest=str(internal_library_root()), names=names)
+        if skipped_text:
+            text += "\n\n" + tr("migrate.skipped", items=skipped_text)
+        box = QMessageBox(_dialog_parent(self))
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(__app_name__)
+        box.setText(text)
+        btn_go = box.addButton(tr("migrate.btn_migrate"), QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(tr("migrate.btn_later"), QMessageBox.ButtonRole.RejectRole)
+        btn_never = (
+            box.addButton(tr("migrate.btn_dont_ask"), QMessageBox.ButtonRole.DestructiveRole)
+            if from_startup
+            else None
+        )
+        box.exec()
+        clicked = box.clickedButton()
+        if btn_never is not None and clicked is btn_never:
+            self.settings.setValue("migration/dont_ask", True)
+            return
+        if clicked is not btn_go:
+            return
+
+        paths = self.paths
+        self._set_steam_busy(True)
+        self.status_label.setText(tr("migrate.running"))
+        worker = SteamOpWorker(lambda: migrate_legacy_games(todo, paths))
+        self._track_worker(worker)
+
+        def _ok(res: object) -> None:
+            self._set_steam_busy(False)
+            self._refresh_shortcuts()
+            if not isinstance(res, MigrationResult) or self._closing_pending:
+                return
+            lines = [tr("migrate.done", count=len(res.migrated))]
+            if res.failed:
+                lines.append(tr("migrate.failed_items", items="\n".join(f"• {n}: {e}" for n, e in res.failed)))
+            if res.journal is not None:
+                lines.append(tr("migrate.undo_hint"))
+            self.status_label.setText(lines[0])
+            show = QMessageBox.warning if res.failed else QMessageBox.information
+            show(_dialog_parent(self), __app_name__, "\n\n".join(lines))
+
+        def _err(err: str) -> None:
+            self._set_steam_busy(False)
+            if not self._closing_pending:
+                QMessageBox.critical(_dialog_parent(self), __app_name__, tr("migrate.failed", err=err))
+
+        worker.finished_ok.connect(_ok)
+        worker.failed.connect(_err)
+        worker.start()
+
+    def _undo_last_migration(self) -> None:
+        """Put the games of the latest migration back in ~/Games."""
+        if _is_wine_game_running():
+            QMessageBox.warning(_dialog_parent(self), __app_name__, tr("migrate.game_running"))
+            return
+        journal = latest_undoable_journal()
+        if journal is None:
+            QMessageBox.information(_dialog_parent(self), __app_name__, tr("migrate.nothing_to_undo"))
+            return
+        ans = QMessageBox.question(
+            _dialog_parent(self), __app_name__, tr("migrate.undo_confirm", name=journal.stem)
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self._set_steam_busy(True)
+        worker = SteamOpWorker(lambda: undo_migration(journal))
+        self._track_worker(worker)
+
+        def _ok(res: object) -> None:
+            self._set_steam_busy(False)
+            self._refresh_shortcuts()
+            if self._closing_pending or not isinstance(res, tuple):
+                return
+            restored, problems = res
+            text = tr("migrate.undo_done", count=len(restored))
+            if problems:
+                text += "\n\n" + tr("migrate.undo_problems", items="\n".join(f"• {p}" for p in problems))
+                QMessageBox.warning(_dialog_parent(self), __app_name__, text)
+            else:
+                QMessageBox.information(_dialog_parent(self), __app_name__, text)
+
+        def _err(err: str) -> None:
+            self._set_steam_busy(False)
+            if not self._closing_pending:
+                QMessageBox.critical(_dialog_parent(self), __app_name__, tr("migrate.failed", err=err))
+
+        worker.finished_ok.connect(_ok)
+        worker.failed.connect(_err)
+        worker.start()
 
     def _refresh_shortcuts(self) -> None:
         self._refresh_libraries()
