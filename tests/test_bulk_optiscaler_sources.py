@@ -156,13 +156,15 @@ def test_start_steam_uses_clean_env_and_waits(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("LD_LIBRARY_PATH", "/tmp/.mount_X/usr/lib:/usr/lib")
     monkeypatch.setenv("QT_QPA_PLATFORMTHEME", "xdgdesktopportal")
     monkeypatch.setenv("PYTHONHOME", "/tmp/.mount_X/usr")
-    states = iter([False, False, True])
+    states = iter([False, False])  # then running for good
+    ticks = iter(range(0, 1000, 2))
     with (
-        mock.patch.object(steam_vdf, "is_steam_running", side_effect=lambda: next(states)),
+        mock.patch.object(steam_vdf, "is_steam_running", side_effect=lambda: next(states, True)),
         mock.patch.object(steam_vdf, "is_gamescope_session", return_value=False),
         mock.patch.object(steam_vdf, "is_flatpak_steam", return_value=False),
         mock.patch.object(steam_vdf.subprocess, "Popen") as popen,
         mock.patch.object(steam_vdf.time, "sleep"),
+        mock.patch.object(steam_vdf.time, "monotonic", side_effect=lambda: float(next(ticks))),
     ):
         assert steam_vdf.start_steam() is True
     kwargs = popen.call_args.kwargs
@@ -207,3 +209,18 @@ def test_qt_environment_no_portal_in_gaming_mode() -> None:
     env = {"XDG_CURRENT_DESKTOP": "KDE"}
     configure_qt_environment(env)
     assert "QT_QPA_PLATFORMTHEME" not in env  # no D-Bus: no portal
+
+
+
+def test_start_steam_ignores_bootstrap_that_dies() -> None:
+    states = iter([False, True, False])  # not running, bootstrap appears, then exits
+    clock = iter([0.0, 1.0, 2.0, 30.0])
+    with (
+        mock.patch.object(steam_vdf, "is_steam_running", side_effect=lambda: next(states, False)),
+        mock.patch.object(steam_vdf, "is_gamescope_session", return_value=False),
+        mock.patch.object(steam_vdf, "is_flatpak_steam", return_value=False),
+        mock.patch.object(steam_vdf.subprocess, "Popen"),
+        mock.patch.object(steam_vdf.time, "sleep"),
+        mock.patch.object(steam_vdf.time, "monotonic", side_effect=lambda: next(clock, 99.0)),
+    ):
+        assert steam_vdf.start_steam() is False

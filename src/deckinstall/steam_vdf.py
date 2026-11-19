@@ -318,6 +318,9 @@ _STEAM_ENV_DROP = (
 )
 
 
+_STEAM_STABLE_SECONDS = 3.0
+
+
 class SteamGamingModeError(RuntimeError):
     """Raised instead of closing Steam inside SteamOS Gaming Mode (it would end the session)."""
 
@@ -348,6 +351,11 @@ def start_steam(steam_root: Path | None = None, wait_seconds: float = 20.0) -> b
         if is_flatpak_steam(steam_root)
         else [shutil.which("steam") or "/usr/bin/steam", "-silent"]
     )
+    # Own systemd scope: Steam must not share DeckInstall's cgroup, or it dies when that is cleaned up
+    # (app closed, ssh/tailscale session ended).
+    systemd_run = shutil.which("systemd-run")
+    if systemd_run:
+        cmd = [systemd_run, "--user", "--scope", "--collect", "--quiet", *cmd]
     try:
         subprocess.Popen(
             cmd,
@@ -363,9 +371,18 @@ def start_steam(steam_root: Path | None = None, wait_seconds: float = 20.0) -> b
         logging.exception("Could not launch Steam with %s", cmd)
         return False
     deadline = time.monotonic() + wait_seconds
+    seen_since: float | None = None
     while time.monotonic() < deadline:
+        now = time.monotonic()
         if is_steam_running():
-            return True
+            # The bootstrap script also matches for a moment and may exit (e.g. no display):
+            # only count Steam as up once it is still running a few seconds later.
+            if seen_since is None:
+                seen_since = now
+            elif now - seen_since >= _STEAM_STABLE_SECONDS:
+                return True
+        else:
+            seen_since = None
         time.sleep(0.5)
     logging.warning("Steam did not appear within %.0f s after %s", wait_seconds, cmd)
     return False

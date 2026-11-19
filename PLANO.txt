@@ -162,7 +162,10 @@ TESTES NO STEAM DECK (v0.18.1, SteamOS 3.9.5, AppImage) - 2026-11-19
    steam_paths.configure_qt_environment: no gamescope remove o tema do portal e usa QT_QPA_PLATFORM="xcb;wayland";
    no Desktop so usa o portal com D-Bus. Log registra as variaveis Qt no inicio. Aguardando deckinstall.log do Deck
    para confirmar a causa.
-   Nao verificado fora do Deck: reabertura real da Steam, Modo Jogo, localconfig.vdf real, dialogos no gamescope.
+   v0.18.2 (testado no Deck, Modo Desktop): start_steam so considera a Steam aberta se continuar viva 3 s depois
+   (o script de bootstrap aparece no pgrep e pode morrer) e roda via systemd-run --user --scope (cgroup proprio;
+   antes a Steam morria junto com a sessao/processo que a abriu). Ciclo fechar 3,4 s / reabrir 3,3 s, env limpo.
+   Nao verificado fora do Deck: reabertura pela GUI do app, Modo Jogo, localconfig.vdf real, dialogos no gamescope.
 
 NAO TESTADO A MAO (so testes automaticos)
 - Instalador GOG real (innoextract nao instalado na maquina), repacks FitGirl/DODI, microSD/exFAT, Steam com link
