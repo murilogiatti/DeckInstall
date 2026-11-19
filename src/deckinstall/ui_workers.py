@@ -269,6 +269,7 @@ class SteamOpWorker(QThread):
         self.fn = fn
         self.need_steam_closed = need_steam_closed
         self.restart_if_was_running = restart_if_was_running
+        self.closed_steam = False  # True once this worker shut Steam down (the window may offer a restart)
 
     def run(self) -> None:
         was_running = False
@@ -279,6 +280,7 @@ class SteamOpWorker(QThread):
                     self.status.emit(tr("add.closing_steam"))
                     if not shutdown_steam():
                         raise RuntimeError(tr("add.close_steam_timeout"))
+                    self.closed_steam = True
             result = self.fn()
             if was_running and self.restart_if_was_running:
                 self.status.emit(tr("add.restarting_steam"))
@@ -326,6 +328,7 @@ class FallbackProton10Worker(QThread):
         super().__init__()
         self.fn_apply = fn_apply
         self.need_steam_closed = need_steam_closed
+        self.closed_steam = False
 
     def run(self) -> None:
         from .runtime_manager import ensure_ge_proton10, list_ge_proton10_dirs
@@ -351,6 +354,7 @@ class FallbackProton10Worker(QThread):
                 self.status.emit(tr("add.closing_steam"))
                 if not shutdown_steam():
                     raise RuntimeError(tr("add.close_steam_timeout"))
+                self.closed_steam = True
 
             self.fn_apply(tool_id)
             self.finished_ok.emit(tool_id)
@@ -696,10 +700,11 @@ class BulkMigrateWorker(QThread):
         self.pre_snapshot_fn = pre_snapshot_fn
 
     def run(self) -> None:
-        was_running = is_steam_running()
+        was_running = False
         migrated: list[str] = []
         errors: list[str] = []
         try:
+            was_running = is_steam_running()
             if was_running:
                 self.status.emit(tr("add.closing_steam"))
                 if not shutdown_steam():
@@ -766,9 +771,12 @@ class BulkMigrateWorker(QThread):
         except Exception as exc:
             self.failed.emit(_format_worker_error(exc))
         finally:
-            if was_running and not is_steam_running():
-                self.status.emit(tr("add.restarting_steam"))
-                start_steam()
+            try:
+                if was_running and not is_steam_running():
+                    self.status.emit(tr("add.restarting_steam"))
+                    start_steam()
+            except Exception:
+                logging.exception("Failed restarting Steam after BulkMigrateWorker")
 
 
 class WinetricksWorker(QThread):
@@ -863,7 +871,6 @@ from .ui_workers_library import (  # noqa: E402, F401
     BulkPlanWorker,
     DirStatsWorker,
     ExtImportSavesWorker,
-    ExtStandaloneWorker,
     LaunchPrepWorker,
     ProtonPrepWorker,
     RemoveShortcutWorker,
@@ -871,7 +878,6 @@ from .ui_workers_library import (  # noqa: E402, F401
     RuntimePreflightWorker,
     SaveSyncWorker,
     ShortcutsRefreshWorker,
-    StandaloneRemoveWorker,
     SteamDetectWorker,
     SteamRunningWorker,
     compute_library_runner_labels,

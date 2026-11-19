@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
@@ -10,7 +11,6 @@ from PySide6.QtCore import QThread, Signal
 
 from .artwork import SteamMatch, download_steam_artwork, search_steam_games
 from .external_actions import (
-    create_standalone_from_external,
     import_external_saves_to_target,
 )
 from .extractor import sanitize_folder_name
@@ -24,11 +24,9 @@ from .runtime_manager import (
     list_ge_proton11_dirs,
     list_installed_compat_tools,
 )
-from .save_sync import snapshot_prefix_saves
 from .standalone import (
     StandaloneGame,
     list_standalone_games,
-    remove_standalone_game,
     resolve_standalone_proton_fallback,
     update_standalone_launch_options,
 )
@@ -107,6 +105,7 @@ class SteamDetectWorker(QThread):
     """Detect Steam paths and load Steam, standalone, and external games."""
 
     ready = Signal(int, int, object, bool, list, list, list, str, object)
+    failed = Signal(str)
 
     def __init__(
         self,
@@ -131,6 +130,12 @@ class SteamDetectWorker(QThread):
         )
 
     def run(self) -> None:
+        try:
+            self._detect()
+        except Exception as exc:
+            self.failed.emit(_format_worker_error(exc))
+
+    def _detect(self) -> None:
         paths = self._resolve_steam_paths()
         steam_root_found = (
             True if paths is not None else (self._find_steam_root() is not None)
@@ -164,6 +169,7 @@ class ShortcutsRefreshWorker(QThread):
     """Reload Steam shortcuts, standalone games, and external launcher games."""
 
     ready = Signal(int, list, list, list, str, object)
+    failed = Signal(str)
 
     def __init__(
         self,
@@ -184,6 +190,12 @@ class ShortcutsRefreshWorker(QThread):
         )
 
     def run(self) -> None:
+        try:
+            self._refresh()
+        except Exception as exc:
+            self.failed.emit(_format_worker_error(exc))
+
+    def _refresh(self) -> None:
         entries: list[ShortcutEntry] = []
         vdf_err = ""
         if self._paths is not None:
@@ -346,15 +358,22 @@ class SteamRunningWorker(QThread):
     """Check whether Steam is currently running."""
 
     ready = Signal(bool)
+    failed = Signal(str)
 
     def run(self) -> None:
-        self.ready.emit(is_steam_running())
+        try:
+            running = is_steam_running()
+        except Exception as exc:
+            self.failed.emit(_format_worker_error(exc))
+            return
+        self.ready.emit(running)
 
 
 class ProtonPrepWorker(QThread):
     """Inspect prefix compatibility and list available Proton tools."""
 
     ready = Signal(bool, list, str)
+    failed = Signal(str)
 
     def __init__(
         self,
@@ -370,6 +389,12 @@ class ProtonPrepWorker(QThread):
         self._appid_u32 = appid_u32
 
     def run(self) -> None:
+        try:
+            self._prepare()
+        except Exception as exc:
+            self.failed.emit(_format_worker_error(exc))
+
+    def _prepare(self) -> None:
         if is_win32_prefix(self._prefix_dir):
             self.ready.emit(True, [], "")
             return
@@ -452,8 +477,9 @@ class RemoveShortcutWorker(QThread):
         self._shortcut = shortcut
 
     def run(self) -> None:
-        was_running = is_steam_running()
+        was_running = False
         try:
+            was_running = is_steam_running()
             if was_running and not shutdown_steam():
                 raise RuntimeError(tr("add.close_steam_timeout"))
             removed = remove_shortcut(self._paths, self._shortcut.appid_u32)
@@ -461,46 +487,11 @@ class RemoveShortcutWorker(QThread):
         except Exception as exc:
             self.failed.emit(_format_worker_error(exc))
         finally:
-            if was_running and not is_steam_running():
-                start_steam()
-
-
-class StandaloneRemoveWorker(QThread):
-    """Remove a standalone game registration and optionally its files/prefix."""
-
-    done = Signal()
-    failed = Signal(str)
-
-    def __init__(
-        self,
-        game: StandaloneGame,
-        del_files: bool,
-        del_prefix: bool,
-        snap_fn: Callable[[Path, str, str, str], Path | None] | None = None,
-    ) -> None:
-        super().__init__()
-        self._game = game
-        self._del_files = del_files
-        self._del_prefix = del_prefix
-        self._snap_fn = snap_fn
-
-    def run(self) -> None:
-        try:
-            if (self._del_files or self._del_prefix) and self._snap_fn is not None:
-                self._snap_fn(
-                    self._game.prefix_dir,
-                    self._game.name,
-                    "remove-game",
-                    "remove",
-                )
-            remove_standalone_game(
-                self._game,
-                delete_files=self._del_files,
-                delete_prefix=self._del_prefix,
-            )
-            self.done.emit()
-        except Exception as exc:
-            self.failed.emit(_format_worker_error(exc))
+            try:
+                if was_running and not is_steam_running():
+                    start_steam()
+            except Exception:
+                logging.exception("Failed restarting Steam after RemoveShortcutWorker")
 
 
 class BulkPlanWorker(QThread):
@@ -571,9 +562,10 @@ class DirStatsWorker(QThread):
         self._inferred_container = inferred_container
 
     def run(self) -> None:
+        # A failure only means "unknown": ready(0, 0) still releases the caller's busy state.
         try:
             count = sum(1 for _ in self._game_dir.iterdir())
-        except OSError:
+        except Exception:
             count = 0
         try:
             size_b = (
@@ -581,7 +573,7 @@ class DirStatsWorker(QThread):
                 if self._inferred_container
                 else _dir_size_bytes(self._game_dir)
             )
-        except OSError:
+        except Exception:
             size_b = 0
         self.ready.emit(count, size_b)
 
@@ -590,6 +582,7 @@ class RuntimePreflightWorker(QThread):
     """Check whether SteamOS optional runtime confirmation is needed."""
 
     ready = Signal(bool)
+    failed = Signal(str)
 
     def __init__(
         self,
@@ -600,33 +593,18 @@ class RuntimePreflightWorker(QThread):
         self._find_steam_root = find_steam_root_fn or find_steam_root
 
     def run(self) -> None:
-        steam_root = self._find_steam_root()
-        has_steam_proton = (
-            steam_root is not None and find_proton_binary(steam_root) is not None
-        )
-        needs_confirm = has_steam_proton and (
-            not get_umu_run_path().is_file() or not list_ge_proton11_dirs()
-        )
-        self.ready.emit(needs_confirm)
-
-
-class ExtStandaloneWorker(QThread):
-    """Create a standalone wrapper for an external launcher game."""
-
-    finished_ok = Signal(object)
-    failed = Signal(str)
-
-    def __init__(self, ext: ExternalLauncherGame, launch_options: str) -> None:
-        super().__init__()
-        self._ext = ext
-        self._launch_options = launch_options
-
-    def run(self) -> None:
         try:
-            game = create_standalone_from_external(self._ext, launch_options=self._launch_options)
-            self.finished_ok.emit(game)
+            steam_root = self._find_steam_root()
+            has_steam_proton = (
+                steam_root is not None and find_proton_binary(steam_root) is not None
+            )
+            needs_confirm = has_steam_proton and (
+                not get_umu_run_path().is_file() or not list_ge_proton11_dirs()
+            )
         except Exception as exc:
             self.failed.emit(_format_worker_error(exc))
+            return
+        self.ready.emit(needs_confirm)
 
 
 class ExtImportSavesWorker(QThread):
@@ -641,20 +619,19 @@ class ExtImportSavesWorker(QThread):
         target_pfx: Path,
         target_label: str,
         *,
-        auto_snap: bool,
+        snapshot_fn: Callable[[Path, str, str, str], Path | None] | None = None,
     ) -> None:
         super().__init__()
         self._ext = ext
         self._target_pfx = target_pfx
         self._target_label = target_label
-        self._auto_snap = auto_snap
+        self._snapshot_fn = snapshot_fn
 
     def run(self) -> None:
         try:
+            fn = self._snapshot_fn
             snap_fn = (
-                (lambda pfx, gname: snapshot_prefix_saves(pfx, gname, reason="ext-import"))
-                if self._auto_snap
-                else None
+                (lambda pfx, gname: fn(pfx, gname, "ext-import", "snap")) if fn is not None else None
             )
             copied = import_external_saves_to_target(
                 self._ext, self._target_pfx, self._target_label, auto_snapshot_fn=snap_fn

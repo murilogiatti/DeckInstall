@@ -1,7 +1,7 @@
 """Migrate schema-v1 games (~/Games layout) into the internal library, with a journal to undo it.
 
 For each v1 game the migration:
-  1. snapshots the prefix saves (ZIP, see save_sync.snapshot_prefix_saves);
+  1. snapshots the prefix saves (ZIP, see save_sync.auto_snapshot);
   2. moves the game folder (only when it lives under ~/Games), its prefix and its shader cache
      into ~/DeckInstall/{Games,Prefixes/<id>,Caches/<id>};
   3. rewrites launch.sh and the .desktop launchers, writes the v2 manifest and registers the game.
@@ -271,10 +271,10 @@ def _migrate_one(item: MigrationItem, journal: _Journal, lib: _lib.Library) -> S
 
     # 1. Save snapshot before touching anything.
     if game.prefix_dir.is_dir() and not game.native_linux:
-        snap = save_sync.snapshot_prefix_saves(
+        snap = save_sync.auto_snapshot(
             game.prefix_dir,
             game.name,
-            reason="migration",
+            "migration",
             game_dir=game.game_dir,
             steam_appid=game.steam_appid,
         )

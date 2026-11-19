@@ -895,13 +895,59 @@ def to_wine_path(path: Path) -> str:
     return "Z:" + str(path.resolve()).replace("/", "\\")
 
 
-def installer_arguments(installer_exe: Path, target_dir: Path, silent: bool = False) -> list[str]:
-    """Command-line switches for the installer: Inno Setup gets /DIR= (and /SILENT when asked)."""
+def _repack_drives() -> tuple[tuple[str, Path], ...]:
+    """Letters umu/GE-Proton map in every prefix: x: -> $HOME, v: -> /run/media (removable disks)."""
+    return (("x:", Path.home()), ("v:", Path("/run/media")))
+
+
+def repack_drive_path(target_dir: Path) -> tuple[str, Path, str] | None:
+    """(letter, its folder, Windows path) for target_dir through x:/v:, or None when outside both.
+
+    FitGirl/DODI unpackers (ISDone/unarc) fail with "Unable to write data to disk" (-11) when
+    writing through Z: (the filesystem root) or the prefix's C:, but work through X:/V:.
+    """
+    resolved = target_dir.resolve()
+    for letter, root in _repack_drives():
+        try:
+            rel = resolved.relative_to(root.resolve())
+        except (ValueError, OSError):
+            continue
+        if rel.parts:
+            return letter, root, letter.upper() + "\\" + "\\".join(rel.parts)
+    return None
+
+
+def map_repack_drive(prefix: Path, letter: str, root: Path) -> None:
+    """Make sure <prefix>/dosdevices/<letter> points at root (Proton keeps letters it did not make)."""
+    devices = prefix / "dosdevices"
+    devices.mkdir(parents=True, exist_ok=True)
+    link = devices / letter
+    if link.is_symlink():
+        try:
+            if Path(os.readlink(link)) == root:
+                return
+        except OSError:
+            pass
+        link.unlink()
+    elif link.exists():
+        return  # a real folder named like a drive: leave it alone
+    link.symlink_to(root)
+
+
+def installer_arguments(
+    installer_exe: Path, target_dir: Path, silent: bool = False, *, repack_drive: bool = False
+) -> list[str]:
+    """Command-line switches for the installer: Inno Setup gets /DIR= (and /SILENT when asked).
+
+    repack_drive: write /DIR= through X:/V: (see repack_drive_path) when target_dir is under one.
+    """
     from .classify import is_inno_setup
 
     if not is_inno_setup(installer_exe):
         return []
-    args = [f"/DIR={to_wine_path(target_dir)}"]
+    mapped = repack_drive_path(target_dir) if repack_drive else None
+    dest = mapped[2] if mapped is not None else to_wine_path(target_dir)
+    args = [f"/DIR={dest}"]
     if silent:
         args += ["/SP-", "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
     return args
@@ -965,15 +1011,28 @@ def _installer_command(
         return [wine, str(installer_exe), *args], env, tmp_pfx
 
 
-def _adopt_from_drive_c(drive_c: Path, target_dir: Path) -> bool:
-    """Move a game the installer put inside the prefix (ignoring /DIR=) into target_dir."""
+DRIVE_C_GAME_PARENTS = ("Games", "GOG Games", "Program Files", "Program Files (x86)")
+
+
+def find_games_in_drive_c(drive_c: Path) -> tuple[list[Path], list[Path]]:
+    """Return (game folders, helper-only folders) found under drive_c's Games/Program Files dirs.
+
+    Windows system folders and symlinks are skipped; a folder counts as a game when it holds
+    an .exe that is not a known helper (redist, crash handler, ...).
+    """
     picked: list[Path] = []
     fallback: list[Path] = []
-    for sub in ("Games", "GOG Games", "Program Files", "Program Files (x86)"):
+    if drive_c.is_symlink() or not drive_c.is_dir():
+        return picked, fallback
+    for sub in DRIVE_C_GAME_PARENTS:
         base = drive_c / sub
         if not base.is_dir() or base.is_symlink():
             continue
-        for cand in base.iterdir():
+        try:
+            children = sorted(base.iterdir(), key=lambda p: p.name)
+        except OSError:
+            continue
+        for cand in children:
             if cand.is_symlink() or not cand.is_dir() or cand.name.lower() in _SYSTEM_DIRS:
                 continue
             new_exes = [p for p in _collect_regular_files(cand) if p.suffix.lower() == ".exe"]
@@ -983,6 +1042,12 @@ def _adopt_from_drive_c(drive_c: Path, target_dir: Path) -> bool:
                 picked.append(cand)
             else:
                 fallback.append(cand)
+    return picked, fallback
+
+
+def _adopt_from_drive_c(drive_c: Path, target_dir: Path) -> bool:
+    """Move a game the installer put inside the prefix (ignoring /DIR=) into target_dir."""
+    picked, fallback = find_games_in_drive_c(drive_c)
     for cand in picked or fallback:
         dest = target_dir / cand.name
         if dest.exists() or dest.is_symlink():
@@ -1013,7 +1078,7 @@ def run_windows_installer(
     data_size = _repack_data_size(installer_exe) if repack else installer_exe.stat().st_size
     check_disk_space(target_dir, max(data_size * 2, 512 * 1024 * 1024))
     keep = (not repack) if keep_prefix is None else keep_prefix
-    args = installer_arguments(installer_exe, target_dir, silent=silent)
+    args = installer_arguments(installer_exe, target_dir, silent=silent, repack_drive=repack)
 
     target_dir.mkdir(parents=True, exist_ok=True)
     pre_existing = _collect_regular_files(target_dir)
@@ -1022,12 +1087,16 @@ def run_windows_installer(
         cmd, env, inst_pfx = _installer_command(installer_exe, args, tmp_pfx, on_log, cancel_flag)
         if repack:
             env["WINE_LARGE_ADDRESS_AWARE"] = "0"
+        mapped = repack_drive_path(target_dir) if repack and args else None
+        if mapped is not None:
+            map_repack_drive(inst_pfx, mapped[0], mapped[1])
         if on_log:
-            on_log(
-                f"Destination: {to_wine_path(target_dir)}"
-                if args
-                else f"Tip: in the installer, set destination to {to_wine_path(target_dir)}"
-            )
+            if mapped is not None:
+                on_log(f"Destination: {mapped[2]} ({target_dir})")
+            elif args:
+                on_log(f"Destination: {to_wine_path(target_dir)}")
+            else:
+                on_log(f"Tip: in the installer, set destination to {to_wine_path(target_dir)}")
         unarc_hits: list[str] = []
 
         def _handle_inst_line(line: str) -> None:
@@ -1062,7 +1131,7 @@ def run_windows_installer(
             if not _adopt_from_drive_c(inst_pfx / "drive_c", target_dir):
                 raise RuntimeError(
                     f"No files were installed in {target_dir}. "
-                    f"Point the installer to {to_wine_path(target_dir)}"
+                    f"Point the installer to {mapped[2] if mapped is not None else to_wine_path(target_dir)}"
                 )
         game_root = game_root_from_new_files(target_dir, _collect_regular_files(target_dir) - pre_existing)
         saved_pfx = target_dir / ".deckinstall_installer_pfx"

@@ -17,6 +17,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from deckinstall import standalone  # noqa: E402
+from deckinstall.cleanup import find_cleanup_candidates  # noqa: E402
 from deckinstall.manifest import (  # noqa: E402
     MANIFEST_V1,
     MANIFEST_V2,
@@ -25,7 +26,6 @@ from deckinstall.manifest import (  # noqa: E402
     read_manifest_fields,
 )
 from deckinstall.steam_paths import SteamPaths  # noqa: E402
-from deckinstall.steam_vdf import find_cleanup_candidates  # noqa: E402
 
 
 @contextmanager

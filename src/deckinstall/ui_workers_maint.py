@@ -7,6 +7,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
+from .cleanup import CleanupCandidate, delete_cleanup_candidates_checked, find_cleanup_candidates
 from .i18n import tr
 from .runtime_manager import (
     get_compat_tools_dir,
@@ -15,13 +16,11 @@ from .runtime_manager import (
     list_ge_proton11_dirs,
     validate_steamrt4_integrity,
 )
+from .space import scan_space
 from .steam_paths import SteamPaths, dir_size_bytes_many, find_proton_binary, find_steam_root
 from .steam_vdf import (
-    CleanupCandidate,
     ShortcutEntry,
     backup_prefix_candidates_to_zip,
-    delete_cleanup_candidates_checked,
-    find_cleanup_candidates,
     load_shortcuts,
     plan_bulk_migration,
     sync_all_external_saves,
@@ -33,6 +32,7 @@ class MaintHealthWorker(QThread):
     """Collect runtime health and disk usage metrics for the Maintenance page."""
 
     ready = Signal(int, dict)
+    failed = Signal(int, str)
 
     def __init__(
         self,
@@ -49,6 +49,12 @@ class MaintHealthWorker(QThread):
         self._find_steam_root = find_steam_root_fn or find_steam_root
 
     def run(self) -> None:
+        try:
+            self._collect()
+        except Exception as exc:
+            self.failed.emit(self._req_id, _format_worker_error(exc))
+
+    def _collect(self) -> None:
         steam_root = self._find_steam_root()
         has_steam_proton = (
             steam_root is not None and find_proton_binary(steam_root) is not None
@@ -117,6 +123,23 @@ class MaintHealthWorker(QThread):
                 "caches_bytes": self._cached_bytes,
             },
         )
+
+
+class SpaceScanWorker(QThread):
+    """Measure disk and per-game usage (space.scan_space) off the UI thread."""
+
+    ready = Signal(int, object)
+    failed = Signal(int, str)
+
+    def __init__(self, req_id: int) -> None:
+        super().__init__()
+        self._req_id = req_id
+
+    def run(self) -> None:
+        try:
+            self.ready.emit(self._req_id, scan_space())
+        except Exception as exc:
+            self.failed.emit(self._req_id, _format_worker_error(exc))
 
 
 class MaintScanWorker(QThread):

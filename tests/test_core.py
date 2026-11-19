@@ -26,6 +26,7 @@ except ImportError:
     fake_vdf.dumps = lambda d, pretty=True: "{}"
     sys.modules["vdf"] = fake_vdf
 
+from deckinstall.cleanup import find_cleanup_candidates  # noqa: E402
 from deckinstall.extractor import (  # noqa: E402
     _select_extract_cmd,
     extract_archive,
@@ -45,7 +46,6 @@ from deckinstall.steam_vdf import (  # noqa: E402
     _backup_file,
     _rewrite_launch_options,
     compute_shortcut_appid,
-    find_cleanup_candidates,
     import_external_prefix_saves,
     infer_game_root_from_exe,
     migrate_shortcut_to_games,
@@ -397,7 +397,7 @@ class CoreTests(unittest.TestCase):
                 ext_cand = next(c for c in cands if c.path == ext_pfx)
                 self.assertTrue(ext_cand.has_saves)
 
-                from deckinstall.steam_vdf import delete_cleanup_candidates_checked
+                from deckinstall.cleanup import delete_cleanup_candidates_checked
 
                 deleted, freed, _ = delete_cleanup_candidates_checked(
                     paths, [c for c in cands if c.path in (orphan, bak)], allow_unverified_saves=True
@@ -699,15 +699,14 @@ class CoreTests(unittest.TestCase):
 
     def test_v073_audit_regressions(self) -> None:
         from deckinstall.artwork import backup_steam_artwork
+        from deckinstall.cleanup import CleanupCandidate, delete_cleanup_candidates_checked
         from deckinstall.fsutil import file_sha256
         from deckinstall.scanner import clean_game_name
         from deckinstall.steam_paths import SteamPaths
         from deckinstall.steam_vdf import (
-            CleanupCandidate,
             ShortcutEntry,
             apply_launch_presets,
             backup_all_saves,
-            delete_cleanup_candidates_checked,
             restore_saves_backup,
             sync_prefix_symlinks,
             update_shortcut_launch_options,
@@ -877,6 +876,7 @@ class CoreTests(unittest.TestCase):
 
     def test_v074_audit_regressions(self) -> None:
         from deckinstall.artwork import restore_steam_artwork_backup
+        from deckinstall.cleanup import delete_cleanup_candidates_checked
         from deckinstall.steam_paths import find_proton_binary
         from deckinstall.steam_vdf import (
             _is_prefix_referenced_by_shortcuts,
@@ -886,7 +886,6 @@ class CoreTests(unittest.TestCase):
             add_or_update_shortcut,
             apply_launch_presets,
             backup_all_saves,
-            delete_cleanup_candidates_checked,
             restore_saves_backup,
             sync_prefix_symlinks,
         )
@@ -1127,7 +1126,7 @@ class CoreTests(unittest.TestCase):
             )
             paths.shortcuts_vdf.parent.mkdir(parents=True, exist_ok=True)
             paths.shortcuts_vdf.write_bytes(b"VDF")
-            from deckinstall.steam_vdf import CleanupCandidate
+            from deckinstall.cleanup import CleanupCandidate
             cand = CleanupCandidate("orphan", "Orphan", cand_pfx.parent, 100, False)
             live_entry = ShortcutEntry("0", 555, "Orphan", '"/g/a.exe"', '"/g"', "", "")
             with mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[live_entry]):
@@ -1649,7 +1648,7 @@ class CoreTests(unittest.TestCase):
 
     def test_system_and_steam_cleanup_discovery(self) -> None:
         """Verify expanded cleanup discovers orphan shadercache, logs, trash, app caches, and old runtimes."""
-        from deckinstall.steam_vdf import delete_cleanup_candidates_checked, find_cleanup_candidates
+        from deckinstall.cleanup import delete_cleanup_candidates_checked, find_cleanup_candidates
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

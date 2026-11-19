@@ -52,12 +52,10 @@ from ..steam_vdf import (
     ShortcutEntry,
     get_compatdata_migration_state,
     get_shortcut_proton,
-    get_steam_input_mode,
     list_microsd_compatdata_targets,
     migrate_compatdata_to_microsd,
     restore_compatdata_from_microsd,
     set_shortcut_proton,
-    set_steam_input_mode,
 )
 from ..ui_cards import (
     FlowLayout,
@@ -362,55 +360,6 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     game_actions_row.addStretch()
     game_form.addRow("", game_actions_row)
 
-    if is_steam and win.paths and isinstance(obj, ShortcutEntry):
-        steam_input_combo = QComboBox()
-        steam_input_combo.addItem(tr("configure.steam_input_default"), "default")
-        steam_input_combo.addItem(tr("configure.steam_input_enabled"), "enabled")
-        steam_input_combo.addItem(tr("configure.steam_input_disabled"), "disabled")
-        cur_si_mode = get_steam_input_mode(win.paths.localconfig_vdf, obj.appid_u32)
-        si_idx = steam_input_combo.findData(cur_si_mode)
-        if si_idx >= 0:
-            steam_input_combo.setCurrentIndex(si_idx)
-
-        def _on_steam_input_changed() -> None:
-            if not win.paths:
-                return
-            mode = str(steam_input_combo.currentData() or "default")
-            localconfig_path = win.paths.localconfig_vdf
-            appid = obj.appid_u32
-            steam_input_combo.setEnabled(False)
-
-            class _SteamInputWorker(QThread):
-                finished_ok = Signal(str)
-                failed = Signal(str)
-
-                def run(self) -> None:
-                    try:
-                        set_steam_input_mode(localconfig_path, appid, mode, create_if_missing=True)
-                        self.finished_ok.emit(mode)
-                    except Exception as exc:
-                        self.failed.emit(_format_worker_error(exc))
-
-            si_worker = _SteamInputWorker()
-            win._track_worker(si_worker)
-
-            def _si_ok(saved_mode: str) -> None:
-                if dlg_alive():
-                    steam_input_combo.setEnabled(True)
-                win.status_label.setText(tr("configure.steam_input_saved", mode=saved_mode))
-
-            def _si_err(err: str) -> None:
-                if dlg_alive():
-                    steam_input_combo.setEnabled(True)
-                    QMessageBox.warning(dlg, __app_name__, err)
-
-            si_worker.finished_ok.connect(_si_ok)
-            si_worker.failed.connect(_si_err)
-            si_worker.start()
-
-        steam_input_combo.currentIndexChanged.connect(_on_steam_input_changed)
-        game_form.addRow(tr("configure.lbl_steam_input"), steam_input_combo)
-
     game_tab_lay.addLayout(game_form)
 
     compat_hdr = QLabel(tr("configure.tab_runner"))
@@ -531,10 +480,8 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         action
         for action in (
             win.act_migrate,
-            win.act_export_standalone,
             win.act_import_steam,
             win.act_ext_to_steam,
-            win.act_ext_to_standalone,
             win.act_ext_import_saves,
             win.act_art,
             win.act_revert_art,

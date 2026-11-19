@@ -28,11 +28,10 @@ except ImportError:
     fake_vdf.dumps = lambda d, pretty=True: "{}"
     sys.modules["vdf"] = fake_vdf
 
-from deckinstall import runtime_manager, standalone, steam_vdf  # noqa: E402
+from deckinstall import cleanup, runtime_manager, standalone, steam_vdf  # noqa: E402
+from deckinstall.cleanup import delete_cleanup_candidates_checked, find_cleanup_candidates  # noqa: E402
 from deckinstall.steam_vdf import (  # noqa: E402
     backup_all_saves,
-    delete_cleanup_candidates_checked,
-    find_cleanup_candidates,
 )
 
 
@@ -111,7 +110,7 @@ class MaintenanceTests(unittest.TestCase):
                 zip_paths.append(zpath)
 
             with (
-                mock.patch.object(steam_vdf, "external_prefix_roots", return_value=[]),
+                mock.patch.object(cleanup, "external_prefix_roots", return_value=[]),
                 mock.patch.object(runtime_manager, "list_ge_proton11_dirs", return_value=[]),
             ):
                 candidates = find_cleanup_candidates(
@@ -168,7 +167,7 @@ class MaintenanceTests(unittest.TestCase):
             prefixes_dir = games_dir / ".prefixes"
 
             with (
-                mock.patch.object(steam_vdf, "external_prefix_roots", return_value=[]),
+                mock.patch.object(cleanup, "external_prefix_roots", return_value=[]),
                 mock.patch.object(runtime_manager, "list_ge_proton11_dirs", return_value=[]),
             ):
                 # Without active standalone games: GE-Proton11-12 preserved, 11-10 and 10-34 flagged
@@ -212,7 +211,7 @@ class MaintenanceTests(unittest.TestCase):
             (steamrt3 / "toolmanifest.vdf").write_text('"manifest" {}', encoding="utf-8")
 
             with (
-                mock.patch.object(steam_vdf, "external_prefix_roots", return_value=[]),
+                mock.patch.object(cleanup, "external_prefix_roots", return_value=[]),
                 mock.patch.object(runtime_manager, "list_ge_proton11_dirs", return_value=[]),
             ):
                 # Missing steamrt4/toolmanifest.vdf -> steamrt3 NOT flagged
@@ -461,8 +460,8 @@ class MaintenanceTests(unittest.TestCase):
             save_file.parent.mkdir(parents=True)
             save_file.write_bytes(b"HYDRA-SAVE")
 
-            with mock.patch.object(steam_vdf, "external_prefix_roots", return_value=[root / "hydra"]):
-                cands = steam_vdf.find_cleanup_candidates(
+            with mock.patch.object(cleanup, "external_prefix_roots", return_value=[root / "hydra"]):
+                cands = cleanup.find_cleanup_candidates(
                     None,
                     home_dir=root / "home",
                 )
@@ -470,7 +469,7 @@ class MaintenanceTests(unittest.TestCase):
                 self.assertTrue(cands[0].has_saves)
                 self.assertFalse(cands[0].saves_verified_migrated)
 
-                deleted, _freed, errs = steam_vdf.delete_cleanup_candidates_checked(
+                deleted, _freed, errs = cleanup.delete_cleanup_candidates_checked(
                     None, cands, allow_unverified_saves=False
                 )
                 self.assertEqual(deleted, 0)
@@ -481,7 +480,7 @@ class MaintenanceTests(unittest.TestCase):
                 self.assertTrue(zpath.is_file())
                 self.assertEqual((gcount, fcount), (1, 1))
 
-                deleted2, _freed2, errs2 = steam_vdf.delete_cleanup_candidates_checked(
+                deleted2, _freed2, errs2 = cleanup.delete_cleanup_candidates_checked(
                     None, cands, allow_unverified_saves=True
                 )
                 self.assertEqual(deleted2, 1)

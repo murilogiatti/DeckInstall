@@ -26,12 +26,12 @@ except ImportError:
     sys.modules["vdf"] = fake_vdf
 
 from deckinstall import runtime_manager, standalone  # noqa: E402
+from deckinstall.cleanup import find_cleanup_candidates  # noqa: E402
 from deckinstall.fsutil import copy_or_move_dir_contents  # noqa: E402
 from deckinstall.scanner import detect_exe_kind, detect_steam_appid  # noqa: E402
 from deckinstall.steam_paths import SteamPaths  # noqa: E402
 from deckinstall.steam_vdf import (  # noqa: E402
     apply_launch_presets,
-    find_cleanup_candidates,
 )
 
 

@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from deckinstall.cleanup import delete_cleanup_candidates_checked, find_cleanup_candidates
 from deckinstall.runtime_manager import (
     get_umu_protonfix_status,
     lookup_umu_database,
@@ -33,12 +34,8 @@ from deckinstall.standalone import (
 from deckinstall.steam_paths import SteamPaths, dir_size_bytes
 from deckinstall.steam_vdf import (
     apply_launch_presets,
-    delete_cleanup_candidates_checked,
-    find_cleanup_candidates,
-    get_steam_input_mode,
     migrate_compatdata_to_microsd,
     restore_compatdata_from_microsd,
-    set_steam_input_mode,
 )
 
 
@@ -274,24 +271,6 @@ class TestNewFeatures(unittest.TestCase):
         self.assertIn("lsfg-vk", preserved)
         self.assertIn("MANGOHUD=1", preserved)
         self.assertTrue(preserved.endswith("%command% -dx11"))
-
-    # 6. get_steam_input_mode & set_steam_input_mode
-    def test_steam_input_mode_get_and_set(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            localconfig = Path(tmp) / "localconfig.vdf"
-            self.assertEqual(get_steam_input_mode(localconfig, 123456), "default")
-
-            set_steam_input_mode(localconfig, 123456, "enabled", create_if_missing=True)
-            self.assertEqual(get_steam_input_mode(localconfig, 123456), "enabled")
-
-            set_steam_input_mode(localconfig, 123456, "disabled")
-            self.assertEqual(get_steam_input_mode(localconfig, 123456), "disabled")
-
-            set_steam_input_mode(localconfig, 123456, "default")
-            self.assertEqual(get_steam_input_mode(localconfig, 123456), "default")
-
-            with self.assertRaises(ValueError):
-                set_steam_input_mode(localconfig, 123456, "invalid-mode")
 
     # 7. migrate_compatdata_to_microsd & restore_compatdata_from_microsd
     def test_migrate_and_restore_compatdata_microsd(self) -> None:

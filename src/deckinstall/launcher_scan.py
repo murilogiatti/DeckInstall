@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import urllib.parse
 from dataclasses import dataclass, field
@@ -21,6 +22,9 @@ class ExternalLauncherGame:
     prefix_dir: Path | None
     runner: str  # "wine" or "linux"
     launch_cmd: list[str] = field(default_factory=list)
+    runtime: str = ""  # runner version as the launcher names it (e.g. "GE-Proton9-20"), if known
+    store: str = ""  # "epic", "gog", "amazon" for Heroic stores
+    game_id: str = ""  # launcher id: Heroic app name, Lutris database id
 
 
 def _strip_yaml_comment(line: str) -> str:
@@ -178,22 +182,47 @@ def _resolve_existing_file(raw_path: str | Path | None, base_dir: Path | None = 
         return None
 
 
+_LUTRIS_TIMESTAMP_RE = re.compile(r"-\d{9,}$")
+
+
+def lutris_slug_from_configpath(configpath: str) -> str:
+    """Lutris names game configs "<slug>-<unix time>"; return the slug part."""
+    return _LUTRIS_TIMESTAMP_RE.sub("", configpath.strip())
+
+
+def _lutris_launch_cmd(is_flatpak: bool, slug: str, game_id: str) -> list[str]:
+    """Lutris opens games by database id (exact) or by slug (what "lutris:rungame/" expects)."""
+    if game_id:
+        target = f"lutris:rungameid/{game_id}"
+    elif slug:
+        target = f"lutris:rungame/{slug}"
+    else:
+        return []
+    return ["flatpak", "run", "net.lutris.Lutris", target] if is_flatpak else ["lutris", target]
+
+
 def _lutris_entry_from_yaml(
     yml_path: Path,
     *,
     is_flatpak: bool = False,
+    db_row: dict[str, Any] | None = None,
 ) -> ExternalLauncherGame | None:
-    """Parse a single Lutris game .yml file into ExternalLauncherGame."""
+    """Parse a single Lutris game .yml file (plus its pga.db row, when known) into ExternalLauncherGame.
+
+    Lutris keeps name, slug and runner in pga.db; the .yml (named "<slug>-<timestamp>.yml")
+    only holds the game/wine/system sections.
+    """
     try:
         data = _parse_simple_yaml(yml_path.read_text(encoding="utf-8", errors="replace"))
     except OSError:
         return None
+    row = db_row or {}
 
     game_section = data.get("game")
     game_dict = game_section if isinstance(game_section, dict) else {}
 
     exe_raw = game_dict.get("exe") or data.get("exe")
-    working_dir_raw = game_dict.get("working_dir") or data.get("working_dir")
+    working_dir_raw = game_dict.get("working_dir") or data.get("working_dir") or row.get("directory")
     base_dir = _resolve_existing_dir(working_dir_raw)
     exe_path = _resolve_existing_file(exe_raw, base_dir=base_dir)
     if exe_path is None:
@@ -202,14 +231,21 @@ def _lutris_entry_from_yaml(
     prefix_raw = game_dict.get("prefix") or data.get("prefix")
     prefix_dir = _resolve_existing_dir(prefix_raw)
     game_dir = base_dir or exe_path.parent
-    name = str(data.get("name") or "").strip() or yml_path.stem
-    slug = str(data.get("slug") or "").strip() or yml_path.stem
-    runner = _normalize_runner(str(data.get("runner") or ""), exe_path)
-
-    if is_flatpak:
-        launch_cmd = ["flatpak", "run", "net.lutris.Lutris", f"lutris:rungame/{slug}"]
-    else:
-        launch_cmd = ["lutris", f"lutris:rungame/{slug}"]
+    slug = (
+        str(row.get("slug") or "").strip()
+        or str(data.get("slug") or "").strip()
+        or lutris_slug_from_configpath(yml_path.stem)
+    )
+    name = (
+        str(row.get("name") or "").strip()
+        or str(data.get("name") or "").strip()
+        or slug.replace("-", " ").title()
+        or yml_path.stem
+    )
+    runner = _normalize_runner(str(row.get("runner") or data.get("runner") or ""), exe_path)
+    wine_section = data.get("wine")
+    runtime = str(wine_section.get("version") or "") if isinstance(wine_section, dict) else ""
+    game_id = str(row.get("id") or "").strip()
 
     return ExternalLauncherGame(
         source="lutris",
@@ -218,12 +254,45 @@ def _lutris_entry_from_yaml(
         game_dir=game_dir,
         prefix_dir=prefix_dir,
         runner=runner,
-        launch_cmd=launch_cmd,
+        launch_cmd=_lutris_launch_cmd(is_flatpak, slug, game_id),
+        runtime=runtime,
+        game_id=game_id,
     )
 
 
+def _lutris_db_rows(db_path: Path) -> list[dict[str, Any]]:
+    """Read installed games from pga.db (read-only); [] when missing or unreadable."""
+    if not db_path.is_file():
+        return []
+    conn: sqlite3.Connection | None = None
+    try:
+        db_uri = f"file:{urllib.parse.quote(str(db_path))}?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(games)").fetchall()}
+        select_cols = [
+            c
+            for c in ("id", "name", "slug", "runner", "directory", "configpath", "installed", "exe", "prefix")
+            if c in cols
+        ]
+        if not select_cols:
+            return []
+        query = f"SELECT {', '.join(select_cols)} FROM games"
+        if "installed" in cols:
+            query += " WHERE installed = 1"
+        return [dict(row) for row in conn.execute(query)]
+    except (sqlite3.Error, OSError):
+        return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+
+
 def _scan_lutris(home: Path) -> list[ExternalLauncherGame]:
-    """Scan Lutris game YAML configs and pga.db in read-only mode."""
+    """Scan Lutris pga.db and game YAML configs in read-only mode."""
     results: list[ExternalLauncherGame] = []
     seen_exes: set[Path] = set()
 
@@ -239,22 +308,7 @@ def _scan_lutris(home: Path) -> list[ExternalLauncherGame]:
         seen_exes.add(resolved)
         results.append(item)
 
-    config_roots = [
-        (home / ".config" / "lutris" / "games", False),
-        (home / ".var" / "app" / "net.lutris.Lutris" / "config" / "lutris" / "games", True),
-    ]
-    for games_dir, is_flatpak in config_roots:
-        if not games_dir.is_dir():
-            continue
-        try:
-            yml_files = sorted(games_dir.glob("*.yml"))
-        except OSError:
-            continue
-        for yml_path in yml_files:
-            if yml_path.is_file():
-                _add(_lutris_entry_from_yaml(yml_path, is_flatpak=is_flatpak))
-
-    db_roots = [
+    roots = [
         (home / ".local" / "share" / "lutris" / "pga.db", home / ".config" / "lutris" / "games", False),
         (
             home / ".var" / "app" / "net.lutris.Lutris" / "data" / "lutris" / "pga.db",
@@ -262,74 +316,50 @@ def _scan_lutris(home: Path) -> list[ExternalLauncherGame]:
             True,
         ),
     ]
-    for db_path, games_dir, is_flatpak in db_roots:
-        if not db_path.is_file():
-            continue
-        conn: sqlite3.Connection | None = None
-        try:
-            db_uri = f"file:{urllib.parse.quote(str(db_path))}?mode=ro"
-            conn = sqlite3.connect(db_uri, uri=True)
-            conn.row_factory = sqlite3.Row
-            cols_rows = conn.execute("PRAGMA table_info(games)").fetchall()
-            cols = {str(r["name"]) for r in cols_rows}
-            if not cols:
-                continue
-            select_cols = [
-                c
-                for c in ("name", "slug", "runner", "directory", "configpath", "installed", "exe", "prefix")
-                if c in cols
-            ]
-            if not select_cols:
-                continue
-            query = f"SELECT {', '.join(select_cols)} FROM games"
-            if "installed" in cols:
-                query += " WHERE installed = 1"
-            for row in conn.execute(query):
-                row_dict = dict(row)
-                cfg = str(row_dict.get("configpath") or "").strip()
-                if cfg:
-                    cfg_path = Path(cfg)
-                    if not cfg_path.is_absolute():
-                        cfg_path = games_dir / (cfg if cfg.endswith(".yml") else f"{cfg}.yml")
-                    if cfg_path.is_file():
-                        _add(_lutris_entry_from_yaml(cfg_path, is_flatpak=is_flatpak))
-                        continue
-
-                dir_path = _resolve_existing_dir(row_dict.get("directory"))
-                exe_path = _resolve_existing_file(row_dict.get("exe"), base_dir=dir_path)
-                if exe_path is None:
+    for db_path, games_dir, is_flatpak in roots:
+        # 1. Database rows first: they carry the real name, slug and id of each game.
+        used_configs: set[Path] = set()
+        for row in _lutris_db_rows(db_path):
+            cfg = str(row.get("configpath") or "").strip()
+            if cfg:
+                cfg_path = Path(cfg)
+                if not cfg_path.is_absolute():
+                    cfg_path = games_dir / (cfg if cfg.endswith(".yml") else f"{cfg}.yml")
+                if cfg_path.is_file():
+                    used_configs.add(cfg_path)
+                    _add(_lutris_entry_from_yaml(cfg_path, is_flatpak=is_flatpak, db_row=row))
                     continue
-                name = str(row_dict.get("name") or "").strip() or exe_path.stem
-                slug = str(row_dict.get("slug") or "").strip()
-                prefix_dir = _resolve_existing_dir(row_dict.get("prefix"))
-                runner = _normalize_runner(str(row_dict.get("runner") or ""), exe_path)
-                if slug:
-                    launch_cmd = (
-                        ["flatpak", "run", "net.lutris.Lutris", f"lutris:rungame/{slug}"]
-                        if is_flatpak
-                        else ["lutris", f"lutris:rungame/{slug}"]
-                    )
-                else:
-                    launch_cmd = []
-                _add(
-                    ExternalLauncherGame(
-                        source="lutris",
-                        name=name,
-                        exe_path=exe_path,
-                        game_dir=dir_path or exe_path.parent,
-                        prefix_dir=prefix_dir,
-                        runner=runner,
-                        launch_cmd=launch_cmd,
-                    )
+
+            dir_path = _resolve_existing_dir(row.get("directory"))
+            exe_path = _resolve_existing_file(row.get("exe"), base_dir=dir_path)
+            if exe_path is None:
+                continue
+            name = str(row.get("name") or "").strip() or exe_path.stem
+            slug = str(row.get("slug") or "").strip()
+            game_id = str(row.get("id") or "").strip()
+            _add(
+                ExternalLauncherGame(
+                    source="lutris",
+                    name=name,
+                    exe_path=exe_path,
+                    game_dir=dir_path or exe_path.parent,
+                    prefix_dir=_resolve_existing_dir(row.get("prefix")),
+                    runner=_normalize_runner(str(row.get("runner") or ""), exe_path),
+                    launch_cmd=_lutris_launch_cmd(is_flatpak, slug, game_id),
+                    game_id=game_id,
                 )
-        except (sqlite3.Error, OSError):
+            )
+
+        # 2. Configs without a database row (older Lutris, or a copied config).
+        if not games_dir.is_dir():
             continue
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except sqlite3.Error:
-                    pass
+        try:
+            yml_files = sorted(games_dir.glob("*.yml"))
+        except OSError:
+            continue
+        for yml_path in yml_files:
+            if yml_path.is_file() and yml_path not in used_configs:
+                _add(_lutris_entry_from_yaml(yml_path, is_flatpak=is_flatpak))
 
     return results
 
@@ -354,6 +384,7 @@ def _heroic_build_game(
     install_path: str,
     executable: str,
     platform: str,
+    store: str = "",
 ) -> ExternalLauncherGame | None:
     """Construct ExternalLauncherGame from a Heroic installed entry + GamesConfig."""
     game_cfg = _heroic_game_config(config_root, app_name)
@@ -389,6 +420,9 @@ def _heroic_build_game(
     else:
         launch_cmd = []
 
+    wine_version = game_cfg.get("wineVersion")
+    runtime = str(wine_version.get("name") or "") if isinstance(wine_version, dict) else ""
+
     return ExternalLauncherGame(
         source="heroic",
         name=name,
@@ -397,6 +431,9 @@ def _heroic_build_game(
         prefix_dir=prefix_dir,
         runner=runner,
         launch_cmd=launch_cmd,
+        runtime=runtime,
+        store=store,
+        game_id=app_name,
     )
 
 
@@ -441,6 +478,7 @@ def _scan_heroic(home: Path) -> list[ExternalLauncherGame]:
                         install_path=str(entry.get("install_path") or ""),
                         executable=str(entry.get("executable") or ""),
                         platform=str(entry.get("platform") or ""),
+                        store="epic",
                     )
                 )
 
@@ -463,6 +501,7 @@ def _scan_heroic(home: Path) -> list[ExternalLauncherGame]:
                     install_path=str(entry.get("install_path") or ""),
                     executable=str(entry.get("executable") or ""),
                     platform=str(entry.get("platform") or ""),
+                    store="gog",
                 )
             )
 
@@ -485,6 +524,7 @@ def _scan_heroic(home: Path) -> list[ExternalLauncherGame]:
                     install_path=str(entry.get("path") or entry.get("install_path") or ""),
                     executable=str(entry.get("executable") or ""),
                     platform=str(entry.get("platform") or ""),
+                    store="amazon",
                 )
             )
 
@@ -599,6 +639,7 @@ def _scan_bottles(home: Path) -> list[ExternalLauncherGame]:
                         prefix_dir=bottle_dir,
                         runner="wine",
                         launch_cmd=launch_cmd,
+                        runtime=str(data.get("Runner") or ""),
                     )
                 )
     return results

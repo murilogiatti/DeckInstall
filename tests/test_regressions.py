@@ -17,6 +17,7 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from deckinstall.cleanup import find_cleanup_candidates  # noqa: E402
 from deckinstall.extractor import _is_non_game_helper_exe  # noqa: E402
 from deckinstall.fsutil import file_sha256  # noqa: E402
 from deckinstall.optiscaler import (  # noqa: E402
@@ -43,7 +44,6 @@ from deckinstall.standalone import (  # noqa: E402
 from deckinstall.steam_paths import SteamPaths  # noqa: E402
 from deckinstall.steam_vdf import (  # noqa: E402
     _format_launch_token,
-    find_cleanup_candidates,
     infer_game_root_from_exe,
 )
 

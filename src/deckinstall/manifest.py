@@ -186,6 +186,7 @@ def _v2_fields(raw: dict[str, Any], game_dir: Path) -> dict[str, Any]:
         raise ValueError("missing prefix.path")
     cache_raw = _str(cache.get("path")).strip()
     script_raw = _str(created.get("launch_script")).strip()
+    backup_raw = _str(created.get("launch_script_backup")).strip()
     desktop_files = _paths(created.get("desktop_files"), root)
     shortcuts = _paths(created.get("desktop_shortcuts"), root)
 
@@ -217,6 +218,7 @@ def _v2_fields(raw: dict[str, Any], game_dir: Path) -> dict[str, Any]:
             "steam": _section(created, "steam"),
             "optiscaler": _section(created, "optiscaler"),
             "logs": _section(raw, "logs"),
+            **({"launch_script_backup": decode_path(backup_raw, root)} if backup_raw else {}),
         },
     }
 
@@ -290,6 +292,7 @@ def build_manifest_v2(fields: dict[str, Any], library_root: Path | None) -> dict
         "cache": {"path": enc(fields.get("cache_dir"))},
         "created": {
             "launch_script": enc(fields.get("launch_script")),
+            **({"launch_script_backup": enc(meta["launch_script_backup"])} if meta.get("launch_script_backup") else {}),
             "desktop_files": [enc(fields["desktop_file"])] if fields.get("desktop_file") else [],
             "desktop_shortcuts": [enc(fields["desktop_shortcut"])] if fields.get("desktop_shortcut") else [],
             "icons": [enc(p) for p in meta.get("icons") or []],

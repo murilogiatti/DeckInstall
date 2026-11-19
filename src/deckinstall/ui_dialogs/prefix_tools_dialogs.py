@@ -629,7 +629,7 @@ def open_optiscaler_dialog(
                     QMessageBox.information(p_win, __app_name__, tr("vdf_queue.enqueued", name=entry.app_name))
                 return
 
-            win._set_steam_busy(True)
+            win._begin_busy()
             steam_worker = SteamOpWorker(
                 lambda: update_shortcut_launch_options(paths, entry.appid_u32, new_opts),
                 need_steam_closed=True,
@@ -638,7 +638,7 @@ def open_optiscaler_dialog(
             steam_worker.status.connect(win.status_label.setText)
 
             def _steam_ok(_res: object) -> None:
-                win._set_steam_busy(False)
+                win._end_busy()
                 win._refresh_shortcuts()
                 _set_busy(False)
                 win.status_label.setText(done_msg)
@@ -647,7 +647,7 @@ def open_optiscaler_dialog(
                     QMessageBox.information(p_win, __app_name__, done_msg)
 
             def _steam_err(err: str) -> None:
-                win._set_steam_busy(False)
+                win._end_busy()
                 _set_busy(False)
                 if not win._closing_pending:
                     QMessageBox.critical(

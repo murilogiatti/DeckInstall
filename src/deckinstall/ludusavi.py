@@ -1,0 +1,654 @@
+"""Import and export game saves in the Ludusavi backup layout.
+
+A Ludusavi backup is one folder per game:
+
+    <root>/<escaped game name>/mapping.yaml
+    <root>/<escaped game name>/drive-C/Users/...           full backup named "." (simple mode)
+    <root>/<escaped game name>/backup-<stamp>/drive-C/...  named full or differential backup
+    <root>/<escaped game name>/backup-<stamp>.zip          the same, with compression on
+
+mapping.yaml:
+
+    name: <game>
+    drives: {drive-C: "C:", drive-0: ""}            # folder name -> original drive ("" = Unix root)
+    backups:                                         # full backups, oldest first
+      - name: "."
+        when: "2026-01-01T00:00:00Z"
+        os: windows
+        files: {"C:/Users/me/save.dat": {hash: <sha1>, size: 12}}
+        registry: {hash: ~}
+        children:                                    # differential backups against that full one
+          - name: backup-20260102T000000Z
+            files: {"C:/Users/me/save.dat": {hash: ..., size: ...}, "C:/Users/me/old.dat": ~}
+
+Export writes one simple full backup ("." with C:/users/steamuser/... paths). Import restores the
+newest full backup plus its newest differential child; Windows paths go into the game's prefix
+(any user -> steamuser), Unix paths only when they stay inside $HOME. Every file is checked against
+its sha1 and size before anything is written, and an existing save is only replaced when the
+safety snapshot taken first holds it.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import shutil
+import tempfile
+import time
+import zipfile
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any, NamedTuple
+
+from . import save_sync
+from .fsutil import is_within
+from .launcher_scan import _split_yaml_key_value, _strip_yaml_comment, _unquote_yaml_scalar
+from .steam_vdf import (
+    _RESTORE_MAX_ENTRIES,
+    _RESTORE_MAX_FILE_BYTES,
+    _RESTORE_MAX_TOTAL_BYTES,
+    _norm_key,
+    _safe_parents_within,
+)
+
+MAPPING_FILE = "mapping.yaml"
+_MAPPING_MAX_BYTES = 16 * 1024 * 1024
+_DRIVE_FOLDER = re.compile(r"^drive-[A-Za-z0-9_]{1,32}$")
+_BACKUP_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_WIN_PATH = re.compile(r"^([A-Za-z]:)(?:/(.*))?$")
+_INT = re.compile(r"^-?[0-9]+$")
+_FOLDER_UNSAFE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+
+
+class LudusaviError(ValueError):
+    """The backup is malformed, unsafe or does not match its hashes; nothing was written."""
+
+
+class ImportResult(NamedTuple):
+    restored: int  # files written
+    unchanged: int  # already identical
+    kept: int  # existing different files left alone (not covered by the safety snapshot)
+    skipped: int  # paths that do not map into this prefix or $HOME
+    backup: str  # name of the backup that was restored
+    snapshot: Path | None  # safety snapshot taken before overwriting
+
+
+# --- minimal YAML (the subset serde_yaml writes for mapping.yaml) -----------------------------
+
+
+def _yaml_scalar(raw: str) -> Any:
+    val = raw.strip()
+    if val in ("~", "null", "Null", "NULL", ""):
+        return None
+    if val == "{}":
+        return {}
+    if val == "[]":
+        return []
+    if val[0] in "'\"":
+        return _unquote_yaml_scalar(val)
+    if val in ("true", "false"):
+        return val == "true"
+    if _INT.match(val):
+        return int(val)
+    return val
+
+
+def _is_item(text: str) -> bool:
+    return text == "-" or text.startswith("- ")
+
+
+def _yaml_block(lines: list[tuple[int, str]], i: int, indent: int) -> tuple[Any, int]:
+    if _is_item(lines[i][1]):
+        return _yaml_seq(lines, i, indent)
+    return _yaml_map(lines, i, indent)
+
+
+def _yaml_value_after(lines: list[tuple[int, str]], i: int, indent: int, rest: str) -> tuple[Any, int]:
+    if rest:
+        return _yaml_scalar(rest), i
+    if i < len(lines) and (lines[i][0] > indent or (lines[i][0] == indent and _is_item(lines[i][1]))):
+        return _yaml_block(lines, i, lines[i][0])
+    return None, i
+
+
+def _yaml_map(lines: list[tuple[int, str]], i: int, indent: int) -> tuple[dict[str, Any], int]:
+    out: dict[str, Any] = {}
+    while i < len(lines):
+        ind, text = lines[i]
+        if ind > indent:
+            raise LudusaviError(f"Unexpected indentation in {MAPPING_FILE} line: {text[:60]}")
+        if ind < indent or _is_item(text):
+            break
+        if text == "?" or text.startswith("? "):
+            # Explicit key, which serde_yaml writes for long keys: "? <key>" then ": <value>".
+            raw_key = text[1:].strip()
+            i += 1
+            # A long plain key wraps onto more-indented lines, folded back with single spaces.
+            while i < len(lines) and lines[i][0] > indent:
+                raw_key += " " + lines[i][1]
+                i += 1
+            key = str(_yaml_scalar(raw_key) or "")
+            if i >= len(lines) or lines[i][0] != indent or not (lines[i][1] == ":" or lines[i][1].startswith(": ")):
+                out[key] = None
+                continue
+            out[key], i = _yaml_inline_block(lines, i, indent)
+            continue
+        split = _split_yaml_key_value(text)
+        if split is None:
+            raise LudusaviError(f"Unsupported {MAPPING_FILE} line: {text[:60]}")
+        key = _unquote_yaml_scalar(split[0])
+        out[key], i = _yaml_value_after(lines, i + 1, indent, split[1].strip())
+    return out, i
+
+
+def _yaml_inline_block(lines: list[tuple[int, str]], i: int, indent: int) -> tuple[Any, int]:
+    """Value after a one-char indicator ("- " item or ": " explicit value) on line i."""
+    text = lines[i][1]
+    body = text[1:].lstrip(" ")
+    offset = indent + len(text) - len(body)
+    if not body:
+        return _yaml_value_after(lines, i + 1, indent, "")
+    if _split_yaml_key_value(body) is not None:
+        lines[i] = (offset, body)
+        return _yaml_map(lines, i, offset)
+    return _yaml_scalar(body), i + 1
+
+
+def _yaml_seq(lines: list[tuple[int, str]], i: int, indent: int) -> tuple[list[Any], int]:
+    out: list[Any] = []
+    while i < len(lines):
+        ind, text = lines[i]
+        if ind > indent:
+            raise LudusaviError(f"Unexpected indentation in {MAPPING_FILE} line: {text[:60]}")
+        if ind < indent or not _is_item(text):
+            break
+        value, i = _yaml_inline_block(lines, i, indent)
+        out.append(value)
+    return out, i
+
+
+def parse_yaml(text: str) -> Any:
+    """Parse block mappings/sequences with plain or quoted scalars (no anchors, no multi-line)."""
+    lines: list[tuple[int, str]] = []
+    for raw in text.splitlines():
+        cleaned = _strip_yaml_comment(raw).rstrip()
+        stripped = cleaned.lstrip(" ")
+        if not stripped or stripped in ("---", "..."):
+            continue
+        if "\t" in cleaned[: len(cleaned) - len(stripped)]:
+            raise LudusaviError(f"Tabs are not valid YAML indentation in {MAPPING_FILE}")
+        lines.append((len(cleaned) - len(stripped), stripped))
+    if not lines:
+        return {}
+    value, end = _yaml_block(lines, 0, lines[0][0])
+    if end != len(lines):
+        raise LudusaviError(f"Could not read {MAPPING_FILE} past: {lines[end][1][:60]}")
+    return value
+
+
+def _q(text: str) -> str:
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _key(text: str) -> str:
+    return text if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", text) else _q(text)
+
+
+def _yaml_out(value: Any) -> str:
+    if value is None:
+        return "~"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, dict):
+        return "{}"
+    if isinstance(value, list):
+        return "[]"
+    return _q(str(value))
+
+
+def _emit(value: Any, indent: int, out: list[str]) -> None:
+    pad = " " * indent
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if isinstance(child, (dict, list)) and child:
+                out.append(f"{pad}{_key(str(key))}:")
+                _emit(child, indent + 2, out)
+            else:
+                out.append(f"{pad}{_key(str(key))}: {_yaml_out(child)}")
+    else:
+        for child in value:
+            if isinstance(child, (dict, list)) and child:
+                sub: list[str] = []
+                _emit(child, indent + 2, sub)
+                sub[0] = f"{pad}- {sub[0][indent + 2:]}"
+                out.extend(sub)
+            else:
+                out.append(f"{pad}- {_yaml_out(child)}")
+
+
+def dump_yaml(value: dict[str, Any]) -> str:
+    out = ["---"]
+    _emit(value, 0, out)
+    return "\n".join(out) + "\n"
+
+
+# --- layout helpers ----------------------------------------------------------------------------
+
+
+def escape_folder_name(name: str) -> str:
+    """Ludusavi's per-game folder name: unsafe characters and a trailing dot/space become '_'."""
+    escaped = _FOLDER_UNSAFE.sub("_", name.strip())
+    if escaped.endswith((".", " ")):
+        escaped = escaped[:-1] + "_"
+    if escaped.startswith("."):
+        escaped = "_" + escaped[1:]
+    return escaped or "_"
+
+
+def _safe_parts(rel: str) -> tuple[str, ...]:
+    """Split a '/' path into components, rejecting traversal, empty parts and control characters."""
+    if "\\" in rel or "\x00" in rel:
+        raise LudusaviError(f"Unsafe path in backup: {rel!r}")
+    parts = tuple(rel.split("/")) if rel else ()
+    for part in parts:
+        if part in ("", ".", "..") or any(ord(c) < 32 for c in part):
+            raise LudusaviError(f"Unsafe path in backup: {rel!r}")
+    return parts
+
+
+def _split_drive(path: str) -> tuple[str, tuple[str, ...]]:
+    """'C:/Users/me/x' -> ('C:', parts); '/home/me/x' -> ('', parts)."""
+    m = _WIN_PATH.match(path)
+    if m:
+        return m.group(1).upper(), _safe_parts(m.group(2) or "")
+    if path.startswith("/"):
+        return "", _safe_parts(path[1:])
+    raise LudusaviError(f"Unsupported path in backup: {path!r}")
+
+
+def _sha1_stream(chunks: Iterator[bytes]) -> tuple[str, int]:
+    h = hashlib.sha1()  # noqa: S324 - Ludusavi's own content hash, not used for security
+    size = 0
+    for chunk in chunks:
+        size += len(chunk)
+        h.update(chunk)
+    return h.hexdigest(), size
+
+
+def _file_chunks(path: Path) -> Iterator[bytes]:
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as fh:
+        while chunk := fh.read(65536):
+            yield chunk
+
+
+# --- export ------------------------------------------------------------------------------------
+
+
+def _export_entries(
+    prefix_dir: Path, game_name: str, game_dir: Path | None, steam_appid: int | None
+) -> tuple[list[tuple[str, Path]], int]:
+    """(original Windows path, source file) for prefix saves, and the count left out."""
+    entries: list[tuple[str, Path]] = []
+    left_out = 0
+    for section, src, rel in save_sync._collect_prefix_save_entries(
+        prefix_dir, game_name=game_name, game_dir=game_dir, steam_appid=steam_appid
+    ):
+        if section not in ("users", "ProgramData"):
+            left_out += 1  # files in the game folder have no stable drive path
+            continue
+        try:
+            parts = _safe_parts(rel.as_posix())
+        except LudusaviError:
+            left_out += 1
+            continue
+        entries.append(("C:/" + "/".join((section, *parts)), src))
+    return entries, left_out
+
+
+def export_ludusavi(
+    prefix_dir: Path,
+    game_name: str,
+    dest_root: Path,
+    *,
+    game_dir: Path | None = None,
+    steam_appid: int | None = None,
+) -> tuple[Path, int, int]:
+    """Write the game's prefix saves as a Ludusavi simple full backup under dest_root.
+
+    Returns (game folder, files exported, files left out). An earlier Ludusavi backup of the same
+    game is replaced; any other existing folder of that name is refused.
+    """
+    entries, left_out = _export_entries(prefix_dir, game_name, game_dir, steam_appid)
+    if not entries:
+        raise LudusaviError(f"No saves found for {game_name}")
+    if len(entries) > _RESTORE_MAX_ENTRIES:
+        raise LudusaviError(f"Too many save files ({len(entries)})")
+    target = dest_root / escape_folder_name(game_name)
+    if target.is_symlink() or (target.exists() and not (target / MAPPING_FILE).is_file()):
+        raise LudusaviError(f"{target} exists and is not a Ludusavi backup")
+    dest_root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(dest_root)))
+    try:
+        files: dict[str, Any] = {}
+        total = 0
+        for original, src in entries:
+            dst = tmp / "drive-C" / original[3:]
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            h = hashlib.sha1()  # noqa: S324 - format-defined hash
+            size = 0
+            with dst.open("wb") as out:
+                for chunk in _file_chunks(src):
+                    size += len(chunk)
+                    total += len(chunk)
+                    if size > _RESTORE_MAX_FILE_BYTES or total > _RESTORE_MAX_TOTAL_BYTES:
+                        raise LudusaviError(f"Save files too large to export ({src.name})")
+                    h.update(chunk)
+                    out.write(chunk)
+            files[original] = {"hash": h.hexdigest(), "size": size}
+        mapping = {
+            "name": game_name,
+            "drives": {"drive-C": "C:"},
+            "backups": [
+                {
+                    "name": ".",
+                    "when": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "os": "windows",
+                    "files": files,
+                    "registry": {"hash": None},
+                    "children": [],
+                }
+            ],
+        }
+        (tmp / MAPPING_FILE).write_text(dump_yaml(mapping), encoding="utf-8")
+        if target.exists():
+            shutil.rmtree(target)
+        os.replace(tmp, target)
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    return target, len(files), left_out
+
+
+# --- import ------------------------------------------------------------------------------------
+
+
+def load_mapping(game_folder: Path) -> dict[str, Any]:
+    path = game_folder / MAPPING_FILE
+    if path.is_symlink() or not path.is_file():
+        raise LudusaviError(f"{MAPPING_FILE} not found in {game_folder}")
+    if path.stat().st_size > _MAPPING_MAX_BYTES:
+        raise LudusaviError(f"{MAPPING_FILE} is too large")
+    data = parse_yaml(path.read_text(encoding="utf-8", errors="replace"))
+    if not isinstance(data, dict) or not isinstance(data.get("backups"), list):
+        raise LudusaviError(f"{MAPPING_FILE} has no backups list")
+    return data
+
+
+def find_game_folder(root: Path, game_name: str) -> Path | None:
+    """root itself when it holds mapping.yaml, else the child backup whose name matches the game."""
+    if (root / MAPPING_FILE).is_file():
+        return root
+    direct = root / escape_folder_name(game_name)
+    if (direct / MAPPING_FILE).is_file():
+        return direct
+    want = _norm_key(game_name)
+    try:
+        children = sorted(root.iterdir())
+    except OSError:
+        return None
+    for child in children:
+        if child.is_symlink() or not (child / MAPPING_FILE).is_file():
+            continue
+        try:
+            name = load_mapping(child).get("name")
+        except (LudusaviError, OSError):
+            continue
+        if isinstance(name, str) and want and _norm_key(name) == want:
+            return child
+    return None
+
+
+def _newest_files(mapping: dict[str, Any]) -> tuple[str, dict[str, tuple[str, str, int]]]:
+    """(label, {original path: (backup name, sha1, size)}) for the newest full backup + child."""
+    backups = [b for b in mapping["backups"] if isinstance(b, dict)]
+    if not backups:
+        raise LudusaviError("The backup holds no full backup")
+    full = backups[-1]
+    chain = [full]
+    children = full.get("children")
+    if isinstance(children, list) and children and isinstance(children[-1], dict):
+        chain.append(children[-1])
+    files: dict[str, tuple[str, str, int]] = {}
+    label = ""
+    for backup in chain:
+        name = str(backup.get("name") or "")
+        if name != "." and (not _BACKUP_NAME.match(name) or ".." in name):
+            raise LudusaviError(f"Unsafe backup name: {name!r}")
+        label = name
+        raw = backup.get("files") or {}
+        if not isinstance(raw, dict):
+            raise LudusaviError(f"Backup {name!r} has no file list")
+        for original, info in raw.items():
+            if info is None:  # removed in this differential backup
+                files.pop(original, None)
+                continue
+            if not isinstance(info, dict):
+                raise LudusaviError(f"Bad entry for {original!r}")
+            digest, size = str(info.get("hash") or "").lower(), info.get("size")
+            if not re.fullmatch(r"[0-9a-f]{40}", digest) or not isinstance(size, int) or size < 0:
+                raise LudusaviError(f"Missing hash or size for {original!r}")
+            files[original] = (name, digest, size)
+    if len(files) > _RESTORE_MAX_ENTRIES:
+        raise LudusaviError(f"Too many files in backup ({len(files)})")
+    return label, files
+
+
+def _drive_folders(mapping: dict[str, Any]) -> dict[str, str]:
+    """{original drive ('C:' / '') : folder name}."""
+    raw = mapping.get("drives") or {}
+    if not isinstance(raw, dict):
+        raise LudusaviError("Bad drives table")
+    out: dict[str, str] = {}
+    for folder, drive in raw.items():
+        if not _DRIVE_FOLDER.match(str(folder)):
+            raise LudusaviError(f"Unsafe drive folder: {folder!r}")
+        drv = str(drive or "").rstrip("/").upper()
+        out[drv] = str(folder)
+    return out
+
+
+def _target_for(drive: str, parts: tuple[str, ...], home: Path) -> tuple[str, tuple[str, ...]] | None:
+    """('prefix', parts under drive_c) or ('home', parts under home); None when it does not map."""
+
+    def windows(rest: tuple[str, ...]) -> tuple[str, tuple[str, ...]] | None:
+        if not rest:
+            return None
+        if rest[0].lower() == "users" and len(rest) >= 3:
+            user = "Public" if rest[1].lower() == "public" else "steamuser"
+            return "prefix", ("users", user, *rest[2:])
+        if rest[0].lower() == "users":
+            return None
+        return "prefix", rest
+
+    if drive == "C:":
+        return windows(parts)
+    if drive:
+        return None  # other Windows drives (game install folders) have no place in a prefix
+    lowered = [p.lower() for p in parts]
+    if "drive_c" in lowered:
+        return windows(parts[lowered.index("drive_c") + 1:])
+    home_parts = home.parts[1:]
+    if len(parts) > len(home_parts) and parts[: len(home_parts)] == home_parts:
+        return "home", parts[len(home_parts):]
+    return None
+
+
+def _ci_path(base: Path, parts: tuple[str, ...]) -> tuple[str, ...]:
+    """Reuse existing directory names that differ only in case (Wine paths are case-insensitive)."""
+    cur, out = base, []
+    for part in parts[:-1]:
+        found = save_sync._find_child_ci(cur, part.lower()) if not (cur / part).exists() else None
+        name = found.name if found is not None else part
+        out.append(name)
+        cur = cur / name
+    return (*out, parts[-1])
+
+
+class _Source(NamedTuple):
+    original: str
+    zip_path: Path | None  # None: a plain file at file_path
+    member: str
+    file_path: Path
+    digest: str
+    size: int
+
+
+def _source_chunks(src: _Source, zips: dict[Path, zipfile.ZipFile]) -> Iterator[bytes]:
+    if src.zip_path is None:
+        yield from _file_chunks(src.file_path)
+        return
+    zf = zips[src.zip_path]
+    try:
+        info = zf.getinfo(src.member)
+    except KeyError as exc:
+        raise LudusaviError(f"Missing in backup: {src.original}") from exc
+    if (info.external_attr >> 16) & 0o170000 == 0o120000 or info.file_size > _RESTORE_MAX_FILE_BYTES:
+        raise LudusaviError(f"Unsafe entry in backup: {src.original}")
+    with zf.open(info) as fh:
+        while chunk := fh.read(65536):
+            yield chunk
+
+
+def _bounded(chunks: Iterator[bytes], limit: int, original: str) -> Iterator[bytes]:
+    seen = 0
+    for chunk in chunks:
+        seen += len(chunk)
+        if seen > limit:
+            raise LudusaviError(f"File larger than recorded: {original}")
+        yield chunk
+
+
+def import_ludusavi(
+    game_folder: Path,
+    prefix_dir: Path,
+    game_name: str,
+    *,
+    home: Path | None = None,
+    game_dir: Path | None = None,
+    steam_appid: int | None = None,
+    dest_root: Path | None = None,
+) -> ImportResult:
+    """Restore the newest backup in game_folder into prefix_dir (see the module docstring)."""
+    home = (home or Path.home()).resolve()
+    mapping = load_mapping(game_folder)
+    label, files = _newest_files(mapping)
+    drives = _drive_folders(mapping)
+    drive_c = save_sync._resolve_drive_c_target(prefix_dir)
+    folder = game_folder.resolve()
+
+    # 1. Map and validate every path before touching anything.
+    plan: list[tuple[_Source, str, tuple[str, ...]]] = []
+    skipped = 0
+    for original, (backup, digest, size) in sorted(files.items()):
+        drive, parts = _split_drive(original)
+        if not parts:
+            raise LudusaviError(f"Unsafe path in backup: {original!r}")
+        dfolder = drives.get(drive) or ("drive-0" if drive == "" else f"drive-{drive[:1]}")
+        base = folder if backup == "." else folder / backup
+        zip_path = folder / f"{backup}.zip" if backup != "." and not base.is_dir() else None
+        member = "/".join((dfolder, *parts))
+        file_path = base.joinpath(dfolder, *parts)
+        if zip_path is None and (not is_within(file_path, folder, strict=True) or not file_path.is_file()):
+            raise LudusaviError(f"Missing in backup: {original}")
+        if zip_path is not None and (zip_path.is_symlink() or not zip_path.is_file()):
+            raise LudusaviError(f"Missing in backup: {original}")
+        target = _target_for(drive, parts, home)
+        if target is None:
+            skipped += 1
+            continue
+        plan.append((_Source(original, zip_path, member, file_path, digest, size), *target))
+
+    zips: dict[Path, zipfile.ZipFile] = {}
+    try:
+        for src, _, _ in plan:
+            if src.zip_path is not None and src.zip_path not in zips:
+                zips[src.zip_path] = zipfile.ZipFile(src.zip_path)
+
+        # 2. Every file must match its recorded sha1 and size.
+        total = 0
+        for src, _, _ in plan:
+            total += src.size
+            if src.size > _RESTORE_MAX_FILE_BYTES or total > _RESTORE_MAX_TOTAL_BYTES:
+                raise LudusaviError(f"Backup too large: {src.original}")
+            digest, size = _sha1_stream(_bounded(_source_chunks(src, zips), src.size, src.original))
+            if digest != src.digest or size != src.size:
+                raise LudusaviError(f"Hash mismatch for {src.original}")
+
+        # 3. Decide per target: new, identical, or an overwrite.
+        writes: list[tuple[_Source, Path, Path, tuple[str, ...]]] = []
+        overwrites: list[tuple[_Source, Path, Path, tuple[str, ...], str]] = []
+        unchanged = kept = 0
+        for src, kind, parts in plan:
+            base = drive_c if kind == "prefix" else home
+            parts = _ci_path(base, parts)
+            dst = base.joinpath(*parts)
+            if dst.is_symlink() or (dst.exists() and not dst.is_file()):
+                kept += 1
+                continue
+            if not dst.exists():
+                writes.append((src, base, dst, parts))
+                continue
+            if _sha1_stream(_file_chunks(dst))[0] == src.digest:
+                unchanged += 1
+            elif kind == "prefix":
+                overwrites.append((src, base, dst, parts, "/".join(parts)))
+            else:
+                kept += 1
+
+        # 4. Overwrite only what the safety snapshot holds.
+        snapshot: Path | None = None
+        if overwrites:
+            snapshot = save_sync.auto_snapshot(
+                prefix_dir, game_name, "pre-import", keep=0,
+                game_dir=game_dir, steam_appid=steam_appid, dest_root=dest_root,
+            )
+            covered: set[str] = set()
+            if snapshot is not None:
+                with zipfile.ZipFile(snapshot) as zf:
+                    covered = {n.split("/", 1)[1] for n in zf.namelist() if "/" in n}
+            for src, base, dst, parts, rel in overwrites:
+                if rel in covered:
+                    writes.append((src, base, dst, parts))
+                else:
+                    kept += 1
+
+        # 5. Write atomically, checking the hash again while copying.
+        restored = 0
+        for src, base, dst, parts in writes:
+            if not _safe_parents_within(base, base.resolve(), parts[:-1]):
+                kept += 1
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=str(dst.parent))
+            tmp = Path(tmp_name)
+            try:
+                h = hashlib.sha1()  # noqa: S324 - format-defined hash
+                with os.fdopen(fd, "wb") as out:
+                    for chunk in _bounded(_source_chunks(src, zips), src.size, src.original):
+                        h.update(chunk)
+                        out.write(chunk)
+                if h.hexdigest() != src.digest:
+                    raise LudusaviError(f"Hash mismatch for {src.original}")
+                os.replace(tmp, dst)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
+            restored += 1
+    finally:
+        for zf in zips.values():
+            zf.close()
+    return ImportResult(restored, unchanged, kept, skipped, label, snapshot)

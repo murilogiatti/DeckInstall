@@ -74,22 +74,48 @@ def test_inno_arguments(tmp_path: Path) -> None:
     plain = tmp_path / "nsis.exe"
     plain.write_bytes(b"MZ")
     assert extractor.installer_arguments(plain, target, silent=True) == []
+    # Outside $HOME and /run/media there is no X:/V:, so Z: stays.
+    with mock.patch.object(extractor, "_repack_drives", return_value=(("x:", tmp_path / "home"),)):
+        assert extractor.installer_arguments(setup, target, repack_drive=True)[0].startswith("/DIR=Z:")
+
+
+def test_repack_dir_goes_through_x_or_v(tmp_path: Path) -> None:
+    # unarc fails with -11 "Unable to write data to disk" through Z:; X: ($HOME) and V: work.
+    home, media = tmp_path / "home", tmp_path / "media"
+    with mock.patch.object(extractor, "_repack_drives", return_value=(("x:", home), ("v:", media))):
+        assert extractor.repack_drive_path(home / "DeckInstall" / "Games" / "My Game") == (
+            "x:", home, "X:\\DeckInstall\\Games\\My Game"
+        )
+        assert extractor.repack_drive_path(media / "sd" / "DeckInstall" / "Games" / "G")[2] == (
+            "V:\\sd\\DeckInstall\\Games\\G"
+        )
+        assert extractor.repack_drive_path(tmp_path / "elsewhere" / "G") is None
 
 
 def test_repack_installs_into_dir_and_discards_prefix(tmp_path: Path) -> None:
     setup = _repack(tmp_path)
-    target = tmp_path / "Lib" / "Games" / "Game"
+    home = tmp_path / "home"
+    target = home / "DeckInstall" / "Games" / "Game"
+    seen: dict[str, Path] = {}
 
-    def installer(_cmd: list[str], _env: dict[str, str]) -> None:
-        (target / "Game.exe").write_bytes(b"MZ")
-        (Path(_env["WINEPREFIX"]) / "drive_c").mkdir(parents=True)
+    def installer(_cmd: list[str], env: dict[str, str]) -> None:
+        drive = Path(env["WINEPREFIX"]) / "dosdevices" / "x:"
+        seen["x"] = drive.resolve()
+        game = drive / "DeckInstall" / "Games" / "Game"  # the installer writes through X:\...
+        game.mkdir(parents=True, exist_ok=True)
+        (game / "Game.exe").write_bytes(b"MZ")
+        (Path(env["WINEPREFIX"]) / "drive_c").mkdir(parents=True)
 
     runner = _Runner(installer)
-    with mock.patch.object(extractor, "check_disk_space") as space:
+    with (
+        mock.patch.object(extractor, "_repack_drives", return_value=(("x:", home),)),
+        mock.patch.object(extractor, "check_disk_space") as space,
+    ):
         out = _run(runner, setup, target, repack=True, silent=True)
 
+    assert seen["x"] == home.resolve()
     assert out == target and (target / "Game.exe").is_file()
-    assert any(a.startswith("/DIR=Z:") for a in runner.cmd) and "/SILENT" in runner.cmd
+    assert "/DIR=X:\\DeckInstall\\Games\\Game" in runner.cmd and "/SILENT" in runner.cmd
     assert runner.env["WINE_LARGE_ADDRESS_AWARE"] == "0"
     assert space.call_args.args[1] >= 2 * (1000 + len(INNO) + 1)
     assert not (target / ".deckinstall_installer_pfx").exists()

@@ -15,9 +15,9 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from deckinstall import standalone  # noqa: E402
+from deckinstall.cleanup import find_cleanup_candidates  # noqa: E402
 from deckinstall.manifest import MANIFEST_V2  # noqa: E402
 from deckinstall.steam_paths import SteamPaths  # noqa: E402
-from deckinstall.steam_vdf import find_cleanup_candidates  # noqa: E402
 
 APPID = 3000000001
 

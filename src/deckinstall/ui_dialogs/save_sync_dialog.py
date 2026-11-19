@@ -1,46 +1,510 @@
-"""Folder-based Save Sync and Auto-Snapshot settings dialog."""
+"""Backup/Sync page (per-game snapshots, Ludusavi import/export) and the folder Save Sync dialog."""
 
 from __future__ import annotations
 
+import logging
+import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import QSettings, Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
+    QWidget,
 )
 
 from .. import __app_name__
+from .. import ludusavi as lds
 from ..i18n import tr
 from ..save_sync import (
     DEFAULT_SYNC_DIR,
+    SNAPSHOT_KEEP_DEFAULT,
+    SaveArchiveEntry,
     SyncDryRunPreview,
     SyncPlanItem,
+    _slugify,
+    auto_snapshot,
+    list_save_archives,
     plan_sync_all,
     preview_sync_operation,
     pull_game_saves,
     push_game_saves,
+    restore_snapshot_safely,
+    snapshot_after_play,
+    snapshot_dir_for,
 )
-from ..ui_cards import _dialog_parent, _format_worker_error, _setting_bool
+from ..standalone import game_log_dir
+from ..steam_vdf import DEFAULT_SAVES_DIR
+from ..ui_cards import (
+    _dialog_parent,
+    _format_worker_error,
+    _make_card,
+    _pick_dir_async,
+    _setting_bool,
+    _SortableTableItem,
+    format_size_bytes,
+)
+from ..ui_workers import SteamOpWorker
 
 if TYPE_CHECKING:
     from ..ui import MainWindow
 
+AUTO_SNAPSHOT_KEY = "safety/auto_snapshot"
+KEEP_KEY = "saves/keep_snapshots"
+AFTER_PLAY_KEY = "saves/snapshot_after_play"
+LUDUSAVI_DIR_KEY = "saves/ludusavi_folder"
+
+
+class SaveTarget(NamedTuple):
+    """A game whose Wine prefix holds saves."""
+
+    name: str
+    prefix_dir: Path
+    game_dir: Path | None
+    steam_appid: int | None
+    run_log: Path | None  # launch.sh run log (library games only)
+
+
+class SaveRow(NamedTuple):
+    """One line of the Backup/Sync table (target None: snapshots of a game no longer installed)."""
+
+    slug: str
+    name: str
+    target: SaveTarget | None
+    snapshots: int
+    last_mtime: float
+    size_bytes: int
+
+
+def snapshot_keep(settings: QSettings) -> int:
+    """Snapshots kept per game (setting saves/keep_snapshots)."""
+    try:
+        value = int(str(settings.value(KEEP_KEY, SNAPSHOT_KEEP_DEFAULT)))
+    except (TypeError, ValueError):
+        return SNAPSHOT_KEEP_DEFAULT
+    return max(1, min(50, value))
+
+
+def collect_save_targets(win: MainWindow) -> list[SaveTarget]:
+    """Library, Steam shortcut and other-launcher games with a Wine prefix (first name wins)."""
+    targets: list[SaveTarget] = []
+    for sg in win._standalone_games:
+        if not sg.native_linux:
+            targets.append(
+                SaveTarget(sg.name, sg.prefix_dir, sg.game_dir, sg.steam_appid, game_log_dir(sg) / "run.log")
+            )
+    if win.paths is not None:
+        for entry in win._steam_shortcuts:
+            compat = win.paths.compatdata_dir / str(entry.appid_u32)
+            pfx = compat / "pfx" if (compat / "pfx").is_dir() else compat
+            raw_dir = entry.start_dir.strip().strip('"')
+            targets.append(SaveTarget(entry.app_name, pfx, Path(raw_dir) if raw_dir else None, None, None))
+    for ext in win._external_games:
+        if ext.prefix_dir is not None and ext.runner != "linux":
+            targets.append(SaveTarget(ext.name, ext.prefix_dir, ext.game_dir, None, None))
+    seen: set[str] = set()
+    unique: list[SaveTarget] = []
+    for t in targets:
+        slug = _slugify(t.name)
+        if slug not in seen:
+            seen.add(slug)
+            unique.append(t)
+    return unique
+
+
+def build_save_rows(targets: list[SaveTarget], archives: list[SaveArchiveEntry]) -> list[SaveRow]:
+    """Group snapshot archives per game; games without snapshots and orphan snapshots included."""
+    stats: dict[str, list[float]] = {}  # slug -> [count, last mtime, size]
+    for a in archives:
+        if a.kind not in ("save_snapshot", "state_snapshot") or not a.game_slug:
+            continue
+        st = stats.setdefault(a.game_slug, [0, 0.0, 0])
+        st[2] += a.size_bytes
+        if a.kind == "save_snapshot":
+            st[0] += 1
+            st[1] = max(st[1], a.mtime)
+    rows: list[SaveRow] = []
+    for t in targets:
+        slug = _slugify(t.name)
+        c, m, z = stats.pop(slug, [0, 0.0, 0])
+        rows.append(SaveRow(slug, t.name, t, int(c), m, int(z)))
+    for slug, (c, m, z) in sorted(stats.items()):
+        rows.append(SaveRow(slug, slug, None, int(c), m, int(z)))
+    return rows
+
+
+def _snapshots_of(slug: str) -> list[SaveArchiveEntry]:
+    return [
+        a for a in list_save_archives()
+        if a.game_slug == slug and a.kind in ("save_snapshot", "state_snapshot")
+    ]
+
+
+def build_saves_page(win: MainWindow) -> QWidget:
+    """The Backup/Sync page: settings, full backups, per-game snapshots and Ludusavi import/export."""
+    page = QWidget()
+    layout = QVBoxLayout(page)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(14)
+
+    title = QLabel(tr("saves.page_title"))
+    title.setObjectName("PageTitle")
+    subtitle = QLabel(tr("saves.page_subtitle"))
+    subtitle.setObjectName("MutedText")
+    subtitle.setWordWrap(True)
+    layout.addWidget(title)
+    layout.addWidget(subtitle)
+
+    card, card_layout = _make_card()
+    folder_label = QLabel(tr("saves.default_folder", path=DEFAULT_SAVES_DIR))
+    folder_label.setWordWrap(True)
+    card_layout.addWidget(folder_label)
+
+    chk_auto = QCheckBox(tr("save_sync.auto_snapshot"))
+    chk_auto.setChecked(_setting_bool(win.settings, AUTO_SNAPSHOT_KEY, True))
+    chk_auto.toggled.connect(lambda on: win.settings.setValue(AUTO_SNAPSHOT_KEY, bool(on)))
+    chk_play = QCheckBox(tr("saves.after_play"))
+    chk_play.setChecked(_setting_bool(win.settings, AFTER_PLAY_KEY, True))
+    chk_play.toggled.connect(lambda on: win.settings.setValue(AFTER_PLAY_KEY, bool(on)))
+    card_layout.addWidget(chk_auto)
+    card_layout.addWidget(chk_play)
+    keep_row = QHBoxLayout()
+    keep_row.addWidget(QLabel(tr("saves.keep_label")))
+    spin_keep = QSpinBox()
+    spin_keep.setRange(1, 50)
+    spin_keep.setValue(snapshot_keep(win.settings))
+    spin_keep.valueChanged.connect(lambda v: win.settings.setValue(KEEP_KEY, int(v)))
+    keep_row.addWidget(spin_keep)
+    keep_row.addStretch()
+    card_layout.addLayout(keep_row)
+    win.chk_save_auto, win.chk_save_after_play, win.spin_save_keep = chk_auto, chk_play, spin_keep
+
+    buttons = QHBoxLayout()
+    win.btn_save_backup = QPushButton(tr("library.btn_backup_saves"))
+    win.btn_save_backup.clicked.connect(win._backup_all_saves)
+    win.btn_save_restore = QPushButton(tr("library.btn_restore_saves"))
+    win.btn_save_restore.clicked.connect(win._restore_saves_backup)
+    win.btn_save_sync = QPushButton(tr("saves.btn_sync"))
+    win.btn_save_sync.clicked.connect(win._open_save_sync_dialog)
+    win.btn_save_refresh = QPushButton(tr("save_sync.btn_refresh"))
+    win.btn_save_refresh.clicked.connect(lambda: refresh_saves_page(win))
+    for b in (win.btn_save_backup, win.btn_save_restore, win.btn_save_sync):
+        buttons.addWidget(b)
+    buttons.addStretch()
+    buttons.addWidget(win.btn_save_refresh)
+    card_layout.addLayout(buttons)
+
+    table = QTableWidget(0, 4)
+    table.setHorizontalHeaderLabels(
+        [tr("add.detected_name_column"), tr("saves.column_last"), tr("saves.column_count"), tr("maint.column_size")]
+    )
+    table.verticalHeader().setVisible(False)
+    table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+    table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+    for col in (1, 2, 3):
+        table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+    table.setSortingEnabled(True)
+    table.setMinimumHeight(220)
+    table.currentCellChanged.connect(lambda *_a: update_saves_action_states(win))
+    win.saves_list = table
+    card_layout.addWidget(table, 1)
+
+    win.lbl_saves_empty = QLabel(tr("saves.empty_list"))
+    win.lbl_saves_empty.setObjectName("MutedText")
+    win.lbl_saves_empty.setWordWrap(True)
+    card_layout.addWidget(win.lbl_saves_empty)
+
+    footer = QHBoxLayout()
+    win.btn_save_snapshot_now = QPushButton(tr("saves.btn_snapshot_now"))
+    win.btn_save_snapshot_now.setObjectName("primaryBtn")
+    win.btn_save_snapshot_now.clicked.connect(lambda: _snapshot_now(win))
+    win.btn_save_restore_selected = QPushButton(tr("saves.btn_restore_selected"))
+    win.btn_save_restore_selected.clicked.connect(lambda: _restore_selected(win))
+    win.btn_save_open_folder = QPushButton(tr("saves.btn_open_folder"))
+    win.btn_save_open_folder.clicked.connect(lambda: _open_folder(win))
+    win.btn_save_export = QPushButton(tr("saves.btn_export"))
+    win.btn_save_export.clicked.connect(lambda: _ludusavi_pick(win, export=True))
+    win.btn_save_import = QPushButton(tr("saves.btn_import"))
+    win.btn_save_import.clicked.connect(lambda: _ludusavi_pick(win, export=False))
+    for b in (win.btn_save_snapshot_now, win.btn_save_restore_selected, win.btn_save_open_folder):
+        footer.addWidget(b)
+    footer.addStretch()
+    footer.addWidget(win.btn_save_export)
+    footer.addWidget(win.btn_save_import)
+    card_layout.addLayout(footer)
+
+    layout.addWidget(card, 1)
+    refresh_saves_page(win)
+    return page
+
+
+def save_row_buttons(win: MainWindow) -> tuple[QPushButton, ...]:
+    return (
+        win.btn_save_snapshot_now,
+        win.btn_save_restore_selected,
+        win.btn_save_open_folder,
+        win.btn_save_export,
+        win.btn_save_import,
+    )
+
+
+def _selected_row(win: MainWindow) -> SaveRow | None:
+    item = win.saves_list.item(win.saves_list.currentRow(), 0)
+    data = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+    return data if isinstance(data, SaveRow) else None
+
+
+def update_saves_action_states(win: MainWindow) -> None:
+    row = _selected_row(win)
+    idle = not win._steam_busy
+    has_target = row is not None and row.target is not None
+    win.btn_save_snapshot_now.setEnabled(idle and has_target)
+    win.btn_save_restore_selected.setEnabled(idle and has_target and row is not None and row.snapshots > 0)
+    win.btn_save_open_folder.setEnabled(row is not None)
+    win.btn_save_export.setEnabled(idle and has_target)
+    win.btn_save_import.setEnabled(idle and has_target)
+
+
+def refresh_saves_page(win: MainWindow, after_play: bool = True) -> None:
+    """Reload the per-game table; with after_play, snapshot games played since the last look."""
+    if not hasattr(win, "saves_list"):
+        return  # the page is not built yet
+    targets = collect_save_targets(win)
+    selected = _selected_row(win)
+    rows = build_save_rows(targets, list_save_archives())
+    table = win.saves_list
+    table.setSortingEnabled(False)
+    table.setRowCount(0)
+    for r, row in enumerate(rows):
+        table.insertRow(r)
+        name_item = QTableWidgetItem(row.name if row.target is not None else tr("saves.orphan", name=row.name))
+        name_item.setData(Qt.ItemDataRole.UserRole, row)
+        last = time.strftime("%Y-%m-%d %H:%M", time.localtime(row.last_mtime)) if row.snapshots else "-"
+        table.setItem(r, 0, name_item)
+        table.setItem(r, 1, _SortableTableItem(last, sort_key=row.last_mtime))
+        table.setItem(r, 2, _SortableTableItem(str(row.snapshots), sort_key=row.snapshots))
+        table.setItem(r, 3, _SortableTableItem(format_size_bytes(row.size_bytes), sort_key=row.size_bytes))
+        if selected is not None and row.slug == selected.slug:
+            table.setCurrentCell(r, 0)
+    table.setSortingEnabled(True)
+    win.lbl_saves_empty.setVisible(not rows)
+    update_saves_action_states(win)
+    if after_play and _setting_bool(win.settings, AFTER_PLAY_KEY, True):
+        _start_after_play(win, [t for t in targets if t.run_log is not None])
+
+
+def _start_after_play(win: MainWindow, targets: list[SaveTarget]) -> None:
+    if not targets or win._after_play_running or win._closing_pending:
+        return
+    keep = snapshot_keep(win.settings)
+
+    def _job() -> object:
+        made = 0
+        for t in targets:
+            assert t.run_log is not None
+            try:
+                if snapshot_after_play(
+                    t.prefix_dir, t.name, t.run_log, keep=keep, game_dir=t.game_dir, steam_appid=t.steam_appid
+                ) is not None:
+                    made += 1
+            except Exception as exc:  # one bad prefix must not stop the others
+                logging.getLogger(__name__).warning("After-play snapshot of %s failed: %s", t.name, exc)
+        return made
+
+    worker = SteamOpWorker(_job)
+    win._track_worker(worker)
+    win._after_play_running = True
+
+    def _done(made: object) -> None:
+        win._after_play_running = False
+        if not win._closing_pending and isinstance(made, int) and made:
+            refresh_saves_page(win, after_play=False)
+
+    def _err(_e: str) -> None:
+        win._after_play_running = False
+
+    worker.finished_ok.connect(_done)
+    worker.failed.connect(_err)
+    worker.start()
+
+
+def _run(
+    win: MainWindow, status: str, job: Callable[[], object], on_ok: Callable[[object], None]
+) -> None:
+    """Run job() in a worker with the window busy; on_ok(result) on the UI thread."""
+    win._begin_busy()
+    win.status_label.setText(status)
+    worker = SteamOpWorker(job)
+    win._track_worker(worker)
+
+    def _done(res: object) -> None:
+        win._end_busy()
+        win.status_label.setText(tr("status.ready"))
+        refresh_saves_page(win, after_play=False)
+        if not win._closing_pending:
+            on_ok(res)
+
+    def _err(err: str) -> None:
+        win._end_busy()
+        win.status_label.setText(tr("status.ready"))
+        if not win._closing_pending:
+            QMessageBox.critical(_dialog_parent(win), __app_name__, tr("saves.error", err=err))
+
+    worker.finished_ok.connect(_done)
+    worker.failed.connect(_err)
+    worker.start()
+def _info(win: MainWindow, msg: str) -> None:
+    win.status_label.setText(msg.splitlines()[0])
+    QMessageBox.information(_dialog_parent(win), __app_name__, msg)
+
+
+def _snapshot_now(win: MainWindow) -> None:
+    row = _selected_row(win)
+    if row is None or row.target is None or win._steam_busy:
+        return
+    t, keep = row.target, snapshot_keep(win.settings)
+    before = {a.path for a in _snapshots_of(row.slug)}
+
+    def _ok(res: object) -> None:
+        if not isinstance(res, Path):
+            _info(win, tr("saves.no_saves", name=t.name))
+        elif res in before:
+            _info(win, tr("saves.snapshot_unchanged", name=t.name))
+        else:
+            _info(win, tr("saves.snapshot_done", name=t.name, path=res))
+
+    _run(
+        win,
+        tr("saves.snapshot_running", name=t.name),
+        lambda: auto_snapshot(
+            t.prefix_dir, t.name, "manual", keep=keep, game_dir=t.game_dir, steam_appid=t.steam_appid
+        ),
+        _ok,
+    )
+
+
+def _restore_selected(win: MainWindow) -> None:
+    row = _selected_row(win)
+    if row is None or row.target is None or win._steam_busy:
+        return
+    t = row.target
+    snaps = _snapshots_of(row.slug)
+    if not snaps:
+        return
+    kinds = {"save_snapshot": tr("saves.type_save_snapshot"), "state_snapshot": tr("saves.type_state_snapshot")}
+    labels = [
+        f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(a.mtime))}  {a.path.stem}  "
+        f"({kinds.get(a.kind, a.kind)}, {format_size_bytes(a.size_bytes)})"
+        for a in snaps
+    ]
+    picked, ok = QInputDialog.getItem(
+        _dialog_parent(win), __app_name__, tr("saves.pick_snapshot", name=t.name), labels, 0, False
+    )
+    if not ok or picked not in labels:
+        return
+    entry = snaps[labels.index(picked)]
+    if QMessageBox.question(
+        _dialog_parent(win), __app_name__, tr("saves.confirm_restore", name=t.name, snap=entry.path.name)
+    ) != QMessageBox.StandardButton.Yes:
+        return
+
+    def _ok(res: object) -> None:
+        count, safety = res if isinstance(res, tuple) else (0, None)
+        _info(win, tr("saves.snapshot_restored", name=t.name, count=count, safety=safety or "-"))
+
+    _run(
+        win,
+        tr("saves.restore_running", name=t.name),
+        lambda: restore_snapshot_safely(
+            entry.path, t.prefix_dir, t.name, state=entry.kind == "state_snapshot",
+            game_dir=t.game_dir, steam_appid=t.steam_appid,
+        ),
+        _ok,
+    )
+
+
+def _open_folder(win: MainWindow) -> None:
+    row = _selected_row(win)
+    if row is None:
+        return
+    folder = snapshot_dir_for(row.name).parent / row.slug
+    folder.mkdir(parents=True, exist_ok=True)
+    QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+
+def _ludusavi_pick(win: MainWindow, *, export: bool) -> None:
+    row = _selected_row(win)
+    if row is None or row.target is None or win._steam_busy:
+        return
+    t = row.target
+    start = Path(str(win.settings.value(LUDUSAVI_DIR_KEY, str(Path.home() / "ludusavi-backup"))))
+    title = tr("saves.pick_export") if export else tr("saves.pick_import")
+
+    def _picked(chosen: str) -> None:
+        if not chosen:
+            return
+        root = Path(chosen)
+        win.settings.setValue(LUDUSAVI_DIR_KEY, str(root if export else root.parent))
+        if export:
+
+            def _exported(res: object) -> None:
+                if isinstance(res, tuple):
+                    path, count, left = res
+                    _info(win, tr("saves.export_done", name=t.name, count=count, left=left, path=path))
+
+            _run(
+                win,
+                tr("saves.export_running", name=t.name),
+                lambda: lds.export_ludusavi(t.prefix_dir, t.name, root, game_dir=t.game_dir, steam_appid=t.steam_appid),
+                _exported,
+            )
+            return
+        folder = lds.find_game_folder(root, t.name)
+        if folder is None:
+            QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.import_not_found", name=t.name, path=root))
+            return
+        if QMessageBox.question(
+            _dialog_parent(win), __app_name__, tr("saves.confirm_import", name=t.name, path=folder)
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        def _ok(res: object) -> None:
+            if isinstance(res, lds.ImportResult):
+                _info(win, tr(
+                    "saves.import_done", name=t.name, restored=res.restored, unchanged=res.unchanged,
+                    kept=res.kept, skipped=res.skipped, safety=res.snapshot or "-",
+                ))
+
+        _run(
+            win,
+            tr("saves.import_running", name=t.name),
+            lambda: lds.import_ludusavi(folder, t.prefix_dir, t.name, game_dir=t.game_dir, steam_appid=t.steam_appid),
+            _ok,
+        )
+
+    _pick_dir_async(_dialog_parent(win), title, start if start.is_dir() else Path.home(), _picked)
+
 
 def open_save_sync_dialog(win: MainWindow) -> None:
-    """Open folder-based Save Sync and Auto-Snapshot settings dialog."""
+    """Open the folder-based Save Sync dialog."""
     dlg = QDialog(_dialog_parent(win))
     dlg.setWindowTitle(tr("save_sync.title"))
     dlg.resize(640, 520)
@@ -67,13 +531,6 @@ def open_save_sync_dialog(win: MainWindow) -> None:
     folder_row.addWidget(sync_dir_edit, 1)
     folder_row.addWidget(btn_browse)
     lay.addLayout(folder_row)
-
-    chk_auto_snap = QCheckBox(tr("save_sync.auto_snapshot"))
-    chk_auto_snap.setChecked(_setting_bool(win.settings, "safety/auto_snapshot", True))
-    chk_auto_snap.toggled.connect(
-        lambda checked: win.settings.setValue("safety/auto_snapshot", bool(checked))
-    )
-    lay.addWidget(chk_auto_snap)
 
     plan_top = QHBoxLayout()
     plan_top.addWidget(QLabel(tr("save_sync.plan_label")))
@@ -119,17 +576,7 @@ def open_save_sync_dialog(win: MainWindow) -> None:
     current_plan: list[SyncPlanItem] = []
 
     def _collect_games_for_sync() -> list[tuple[str, Path]]:
-        games: list[tuple[str, Path]] = []
-        if win.paths is not None:
-            for entry in win._steam_shortcuts:
-                games.append((entry.app_name, win.paths.compatdata_dir / str(entry.appid_u32) / "pfx"))
-        for sg in win._standalone_games:
-            if not sg.native_linux:
-                games.append((sg.name, sg.prefix_dir))
-        for ext in win._external_games:
-            if ext.prefix_dir is not None and ext.runner != "linux":
-                games.append((ext.name, ext.prefix_dir))
-        return games
+        return [(t.name, t.prefix_dir) for t in collect_save_targets(win)]
 
     def _current_sync_root() -> Path:
         raw = sync_dir_edit.text().strip() or str(DEFAULT_SYNC_DIR)

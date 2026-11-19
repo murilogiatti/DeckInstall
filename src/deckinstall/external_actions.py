@@ -79,11 +79,23 @@ def import_external_saves_to_target(
     auto_snapshot_fn: Callable[[Path, str], Any] | None = None,
 ) -> int:
     """Copy newer save files from an external game's Wine prefix into target_prefix."""
-    if ext.prefix_dir is None or ext.prefix_dir.is_symlink() or not ext.prefix_dir.is_dir():
+    if ext.prefix_dir is None:
+        return 0
+    return import_prefix_saves(ext.prefix_dir, target_prefix, target_name, auto_snapshot_fn)
+
+
+def import_prefix_saves(
+    src_prefix: Path,
+    target_prefix: Path,
+    target_name: str,
+    auto_snapshot_fn: Callable[[Path, str], Any] | None = None,
+) -> int:
+    """Copy newer save files (users/*, ProgramData) from src_prefix into target_prefix."""
+    if src_prefix.is_symlink() or not src_prefix.is_dir():
         return 0
 
-    src_users = _prefix_users_dir(ext.prefix_dir)
-    src_progdata = _prefix_programdata_dir(ext.prefix_dir)
+    src_users = _prefix_users_dir(src_prefix)
+    src_progdata = _prefix_programdata_dir(src_prefix)
     if src_users is None and src_progdata is None:
         return 0
 

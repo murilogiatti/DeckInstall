@@ -75,7 +75,7 @@ def bulk_migrate_proton_dialog(win: MainWindow) -> None:
     if not win.paths:
         return
     paths = win.paths
-    win._set_steam_busy(True)
+    win._begin_busy()
 
     class _BulkMigrateLoadWorker(QThread):
         ready = Signal(list, list)
@@ -90,7 +90,7 @@ def bulk_migrate_proton_dialog(win: MainWindow) -> None:
                 self.failed.emit(_format_worker_error(exc))
 
     def _on_load_err(err: str) -> None:
-        win._set_steam_busy(False)
+        win._end_busy()
         if not win._closing_pending:
             QMessageBox.critical(win, __app_name__, tr("proton.error", err=err))
 
@@ -98,7 +98,7 @@ def bulk_migrate_proton_dialog(win: MainWindow) -> None:
         usage: list[CompatMappingEntry],
         protons: list[tuple[str, str]],
     ) -> None:
-        win._set_steam_busy(False)
+        win._end_busy()
         if win._closing_pending:
             return
         if not usage:
@@ -245,7 +245,7 @@ def bulk_migrate_proton_dialog(win: MainWindow) -> None:
         def _proceed_bulk_action() -> None:
             if win._closing_pending:
                 return
-            win._set_steam_busy(True)
+            win._begin_busy()
             if mode_kind == "clean_orphans":
                 orphan_ids = [u.appid_u32 for u in selected if u.source == "Orphan"]
                 worker = SteamOpWorker(
@@ -255,7 +255,7 @@ def bulk_migrate_proton_dialog(win: MainWindow) -> None:
                 win._track_worker(worker)
 
                 def _ok_clean(count: object) -> None:
-                    win._set_steam_busy(False)
+                    win._end_busy()
                     msg = tr("proton_bulk.orphans_removed", count=count)
                     win.status_label.setText(msg)
                     if not win._closing_pending:
@@ -280,7 +280,7 @@ def bulk_migrate_proton_dialog(win: MainWindow) -> None:
                 win._track_worker(worker)
 
                 def _ok_mig(count: object) -> None:
-                    win._set_steam_busy(False)
+                    win._end_busy()
                     msg = tr("proton_bulk.migrated", count=count, tool=target_tool)
                     win.status_label.setText(msg)
                     if not win._closing_pending:
@@ -289,7 +289,7 @@ def bulk_migrate_proton_dialog(win: MainWindow) -> None:
                 worker.finished_ok.connect(_ok_mig)
 
             def _on_bulk_proton_err(err: str) -> None:
-                win._set_steam_busy(False)
+                win._end_busy()
                 if not win._closing_pending:
                     QMessageBox.critical(win, __app_name__, tr("proton.error", err=err))
 

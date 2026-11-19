@@ -561,7 +561,7 @@ def edit_launch_options_presets(win: MainWindow) -> None:
     def _proceed_update_steam_opts() -> None:
         if win._closing_pending:
             return
-        win._set_steam_busy(True)
+        win._begin_busy()
         worker = SteamOpWorker(
             lambda: update_shortcut_launch_options(paths, entry.appid_u32, new_opts),
             need_steam_closed=True,
@@ -570,7 +570,7 @@ def edit_launch_options_presets(win: MainWindow) -> None:
         worker.status.connect(win.status_label.setText)
 
         def _ok(_res: object) -> None:
-            win._set_steam_busy(False)
+            win._end_busy()
             win._refresh_shortcuts()
             msg = tr("launch.saved", name=title_name)
             win.status_label.setText(msg)
@@ -578,7 +578,7 @@ def edit_launch_options_presets(win: MainWindow) -> None:
                 QMessageBox.information(_dialog_parent(win), __app_name__, msg)
 
         def _err(err: str) -> None:
-            win._set_steam_busy(False)
+            win._end_busy()
             if not win._closing_pending:
                 QMessageBox.critical(_dialog_parent(win), __app_name__, err)
 

@@ -20,6 +20,7 @@ from .steam_vdf import (
     _RESTORE_MAX_FILE_BYTES,
     _RESTORE_MAX_TOTAL_BYTES,
     DEFAULT_SAVES_DIR,
+    SNAPSHOT_KEEP_DEFAULT,
     _iter_prefix_save_pairs,
     _iter_programdata_save_pairs,
     _norm_key,
@@ -34,6 +35,11 @@ DEFAULT_SYNC_DIR = DEFAULT_SAVES_DIR / "sync"
 DEFAULT_LUDUSAVI_MANIFEST_PATH = (
     Path.home() / ".local" / "share" / "deckinstall" / "ludusavi_manifest.json"
 )
+
+# SNAPSHOT_KEEP_DEFAULT (steam_vdf): snapshots kept per game unless the Backup/Sync screen changes it.
+# Per-game sidecar in snapshots/<slug>/: {"digest": last content hash, "zip": its file, "played": run.log mtime}.
+_SNAPSHOT_INDEX = ".index.json"
+_RUN_EXIT_MARKER = b"== DeckInstall: exit code"
 
 _META_MAX_BYTES = 1024 * 1024
 _LUDUSAVI_MANIFEST_MAX_BYTES = 64 * 1024 * 1024
@@ -728,23 +734,59 @@ def _write_saves_zip_atomic(
         raise
 
 
+def snapshot_dir_for(game_name: str, dest_root: Path | None = None) -> Path:
+    """The folder holding a game's save snapshots."""
+    return (dest_root or DEFAULT_SNAPSHOTS_DIR) / _slugify(game_name)
+
+
+def _read_snapshot_index(snap_dir: Path) -> dict[str, object]:
+    raw = _read_sync_meta(snap_dir / _SNAPSHOT_INDEX)
+    return raw if raw is not None else {}
+
+
+def _write_snapshot_index(snap_dir: Path, index: dict[str, object]) -> None:
+    try:
+        atomic_write_bytes(snap_dir / _SNAPSHOT_INDEX, json.dumps(index, sort_keys=True).encode("utf-8"))
+    except OSError as exc:
+        logging.getLogger(__name__).warning("Could not write snapshot index in %s: %s", snap_dir, exc)
+
+
 def snapshot_prefix_saves(
     prefix_dir: Path,
     game_name: str,
     reason: str,
     key_prefix: str = "snap",
     dest_root: Path | None = None,
-    max_keep: int = 5,
+    max_keep: int = SNAPSHOT_KEEP_DEFAULT,
     game_dir: Path | None = None,
     steam_appid: int | None = None,
+    dedup: bool = False,
 ) -> Path | None:
-    """Create a rotated pre-operation ZIP snapshot of prefix saves."""
+    """Create a rotated ZIP snapshot of prefix saves (max_keep <= 0: no rotation).
+
+    With dedup, saves whose content hash matches the newest snapshot return that snapshot
+    instead of writing an identical ZIP.
+    """
     if not prefix_dir.is_dir():
         return None
-    root = dest_root or DEFAULT_SNAPSHOTS_DIR
-    safe_slug = _slugify(game_name)
+    snap_dir = snapshot_dir_for(game_name, dest_root)
+    digest = ""
+    if dedup:
+        digest = compute_prefix_saves_fingerprint(
+            prefix_dir, game_name=game_name, game_dir=game_dir, steam_appid=steam_appid
+        ).digest
+        if not digest:
+            return None
+        index = _read_snapshot_index(snap_dir)
+        last_zip = snap_dir / str(index.get("zip") or "")
+        if (
+            index.get("digest") == digest
+            and last_zip.suffix == ".zip"
+            and last_zip.is_file()
+            and not last_zip.is_symlink()
+        ):
+            return last_zip
     safe_reason = _slugify(reason, fallback="op")
-    snap_dir = root / safe_slug
     stamp = time.strftime("%Y%m%d-%H%M%S")
     target_zip = snap_dir / f"{stamp}-{safe_reason}.zip"
     if target_zip.exists():
@@ -759,8 +801,108 @@ def snapshot_prefix_saves(
     )
     if written == 0:
         return None
+    if digest:
+        index = _read_snapshot_index(snap_dir)
+        index.update(digest=digest, zip=target_zip.name)
+        _write_snapshot_index(snap_dir, index)
     _rotate_snapshots(snap_dir, max_keep)
     return target_zip
+
+
+def auto_snapshot(
+    prefix_dir: Path,
+    game_name: str,
+    reason: str,
+    key_prefix: str = "snap",
+    *,
+    keep: int = SNAPSHOT_KEEP_DEFAULT,
+    game_dir: Path | None = None,
+    steam_appid: int | None = None,
+    dest_root: Path | None = None,
+) -> Path | None:
+    """The one entry point for app snapshots: deduplicated by content, newest `keep` kept per game."""
+    return snapshot_prefix_saves(
+        prefix_dir,
+        game_name,
+        reason,
+        key_prefix=key_prefix,
+        dest_root=dest_root,
+        max_keep=keep,
+        game_dir=game_dir,
+        steam_appid=steam_appid,
+        dedup=True,
+    )
+
+
+def _run_finished(run_log: Path) -> bool:
+    """True when launch.sh wrote its exit line (the game is not running anymore)."""
+    try:
+        with run_log.open("rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, size - 4096))
+            return _RUN_EXIT_MARKER in fh.read()
+    except OSError:
+        return False
+
+
+def snapshot_after_play(
+    prefix_dir: Path,
+    game_name: str,
+    run_log: Path,
+    *,
+    keep: int = SNAPSHOT_KEEP_DEFAULT,
+    game_dir: Path | None = None,
+    steam_appid: int | None = None,
+    dest_root: Path | None = None,
+) -> Path | None:
+    """Snapshot once per finished session recorded in run.log; None when there is nothing new."""
+    if run_log.is_symlink() or not run_log.is_file():
+        return None
+    try:
+        played = run_log.stat().st_mtime
+    except OSError:
+        return None
+    snap_dir = snapshot_dir_for(game_name, dest_root)
+    seen = _read_snapshot_index(snap_dir).get("played")
+    if isinstance(seen, (int, float)) and played <= float(seen):
+        return None
+    if not _run_finished(run_log):
+        return None
+    snap = auto_snapshot(
+        prefix_dir, game_name, "after-play", keep=keep,
+        game_dir=game_dir, steam_appid=steam_appid, dest_root=dest_root,
+    )
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    index = _read_snapshot_index(snap_dir)
+    index["played"] = played
+    _write_snapshot_index(snap_dir, index)
+    return snap
+
+
+def restore_snapshot_safely(
+    snapshot_zip: Path,
+    prefix_dir: Path,
+    game_name: str,
+    *,
+    state: bool = False,
+    game_dir: Path | None = None,
+    steam_appid: int | None = None,
+    dest_root: Path | None = None,
+) -> tuple[int, Path | None]:
+    """Snapshot the current saves (never rotated away), then restore snapshot_zip.
+
+    Returns (items restored, safety snapshot). A failed safety snapshot aborts the restore.
+    """
+    if snapshot_zip.is_symlink() or not snapshot_zip.is_file():
+        raise FileNotFoundError(f"Snapshot not found: {snapshot_zip}")
+    safety = auto_snapshot(
+        prefix_dir, game_name, "pre-restore", keep=0,
+        game_dir=game_dir, steam_appid=steam_appid, dest_root=dest_root,
+    )
+    if state:
+        files, regs = restore_prefix_state_snapshot(snapshot_zip, prefix_dir)
+        return files + regs, safety
+    return _restore_saves_archive(snapshot_zip, prefix_dir, game_dir), safety
 
 
 def snapshot_prefix_state(
@@ -1682,7 +1824,8 @@ def list_save_archives(
         except OSError:
             continue
 
-    for sroot in (base_saves / "snapshots", legacy_base / "snapshots"):
+    snapshots_root = base_saves / "snapshots" if saves_dir is not None else DEFAULT_SNAPSHOTS_DIR
+    for sroot in (snapshots_root, legacy_base / "snapshots"):
         if not sroot.is_dir() or sroot.is_symlink():
             continue
         try:

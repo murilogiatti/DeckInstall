@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from deckinstall import optiscaler, save_sync, standalone
+from deckinstall.ui_dialogs import save_sync_dialog
 
 
 class OptiScalerSnapshotTests(unittest.TestCase):
@@ -210,11 +211,14 @@ class UniqueLibraryActionTests(unittest.TestCase):
                 self.assertEqual(game, [])
                 self.assertEqual(library, [])
                 self.assertEqual(win.btn_remove_game.objectName(), "dangerBtn")
-                self.assertEqual(win.btn_remove_game.text(), tr("library.btn_remove_game"))
+                self.assertEqual(win.btn_remove_game.text(), tr("library.btn_uninstall"))
                 self.assertIsNone(win.btn_remove_game.menu())
                 self.assertIsNone(win.btn_save_sync.menu())
                 self.assertEqual(win.stack.count(), 4)
-                self.assertEqual(win._nav_buttons[2].text(), tr("tabs.saves"))
+                self.assertEqual(
+                    [b.text() for b in win._nav_buttons],
+                    [tr("tabs.install"), tr("tabs.library"), tr("tabs.saves"), tr("tabs.maintenance")],
+                )
                 self.assertFalse(hasattr(win, "btn_game_actions"))
                 self.assertFalse(hasattr(win, "btn_tools_menu"))
                 self.assertNotEqual(win.shortcuts_list.contextMenuPolicy(), Qt.ContextMenuPolicy.CustomContextMenu)
@@ -367,7 +371,7 @@ class LibraryColumnsFilterAndLogsTests(unittest.TestCase):
                     "QSettings",
                     return_value=QSettings(str(root / "prefs.ini"), QSettings.Format.IniFormat),
                 ),
-                mock.patch.object(ui, "list_save_archives", return_value=[fake_archive]),
+                mock.patch.object(save_sync_dialog, "list_save_archives", return_value=[fake_archive]),
                 mock.patch.object(ui.MainWindow, "_refresh_games"),
                 mock.patch.object(ui.MainWindow, "_redetect_steam"),
             ):
@@ -497,7 +501,7 @@ class UiUxSimplificationTests(unittest.TestCase):
                     "QSettings",
                     return_value=QSettings(str(root / "prefs.ini"), QSettings.Format.IniFormat),
                 ),
-                mock.patch.object(ui, "list_save_archives", return_value=[]),
+                mock.patch.object(save_sync_dialog, "list_save_archives", return_value=[]),
                 mock.patch.object(ui.MainWindow, "_refresh_games"),
                 mock.patch.object(ui.MainWindow, "_redetect_steam"),
             ):
@@ -557,7 +561,7 @@ class UiUxSimplificationTests(unittest.TestCase):
                     "QSettings",
                     return_value=QSettings(str(root / "empty.ini"), QSettings.Format.IniFormat),
                 ),
-                mock.patch.object(ui, "list_save_archives", return_value=[]),
+                mock.patch.object(save_sync_dialog, "list_save_archives", return_value=[]),
                 mock.patch.object(ui.MainWindow, "_refresh_games"),
                 mock.patch.object(ui.MainWindow, "_redetect_steam"),
             ):
@@ -577,7 +581,7 @@ class UiUxSimplificationTests(unittest.TestCase):
                     "QSettings",
                     return_value=QSettings(str(root / "filled.ini"), QSettings.Format.IniFormat),
                 ),
-                mock.patch.object(ui, "list_save_archives", return_value=[]),
+                mock.patch.object(save_sync_dialog, "list_save_archives", return_value=[]),
                 mock.patch.object(ui.MainWindow, "_refresh_games"),
                 mock.patch.object(ui.MainWindow, "_redetect_steam"),
             ):

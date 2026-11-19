@@ -33,12 +33,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .cleanup import CleanupCandidate, is_default_checked
 from .extractor import InsufficientSpaceError
 from .i18n import tr
 from .launch_presets import parse_presets
 from .scanner import is_native_linux_exe
 from .steam_paths import is_gamescope_session
-from .steam_vdf import CleanupCandidate, _strip_vdf_quotes
+from .steam_vdf import _strip_vdf_quotes
 
 
 def _dialog_parent(win: QWidget) -> QWidget:
@@ -240,11 +241,7 @@ def _is_wine_game_running() -> bool:
 
 def _cleanup_candidate_auto_check(cand: CleanupCandidate) -> bool:
     """Return True if a cleanup candidate is safe to auto-select for 1-click clean."""
-    if cand.category in ("GPU Shader Cache", "Old Proton/Runtime"):
-        return False
-    if cand.category in ("Prefixo Externo", "external_prefix"):
-        return bool(cand.matched_game) and ((not cand.has_saves) or cand.saves_verified_migrated)
-    return (not cand.has_saves) or cand.saves_verified_migrated
+    return is_default_checked(cand)
 
 
 def format_size_bytes(num_bytes: int | float) -> str:
