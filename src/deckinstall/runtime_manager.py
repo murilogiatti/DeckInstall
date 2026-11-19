@@ -1431,6 +1431,11 @@ def fetch_available_proton_releases(
                 prerelease=bool(rel.get("prerelease", False)),
             )
         )
+    # GitHub lists by publish date, which puts GE-Proton11-9 above GE-Proton11-12: order by version.
+    results.sort(
+        key=lambda r: (tuple(int(n) for n in re.findall(r"\d+", r.tag_name)), r.published_at),
+        reverse=True,
+    )
     return results
 
 

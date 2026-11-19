@@ -106,6 +106,29 @@ def remove_path_or_tree(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def prune_empty_parents(path: Path, roots: list[Path]) -> None:
+    """Remove the empty folders left above a deleted path, stopping at (and keeping) each root."""
+    try:
+        resolved_roots = [r.resolve() for r in roots]
+    except OSError:
+        return
+    parent = path.parent
+    while True:
+        try:
+            if (
+                parent.is_symlink()
+                or not parent.is_dir()
+                or parent.resolve() in resolved_roots
+                or not any(parent.resolve().is_relative_to(r) for r in resolved_roots)
+                or any(parent.iterdir())
+            ):
+                return
+            parent.rmdir()
+        except OSError:
+            return
+        parent = parent.parent
+
+
 def move_dir_safely(src: Path, dst: Path) -> None:
     """Move a directory without ever leaving the only full copy at risk.
 

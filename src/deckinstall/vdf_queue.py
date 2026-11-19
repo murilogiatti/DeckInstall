@@ -15,19 +15,21 @@ from .steam_vdf import (
     remove_compat_tools,
     remove_shortcut,
     set_shortcut_proton,
+    set_steam_app_launch_options,
     update_shortcut_launch_options,
 )
 
 VdfEditOp = Literal[
     "set_proton",
     "set_launch_options",
+    "set_app_launch_options",
     "bulk_migrate_compat",
     "remove_compat",
     "remove_shortcut",
     "add_or_update_shortcut",
 ]
 
-_COALESCIBLE_OPS = frozenset({"set_proton", "set_launch_options"})
+_COALESCIBLE_OPS = frozenset({"set_proton", "set_launch_options", "set_app_launch_options"})
 
 
 @dataclass(frozen=True)
@@ -121,6 +123,10 @@ class VdfEditQueue:
             launch_options = str(payload.get("launch_options", ""))
             if not update_shortcut_launch_options(paths, edit.appid_u32, launch_options):
                 raise RuntimeError(f"Atalho {edit.appid_u32} não encontrado em shortcuts.vdf")
+        elif edit.op == "set_app_launch_options":
+            launch_options = str(payload.get("launch_options", ""))
+            if not set_steam_app_launch_options(paths, edit.appid_u32, launch_options):
+                raise RuntimeError(f"localconfig.vdf ausente para o jogo {edit.appid_u32}")
         elif edit.op == "bulk_migrate_compat":
             raw_appids = payload.get("appids")
             appids = (

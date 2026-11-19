@@ -35,7 +35,7 @@ from ..runtime_manager import (
     remove_compat_tool,
 )
 from ..standalone import list_standalone_games, resolve_standalone_proton_fallback
-from ..steam_paths import SteamPaths, list_installed_protons
+from ..steam_paths import SteamPaths, list_installed_protons, proton_name_sort_key
 from ..steam_vdf import (
     CompatMappingEntry,
     bulk_migrate_compat_tool,
@@ -138,7 +138,7 @@ def bulk_migrate_proton_dialog(win: MainWindow) -> None:
         filter_combo = QComboBox()
         filter_combo.addItem(tr("proton_bulk.filter_all"), "__ALL__")
         filter_combo.addItem(tr("proton_bulk.filter_orphans"), "__ORPHAN__")
-        for tool in sorted(by_tool.keys()):
+        for tool in sorted(by_tool.keys(), key=proton_name_sort_key, reverse=True):
             filter_combo.addItem(f"{tool} ({len(by_tool[tool])})", tool)
         filter_row.addWidget(filter_combo, 1)
 

@@ -88,3 +88,33 @@ def test_install_form_has_one_presets_button_with_summary(tmp_path: Path) -> Non
         app.processEvents()
         win._active_workers.clear()
         win.close()
+
+
+def test_edit_presets_uses_given_game_and_parent_and_warns_without_steam(tmp_path: Path) -> None:
+    from PySide6.QtWidgets import QApplication, QWidget
+
+    from deckinstall.steam_vdf import ShortcutEntry
+    from deckinstall.ui_dialogs import launch_presets_dialog as lpd
+
+    app = QApplication.instance() or QApplication([])
+    parent = QWidget()
+    try:
+        win = mock.Mock()
+        win.paths = None
+        win._selected_library_item.return_value = None
+        sc = ShortcutEntry("0", 2147483649, "Game", '"/g/Game.exe"', '"/g"', "", "")
+        with mock.patch.object(lpd.QMessageBox, "warning") as warn:
+            lpd.edit_launch_options_presets(win, sel=("steam", sc), parent=parent)
+        warn.assert_called_once()
+        assert warn.call_args.args[0] is parent
+        win._open_launch_presets_dialog.assert_not_called()
+
+        win.paths = mock.Mock()
+        win._open_launch_presets_dialog.return_value = None
+        lpd.edit_launch_options_presets(win, sel=("steam", sc), parent=parent)
+        assert win._open_launch_presets_dialog.call_args.kwargs["parent"] is parent
+        assert win._open_launch_presets_dialog.call_args.kwargs["game_obj"] is sc
+        win._selected_library_item.assert_not_called()
+    finally:
+        parent.deleteLater()
+        app.processEvents()

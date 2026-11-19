@@ -141,6 +141,29 @@ CONTINUO
 - Testes Qt: guardar a referencia do QApplication e apagar dialogos sem pai no fim do teste
   (senao o Python cai com segfault ao sair, de forma intermitente no CI).
 
+TESTES NO STEAM DECK (v0.18.1, SteamOS 3.9.5, AppImage) - 2026-11-19
+1. [FEITO] Reabrir a Steam: start_steam (steam_vdf) usa o ambiente limpo (app_updater.build_clean_relaunch_env +
+   remove PYTHONHOME/PYTHONPATH/QT_*), nova sessao (setsid), cwd=$HOME e espera ate 20 s o processo aparecer;
+   devolve False se nao subir. SteamOpWorker agora reabre sozinho (restart_if_was_running=True por padrao, inclusive
+   se a operacao falhar); AddToSteam/BulkMigrate/RemoveShortcut usam o mesmo caminho; falha = aviso
+   "A Steam nao abriu de novo sozinha" (MainWindow._warn_steam_restart_failed). A pergunta "Iniciar a Steam de novo?"
+   ficou so para a fila VDF automatica.
+   Modo Jogo: shutdown_steam levanta SteamGamingModeError (fechar a Steam encerra a sessao) com mensagem pedindo
+   Modo Desktop ou a fila; start_steam nao lanca nada no gamescope (a sessao reinicia a Steam).
+2. [FEITO] OptiScaler em massa para atalhos Steam (.exe direto) e jogos da biblioteca Steam (appmanifest + prefixo
+   compatdata + .exe localizado por scanner.scan_game_folder); coluna Origem. optiscaler.bulk_optiscaler_targets
+   (BulkTarget) copia os arquivos sem fechar a Steam, depois UM SteamOpWorker grava todas as opcoes de inicializacao
+   (shortcuts.vdf / localconfig.vdf via set_steam_app_launch_options, com backup) = um fechamento e uma reabertura.
+   Fila VDF ligada: enfileira (op nova set_app_launch_options). Modo Jogo: atalhos/jogos Steam sao pulados com aviso
+   (a fila fica so na memoria e trocar para o Desktop fecha o app).
+3. [FEITO] "Editar opcoes e presets" no Configurar jogo: recebe o jogo e o dialogo pai explicitamente
+   (edit_launch_options_presets(win, sel, parent, on_saved)); aviso quando falta a Steam; filho ApplicationModal.
+4. [PARCIAL] Crash SEGV (libqwayland): main.py/AppRun nao forcam mais QT_QPA_PLATFORMTHEME=xdgdesktopportal.
+   steam_paths.configure_qt_environment: no gamescope remove o tema do portal e usa QT_QPA_PLATFORM="xcb;wayland";
+   no Desktop so usa o portal com D-Bus. Log registra as variaveis Qt no inicio. Aguardando deckinstall.log do Deck
+   para confirmar a causa.
+   Nao verificado fora do Deck: reabertura real da Steam, Modo Jogo, localconfig.vdf real, dialogos no gamescope.
+
 NAO TESTADO A MAO (so testes automaticos)
 - Instalador GOG real (innoextract nao instalado na maquina), repacks FitGirl/DODI, microSD/exFAT, Steam com link
   do compatdata, OptiScaler real, telas novas da Fase 3 no app aberto.

@@ -1,7 +1,9 @@
-"""Bulk OptiScaler install/remove for DeckInstall games, with per-game compatibility."""
+"""Bulk OptiScaler install/remove for DeckInstall games, Steam shortcuts and Steam store games."""
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt
@@ -21,27 +23,151 @@ from PySide6.QtWidgets import (
 
 from .. import __app_name__
 from ..i18n import tr
+from ..launch_presets import apply_presets, parse_presets
 from ..optiscaler import (
     OPTISCALER_BACKENDS,
     BulkOutcome,
+    BulkTarget,
     OptiScalerCompatibility,
-    bulk_optiscaler,
+    bulk_optiscaler_targets,
     check_optiscaler_compatibility,
+    standalone_bulk_target,
 )
-from ..standalone import StandaloneGame, list_standalone_games
+from ..standalone import list_standalone_games, update_standalone_launch_options
+from ..steam_paths import SteamPaths, is_gamescope_session
+from ..steam_vdf import (
+    _strip_vdf_quotes,
+    get_steam_app_launch_options,
+    list_steam_library_games,
+    load_shortcuts,
+    set_steam_app_launch_options,
+    update_shortcut_launch_options,
+)
 from ..ui_cards import _dialog_parent
 from ..ui_workers import SteamOpWorker
+from ..vdf_queue import QueuedVdfEdit, VdfEditOp
 
 if TYPE_CHECKING:
     from ..ui import MainWindow
 
 
-def _scan() -> list[tuple[StandaloneGame, OptiScalerCompatibility]]:
-    return [
-        (g, check_optiscaler_compatibility(g.exe_path, g.game_dir))
-        for g in list_standalone_games()
-        if not g.native_linux
-    ]
+Row = tuple[BulkTarget, OptiScalerCompatibility]
+# One pending launch-options write: (source "shortcut"/"steam", appid, name, new LaunchOptions).
+VdfWrite = tuple[str, int, str, str]
+
+
+def _collect_targets(paths: SteamPaths | None) -> list[BulkTarget]:
+    targets = [standalone_bulk_target(g) for g in list_standalone_games() if not g.native_linux]
+    if paths is None:
+        return targets
+    seen_exes = {t.exe_path for t in targets}
+    try:
+        shortcuts = load_shortcuts(paths.shortcuts_vdf)
+    except Exception:
+        logging.exception("Could not read shortcuts.vdf for bulk OptiScaler")
+        shortcuts = []
+    for sc in shortcuts:
+        raw = _strip_vdf_quotes(sc.exe)
+        # Only shortcuts that point straight at a Windows .exe (DeckInstall's launch.sh games are listed above).
+        if not raw.lower().endswith(".exe"):
+            continue
+        exe = Path(raw)
+        if exe in seen_exes or not exe.is_file():
+            continue
+        seen_exes.add(exe)
+        start = Path(_strip_vdf_quotes(sc.start_dir)) if sc.start_dir else exe.parent
+        targets.append(
+            BulkTarget(
+                name=sc.app_name,
+                exe_path=exe,
+                game_dir=start if start.is_dir() else exe.parent,
+                prefix_dir=paths.compatdata_dir / str(sc.appid_u32) / "pfx",
+                winedll=str(parse_presets(sc.launch_options)["winedll"] or ""),
+                source="shortcut",
+                ref=sc,
+            )
+        )
+    try:
+        steam_games = list_steam_library_games(paths)
+    except Exception:
+        logging.exception("Could not list Steam library games for bulk OptiScaler")
+        steam_games = []
+    for g in steam_games:
+        if g.exe_path in seen_exes:
+            continue
+        opts = get_steam_app_launch_options(paths, g.appid)
+        targets.append(
+            BulkTarget(
+                name=g.name,
+                exe_path=g.exe_path,
+                game_dir=g.install_dir,
+                prefix_dir=g.prefix_dir,
+                winedll=str(parse_presets(opts)["winedll"] or ""),
+                source="steam",
+                ref=(g.appid, opts),
+            )
+        )
+    return targets
+
+
+def _scan(paths: SteamPaths | None) -> list[Row]:
+    return [(t, check_optiscaler_compatibility(t.exe_path, t.game_dir)) for t in _collect_targets(paths)]
+
+
+def _source_text(t: BulkTarget) -> str:
+    labels = {
+        "deckinstall": tr("optiscaler_bulk.source_deckinstall"),
+        "shortcut": tr("optiscaler_bulk.source_shortcut"),
+        "steam": tr("optiscaler_bulk.source_steam"),
+    }
+    return labels.get(t.source, t.source)
+
+
+def _install_files(
+    targets: list[BulkTarget], remove: bool, backend: str
+) -> tuple[list[BulkOutcome], list[VdfWrite]]:
+    """Copy/remove OptiScaler files (Steam may stay open); save DeckInstall games; return the Steam writes."""
+    outcomes: list[BulkOutcome] = []
+    writes: list[VdfWrite] = []
+    for t, (outcome, dll) in zip(
+        targets, bulk_optiscaler_targets(targets, remove=remove, backend=backend), strict=True
+    ):
+        if dll is not None:
+            try:
+                if t.source == "deckinstall":
+                    update_standalone_launch_options(
+                        t.game_dir, winedlloverrides=dll, launch_options=t.ref.launch_options
+                    )
+                elif t.source == "shortcut":
+                    writes.append(
+                        ("shortcut", t.ref.appid_u32, t.name, apply_presets(t.ref.launch_options, winedlloverrides=dll))
+                    )
+                elif t.source == "steam":
+                    appid, opts = t.ref
+                    writes.append(("steam", appid, t.name, apply_presets(opts, winedlloverrides=dll)))
+            except Exception as exc:
+                logging.exception("Could not save DLL overrides for %s", t.name)
+                outcome = BulkOutcome(t.name, "failed", str(exc))
+        outcomes.append(outcome)
+    return outcomes, writes
+
+
+def _write_vdf(paths: SteamPaths, writes: list[VdfWrite]) -> list[str]:
+    """Write every launch-options change in one go (Steam closed by the caller). Returns error lines."""
+    errors: list[str] = []
+    for source, appid, name, opts in writes:
+        try:
+            ok = (
+                update_shortcut_launch_options(paths, appid, opts)
+                if source == "shortcut"
+                else set_steam_app_launch_options(paths, appid, opts)
+            )
+            if not ok:
+                errors.append(tr("optiscaler_bulk.vdf_missing", name=name))
+        except Exception as exc:
+            logging.exception("Could not write launch options for %s", name)
+            errors.append(f"{name}: {exc}")
+    return errors
 
 
 def _tier_text(compat: OptiScalerCompatibility) -> str:
@@ -76,7 +202,8 @@ def _outcome_line(o: BulkOutcome) -> str:
 def bulk_optiscaler_dialog(win: MainWindow) -> None:
     """Scan DeckInstall games in the background, then open the bulk OptiScaler dialog."""
     win.status_label.setText(tr("optiscaler_bulk.scanning"))
-    loader = SteamOpWorker(_scan, need_steam_closed=False)
+    paths = win.paths
+    loader = SteamOpWorker(lambda: _scan(paths), need_steam_closed=False)
     win._track_worker(loader)
 
     def _loaded(rows: object) -> None:
@@ -97,29 +224,41 @@ def bulk_optiscaler_dialog(win: MainWindow) -> None:
     loader.start()
 
 
-def _show(win: MainWindow, rows: list[tuple[StandaloneGame, OptiScalerCompatibility]]) -> None:
+def _show(win: MainWindow, rows: list[Row]) -> None:
     dlg = QDialog(_dialog_parent(win))
     dlg.setWindowTitle(tr("optiscaler_bulk.title"))
-    dlg.resize(820, 540)
+    dlg.resize(1100, 560)
     lay = QVBoxLayout(dlg)
     hint = QLabel(tr("optiscaler_bulk.hint"))
     hint.setWordWrap(True)
     lay.addWidget(hint)
 
-    tbl = QTableWidget(0, 3)
+    tbl = QTableWidget(0, 4)
     tbl.setHorizontalHeaderLabels(
-        [tr("table.name"), tr("optiscaler_bulk.col_compat"), tr("optiscaler_bulk.col_state")]
+        [
+            tr("table.name"),
+            tr("optiscaler_bulk.col_source"),
+            tr("optiscaler_bulk.col_compat"),
+            tr("optiscaler_bulk.col_state"),
+        ]
     )
     tbl.verticalHeader().setVisible(False)
     tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-    tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+    header = tbl.horizontalHeader()
+    header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+    header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+    header.setStretchLastSection(False)
     lay.addWidget(tbl, 1)
 
-    games: list[StandaloneGame] = []
+    games: list[BulkTarget] = []
+    current: list[Row] = []
 
-    def _fill(data: list[tuple[StandaloneGame, OptiScalerCompatibility]]) -> None:
+    def _fill(data: list[Row]) -> None:
         games.clear()
+        current[:] = data
         tbl.setRowCount(0)
         for game, compat in data:
             row = tbl.rowCount()
@@ -136,8 +275,9 @@ def _show(win: MainWindow, rows: list[tuple[StandaloneGame, OptiScalerCompatibil
             if not compat.compatible:
                 it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
             tbl.setItem(row, 0, it)
-            tbl.setItem(row, 1, QTableWidgetItem(_tier_text(compat)))
-            tbl.setItem(row, 2, QTableWidgetItem(_state_text(compat)))
+            tbl.setItem(row, 1, QTableWidgetItem(_source_text(game)))
+            tbl.setItem(row, 2, QTableWidgetItem(_tier_text(compat)))
+            tbl.setItem(row, 3, QTableWidgetItem(_state_text(compat)))
 
     _fill(rows)
 
@@ -151,8 +291,15 @@ def _show(win: MainWindow, rows: list[tuple[StandaloneGame, OptiScalerCompatibil
     btn_row = QHBoxLayout()
     btn_install = QPushButton(tr("optiscaler_bulk.btn_install"))
     btn_install.setObjectName("primaryBtn")
+    btn_select_all = QPushButton(tr("optiscaler_bulk.btn_select_all"))
+    btn_select_none = QPushButton(tr("optiscaler_bulk.btn_select_none"))
+    btn_all = QPushButton(tr("optiscaler_bulk.btn_install_all"))
+    btn_all.setToolTip(tr("optiscaler_bulk.btn_install_all_tooltip"))
     btn_remove = QPushButton(tr("optiscaler_bulk.btn_remove"))
     btn_close = QPushButton(tr("proton_bulk.btn_close"))
+    btn_row.addWidget(btn_select_all)
+    btn_row.addWidget(btn_select_none)
+    btn_row.addWidget(btn_all)
     btn_row.addWidget(btn_install)
     btn_row.addWidget(btn_remove)
     btn_row.addStretch()
@@ -160,13 +307,36 @@ def _show(win: MainWindow, rows: list[tuple[StandaloneGame, OptiScalerCompatibil
     lay.addLayout(btn_row)
     btn_close.clicked.connect(dlg.accept)
 
-    def _checked() -> list[StandaloneGame]:
-        out: list[StandaloneGame] = []
+    def _checked() -> list[BulkTarget]:
+        out: list[BulkTarget] = []
         for i, game in enumerate(games):
             it = tbl.item(i, 0)
             if it is not None and it.checkState() == Qt.CheckState.Checked:
                 out.append(game)
         return out
+
+    def _set_all_checked(state: Qt.CheckState) -> None:
+        for i in range(tbl.rowCount()):
+            it = tbl.item(i, 0)
+            if it is not None and it.flags() & Qt.ItemFlag.ItemIsUserCheckable:
+                it.setCheckState(state)
+
+    def _install_all() -> None:
+        """Check every compatible game that has no OptiScaler yet, then install on them."""
+        todo = [i for i, (_g, compat) in enumerate(current) if compat.compatible and compat.installed_state is None]
+        if not todo:
+            QMessageBox.information(dlg, __app_name__, tr("optiscaler_bulk.none_compatible"))
+            return
+        answer = QMessageBox.question(
+            dlg, __app_name__, tr("optiscaler_bulk.confirm_all", count=len(todo))
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        for i in range(tbl.rowCount()):
+            it = tbl.item(i, 0)
+            if it is not None:
+                it.setCheckState(Qt.CheckState.Checked if i in todo else Qt.CheckState.Unchecked)
+        _run(False)
 
     def _run(remove: bool) -> None:
         picked = _checked()
@@ -174,36 +344,89 @@ def _show(win: MainWindow, rows: list[tuple[StandaloneGame, OptiScalerCompatibil
             QMessageBox.information(dlg, __app_name__, tr("proton_bulk.none_selected"))
             return
         backend = str(combo_backend.currentData() or "auto")
-        for b in (btn_install, btn_remove):
+        buttons = (btn_all, btn_install, btn_remove)
+        for b in buttons:
             b.setEnabled(False)
+        paths = win.paths
 
-        def _job() -> tuple[list[BulkOutcome], list[tuple[StandaloneGame, OptiScalerCompatibility]]]:
-            outcomes = bulk_optiscaler(list(picked), remove=remove, backend=backend)
-            return outcomes, _scan()
+        def _finish(outcomes: list[BulkOutcome], fresh: object, extra: list[str]) -> None:
+            for b in buttons:
+                b.setEnabled(True)
+            win._refresh_shortcuts()
+            if dlg.isVisible() and isinstance(fresh, list):
+                _fill(fresh)
+            lines = [_outcome_line(o) for o in outcomes] + extra
+            QMessageBox.information(dlg, __app_name__, "\n".join(lines))
+
+        def _fail(err: str) -> None:
+            for b in buttons:
+                b.setEnabled(True)
+            QMessageBox.critical(dlg, __app_name__, tr("optiscaler.error", err=err))
+
+        def _write_steam(outcomes: list[BulkOutcome], writes: list[VdfWrite]) -> None:
+            if paths is None:
+                _finish(outcomes, None, [tr("add.steam_missing")])
+                return
+            if win.is_batch_vdf_enabled():
+                for source, appid, name, opts in writes:
+                    op: VdfEditOp = "set_launch_options" if source == "shortcut" else "set_app_launch_options"
+                    win.enqueue_vdf_edit(
+                        QueuedVdfEdit(
+                            edit_id=f"{op}:{appid}",
+                            op=op,
+                            appid_u32=appid,
+                            label=name,
+                            payload={"launch_options": opts},
+                        )
+                    )
+                _finish(outcomes, None, [tr("optiscaler_bulk.queued", count=len(writes))])
+                return
+            # One Steam shutdown and one restart for every game in the batch.
+            vdf_worker = SteamOpWorker(
+                lambda: (_write_vdf(paths, writes), _scan(paths)), need_steam_closed=True
+            )
+            win._track_worker(vdf_worker)
+            vdf_worker.status.connect(win.status_label.setText)
+
+            def _vdf_done(res: object) -> None:
+                errs, fresh = res if isinstance(res, tuple) else ([], None)
+                _finish(outcomes, fresh, list(errs))
+
+            vdf_worker.finished_ok.connect(_vdf_done)
+            vdf_worker.failed.connect(_fail)
+            vdf_worker.start()
+
+        def _job() -> tuple[list[BulkOutcome], list[VdfWrite], list[Row] | None]:
+            todo = list(picked)
+            skipped: list[BulkOutcome] = []
+            if any(t.source != "deckinstall" for t in todo) and is_gamescope_session():
+                # Gaming Mode: writing Steam's launch options needs Steam closed, which ends the session.
+                skipped = [BulkOutcome(t.name, "skipped", tr("optiscaler_bulk.gaming_mode")) for t in todo
+                           if t.source != "deckinstall"]
+                todo = [t for t in todo if t.source == "deckinstall"]
+            outcomes, writes = _install_files(todo, remove, backend)
+            return outcomes + skipped, writes, (None if writes else _scan(paths))
 
         worker = SteamOpWorker(_job, need_steam_closed=False)
         win._track_worker(worker)
 
         def _done(result: object) -> None:
-            for b in (btn_install, btn_remove):
-                b.setEnabled(True)
             if not isinstance(result, tuple):
+                _fail("?")
                 return
-            outcomes, fresh = result
-            win._refresh_shortcuts()
-            if dlg.isVisible():
-                _fill(fresh)
-            QMessageBox.information(dlg, __app_name__, "\n".join(_outcome_line(o) for o in outcomes))
-
-        def _fail(err: str) -> None:
-            for b in (btn_install, btn_remove):
-                b.setEnabled(True)
-            QMessageBox.critical(dlg, __app_name__, tr("optiscaler.error", err=err))
+            outcomes, writes, fresh = result
+            if writes:  # files are already in place: always write the launch options, even if the dialog closed
+                _write_steam(outcomes, writes)
+            else:
+                _finish(outcomes, fresh, [])
 
         worker.finished_ok.connect(_done)
         worker.failed.connect(_fail)
         worker.start()
 
+    btn_select_all.clicked.connect(lambda: _set_all_checked(Qt.CheckState.Checked))
+    btn_select_none.clicked.connect(lambda: _set_all_checked(Qt.CheckState.Unchecked))
+    btn_all.clicked.connect(_install_all)
     btn_install.clicked.connect(lambda: _run(False))
     btn_remove.clicked.connect(lambda: _run(True))
     dlg.exec()

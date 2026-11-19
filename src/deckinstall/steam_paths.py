@@ -291,6 +291,11 @@ def _proton_version_key(entry: Path) -> tuple[tuple[int, ...], str]:
     return (nums, entry.name.lower())
 
 
+def proton_name_sort_key(name: str) -> tuple[tuple[int, ...], str]:
+    """Sort key for tool names by version numbers (GE-Proton11-12 > GE-Proton11-9); use reverse=True."""
+    return (tuple(int(n) for n in re.findall(r"\d+", name)), name.lower())
+
+
 def find_default_proton_name(steam_root: Path) -> str:
     """Return the Steam CompatToolMapping name for the newest stable Proton."""
     libs = _list_steam_library_roots(steam_root)
@@ -462,10 +467,36 @@ def list_installed_protons(steam_root: Path) -> list[tuple[str, str]]:
     return found
 
 
+def _env_is_gamescope(env: dict[str, str] | os._Environ[str]) -> bool:
+    return (
+        "gamescope" in env.get("XDG_CURRENT_DESKTOP", "").lower()
+        or bool(env.get("GAMESCOPE_WAYLAND_DISPLAY"))
+        or env.get("SteamGamepadUI") == "1"
+    )
+
+
+def configure_qt_environment(env: dict[str, str] | os._Environ[str]) -> None:
+    """Pick safe Qt platform settings before QApplication exists (called from main.py).
+
+    The AppImage's Qt crashed (SIGSEGV in libqwayland / the portal theme) on the Deck. So:
+    - Gaming Mode (gamescope): never load the xdg-desktop-portal theme (no portal there) and prefer
+      XWayland (xcb) over gamescope's Wayland socket, falling back to wayland if xcb is missing.
+    - Desktop: use the portal theme only when a D-Bus session exists (needed for the file chooser).
+    Explicit user settings always win.
+    """
+    if _env_is_gamescope(env):
+        if env.get("QT_QPA_PLATFORMTHEME") == "xdgdesktopportal" and env.get("DECKINSTALL_KEEP_PORTAL") != "1":
+            env.pop("QT_QPA_PLATFORMTHEME", None)
+        if not env.get("QT_QPA_PLATFORM") and env.get("DISPLAY"):
+            env["QT_QPA_PLATFORM"] = "xcb;wayland"
+        return
+    if env.get("DBUS_SESSION_BUS_ADDRESS"):
+        env.setdefault("QT_QPA_PLATFORMTHEME", "xdgdesktopportal")
+
+
 def is_gamescope_session() -> bool:
     """Return True if currently running inside SteamOS Gaming Mode (gamescope)."""
-    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
-    if "gamescope" in desktop:
+    if _env_is_gamescope(os.environ):
         return True
     try:
         res = subprocess.run(

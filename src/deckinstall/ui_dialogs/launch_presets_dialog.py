@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import shutil
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QThread, Signal
+import shiboken6
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -59,8 +61,12 @@ def open_launch_presets_dialog(
     initial_winedll: str,
     game_obj: object | None = None,
     is_native_linux: bool = False,
+    parent: QWidget | None = None,
 ) -> tuple[str, str] | None:
-    """Open launch options presets dialog and return (launch_opts, winedll) or None."""
+    """Open launch options presets dialog and return (launch_opts, winedll) or None.
+
+    parent: the dialog that asked (e.g. Configure game), so the child stays above it under gamescope/Wayland.
+    """
     is_native_linux = bool(
         is_native_linux or (game_obj is not None and _is_native_linux_game(kind, game_obj))
     )
@@ -72,7 +78,8 @@ def open_launch_presets_dialog(
         if extracted_dll:
             winedll_now = extracted_dll
 
-    dlg = QDialog(_dialog_parent(win))
+    dlg = QDialog(parent if parent is not None else _dialog_parent(win))
+    dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
     dlg.setWindowTitle(tr("launch.title", name=title))
     dlg.resize(580, 500)
     dlg_lay = QVBoxLayout(dlg)
@@ -473,16 +480,35 @@ def open_launch_presets_dialog(
     return new_opts_out, new_dll_out
 
 
-def edit_launch_options_presets(win: MainWindow) -> None:
-    """Open launch options presets for the currently selected library game and save."""
-    sel = win._selected_library_item()
+def edit_launch_options_presets(
+    win: MainWindow,
+    sel: tuple[str, object] | None = None,
+    parent: QWidget | None = None,
+    on_saved: Callable[[str], None] | None = None,
+) -> None:
+    """Open launch options presets for a game (default: the selected library game) and save.
+
+    sel/parent come from the Configure dialog so the right game is edited and the child opens above it;
+    on_saved(new_opts) runs once the new options are stored (or queued).
+    """
+    if sel is None:
+        sel = win._selected_library_item()
+
+    def box_parent() -> QWidget:
+        # The Configure dialog may be closed by the time an async save reports back.
+        if parent is not None and shiboken6.isValid(parent):
+            return parent
+        return _dialog_parent(win)
+
     if not sel:
+        QMessageBox.information(box_parent(), __app_name__, tr("launch.no_game"))
         return
     kind, obj = sel
     if kind not in ("steam", "standalone", "external"):
         return
     if isinstance(obj, ShortcutEntry):
         if not win.paths:
+            QMessageBox.warning(box_parent(), __app_name__, tr("add.steam_missing"))
             return
         title_name = obj.app_name
         opts_now = obj.launch_options or ""
@@ -505,6 +531,7 @@ def edit_launch_options_presets(win: MainWindow) -> None:
         initial_winedll=winedll_now,
         game_obj=obj,
         is_native_linux=_is_native_linux_game(kind, obj),
+        parent=parent,
     )
     if res is None:
         return
@@ -514,12 +541,14 @@ def edit_launch_options_presets(win: MainWindow) -> None:
         try:
             save_external_launch_presets(obj, new_opts)
         except Exception as exc:
-            QMessageBox.critical(_dialog_parent(win), __app_name__, str(exc))
+            QMessageBox.critical(box_parent(), __app_name__, str(exc))
             return
         msg = tr("launch.saved", name=title_name)
         win.status_label.setText(msg)
+        if on_saved is not None:
+            on_saved(new_opts)
         if not win._closing_pending:
-            QMessageBox.information(_dialog_parent(win), __app_name__, msg)
+            QMessageBox.information(box_parent(), __app_name__, msg)
         return
 
     if isinstance(obj, StandaloneGame):
@@ -530,13 +559,15 @@ def edit_launch_options_presets(win: MainWindow) -> None:
                 launch_options=new_opts,
             )
         except Exception as exc:
-            QMessageBox.critical(_dialog_parent(win), __app_name__, str(exc))
+            QMessageBox.critical(box_parent(), __app_name__, str(exc))
             return
         win._refresh_shortcuts()
         msg = tr("launch.saved", name=title_name)
         win.status_label.setText(msg)
+        if on_saved is not None:
+            on_saved(new_opts)
         if not win._closing_pending:
-            QMessageBox.information(_dialog_parent(win), __app_name__, msg)
+            QMessageBox.information(box_parent(), __app_name__, msg)
         return
 
     if not win.paths:
@@ -556,6 +587,8 @@ def edit_launch_options_presets(win: MainWindow) -> None:
         )
         msg = tr("vdf_queue.enqueued", name=title_name)
         win.status_label.setText(msg)
+        if on_saved is not None:
+            on_saved(new_opts)
         return
 
     def _proceed_update_steam_opts() -> None:
@@ -574,13 +607,15 @@ def edit_launch_options_presets(win: MainWindow) -> None:
             win._refresh_shortcuts()
             msg = tr("launch.saved", name=title_name)
             win.status_label.setText(msg)
+            if on_saved is not None:
+                on_saved(new_opts)
             if not win._closing_pending:
-                QMessageBox.information(_dialog_parent(win), __app_name__, msg)
+                QMessageBox.information(box_parent(), __app_name__, msg)
 
         def _err(err: str) -> None:
             win._end_busy()
             if not win._closing_pending:
-                QMessageBox.critical(_dialog_parent(win), __app_name__, err)
+                QMessageBox.critical(box_parent(), __app_name__, err)
 
         worker.finished_ok.connect(_ok)
         worker.failed.connect(_err)

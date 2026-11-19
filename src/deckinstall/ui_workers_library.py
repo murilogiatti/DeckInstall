@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Literal
 
@@ -14,6 +15,7 @@ from .external_actions import (
     import_external_saves_to_target,
 )
 from .extractor import sanitize_folder_name
+from .gameinfo import detect_game_tech
 from .i18n import tr
 from .launcher_scan import ExternalLauncherGame, scan_external_launcher_games
 from .optiscaler import inspect_optiscaler_state
@@ -98,7 +100,36 @@ def compute_library_runner_labels(
             runner += _opti_tag(ext.exe_path)
         labels[("external", f"{ext.source}:{ext.name}:{ext.exe_path}")] = runner
 
+    _add_tech_labels(labels, entries, standalone_games, external_games)
     return labels
+
+
+def _add_tech_labels(
+    labels: dict[tuple[str, str], str],
+    entries: list[ShortcutEntry],
+    standalone_games: list[StandaloneGame],
+    external_games: list[ExternalLauncherGame],
+) -> None:
+    """Add ("api", key) / ("engine", key) labels: graphics API and engine with versions."""
+    jobs: list[tuple[str, Path, Path | None]] = []  # ("<kind>:<key>", exe, game folder)
+    for entry in entries:
+        exe_clean = _strip_vdf_quotes(entry.exe)
+        if exe_clean:
+            start = _strip_vdf_quotes(entry.start_dir)
+            jobs.append((f"steam:{entry.appid_u32}", Path(exe_clean), Path(start) if start else None))
+    jobs.extend((f"standalone:{g.game_dir}", g.exe_path, g.game_dir) for g in standalone_games)
+    jobs.extend((f"external:{e.source}:{e.name}:{e.exe_path}", e.exe_path, e.game_dir) for e in external_games)
+
+    def _one(job: tuple[str, Path, Path | None]) -> tuple[str, tuple[str, str]]:
+        try:
+            return job[0], detect_game_tech(job[1], job[2])
+        except Exception:
+            return job[0], ("-", "-")
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for key, (api, engine) in pool.map(_one, jobs):
+            labels[("api", key)] = api
+            labels[("engine", key)] = engine
 
 
 class SteamDetectWorker(QThread):
@@ -341,6 +372,7 @@ class ArtDownloadWorker(QThread):
         super().__init__()
         self._paths = paths
         self._shortcut = shortcut
+        self.restart_failed = False
         self._match = match
 
     def run(self) -> None:
@@ -488,10 +520,11 @@ class RemoveShortcutWorker(QThread):
             self.failed.emit(_format_worker_error(exc))
         finally:
             try:
-                if was_running and not is_steam_running():
-                    start_steam()
+                if was_running and not is_steam_running() and not start_steam():
+                    self.restart_failed = True
             except Exception:
                 logging.exception("Failed restarting Steam after RemoveShortcutWorker")
+                self.restart_failed = True
 
 
 class BulkPlanWorker(QThread):

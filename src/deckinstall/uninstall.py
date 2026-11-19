@@ -15,7 +15,7 @@ from pathlib import Path
 
 from . import library as _lib
 from . import standalone as _sa
-from .fsutil import is_within, remove_path_or_tree
+from .fsutil import is_within, prune_empty_parents, remove_path_or_tree
 from .library import find_library_root
 from .manifest import decode_path
 from .standalone import (
@@ -315,6 +315,7 @@ def execute_uninstall(
             done(game_item, False)
         else:
             remove_path_or_tree(gd)
+            prune_empty_parents(gd, _games_roots(gd))
             done(game_item, _gone([gd]))
             for covered in (opti_item, icons_item):
                 if covered is not None and covered.id in chosen:

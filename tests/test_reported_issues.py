@@ -377,7 +377,7 @@ class LibraryColumnsFilterAndLogsTests(unittest.TestCase):
             ):
                 win = ui.MainWindow(app)
                 try:
-                    self.assertEqual(win.shortcuts_list.columnCount(), 4)
+                    self.assertEqual(win.shortcuts_list.columnCount(), 6)
                     self.assertEqual(win.saves_list.columnCount(), 4)
                     self.assertEqual(win.saves_list.rowCount(), 1)
                     self.assertTrue(win.btn_save_restore.isEnabled())

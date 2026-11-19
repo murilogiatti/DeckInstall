@@ -7,6 +7,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .fsutil import atomic_copy_file, atomic_write_text
 from .runtime_manager import ProgressCb, _load_versions, ensure_optiscaler
@@ -915,6 +916,101 @@ class BulkOutcome:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class BulkTarget:
+    """One game for a bulk OptiScaler run, whatever its origin.
+
+    source: "deckinstall" (StandaloneGame), "shortcut" (Steam non-Steam shortcut) or "steam" (store game).
+    ref is the original object; winedll is its current WINEDLLOVERRIDES value.
+    """
+
+    name: str
+    exe_path: Path
+    game_dir: Path
+    prefix_dir: Path | None
+    winedll: str
+    source: str
+    ref: Any = None
+    native_linux: bool = False
+
+
+def bulk_optiscaler_targets(
+    targets: list[BulkTarget],
+    *,
+    remove: bool = False,
+    backend: str = "auto",
+    fg_mode: str = "auto",
+    spoof_mode: str = "auto",
+    overlay_menu: bool = True,
+    progress_cb: ProgressCb | None = None,
+) -> list[tuple[BulkOutcome, str | None]]:
+    """Install (or remove) OptiScaler files on several games; return each outcome and its new DLL overrides.
+
+    Only game files are touched here: the caller writes the returned WINEDLLOVERRIDES (None = unchanged)
+    to wherever the game keeps its launch options. Proxy slots taken by an unmanaged DLL are reported
+    as "conflict" and left untouched (nothing is overwritten in bulk).
+    """
+    from .steam_vdf import merge_winedlloverride, remove_winedlloverride
+
+    out: list[tuple[BulkOutcome, str | None]] = []
+    for index, t in enumerate(targets):
+        if progress_cb is not None:
+            progress_cb(t.name, int(index * 100 / max(1, len(targets))))
+        try:
+            if remove:
+                result = uninstall_optiscaler_for_game(t.exe_path)
+                if result.state is None:
+                    out.append((BulkOutcome(t.name, "skipped", "not_installed"), None))
+                    continue
+                dll = remove_winedlloverride(t.winedll, result.state.proxy_dll)
+                out.append((BulkOutcome(t.name, "removed"), dll))
+                continue
+
+            compat = check_optiscaler_compatibility(t.exe_path, t.game_dir)
+            if not compat.compatible or t.native_linux:
+                out.append((BulkOutcome(t.name, "skipped", compat.pe_arch), None))
+                continue
+            if "all_taken" in compat.notes:
+                out.append((BulkOutcome(t.name, "conflict", "all_taken"), None))
+                continue
+            prev = compat.installed_state
+            state = install_optiscaler_for_game(
+                t.exe_path,
+                proxy_dll=compat.recommended_proxy,
+                backend=backend,
+                fg_mode=fg_mode,
+                spoof_mode=spoof_mode,
+                overlay_menu=overlay_menu,
+                prefix_dir=t.prefix_dir,
+                game_name=t.name,
+            )
+            dll = t.winedll
+            if prev is not None and prev.proxy_dll != state.proxy_dll:
+                dll = remove_winedlloverride(dll, prev.proxy_dll)
+            dll = merge_winedlloverride(dll, state.proxy_dll, "n,b")
+            out.append((BulkOutcome(t.name, "installed", f"{state.proxy_dll}.dll"), dll))
+        except OptiScalerConflictError as exc:
+            out.append((BulkOutcome(t.name, "conflict", exc.existing_path.name), None))
+        except Exception as exc:
+            logging.exception("Bulk OptiScaler failed for %s", t.name)
+            out.append((BulkOutcome(t.name, "failed", str(exc)), None))
+    return out
+
+
+def standalone_bulk_target(game: Any) -> BulkTarget:
+    """Wrap a DeckInstall StandaloneGame as a BulkTarget."""
+    return BulkTarget(
+        name=game.name,
+        exe_path=game.exe_path,
+        game_dir=game.game_dir,
+        prefix_dir=game.prefix_dir,
+        winedll=game.winedlloverrides,
+        source="deckinstall",
+        ref=game,
+        native_linux=bool(game.native_linux),
+    )
+
+
 def bulk_optiscaler(
     games: list[object],
     *,
@@ -925,62 +1021,28 @@ def bulk_optiscaler(
     overlay_menu: bool = True,
     progress_cb: ProgressCb | None = None,
 ) -> list[BulkOutcome]:
-    """Install (or remove) OptiScaler on several DeckInstall games and update their DLL overrides.
-
-    Each game gets its recommended proxy DLL; games whose proxy slot is taken by an unmanaged DLL
-    are reported as "conflict" and left untouched (nothing is overwritten in bulk).
-    """
+    """Install (or remove) OptiScaler on several DeckInstall games and update their DLL overrides."""
     from .standalone import StandaloneGame, update_standalone_launch_options
-    from .steam_vdf import merge_winedlloverride, remove_winedlloverride
 
+    targets = [standalone_bulk_target(g) for g in games if isinstance(g, StandaloneGame)]
+    results = bulk_optiscaler_targets(
+        targets,
+        remove=remove,
+        backend=backend,
+        fg_mode=fg_mode,
+        spoof_mode=spoof_mode,
+        overlay_menu=overlay_menu,
+        progress_cb=progress_cb,
+    )
     outcomes: list[BulkOutcome] = []
-    for index, game in enumerate(games):
-        if not isinstance(game, StandaloneGame):
-            continue
-        if progress_cb is not None:
-            progress_cb(game.name, int(index * 100 / max(1, len(games))))
-        try:
-            if remove:
-                result = uninstall_optiscaler_for_game(game.exe_path)
-                if result.state is None:
-                    outcomes.append(BulkOutcome(game.name, "skipped", "not_installed"))
-                    continue
-                dll = remove_winedlloverride(game.winedlloverrides, result.state.proxy_dll)
+    for t, (outcome, dll) in zip(targets, results, strict=True):
+        if dll is not None:
+            try:
                 update_standalone_launch_options(
-                    game.game_dir, winedlloverrides=dll, launch_options=game.launch_options
+                    t.game_dir, winedlloverrides=dll, launch_options=t.ref.launch_options
                 )
-                outcomes.append(BulkOutcome(game.name, "removed"))
-                continue
-
-            compat = check_optiscaler_compatibility(game.exe_path, game.game_dir)
-            if not compat.compatible or game.native_linux:
-                outcomes.append(BulkOutcome(game.name, "skipped", compat.pe_arch))
-                continue
-            if "all_taken" in compat.notes:
-                outcomes.append(BulkOutcome(game.name, "conflict", "all_taken"))
-                continue
-            prev = compat.installed_state
-            state = install_optiscaler_for_game(
-                game.exe_path,
-                proxy_dll=compat.recommended_proxy,
-                backend=backend,
-                fg_mode=fg_mode,
-                spoof_mode=spoof_mode,
-                overlay_menu=overlay_menu,
-                prefix_dir=game.prefix_dir,
-                game_name=game.name,
-            )
-            dll = game.winedlloverrides
-            if prev is not None and prev.proxy_dll != state.proxy_dll:
-                dll = remove_winedlloverride(dll, prev.proxy_dll)
-            dll = merge_winedlloverride(dll, state.proxy_dll, "n,b")
-            update_standalone_launch_options(
-                game.game_dir, winedlloverrides=dll, launch_options=game.launch_options
-            )
-            outcomes.append(BulkOutcome(game.name, "installed", f"{state.proxy_dll}.dll"))
-        except OptiScalerConflictError as exc:
-            outcomes.append(BulkOutcome(game.name, "conflict", exc.existing_path.name))
-        except Exception as exc:
-            logging.exception("Bulk OptiScaler failed for %s", game.name)
-            outcomes.append(BulkOutcome(game.name, "failed", str(exc)))
+            except Exception as exc:
+                logging.exception("Could not save DLL overrides for %s", t.name)
+                outcome = BulkOutcome(t.name, "failed", str(exc))
+        outcomes.append(outcome)
     return outcomes

@@ -253,7 +253,11 @@ def format_size_bytes(num_bytes: int | float) -> str:
 
 
 def _format_worker_error(exc: Exception) -> str:
-    """Format worker exceptions, localizing InsufficientSpaceError."""
+    """Format worker exceptions, localizing InsufficientSpaceError and Gaming Mode refusals."""
+    from .steam_vdf import SteamGamingModeError
+
+    if isinstance(exc, SteamGamingModeError):
+        return tr("steam.gaming_mode_refuse")
     if isinstance(exc, InsufficientSpaceError):
         return tr(
             "error.insufficient_space",

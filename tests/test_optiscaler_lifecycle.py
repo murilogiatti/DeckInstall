@@ -165,7 +165,7 @@ def test_bulk_dialog_lists_compatibility(tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     game = _installed_game(tmp_path, "Alpha")
     (game.game_dir / "nvngx_dlss.dll").write_bytes(b"x")
-    rows = bd._scan()
+    rows = bd._scan(None)
     seen: list[tuple[str, bool, str]] = []
 
     def fake_exec(dlg: QDialog) -> int:
@@ -173,7 +173,7 @@ def test_bulk_dialog_lists_compatibility(tmp_path: Path) -> None:
         tbl = dlg.findChild(QTableWidget)
         assert tbl is not None
         item = tbl.item(0, 0)
-        seen.append((item.text(), item.checkState() == Qt.CheckState.Checked, tbl.item(0, 1).text()))
+        seen.append((item.text(), item.checkState() == Qt.CheckState.Checked, tbl.item(0, 2).text()))
         return 0
 
     with mock.patch.object(bd, "_dialog_parent", return_value=None), mock.patch.object(QDialog, "exec", fake_exec):

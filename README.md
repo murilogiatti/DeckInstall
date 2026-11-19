@@ -4,15 +4,15 @@
 
 Non-Steam game installer, Proton prefix migrator, save validator, and official Steam artwork manager for **Steam Deck / SteamOS** (KDE Plasma + Qt6).
 
-**Current version:** `0.18.0`
+**Current version:** `0.18.1`
 
 ## Features
 - **Unified 4-Tab UI & Smart Initial View**: Streamlined 4-tab layout (`Install` as Source → Executable → Shortcuts with the rest under Advanced, `Library` with Play / Configure / Uninstall, `Backup/Sync`, `Maintenance`) with a clean sidebar, automatic landing on the Library tab when games already exist, a 4-column sortable Non-Steam Library (`Name`, `Source`, `Proton / Runner` with `[OptiScaler]` badge, `Executable`), instant source filter pills (`All`, `Steam`, `Standalone`, `External`), and a compact 2-tab **Configure Game** dialog with inline Proton switching.
 - **Standalone & Steam Modes**: Install and launch Windows games via **Standalone mode** (`umu-run` + `GE-Proton11+`, with `GE-Proton10` fallback and automatic runtime fallback, no Steam required) or add them directly as transactional Non-Steam Steam shortcuts.
 - **Unified Install / Add Flow, Progressive Disclosure & Auto Artwork**: Extracts `.zip`, `.rar`, `.7z`, and `.tar.*` into the selected library (`~/DeckInstall/Games/<Game>` by default; unwrapping nested single root folders without wiping existing files) or runs Windows `setup.exe` installers via Proton inside the unified **Install / Add Game** tab alongside detected folders, smart drag-and-drop routing, collapsible **Advanced Options ▾**, BoilR-style automatic artwork preview, and automatic transition after extraction.
 - **Per-Disk Game Libraries & One Prefix per Game**: New installs go to a library on the chosen disk (`~/DeckInstall` internally, `<disk>/DeckInstall` on microSD/USB) with `Games`, `Prefixes` and `Caches` folders and a `library.json`; libraries are found again after a remount, games on an unmounted disk are listed as unavailable, and exFAT/NTFS disks keep the Wine prefix on the internal disk. Each game has a portable manifest (`.deckinstall.json`, library-relative paths) recording everything DeckInstall created, and adding it to Steam links `compatdata/<appid>` to the same prefix instead of copying it. Games from the old `~/Games` layout can be migrated into the library in one step (offered at startup and in Maintenance), with a save snapshot first and a journal so **Undo last migration** puts everything back.
-- **Smart Installers (GOG, Repacks, Linux .sh)**: Recognizes archives, GOG offline installers (unpacked with `innoextract` when available), FitGirl/DODI-style repacks, other Windows setups and Linux `.sh` installers. Inno Setup installers get `/DIR=` pointing at the library, repacks run with `WINE_LARGE_ADDRESS_AWARE=0`, optional silent mode and MD5 verification, a clear unarc.dll error, and a throwaway installer prefix. The game executable is picked from GOG `playTasks`, the folder the installer created, or a ranking that includes native `start.sh`/`*.x86_64`, and can be switched in one click. OnlineFix/Goldberg/CODEX get the DLL overrides they need, GOG games run with `STORE=gog` and the matching umu `GAMEID`, and archives are no longer capped at 4 GiB (zip-bomb guard by compression ratio, free space checked against the declared size).
-- **Proton per Game & Safe OptiScaler**: Each game runs on **Default (newest GE-Proton)** or a pinned version, with **Use previous version** in one click; GE-Proton updates move Default games automatically and keep only the current and previous versions (never one a game or Steam still uses), and **Games' Proton** pins/unpins many games at once. OptiScaler installs are journaled and roll back on error, a half-done install can be undone with Remove, the proxy DLL is chosen to avoid ReShade/OnlineFix clashes, installs are recorded in the game manifest, and **OptiScaler (bulk)** installs or removes it on many games with a compatibility check.
+- **Smart Installers (GOG, Repacks, Linux .sh)**: Recognizes archives, GOG offline installers (unpacked with `innoextract` when available), FitGirl/DODI-style repacks, other Windows setups and Linux `.sh` installers. Inno Setup installers get `/DIR=` pointing at the library, repacks run with `WINE_LARGE_ADDRESS_AWARE=0`, optional MD5 verification, a clear unarc.dll error, and a throwaway installer prefix. The game executable is picked from GOG `playTasks`, the folder the installer created, or a ranking that includes native `start.sh`/`*.x86_64`, and can be switched in one click. OnlineFix/Goldberg/CODEX get the DLL overrides they need, GOG games run with `STORE=gog` and the matching umu `GAMEID`, and archives are no longer capped at 4 GiB (zip-bomb guard by compression ratio, free space checked against the declared size).
+- **Proton per Game & Safe OptiScaler**: Each game runs on **Default (newest GE-Proton)** or a pinned version, with **Use previous version** in one click; GE-Proton updates move Default games automatically and keep only the current and previous versions (never one a game or Steam still uses), and **Games' Proton** pins/unpins many games at once. OptiScaler installs are journaled and roll back on error, a half-done install can be undone with Remove, the proxy DLL is chosen to avoid ReShade/OnlineFix clashes, installs are recorded in the game manifest, and **OptiScaler (bulk)** installs or removes it on many games (DeckInstall games, Steam shortcuts and Steam library games) with a compatibility check, closing and reopening Steam only once.
 - **Smart Game Detection & Dynamic Scan Folders**: Scans configurable scan folders (`~/Games`, `~/Downloads`, `~/Syncthing`, SD cards `/run/media/*`, and user-added paths), skipping helper/redistributable binaries to highlight the real game executable while reading validated `steam_appid.txt` (`1..4294967295`) and emulator metadata.
 - **Transactional Steam Shortcuts, Prefix Guard & Multi-Proton Manager**: Safely manages `shortcuts.vdf` and `config.vdf` under file locking (`flock`), preserves existing `LaunchOptions`, `icon`, and Proton tool mappings, migrates `compatdata`/grid assets when paths change, enforces a `win32` prefix guard, disables VDF writes with a warning banner if `shortcuts.vdf` is corrupted, and lets you inspect or remove installed Proton/GE-Proton versions.
 - **Run `.exe` in Prefix, OptiScaler & Winetricks**: Run arbitrary `.exe` tools (patches, trainers, modders) inside any game's Wine/Proton prefix, inject/roll back OptiScaler DLSS/FSR/XeSS per game, and install Winetricks verbs/DLLs directly.
@@ -27,10 +27,10 @@ Non-Steam game installer, Proton prefix migrator, save validator, and official S
 Download `DeckInstall-<version>-x86_64.AppImage` from [GitHub Releases](https://github.com/murilogiatti/DeckInstall/releases):
 
 ```bash
-chmod +x DeckInstall-0.18.0-x86_64.AppImage
-./DeckInstall-0.18.0-x86_64.AppImage --version
-QT_QPA_PLATFORM=offscreen ./DeckInstall-0.18.0-x86_64.AppImage --smoke-test
-./DeckInstall-0.18.0-x86_64.AppImage
+chmod +x DeckInstall-0.18.1-x86_64.AppImage
+./DeckInstall-0.18.1-x86_64.AppImage --version
+QT_QPA_PLATFORM=offscreen ./DeckInstall-0.18.1-x86_64.AppImage --smoke-test
+./DeckInstall-0.18.1-x86_64.AppImage
 ```
 
 ## Translating DeckInstall
@@ -55,7 +55,7 @@ mypy src
 ```
 
 ## Build AppImage (GitHub Actions)
-Push a semantic tag matching `VERSION` (e.g. `v0.18.0`) to automatically run the complete test suite on Python 3.10, 3.11, and 3.13, check lint and types, compile a standalone binary with Nuitka, smoke-test the packaged `AppDir`, build `DeckInstall-<version>-x86_64.AppImage`, and attach it plus `SHA256SUMS` to the GitHub Release.
+Push a semantic tag matching `VERSION` (e.g. `v0.18.1`) to automatically run the complete test suite on Python 3.10, 3.11, and 3.13, check lint and types, compile a standalone binary with Nuitka, smoke-test the packaged `AppDir`, build `DeckInstall-<version>-x86_64.AppImage`, and attach it plus `SHA256SUMS` to the GitHub Release.
 
 ## License
 Distributed under the [MIT License](LICENSE).

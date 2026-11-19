@@ -21,6 +21,7 @@ from .fsutil import (
     copy_or_move_dir_contents,
     is_within,
     move_dir_safely,
+    prune_empty_parents,
     remove_path_or_tree,
     sanitize_dir_name,
     slugify,
@@ -155,6 +156,15 @@ def _library_roots_on_disks() -> list[Path]:
         root = mount / _lib.LIBRARY_DIRNAME
         if read_library_file(root) is not None:
             roots.append(root)
+    return roots
+
+
+def _games_roots_for(game_dir: Path) -> list[Path]:
+    """Games folders DeckInstall manages: empty wrappers are pruned up to (not including) them."""
+    roots = [get_games_dir(), get_legacy_games_dir()]
+    lib_root = find_library_root(game_dir)
+    if lib_root is not None:
+        roots.append(lib_root / _lib.GAMES)
     return roots
 
 
@@ -1302,6 +1312,8 @@ def install_standalone_game(
             target_exe_path = exe_path
         else:
             target_game_dir = games_dir / safe_dir_name
+            if target_game_dir.is_dir() and not target_game_dir.is_symlink() and not any(target_game_dir.iterdir()):
+                target_game_dir.rmdir()  # an empty leftover folder is not a reason for "(2)"
             if target_game_dir.exists() and target_game_dir.resolve() != src_dir:
                 idx = 2
                 while (games_dir / f"{safe_dir_name} ({idx})").exists():
@@ -1775,6 +1787,7 @@ def remove_standalone_game(
             )
         else:
             remove_path_or_tree(game.game_dir)
+            prune_empty_parents(game.game_dir, _games_roots_for(game.game_dir))
     if (delete_files or delete_prefix) and not _prefix_used_by_other_game(game.prefix_dir, game.game_dir):
         _unlink_steam_compatdata(game)
         _safe_remove_prefix_dir(game.prefix_dir)

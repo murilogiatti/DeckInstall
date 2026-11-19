@@ -35,6 +35,7 @@ from .steam_paths import (
     dir_size_bytes,
     find_default_proton_name,
     is_flatpak_steam,
+    is_gamescope_session,
     is_steam_running,
     list_steam_users,
     read_library_paths,
@@ -250,9 +251,14 @@ def load_shortcuts(shortcuts_vdf: Path) -> list[ShortcutEntry]:
 
 
 def shutdown_steam(timeout_seconds: int = 15, steam_root: Path | None = None) -> bool:
-    """Gracefully shut down Steam and wait for exit."""
+    """Gracefully shut down Steam and wait for exit.
+
+    Raises SteamGamingModeError in SteamOS Gaming Mode: closing Steam there ends the session.
+    """
     if not is_steam_running():
         return True
+    if is_gamescope_session():
+        raise SteamGamingModeError("Steam cannot be closed in Gaming Mode")
     use_flatpak = is_flatpak_steam(steam_root)
     cmd = (
         ["flatpak", "run", "com.valvesoftware.Steam", "-shutdown"]
@@ -300,24 +306,69 @@ def shutdown_steam(timeout_seconds: int = 15, steam_root: Path | None = None) ->
     return not is_steam_running()
 
 
-def start_steam(steam_root: Path | None = None) -> None:
-    """Start Steam in the background using the current desktop environment."""
-    env = os.environ.copy()
+_STEAM_ENV_DROP = (
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PYTHONNOUSERSITE",
+    "QT_QPA_PLATFORMTHEME",
+    "QT_QPA_PLATFORM",
+    "QT_PLUGIN_PATH",
+    "QML2_IMPORT_PATH",
+    "QT_QPA_PLATFORM_PLUGIN_PATH",
+)
+
+
+class SteamGamingModeError(RuntimeError):
+    """Raised instead of closing Steam inside SteamOS Gaming Mode (it would end the session)."""
+
+
+def _steam_launch_env() -> dict[str, str]:
+    """Environment for Steam without the AppImage's bundled libraries, Python and Qt settings."""
+    from .app_updater import build_clean_relaunch_env
+
+    env = build_clean_relaunch_env()
+    for key in _STEAM_ENV_DROP:
+        env.pop(key, None)
     if "DISPLAY" not in env:
         env["DISPLAY"] = ":0"
+    return env
+
+
+def start_steam(steam_root: Path | None = None, wait_seconds: float = 20.0) -> bool:
+    """Start Steam in its own session with a clean environment; return True once it is running.
+
+    Inside Gaming Mode the session restarts Steam by itself, so nothing is launched there.
+    """
+    if is_steam_running():
+        return True
+    if is_gamescope_session():
+        return False
     cmd = (
         ["flatpak", "run", "com.valvesoftware.Steam", "-silent"]
         if is_flatpak_steam(steam_root)
         else [shutil.which("steam") or "/usr/bin/steam", "-silent"]
     )
-    subprocess.Popen(
-        cmd,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    try:
+        subprocess.Popen(
+            cmd,
+            env=_steam_launch_env(),
+            cwd=str(Path.home()),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError:
+        logging.exception("Could not launch Steam with %s", cmd)
+        return False
+    deadline = time.monotonic() + wait_seconds
+    while time.monotonic() < deadline:
+        if is_steam_running():
+            return True
+        time.sleep(0.5)
+    logging.warning("Steam did not appear within %.0f s after %s", wait_seconds, cmd)
+    return False
 
 
 def _is_same_game_entry(item: dict, exe_path: Path, start_dir: Path) -> bool:
@@ -685,6 +736,120 @@ def _installed_steam_app_names(steam_root: Path) -> dict[int, str]:
                 pass
             names[appid] = app_name
     return names
+
+
+@dataclass(frozen=True)
+class SteamLibraryGame:
+    """An installed Steam (store) game that runs through Proton and has a locatable Windows exe."""
+
+    appid: int
+    name: str
+    install_dir: Path
+    exe_path: Path
+    prefix_dir: Path
+
+
+def _localconfig_apps(data: Any, create: bool = False) -> Any | None:
+    node = data
+    for key in ("UserLocalConfigStore", "Software", "Valve", "Steam", "apps"):
+        child = _get_vdf_section(node, key)
+        if child is None:
+            if not create or not hasattr(node, "items"):
+                return None
+            child = type(node)()
+            node[key] = child
+        node = child
+    return node
+
+
+def get_steam_app_launch_options(paths: SteamPaths, appid: int) -> str:
+    """Return the LaunchOptions of a Steam store game from localconfig.vdf ("" if unset)."""
+    cfg = paths.localconfig_vdf
+    if not cfg.is_file():
+        return ""
+    try:
+        apps = _localconfig_apps(_load_vdf_mapping(cfg))
+    except Exception:
+        return ""
+    app = _get_vdf_section(apps, str(appid)) if apps is not None else None
+    value = _get_vdf_section(app, "LaunchOptions") if app is not None else None
+    return str(value or "")
+
+
+def set_steam_app_launch_options(paths: SteamPaths, appid: int, launch_options: str) -> bool:
+    """Write LaunchOptions of a Steam store game into localconfig.vdf (backup first). Steam must be closed."""
+    cfg = paths.localconfig_vdf
+    with _steam_transaction_lock(cfg):
+        if not cfg.is_file():
+            return False
+        data = _load_vdf_mapping(cfg)
+        apps = _localconfig_apps(data, create=True)
+        if apps is None:
+            return False
+        app = _get_vdf_section(apps, str(appid))
+        if app is None:
+            app = type(apps)()
+            apps[str(appid)] = app
+        key = next((k for k in app if str(k).lower() == "launchoptions"), "LaunchOptions")
+        app[key] = launch_options
+        _backup_file(cfg)
+        _dump_vdf_mapping(cfg, data)
+        return True
+
+
+def list_steam_library_games(paths: SteamPaths) -> list[SteamLibraryGame]:
+    """List installed Steam store games with a Proton prefix and a Windows .exe found in their folder."""
+    from .scanner import scan_game_folder
+
+    out: list[SteamLibraryGame] = []
+    seen: set[int] = set()
+    steamapps_dirs = [paths.steam_root / "steamapps"]
+    steamapps_dirs.extend(lib / "steamapps" for lib in read_library_paths(paths.steam_root))
+    for sa in steamapps_dirs:
+        if not sa.is_dir():
+            continue
+        for acf in sorted(sa.glob("appmanifest_*.acf")):
+            stem_id = acf.stem.removeprefix("appmanifest_")
+            if not (stem_id.isascii() and stem_id.isdigit()):
+                continue
+            appid = int(stem_id)
+            if appid in seen:
+                continue
+            try:
+                parsed = vdf.loads(acf.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                continue
+            state = parsed.get("AppState") or parsed.get("appstate") or {}
+            if not isinstance(state, dict) or not state.get("installdir"):
+                continue
+            install_dir = sa / "common" / str(state["installdir"])
+            prefix_dir = next(
+                (
+                    c / str(appid) / "pfx"
+                    for c in (sa / "compatdata", paths.compatdata_dir)
+                    if (c / str(appid) / "pfx").is_dir()
+                ),
+                None,
+            )
+            if prefix_dir is None or not install_dir.is_dir():
+                continue  # native Linux game or never launched with Proton
+            try:
+                detected = scan_game_folder(install_dir)
+            except OSError:
+                continue
+            if detected is None or detected.primary_exe.suffix.lower() != ".exe":
+                continue
+            seen.add(appid)
+            out.append(
+                SteamLibraryGame(
+                    appid=appid,
+                    name=str(state.get("name") or f"AppID {appid}"),
+                    install_dir=install_dir,
+                    exe_path=detected.primary_exe,
+                    prefix_dir=prefix_dir,
+                )
+            )
+    return out
 
 
 def list_compat_tool_usage(paths: SteamPaths) -> list[CompatMappingEntry]:
@@ -2793,7 +2958,7 @@ def _is_managed_mangohud_config(value: str) -> bool:
     ):
         return True
     parts = [p.strip() for p in cleaned.split(",") if p.strip()]
-    return bool(parts) and all(p.startswith(("position=", "fps_limit=")) for p in parts)
+    return bool(parts) and all(p.startswith(("position=", "fps_limit=", "cpu_text=", "gpu_text=")) for p in parts)
 
 
 def _build_mangohud_config_parts(
@@ -2824,6 +2989,16 @@ def _build_mangohud_config_parts(
             parts.append(f"position={pos}")
     else:
         parts = [f"position={pos}"] if pos else []
+
+    if mangohud_level in (2, 3, 4):
+        # Real hardware names instead of the generic "CPU" / "GPU" labels.
+        from .hwnames import cpu_short_name, gpu_short_name
+
+        cpu, gpu = cpu_short_name(), gpu_short_name()
+        if cpu:
+            parts.append(f"cpu_text={cpu}")
+        if gpu:
+            parts.append(f"gpu_text={gpu}")
 
     if mangohud_fps_limit and mangohud_fps_limit > 0:
         parts.append(f"fps_limit={mangohud_fps_limit}")

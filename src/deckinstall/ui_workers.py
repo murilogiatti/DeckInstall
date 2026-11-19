@@ -7,6 +7,7 @@ import shlex
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from PySide6.QtCore import QThread, Signal
 
@@ -72,6 +73,20 @@ from .steam_vdf import (
 from .ui_cards import _format_worker_error
 
 
+def restart_steam_after_op(worker: Any, status: Any) -> bool:
+    """Start Steam again after a worker closed it; record failure on the worker for the window."""
+    status.emit(tr("add.restarting_steam"))
+    try:
+        ok = start_steam()
+    except Exception:
+        logging.exception("Failed restarting Steam after %s", type(worker).__name__)
+        ok = False
+    if not ok:
+        worker.restart_failed = True
+        status.emit(tr("steam.restart_failed"))
+    return ok
+
+
 class ExtractWorker(QThread):
     """Background worker for archive extraction or Proton setup.exe execution."""
 
@@ -85,14 +100,12 @@ class ExtractWorker(QThread):
         source: Path,
         dest_root: Path,
         folder_name: str,
-        silent: bool = False,
         verify_md5: bool = False,
     ) -> None:
         super().__init__()
         self.source = source
         self.dest_root = dest_root
         self.folder_name = folder_name
-        self.silent = silent
         self.verify_md5 = verify_md5
         self.kind = ""
         self._cancel_event = threading.Event()
@@ -124,7 +137,6 @@ class ExtractWorker(QThread):
             on_log=lambda msg: self.progress.emit(50, msg),
             cancel_flag=self._is_cancelled,
             repack=repack,
-            silent=self.silent,
         )
         self.progress.emit(100, tr("install.installer_done", out=out))
         return out
@@ -263,13 +275,14 @@ class SteamOpWorker(QThread):
         self,
         fn: Callable[[], object],
         need_steam_closed: bool = False,
-        restart_if_was_running: bool = False,
+        restart_if_was_running: bool = True,
     ) -> None:
         super().__init__()
         self.fn = fn
         self.need_steam_closed = need_steam_closed
         self.restart_if_was_running = restart_if_was_running
         self.closed_steam = False  # True once this worker shut Steam down (the window may offer a restart)
+        self.restart_failed = False
 
     def run(self) -> None:
         was_running = False
@@ -281,10 +294,12 @@ class SteamOpWorker(QThread):
                     if not shutdown_steam():
                         raise RuntimeError(tr("add.close_steam_timeout"))
                     self.closed_steam = True
-            result = self.fn()
-            if was_running and self.restart_if_was_running:
-                self.status.emit(tr("add.restarting_steam"))
-                start_steam()
+            try:
+                result = self.fn()
+            finally:
+                # Reopen Steam before reporting, whether the operation worked or not.
+                if self.closed_steam and self.restart_if_was_running:
+                    restart_steam_after_op(self, self.status)
             self.finished_ok.emit(result)
         except Exception as exc:
             self.failed.emit(_format_worker_error(exc))
@@ -368,6 +383,8 @@ class AddToSteamWorker(QThread):
     status = Signal(str)
     finished_ok = Signal(str)
     failed = Signal(str, bool)
+
+    restart_failed = False
 
     def __init__(
         self,
@@ -454,12 +471,8 @@ class AddToSteamWorker(QThread):
         except Exception as exc:
             self.failed.emit(_format_worker_error(exc), shortcut_written)
         finally:
-            if was_running and self.restart_steam:
-                try:
-                    self.status.emit(tr("add.restarting_steam"))
-                    start_steam()
-                except Exception:
-                    logging.exception("Failed restarting Steam after AddToSteamWorker")
+            if was_running and self.restart_steam and not is_steam_running():
+                restart_steam_after_op(self, self.status)
 
 
 class RuntimeUpdateWorker(QThread):
@@ -688,6 +701,8 @@ class BulkMigrateWorker(QThread):
     finished_ok = Signal(str)
     failed = Signal(str)
 
+    restart_failed = False
+
     def __init__(
         self,
         paths: SteamPaths,
@@ -771,12 +786,8 @@ class BulkMigrateWorker(QThread):
         except Exception as exc:
             self.failed.emit(_format_worker_error(exc))
         finally:
-            try:
-                if was_running and not is_steam_running():
-                    self.status.emit(tr("add.restarting_steam"))
-                    start_steam()
-            except Exception:
-                logging.exception("Failed restarting Steam after BulkMigrateWorker")
+            if was_running and not is_steam_running():
+                restart_steam_after_op(self, self.status)
 
 
 class WinetricksWorker(QThread):

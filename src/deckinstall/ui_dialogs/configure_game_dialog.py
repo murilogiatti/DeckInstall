@@ -288,15 +288,13 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     btn_edit_opts.setEnabled(is_steam or is_standalone or is_external)
 
     def _on_edit_opts() -> None:
-        win._edit_launch_options_presets()
-        if not dlg_alive():
-            return
-        if isinstance(obj, ExternalLauncherGame):
-            opts_edit.setText(load_external_launch_presets(obj))
-            return
-        cur = win._selected_library_item()
-        if cur is not None:
-            opts_edit.setText(str(getattr(cur[1], "launch_options", "") or ""))
+        def _saved(new_opts: str) -> None:
+            if dlg_alive():
+                opts_edit.setText(new_opts)
+
+        # Pass this game and this dialog explicitly: the library selection may differ (or be empty),
+        # and without the parent the child can open behind this dialog under gamescope/Wayland.
+        win._edit_launch_options_presets((kind, obj), parent=dlg, on_saved=_saved)
 
     btn_edit_opts.clicked.connect(_on_edit_opts)
 
@@ -398,11 +396,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         proton_btns = QHBoxLayout()
         btn_change_proton = QPushButton(tr("library.btn_proton"))
         btn_change_proton.setEnabled((is_steam and bool(win.paths)) or is_standalone)
-        btn_fallback10 = QPushButton(tr("library.btn_fallback_proton10"))
-        btn_fallback10.setEnabled((is_steam and bool(win.paths)) or is_standalone)
-        btn_fallback10.clicked.connect(win._fallback_selected_proton10)
         proton_btns.addWidget(btn_change_proton)
-        proton_btns.addWidget(btn_fallback10)
         if is_standalone:
             btn_previous_proton = QPushButton(tr("configure.btn_previous_proton"))
             btn_previous_proton.setEnabled(False)

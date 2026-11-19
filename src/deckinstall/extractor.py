@@ -11,6 +11,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 import zipfile
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
@@ -895,62 +896,17 @@ def to_wine_path(path: Path) -> str:
     return "Z:" + str(path.resolve()).replace("/", "\\")
 
 
-def _repack_drives() -> tuple[tuple[str, Path], ...]:
-    """Letters umu/GE-Proton map in every prefix: x: -> $HOME, v: -> /run/media (removable disks)."""
-    return (("x:", Path.home()), ("v:", Path("/run/media")))
+def installer_arguments(installer_exe: Path, target_dir: Path) -> list[str]:
+    """Command-line switches for the installer: Inno Setup gets /DIR=.
 
-
-def repack_drive_path(target_dir: Path) -> tuple[str, Path, str] | None:
-    """(letter, its folder, Windows path) for target_dir through x:/v:, or None when outside both.
-
-    FitGirl/DODI unpackers (ISDone/unarc) fail with "Unable to write data to disk" (-11) when
-    writing through Z: (the filesystem root) or the prefix's C:, but work through X:/V:.
-    """
-    resolved = target_dir.resolve()
-    for letter, root in _repack_drives():
-        try:
-            rel = resolved.relative_to(root.resolve())
-        except (ValueError, OSError):
-            continue
-        if rel.parts:
-            return letter, root, letter.upper() + "\\" + "\\".join(rel.parts)
-    return None
-
-
-def map_repack_drive(prefix: Path, letter: str, root: Path) -> None:
-    """Make sure <prefix>/dosdevices/<letter> points at root (Proton keeps letters it did not make)."""
-    devices = prefix / "dosdevices"
-    devices.mkdir(parents=True, exist_ok=True)
-    link = devices / letter
-    if link.is_symlink():
-        try:
-            if Path(os.readlink(link)) == root:
-                return
-        except OSError:
-            pass
-        link.unlink()
-    elif link.exists():
-        return  # a real folder named like a drive: leave it alone
-    link.symlink_to(root)
-
-
-def installer_arguments(
-    installer_exe: Path, target_dir: Path, silent: bool = False, *, repack_drive: bool = False
-) -> list[str]:
-    """Command-line switches for the installer: Inno Setup gets /DIR= (and /SILENT when asked).
-
-    repack_drive: write /DIR= through X:/V: (see repack_drive_path) when target_dir is under one.
+    Not used for repacks: FitGirl/DODI unpackers (ISDone/unarc) fail with "Unable to write
+    data to disk" (-11) when the folder comes from /DIR=, but work when picked in the installer.
     """
     from .classify import is_inno_setup
 
     if not is_inno_setup(installer_exe):
         return []
-    mapped = repack_drive_path(target_dir) if repack_drive else None
-    dest = mapped[2] if mapped is not None else to_wine_path(target_dir)
-    args = [f"/DIR={dest}"]
-    if silent:
-        args += ["/SP-", "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
-    return args
+    return [f"/DIR={to_wine_path(target_dir)}"]
 
 
 def _installer_prefix_parent(target_dir: Path) -> Path:
@@ -1057,6 +1013,42 @@ def _adopt_from_drive_c(drive_c: Path, target_dir: Path) -> bool:
     return bool(picked or fallback)
 
 
+def _installed_elsewhere_roots(target_dir: Path) -> list[Path]:
+    """Folders where a user-picked install folder usually ends up (outside the prefix)."""
+    home = Path.home()
+    roots = [target_dir.parent, home / "Games", home]
+    out: list[Path] = []
+    for r in roots:
+        if r.is_dir() and not r.is_symlink() and r not in out:
+            out.append(r)
+    return out
+
+
+def _adopt_installed_elsewhere(
+    new_dirs: set[Path], target_dir: Path, started: float, on_log: Callable[[str], None] | None
+) -> bool:
+    """Move the one game folder an installer created outside target_dir into target_dir."""
+    games: list[Path] = []
+    for cand in sorted(new_dirs):
+        try:
+            if cand.is_symlink() or cand.stat().st_mtime < started - 5:
+                continue
+        except OSError:
+            continue
+        if any(not _is_non_game_helper_exe(p) for p in _collect_regular_files(cand) if p.suffix.lower() == ".exe"):
+            games.append(cand)
+    if len(games) != 1:
+        return False  # none, or ambiguous: never guess between several new folders
+    found = games[0]
+    if any(target_dir.iterdir()):
+        return False
+    if on_log:
+        on_log(f"Game installed in {found}; moving it to {target_dir}")
+    target_dir.rmdir()
+    move_dir_safely(found, target_dir)
+    return True
+
+
 def run_windows_installer(
     installer_exe: Path,
     target_dir: Path,
@@ -1064,39 +1056,36 @@ def run_windows_installer(
     cancel_flag: Callable[[], bool] | None = None,
     *,
     repack: bool = False,
-    silent: bool = False,
     keep_prefix: bool | None = None,
 ) -> Path:
     """Run a Windows installer in a throwaway prefix and return the folder holding the game.
 
-    Inno Setup installers (GOG, FitGirl/DODI repacks) get /DIR= pointing at target_dir, so the
-    game lands in the library directly; if the installer ignores it, the game is moved out of
-    the prefix's drive_c. Repacks get twice their size checked, WINE_LARGE_ADDRESS_AWARE=0 while
-    installing, a specific error when unarc.dll fails, and their installer prefix is discarded.
-    Other installers keep it as .deckinstall_installer_pfx (adopted when added to Steam).
+    Inno Setup installers (GOG) get /DIR= pointing at target_dir, so the game lands in the
+    library directly. Repacks (FitGirl/DODI) run as they are, with no /DIR=
+    (their unarc unpacker fails with /DIR=): the user picks the folder, and a folder created
+    elsewhere is moved into target_dir afterwards. If an installer ignores /DIR=, the game is
+    moved out of the prefix's drive_c. Repacks get twice their size checked,
+    WINE_LARGE_ADDRESS_AWARE=0 while installing, a specific error when unarc.dll fails, and
+    their installer prefix is discarded. Other installers keep it as .deckinstall_installer_pfx
+    (adopted when added to Steam).
     """
     data_size = _repack_data_size(installer_exe) if repack else installer_exe.stat().st_size
     check_disk_space(target_dir, max(data_size * 2, 512 * 1024 * 1024))
     keep = (not repack) if keep_prefix is None else keep_prefix
-    args = installer_arguments(installer_exe, target_dir, silent=silent, repack_drive=repack)
+    args = [] if repack else installer_arguments(installer_exe, target_dir)
 
     target_dir.mkdir(parents=True, exist_ok=True)
     pre_existing = _collect_regular_files(target_dir)
+    watch_roots = _installed_elsewhere_roots(target_dir)
+    dirs_before = _child_dirs(watch_roots)
+    started = time.time()
     with tempfile.TemporaryDirectory(prefix="deckinstall_pfx_", dir=str(_installer_prefix_parent(target_dir))) as tmp:
         tmp_pfx = Path(tmp)
         cmd, env, inst_pfx = _installer_command(installer_exe, args, tmp_pfx, on_log, cancel_flag)
         if repack:
             env["WINE_LARGE_ADDRESS_AWARE"] = "0"
-        mapped = repack_drive_path(target_dir) if repack and args else None
-        if mapped is not None:
-            map_repack_drive(inst_pfx, mapped[0], mapped[1])
-        if on_log:
-            if mapped is not None:
-                on_log(f"Destination: {mapped[2]} ({target_dir})")
-            elif args:
-                on_log(f"Destination: {to_wine_path(target_dir)}")
-            else:
-                on_log(f"Tip: in the installer, set destination to {to_wine_path(target_dir)}")
+        if on_log and args:
+            on_log(f"Destination: {to_wine_path(target_dir)}")
         unarc_hits: list[str] = []
 
         def _handle_inst_line(line: str) -> None:
@@ -1128,11 +1117,13 @@ def run_windows_installer(
             raise RuntimeError(f"Installer exited with code {rc}.")
 
         if not (_collect_regular_files(target_dir) - pre_existing):
-            if not _adopt_from_drive_c(inst_pfx / "drive_c", target_dir):
-                raise RuntimeError(
-                    f"No files were installed in {target_dir}. "
-                    f"Point the installer to {mapped[2] if mapped is not None else to_wine_path(target_dir)}"
-                )
+            new_dirs = {
+                d for d in _child_dirs(watch_roots) - dirs_before
+                if d != target_dir and d != tmp_pfx and not d.name.startswith("deckinstall_pfx_")
+            }
+            moved = _adopt_installed_elsewhere(new_dirs, target_dir, started, on_log)
+            if not moved and not _adopt_from_drive_c(inst_pfx / "drive_c", target_dir):
+                raise RuntimeError(f"No files were installed in {target_dir}.")
         game_root = game_root_from_new_files(target_dir, _collect_regular_files(target_dir) - pre_existing)
         saved_pfx = target_dir / ".deckinstall_installer_pfx"
         if keep and (inst_pfx / "drive_c").is_dir() and not inst_pfx.is_symlink():

@@ -1,4 +1,4 @@
-"""Repack / Windows installer runner (Fase 2.2): /DIR=, LAA, silent, wine fallback, unarc, MD5."""
+"""Repack / Windows installer runner (Fase 2.2): /DIR=, LAA, wine fallback, unarc, MD5."""
 
 from __future__ import annotations
 
@@ -69,53 +69,27 @@ def test_inno_arguments(tmp_path: Path) -> None:
     setup = _repack(tmp_path)
     target = tmp_path / "Lib" / "Games" / "My Game"
     assert extractor.installer_arguments(setup, target) == [f"/DIR=Z:{str(target.resolve()).replace('/', chr(92))}"]
-    silent = extractor.installer_arguments(setup, target, silent=True)
-    assert silent[1:] == ["/SP-", "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]
     plain = tmp_path / "nsis.exe"
     plain.write_bytes(b"MZ")
-    assert extractor.installer_arguments(plain, target, silent=True) == []
-    # Outside $HOME and /run/media there is no X:/V:, so Z: stays.
-    with mock.patch.object(extractor, "_repack_drives", return_value=(("x:", tmp_path / "home"),)):
-        assert extractor.installer_arguments(setup, target, repack_drive=True)[0].startswith("/DIR=Z:")
+    assert extractor.installer_arguments(plain, target) == []
 
 
-def test_repack_dir_goes_through_x_or_v(tmp_path: Path) -> None:
-    # unarc fails with -11 "Unable to write data to disk" through Z:; X: ($HOME) and V: work.
-    home, media = tmp_path / "home", tmp_path / "media"
-    with mock.patch.object(extractor, "_repack_drives", return_value=(("x:", home), ("v:", media))):
-        assert extractor.repack_drive_path(home / "DeckInstall" / "Games" / "My Game") == (
-            "x:", home, "X:\\DeckInstall\\Games\\My Game"
-        )
-        assert extractor.repack_drive_path(media / "sd" / "DeckInstall" / "Games" / "G")[2] == (
-            "V:\\sd\\DeckInstall\\Games\\G"
-        )
-        assert extractor.repack_drive_path(tmp_path / "elsewhere" / "G") is None
-
-
-def test_repack_installs_into_dir_and_discards_prefix(tmp_path: Path) -> None:
+def test_repack_runs_without_dir_and_installs_into_dir(tmp_path: Path) -> None:
+    # unarc fails (-11 "Unable to write data to disk") with /DIR=, so repacks run as they are.
     setup = _repack(tmp_path)
-    home = tmp_path / "home"
-    target = home / "DeckInstall" / "Games" / "Game"
-    seen: dict[str, Path] = {}
+    target = tmp_path / "Lib" / "Games" / "Game"
+    logs: list[str] = []
 
     def installer(_cmd: list[str], env: dict[str, str]) -> None:
-        drive = Path(env["WINEPREFIX"]) / "dosdevices" / "x:"
-        seen["x"] = drive.resolve()
-        game = drive / "DeckInstall" / "Games" / "Game"  # the installer writes through X:\...
-        game.mkdir(parents=True, exist_ok=True)
-        (game / "Game.exe").write_bytes(b"MZ")
+        (target / "Game.exe").write_bytes(b"MZ")  # the user picked the suggested folder
         (Path(env["WINEPREFIX"]) / "drive_c").mkdir(parents=True)
 
     runner = _Runner(installer)
-    with (
-        mock.patch.object(extractor, "_repack_drives", return_value=(("x:", home),)),
-        mock.patch.object(extractor, "check_disk_space") as space,
-    ):
-        out = _run(runner, setup, target, repack=True, silent=True)
+    with mock.patch.object(extractor, "check_disk_space") as space:
+        out = _run(runner, setup, target, repack=True, on_log=logs.append)
 
-    assert seen["x"] == home.resolve()
     assert out == target and (target / "Game.exe").is_file()
-    assert "/DIR=X:\\DeckInstall\\Games\\Game" in runner.cmd and "/SILENT" in runner.cmd
+    assert not any(a.startswith("/DIR=") for a in runner.cmd)
     assert runner.env["WINE_LARGE_ADDRESS_AWARE"] == "0"
     assert space.call_args.args[1] >= 2 * (1000 + len(INNO) + 1)
     assert not (target / ".deckinstall_installer_pfx").exists()
@@ -134,6 +108,50 @@ def test_repack_that_ignores_dir_is_moved_out_of_drive_c(tmp_path: Path) -> None
     out = _run(_Runner(installer), setup, target, repack=True)
     assert out == target / "Game"  # the folder the game really lives in
     assert (out / "Game.exe").is_file()
+
+
+def test_repack_installed_in_another_folder_is_moved_into_target(tmp_path: Path) -> None:
+    # The user picked X:\Games\<Game> in the installer instead of the library folder.
+    setup = _repack(tmp_path)
+    home_games = tmp_path / "home" / "Games"
+    home_games.mkdir(parents=True)
+    (home_games / "Old Game").mkdir()  # existed before: never touched
+    (home_games / "Old Game" / "Old.exe").write_bytes(b"MZ")
+    target = tmp_path / "Lib" / "Games" / "Game"
+    logs: list[str] = []
+
+    def installer(_cmd: list[str], _env: dict[str, str]) -> None:
+        picked = home_games / "The Game"
+        (picked / "Data").mkdir(parents=True)
+        (picked / "Game.exe").write_bytes(b"MZ")
+        (picked / "Data" / "a.pak").write_bytes(b"x")
+
+    with mock.patch.object(extractor, "_installed_elsewhere_roots", return_value=[target.parent, home_games]):
+        out = _run(_Runner(installer), setup, target, repack=True, on_log=logs.append)
+
+    assert out == target and (target / "Game.exe").is_file() and (target / "Data" / "a.pak").is_file()
+    assert not (home_games / "The Game").exists()
+    assert (home_games / "Old Game" / "Old.exe").is_file()
+    assert any("moving it to" in line for line in logs)
+
+
+def test_repack_with_two_new_folders_is_not_guessed(tmp_path: Path) -> None:
+    setup = _repack(tmp_path)
+    home_games = tmp_path / "home" / "Games"
+    home_games.mkdir(parents=True)
+    target = tmp_path / "Lib" / "Games" / "Game"
+
+    def installer(_cmd: list[str], _env: dict[str, str]) -> None:
+        for name in ("A", "B"):
+            (home_games / name).mkdir()
+            (home_games / name / f"{name}.exe").write_bytes(b"MZ")
+
+    with (
+        mock.patch.object(extractor, "_installed_elsewhere_roots", return_value=[target.parent, home_games]),
+        pytest.raises(RuntimeError, match="No files were installed"),
+    ):
+        _run(_Runner(installer), setup, target, repack=True)
+    assert (home_games / "A").is_dir() and (home_games / "B").is_dir()
 
 
 def test_unarc_failure_has_its_own_error(tmp_path: Path) -> None:
