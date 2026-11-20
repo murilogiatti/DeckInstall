@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import NoReturn, TypedDict, cast
 
 from PySide6.QtCore import (
     QFileSystemWatcher,
@@ -3957,4 +3958,22 @@ def main() -> int:
         app.processEvents()
         return 0
     win.showMaximized()
-    return app.exec()
+    code = app.exec()
+    win.settings.sync()
+    return code
+
+
+def exit_now(code: int) -> NoReturn:
+    """End the process without Python's normal shutdown.
+
+    At interpreter exit PySide deletes the Qt objects it still tracks; one already freed by
+    Qt (seen with a QPushButton) crashed the app on close (SIGBUS/SIGSEGV in ~QObject).
+    Settings are synced in main(), so only the logs and std streams need flushing here.
+    """
+    logging.shutdown()
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            pass
+    os._exit(code)

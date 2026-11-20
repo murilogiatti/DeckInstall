@@ -4,7 +4,7 @@
 
 Non-Steam game installer, Proton prefix migrator, save validator, and official Steam artwork manager for **Steam Deck / SteamOS** (KDE Plasma + Qt6).
 
-**Current version:** `0.20.0`
+**Current version:** `0.20.1`
 
 ## Features
 - **Unified 4-Tab UI & Smart Initial View**: Streamlined 4-tab layout (`Install` in two steps, Source → Game, everything visible, `Library` with Play / Configure / Uninstall, `Backup/Sync`, `Maintenance`) with a clean sidebar, automatic landing on the Library tab when games already exist, a 4-column sortable Non-Steam Library (`Name`, `Source`, `Proton / Runner` with `[OptiScaler]` badge, `Executable`), instant source filter pills (`All`, `Steam`, `Standalone`, `External`), and a compact 2-tab **Configure Game** dialog with inline Proton switching.
@@ -27,10 +27,10 @@ Non-Steam game installer, Proton prefix migrator, save validator, and official S
 Download `DeckInstall-<version>-x86_64.AppImage` from [GitHub Releases](https://github.com/murilogiatti/DeckInstall/releases):
 
 ```bash
-chmod +x DeckInstall-0.20.0-x86_64.AppImage
-./DeckInstall-0.20.0-x86_64.AppImage --version
-QT_QPA_PLATFORM=offscreen ./DeckInstall-0.20.0-x86_64.AppImage --smoke-test
-./DeckInstall-0.20.0-x86_64.AppImage
+chmod +x DeckInstall-0.20.1-x86_64.AppImage
+./DeckInstall-0.20.1-x86_64.AppImage --version
+QT_QPA_PLATFORM=offscreen ./DeckInstall-0.20.1-x86_64.AppImage --smoke-test
+./DeckInstall-0.20.1-x86_64.AppImage
 ```
 
 ## Translating DeckInstall
@@ -55,7 +55,7 @@ mypy src
 ```
 
 ## Build AppImage (GitHub Actions)
-Push a semantic tag matching `VERSION` (e.g. `v0.20.0`) to automatically run the complete test suite on Python 3.10, 3.11, and 3.13, check lint and types, compile a standalone binary with Nuitka, smoke-test the packaged `AppDir`, build `DeckInstall-<version>-x86_64.AppImage`, and attach it plus `SHA256SUMS` to the GitHub Release. Pushes and pull requests only run the tests (in parallel), lint and types; a test AppImage can be built from **Actions > Run workflow**.
+Push a semantic tag matching `VERSION` (e.g. `v0.20.1`) to automatically run the complete test suite on Python 3.10, 3.11, and 3.13, check lint and types, compile a standalone binary with Nuitka, smoke-test the packaged `AppDir`, build `DeckInstall-<version>-x86_64.AppImage`, and attach it plus `SHA256SUMS` to the GitHub Release. Pushes and pull requests only run the tests (in parallel), lint and types; a test AppImage can be built from **Actions > Run workflow**.
 
 ## License
 Distributed under the [MIT License](LICENSE).

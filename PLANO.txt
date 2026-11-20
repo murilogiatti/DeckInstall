@@ -1,7 +1,9 @@
 DeckInstall - Plano de acao v3 (2026-11-17, atualizado 2026-11-19)
 ==========================================================
 
-STATUS: Fases 0 a 11 concluidas. Ultima release: v0.20.0 (2026-11-20, Fase 11 - auditoria).
+STATUS: Fases 0 a 11 concluidas. Ultima release: v0.20.1 (2026-11-20, crash ao fechar o app).
+v0.20.1: o app caia ao fechar (SIGBUS/SIGSEGV em QObject::~QObject na limpeza do PySide no fim do Python,
+visto no core do Deck: QPushButton ja liberado). Agora main() sincroniza o QSettings e sai com os._exit.
 v0.19.0: tag enviada mas o CI abortou na saida do Python 3.10 (thread da busca de saves ainda rodando ao destruir
 as janelas dos testes); sem release. v0.19.1: a busca de fontes Steam/Hydra/UMU/Nexus so roda ao abrir a aba
 Backup/Sync (nao no inicio do app) e um teste deixava widget sem pai.
