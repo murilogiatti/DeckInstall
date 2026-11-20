@@ -63,6 +63,7 @@ class GameSpace:
 class SpaceReport:
     disks: list[DiskSpace]
     games: list[GameSpace]
+    top_folders: list[tuple[str, int]] = field(default_factory=list)
 
 
 def _real(path: Path | None) -> str | None:
@@ -261,6 +262,15 @@ def disk_space(libraries: list[Library], measured: dict[str, int] | None = None)
     return sorted(disks.values(), key=lambda d: (not d.internal, str(d.mount)))
 
 
+TOP_FOLDERS = 5
+
+
+def top_folders(measured: dict[str, int], limit: int = TOP_FOLDERS) -> list[tuple[str, int]]:
+    """The largest measured folders (path, bytes), biggest first; empty folders are left out."""
+    ranked = sorted(((p, n) for p, n in measured.items() if n > 0), key=lambda it: (-it[1], it[0]))
+    return ranked[:limit]
+
+
 def scan_space(
     libraries: list[Library] | None = None, games: list[StandaloneGame] | None = None
 ) -> SpaceReport:
@@ -272,5 +282,5 @@ def scan_space(
     for g in list_unavailable_games(libs):
         per_game.append(GameSpace(g["name"], uid=g["id"], library=g["library"], available=False))
     per_game.sort(key=lambda g: g.name.lower())
-    return SpaceReport(disk_space(libs, measured), per_game)
+    return SpaceReport(disk_space(libs, measured), per_game, top_folders(measured))
 

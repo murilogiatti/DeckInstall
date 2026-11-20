@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -46,7 +47,13 @@ from ..runtime_manager import (
     resolve_game_prefix,
 )
 from ..scanner import scan_game_folder
-from ..standalone import StandaloneGame, change_standalone_exe, game_run_logs
+from ..standalone import (
+    StandaloneGame,
+    change_standalone_exe,
+    find_game_launchers,
+    game_run_logs,
+    set_game_launcher,
+)
 from ..steam_paths import list_installed_protons
 from ..steam_vdf import (
     ShortcutEntry,
@@ -66,6 +73,7 @@ from ..ui_cards import (
     get_game_log_path,
 )
 from ..ui_workers import SteamOpWorker
+from ..vdf_queue import QueuedVdfEdit
 
 if TYPE_CHECKING:
     from ..ui import MainWindow
@@ -92,7 +100,7 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
     folder_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
     folder_list.horizontalHeader().setSectionsClickable(True)
     folder_list.setSortingEnabled(True)
-    _, custom_entries = win._load_scan_folders()
+    default_entries, custom_entries = win._load_scan_folders()
 
     def _add_entry(kind: str, path_str: str, enabled: bool) -> QTableWidgetItem:
         was_sorting = folder_list.isSortingEnabled()
@@ -113,6 +121,10 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
         folder_list.setSortingEnabled(was_sorting)
         return item
 
+    for path, enabled in default_entries:
+        item = _add_entry("default", str(path), enabled)
+        if path == Path.home():
+            item.setText(tr("scan_folders.home_entry", path=str(path)))
     for entry in custom_entries:
         _add_entry("custom", str(entry["path"]), bool(entry.get("enabled", True)))
 
@@ -200,6 +212,43 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
     dlg.exec()
 
 
+def _launcher_checkboxes(win: MainWindow, dlg: QDialog, game: StandaloneGame) -> QWidget:
+    """Desktop / app-menu launcher boxes, checked by what really exists; toggling creates or removes."""
+    box = QWidget()
+    lay = QHBoxLayout(box)
+    lay.setContentsMargins(0, 0, 0, 0)
+    try:
+        found = find_game_launchers(game)
+    except OSError:
+        found = {"menu": [], "desktop": []}
+    for where, label in (
+        ("desktop", tr("configure.chk_desktop_launcher")),
+        ("menu", tr("configure.chk_menu_launcher")),
+    ):
+        chk = QCheckBox(label)
+        chk.setChecked(bool(found.get(where)))
+
+        def _toggled(checked: bool, w: str = where, c: QCheckBox = chk) -> None:
+            try:
+                set_game_launcher(game, w, checked)
+            except (OSError, ValueError) as exc:
+                QMessageBox.warning(dlg, __app_name__, tr("configure.launcher_failed", err=str(exc)))
+                c.blockSignals(True)
+                c.setChecked(not checked)
+                c.blockSignals(False)
+                return
+            win.status_label.setText(
+                tr("configure.launcher_created", name=game.name)
+                if checked
+                else tr("configure.launcher_removed", name=game.name)
+            )
+
+        chk.toggled.connect(_toggled)
+        lay.addWidget(chk)
+    lay.addStretch()
+    return box
+
+
 def open_configure_game_dialog(win: MainWindow) -> None:
     """Open a streamlined 2-tab configuration dialog for the selected game."""
     sel = win._selected_library_item()
@@ -274,6 +323,8 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     else:
         game_form.addRow(tr("configure.lbl_exe"), lbl_exe)
     game_form.addRow(tr("configure.lbl_dir"), lbl_dir)
+    if isinstance(obj, StandaloneGame):
+        game_form.addRow(tr("configure.lbl_launchers"), _launcher_checkboxes(win, dlg, obj))
 
     initial_opts_text = (
         load_external_launch_presets(obj)
@@ -473,12 +524,9 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     visible_org_actions = [
         action
         for action in (
-            win.act_migrate,
             win.act_import_steam,
             win.act_ext_to_steam,
             win.act_ext_import_saves,
-            win.act_art,
-            win.act_revert_art,
         )
         if action.isVisible() and action.isEnabled()
     ]
@@ -759,6 +807,8 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                         if not dlg_alive() or win._closing_pending:
                             return
 
+                        queued = win.should_queue_vdf_edits()  # Gaming Mode: save it for when Steam closes
+
                         def _do_steam() -> None:
                             win._auto_snapshot_if_enabled(
                                 pfx_dir,
@@ -767,16 +817,28 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                                 "proton",
                                 enabled=auto_snap_enabled,
                             )
-                            set_shortcut_proton(paths_local_p.config_vdf, entry.appid_u32, tool_id)
+                            if not queued:
+                                set_shortcut_proton(paths_local_p.config_vdf, entry.appid_u32, tool_id)
 
-                        worker = SteamOpWorker(_do_steam, need_steam_closed=True)
+                        worker = SteamOpWorker(_do_steam, need_steam_closed=not queued)
                         win._track_worker(worker)
                         worker.status.connect(win.status_label.setText)
 
                         def _st_ok(_res: object) -> None:
                             active_proton_ref[0] = tool_id
-                            win._refresh_shortcuts()
                             msg = tr("proton.updated", name=entry.app_name, tool=tool_id)
+                            if queued:
+                                win.enqueue_vdf_edit(
+                                    QueuedVdfEdit(
+                                        f"set_proton:{entry.appid_u32}",
+                                        "set_proton",
+                                        entry.appid_u32,
+                                        entry.app_name,
+                                        {"tool_name": tool_id},
+                                    )
+                                )
+                                msg = tr("vdf_queue.enqueued", name=entry.app_name)
+                            win._refresh_shortcuts()
                             win.status_label.setText(msg)
                             if dlg_alive():
                                 _set_proton_controls_enabled(True)

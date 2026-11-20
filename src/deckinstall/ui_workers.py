@@ -31,7 +31,6 @@ from .extractor import (
     install_native_sh,
     run_windows_installer,
     sanitize_folder_name,
-    verify_repack_md5,
 )
 from .i18n import tr
 from .library import Library
@@ -55,20 +54,16 @@ from .scanner import (
 from .standalone import install_standalone_game
 from .steam_paths import (
     SteamPaths,
-    _read_compat_tool_id,
     is_steam_running,
 )
 from .steam_vdf import (
-    MigrationPlanItem,
     _format_winedlloverrides_token,
     add_or_update_shortcut,
     adopt_installer_prefix,
     import_external_prefix_saves,
     infer_game_root_from_exe,
-    migrate_shortcut_to_games,
     shutdown_steam,
     start_steam,
-    sync_all_external_saves,
 )
 from .ui_cards import _format_worker_error
 
@@ -100,13 +95,11 @@ class ExtractWorker(QThread):
         source: Path,
         dest_root: Path,
         folder_name: str,
-        verify_md5: bool = False,
     ) -> None:
         super().__init__()
         self.source = source
         self.dest_root = dest_root
         self.folder_name = folder_name
-        self.verify_md5 = verify_md5
         self.kind = ""
         self._cancel_event = threading.Event()
 
@@ -116,18 +109,6 @@ class ExtractWorker(QThread):
 
     def _is_cancelled(self) -> bool:
         return self._cancel_event.is_set() or self.isInterruptionRequested()
-
-    def _check_md5(self, folder: Path) -> None:
-        self.progress.emit(5, tr("install.md5_checking"))
-        checked, problems = verify_repack_md5(
-            folder, on_progress=lambda p, msg: self.progress.emit(p, msg), cancel_flag=self._is_cancelled
-        )
-        if checked == 0:
-            self.progress.emit(10, tr("install.md5_none"))
-        elif problems:
-            raise RuntimeError(tr("install.md5_failed", count=len(problems), items="\n".join(problems[:10])))
-        else:
-            self.progress.emit(10, tr("install.md5_ok", count=checked))
 
     def _run_installer(self, installer: Path, repack: bool = False) -> Path:
         self.progress.emit(20, tr("install.running_installer", name=installer.name))
@@ -172,8 +153,6 @@ class ExtractWorker(QThread):
                     self.progress.emit(10, tr("install.gog_innoextract_failed", err=str(exc)))
                     out = self._run_installer(info.installer)
             elif info.kind == classify.REPACK and info.installer is not None:
-                if self.verify_md5:
-                    self._check_md5(info.installer.parent)
                 out = self._run_installer(info.installer, repack=True)
             elif info.kind == classify.INSTALLER and info.installer is not None:
                 out = self._run_installer(info.installer)
@@ -328,53 +307,6 @@ class ScanWorker(QThread):
             self.finished_scan.emit([])
 
 
-class FallbackProton10Worker(QThread):
-    """Background worker to resolve/download GE-Proton 10 and apply it to a game."""
-
-    status = Signal(str)
-    finished_ok = Signal(str)
-    failed = Signal(str, bool)
-
-    def __init__(
-        self,
-        fn_apply: Callable[[str], None],
-        need_steam_closed: bool = False,
-    ) -> None:
-        super().__init__()
-        self.fn_apply = fn_apply
-        self.need_steam_closed = need_steam_closed
-        self.closed_steam = False
-
-    def run(self) -> None:
-        from .runtime_manager import ensure_ge_proton10, list_ge_proton10_dirs
-
-        try:
-            ge10_dirs = list_ge_proton10_dirs()
-            if ge10_dirs:
-                ge10_dir = ge10_dirs[0]
-            else:
-                self.status.emit(tr("proton10.downloading"))
-                try:
-                    ge10_dir = ensure_ge_proton10(
-                        progress_cb=lambda msg, _pct: self.status.emit(msg)
-                    )
-                except Exception as exc:
-                    self.failed.emit(_format_worker_error(exc), True)
-                    return
-
-            tool_id = _read_compat_tool_id(
-                ge10_dir / "compatibilitytool.vdf", ge10_dir.name
-            )
-            if self.need_steam_closed and is_steam_running():
-                self.status.emit(tr("add.closing_steam"))
-                if not shutdown_steam():
-                    raise RuntimeError(tr("add.close_steam_timeout"))
-                self.closed_steam = True
-
-            self.fn_apply(tool_id)
-            self.finished_ok.emit(tool_id)
-        except Exception as exc:
-            self.failed.emit(_format_worker_error(exc), False)
 
 
 class AddToSteamWorker(QThread):
@@ -694,102 +626,6 @@ class StandaloneInstallWorker(QThread):
             self.failed.emit(_format_worker_error(exc))
 
 
-class BulkMigrateWorker(QThread):
-    """Background worker to migrate multiple Non-Steam games to ~/Games safely."""
-
-    status = Signal(str)
-    finished_ok = Signal(str)
-    failed = Signal(str)
-
-    restart_failed = False
-
-    def __init__(
-        self,
-        paths: SteamPaths,
-        items: list[MigrationPlanItem],
-        pre_snapshot_fn: Callable[[Path, str, str, str], Path | None] | None = None,
-    ) -> None:
-        super().__init__()
-        self.paths = paths
-        self.items = items
-        self.pre_snapshot_fn = pre_snapshot_fn
-
-    def run(self) -> None:
-        was_running = False
-        migrated: list[str] = []
-        errors: list[str] = []
-        try:
-            was_running = is_steam_running()
-            if was_running:
-                self.status.emit(tr("add.closing_steam"))
-                if not shutdown_steam():
-                    raise RuntimeError(tr("add.close_steam_timeout"))
-
-            games_root = Path.home() / "Games"
-            for idx, item in enumerate(self.items, start=1):
-                self.status.emit(
-                    tr(
-                        "migrate.progress",
-                        idx=idx,
-                        total=len(self.items),
-                        old=item.entry.app_name,
-                        new=item.new_name,
-                    )
-                )
-                try:
-                    if self.pre_snapshot_fn is not None:
-                        self.pre_snapshot_fn(
-                            self.paths.compatdata_dir / str(item.entry.appid_u32) / "pfx",
-                            item.entry.app_name,
-                            "migrate-games",
-                            "migrate",
-                        )
-                    new_appid, _, steam_appid = migrate_shortcut_to_games(
-                        paths=self.paths,
-                        entry=item.entry,
-                        games_root=games_root,
-                        new_name=item.new_name,
-                    )
-                    if steam_appid is None:
-                        try:
-                            matches = search_steam_games(item.new_name, limit=1)
-                            if matches:
-                                steam_appid = matches[0].appid
-                        except Exception:
-                            pass
-                    if steam_appid:
-                        try:
-                            download_steam_artwork(steam_appid, new_appid, self.paths.grid_dir)
-                        except Exception:
-                            pass
-                    migrated.append(item.new_name)
-                except Exception as exc:
-                    errors.append(f"{item.entry.app_name}: {_format_worker_error(exc)}")
-
-            self.status.emit(tr("migrate.sync_all"))
-            checked, copied = 0, 0
-            try:
-                checked, copied = sync_all_external_saves(self.paths)
-            except Exception as exc:
-                errors.append(f"sync_all_external_saves: {exc}")
-
-            summary = tr(
-                "migrate.summary",
-                count=len(migrated),
-                names=", ".join(migrated) or tr("art.none"),
-                checked=checked,
-                copied=copied,
-            )
-            if errors:
-                summary += tr("migrate.errors_header", errs="\n".join(errors))
-            self.finished_ok.emit(summary)
-        except Exception as exc:
-            self.failed.emit(_format_worker_error(exc))
-        finally:
-            if was_running and not is_steam_running():
-                restart_steam_after_op(self, self.status)
-
-
 class WinetricksWorker(QThread):
     """Background worker to install winetricks verbs into a game's Wine prefix."""
 
@@ -876,10 +712,7 @@ class RunExeInPrefixWorker(QThread):
 
 
 from .ui_workers_library import (  # noqa: E402, F401
-    ArtDownloadWorker,
-    ArtSearchWorker,
     BackupWorker,
-    BulkPlanWorker,
     DirStatsWorker,
     ExtImportSavesWorker,
     LaunchPrepWorker,
@@ -887,16 +720,8 @@ from .ui_workers_library import (  # noqa: E402, F401
     RemoveShortcutWorker,
     RestoreWorker,
     RuntimePreflightWorker,
-    SaveSyncWorker,
     ShortcutsRefreshWorker,
     SteamDetectWorker,
     SteamRunningWorker,
     compute_library_runner_labels,
-)
-from .ui_workers_maint import (  # noqa: E402, F401
-    MaintBackupWorker,
-    MaintDeleteWorker,
-    MaintHealthWorker,
-    MaintRevalWorker,
-    MaintScanWorker,
 )

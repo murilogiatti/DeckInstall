@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QPoint, Qt, QUrl
@@ -116,24 +118,6 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     layout.addWidget(health_card)
     layout.addWidget(_build_space_card(win))
 
-    batch_card, batch_layout = _make_card()
-    win.maint_batch_card = batch_card
-    batch_layout.addWidget(QLabel(tr("library.menu_batch")))
-    for action in (win.act_bulk_migrate, win.act_bulk_proton):
-        button = QPushButton(action.text())
-        button.setEnabled(action.isEnabled())
-        action.changed.connect(lambda a=action, b=button: b.setEnabled(a.isEnabled()))
-        button.clicked.connect(lambda _checked=False, a=action: a.trigger())
-        batch_layout.addWidget(button)
-    win.btn_migrate_legacy = QPushButton(tr("maint.btn_migrate_legacy"))
-    win.btn_migrate_legacy.setToolTip(tr("maint.migrate_legacy_tooltip"))
-    win.btn_migrate_legacy.clicked.connect(lambda: win._start_legacy_migration())
-    win.btn_undo_migration = QPushButton(tr("maint.btn_undo_migration"))
-    win.btn_undo_migration.clicked.connect(lambda: win._undo_last_migration())
-    batch_layout.addWidget(win.btn_migrate_legacy)
-    batch_layout.addWidget(win.btn_undo_migration)
-    layout.addWidget(batch_card)
-
     clean_card, clean_layout = _make_card()
     clean_top = QHBoxLayout()
     clean_lbl = QLabel(tr("maint.cleanup_title"))
@@ -220,15 +204,6 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     return page
 
 
-def open_maintenance_page(win: MainWindow, *, auto_scan: bool = True) -> None:
-    """Switch to the Maintenance page and refresh health/cleanup data."""
-    win.stack.setCurrentIndex(3)
-    if len(win._nav_buttons) > 3:
-        win._nav_buttons[3].setChecked(True)
-    refresh_maintenance_health(win)
-    refresh_space(win)
-    if auto_scan:
-        scan_maintenance_cleanup(win)
 
 
 _SPACE_COLUMNS = 7
@@ -256,6 +231,11 @@ def _build_space_card(win: MainWindow) -> QWidget:
     win.space_disks_layout.setContentsMargins(0, 0, 0, 0)
     win.space_disks_layout.setSpacing(4)
     card_layout.addWidget(disks_box)
+    win.lbl_space_top = QLabel("")
+    win.lbl_space_top.setWordWrap(True)
+    win.lbl_space_top.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    win.lbl_space_top.setVisible(False)
+    card_layout.addWidget(win.lbl_space_top)
 
     table = QTableWidget(0, _SPACE_COLUMNS)
     table.setHorizontalHeaderLabels(
@@ -312,6 +292,18 @@ def refresh_space(win: MainWindow) -> None:
     worker.start()
 
 
+def _format_top_folders(folders: list[tuple[str, int]]) -> str:
+    """Biggest folders as plain text, one per line, sizes readable and paths shortened to ~."""
+    if not folders:
+        return ""
+    home = str(Path.home())
+    lines = [tr("space.top_title", count=len(folders))]
+    for path, size in folders:
+        short = "~" + path[len(home) :] if path == home or path.startswith(home + os.sep) else path
+        lines.append(tr("space.top_item", size=format_size_bytes(size), path=short))
+    return "\n".join(lines)
+
+
 def apply_space_report(win: MainWindow, report: SpaceReport) -> None:
     """Show one bar per disk and one row per game."""
     box = win.space_disks_layout
@@ -347,6 +339,9 @@ def apply_space_report(win: MainWindow, report: SpaceReport) -> None:
         detail.setWordWrap(True)
         for widget in (head, bar, detail):
             box.addWidget(widget)
+
+    win.lbl_space_top.setText(_format_top_folders(report.top_folders))
+    win.lbl_space_top.setVisible(bool(report.top_folders))
 
     table = win.space_games_list
     table.setSortingEnabled(False)

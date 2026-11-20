@@ -146,13 +146,13 @@ QPushButton:disabled {
     border-color: $disabled_border;
     color: $disabled_fg;
 }
-QPushButton#primaryBtn {
+QPushButton#primaryBtn, QMessageBox QPushButton:default {
     background-color: #1d6fa5;
     border-color: $primary_border;
     color: #ffffff;
     font-weight: 600;
 }
-QPushButton#primaryBtn:hover {
+QPushButton#primaryBtn:hover, QMessageBox QPushButton:default:hover {
     background-color: #2584c4;
 }
 QPushButton#primaryBtn:disabled {

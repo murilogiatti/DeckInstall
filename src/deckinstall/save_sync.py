@@ -604,16 +604,45 @@ def _restore_registry_saves(prefix_dir: Path, reg_json_bytes: bytes) -> int:
     return restored_count
 
 
+# Save folders outside the Wine prefix, stored in snapshots under their own section.
+# "steamcloud" = Steam's local cloud copy (userdata/<user>/<appid>/remote).
+EXTRA_SECTIONS = ("steamcloud",)
+ExtraDirs = tuple[tuple[str, Path], ...]
+_EXTRA_SKIP_DIRS = frozenset({"shadercache", "cache", "logs", "dxvk", "temp", "gpucache"})
+_EXTRA_SKIP_SUFFIXES = (".log", ".dxvk-cache", ".tmp")
+
+
+def _extra_save_entries(extra_dirs: ExtraDirs | None) -> list[tuple[str, Path, Path]]:
+    """(section, file, path inside that folder) for extra save folders; caches and logs left out."""
+    entries: list[tuple[str, Path, Path]] = []
+    for section, root in extra_dirs or ():
+        if section not in EXTRA_SECTIONS or root.is_symlink() or not root.is_dir():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames[:] = [d for d in dirnames if d.lower() not in _EXTRA_SKIP_DIRS]
+            cur = Path(dirpath)
+            for fname in filenames:
+                if fname.lower().endswith(_EXTRA_SKIP_SUFFIXES):
+                    continue
+                src = cur / fname
+                if src.is_symlink() or not src.is_file():
+                    continue
+                entries.append((section, src, src.relative_to(root)))
+    return entries
+
+
 def _collect_prefix_save_entries(
     prefix_dir: Path,
     game_name: str = "",
     game_dir: Path | None = None,
     steam_appid: int | None = None,
+    extra_dirs: ExtraDirs | None = None,
 ) -> list[tuple[str, Path, Path]]:
-    """Collect sorted (section, src_file, rel_path) tuples for save files in prefix_dir."""
+    """Collect sorted (section, src_file, rel_path) tuples for save files in prefix_dir (and extra_dirs)."""
+    extras = _extra_save_entries(extra_dirs)
     if not prefix_dir.is_dir():
-        return []
-    entries: list[tuple[str, Path, Path]] = []
+        return sorted(extras, key=lambda item: (item[0], item[2].as_posix()))
+    entries: list[tuple[str, Path, Path]] = list(extras)
     seen: set[tuple[str, str]] = set()
     src_users = _prefix_users_dir(prefix_dir)
     if src_users is not None:
@@ -676,8 +705,9 @@ def _write_saves_zip_atomic(
     game_name: str = "",
     game_dir: Path | None = None,
     steam_appid: int | None = None,
+    extra_dirs: ExtraDirs | None = None,
 ) -> int:
-    """Write prefix saves to target_zip atomically; return count of backed-up files."""
+    """Write prefix saves (and extra_dirs) to target_zip atomically; return count of backed-up files."""
     target_zip.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{target_zip.stem}-", suffix=".zip.tmp", dir=str(target_zip.parent)
@@ -691,7 +721,8 @@ def _write_saves_zip_atomic(
             )
             written = set(zf.namelist())
             for section, src_file, rel_path in _collect_prefix_save_entries(
-                prefix_dir, game_name=game_name, game_dir=game_dir, steam_appid=steam_appid
+                prefix_dir, game_name=game_name, game_dir=game_dir, steam_appid=steam_appid,
+                extra_dirs=extra_dirs,
             ):
                 arcname = f"{key_prefix}/{section}/{rel_path.as_posix()}"
                 if arcname in written:
@@ -751,6 +782,22 @@ def _write_snapshot_index(snap_dir: Path, index: dict[str, object]) -> None:
         logging.getLogger(__name__).warning("Could not write snapshot index in %s: %s", snap_dir, exc)
 
 
+def remember_snapshot_name(snap_dir: Path, game_name: str) -> None:
+    """Keep the game's real name next to its snapshots (shown once the game is uninstalled)."""
+    if not game_name or not snap_dir.is_dir():
+        return
+    index = _read_snapshot_index(snap_dir)
+    if index.get("name") != game_name:
+        index["name"] = game_name
+        _write_snapshot_index(snap_dir, index)
+
+
+def snapshot_display_name(slug: str, dest_root: Path | None = None) -> str:
+    """The name saved with a game's snapshots, or the folder name."""
+    name = _read_snapshot_index((dest_root or DEFAULT_SNAPSHOTS_DIR) / slug).get("name")
+    return name if isinstance(name, str) and name.strip() else slug
+
+
 def snapshot_prefix_saves(
     prefix_dir: Path,
     game_name: str,
@@ -761,19 +808,21 @@ def snapshot_prefix_saves(
     game_dir: Path | None = None,
     steam_appid: int | None = None,
     dedup: bool = False,
+    extra_dirs: ExtraDirs | None = None,
 ) -> Path | None:
     """Create a rotated ZIP snapshot of prefix saves (max_keep <= 0: no rotation).
 
     With dedup, saves whose content hash matches the newest snapshot return that snapshot
     instead of writing an identical ZIP.
     """
-    if not prefix_dir.is_dir():
+    if not prefix_dir.is_dir() and not extra_dirs:
         return None
     snap_dir = snapshot_dir_for(game_name, dest_root)
     digest = ""
     if dedup:
         digest = compute_prefix_saves_fingerprint(
-            prefix_dir, game_name=game_name, game_dir=game_dir, steam_appid=steam_appid
+            prefix_dir, game_name=game_name, game_dir=game_dir, steam_appid=steam_appid,
+            extra_dirs=extra_dirs,
         ).digest
         if not digest:
             return None
@@ -797,14 +846,15 @@ def snapshot_prefix_saves(
 
     written = _write_saves_zip_atomic(
         prefix_dir, target_zip, key_prefix, game_name=game_name,
-        game_dir=game_dir, steam_appid=steam_appid,
+        game_dir=game_dir, steam_appid=steam_appid, extra_dirs=extra_dirs,
     )
     if written == 0:
         return None
+    index = _read_snapshot_index(snap_dir)
     if digest:
-        index = _read_snapshot_index(snap_dir)
         index.update(digest=digest, zip=target_zip.name)
-        _write_snapshot_index(snap_dir, index)
+    index["name"] = game_name
+    _write_snapshot_index(snap_dir, index)
     _rotate_snapshots(snap_dir, max_keep)
     return target_zip
 
@@ -819,6 +869,7 @@ def auto_snapshot(
     game_dir: Path | None = None,
     steam_appid: int | None = None,
     dest_root: Path | None = None,
+    extra_dirs: ExtraDirs | None = None,
 ) -> Path | None:
     """The one entry point for app snapshots: deduplicated by content, newest `keep` kept per game."""
     return snapshot_prefix_saves(
@@ -831,6 +882,7 @@ def auto_snapshot(
         game_dir=game_dir,
         steam_appid=steam_appid,
         dedup=True,
+        extra_dirs=extra_dirs,
     )
 
 
@@ -888,6 +940,7 @@ def restore_snapshot_safely(
     game_dir: Path | None = None,
     steam_appid: int | None = None,
     dest_root: Path | None = None,
+    extra_dirs: ExtraDirs | None = None,
 ) -> tuple[int, Path | None]:
     """Snapshot the current saves (never rotated away), then restore snapshot_zip.
 
@@ -897,12 +950,12 @@ def restore_snapshot_safely(
         raise FileNotFoundError(f"Snapshot not found: {snapshot_zip}")
     safety = auto_snapshot(
         prefix_dir, game_name, "pre-restore", keep=0,
-        game_dir=game_dir, steam_appid=steam_appid, dest_root=dest_root,
+        game_dir=game_dir, steam_appid=steam_appid, dest_root=dest_root, extra_dirs=extra_dirs,
     )
     if state:
         files, regs = restore_prefix_state_snapshot(snapshot_zip, prefix_dir)
         return files + regs, safety
-    return _restore_saves_archive(snapshot_zip, prefix_dir, game_dir), safety
+    return _restore_saves_archive(snapshot_zip, prefix_dir, game_dir, extra_dirs=extra_dirs), safety
 
 
 def snapshot_prefix_state(
@@ -1109,13 +1162,15 @@ def compute_prefix_saves_fingerprint(
     game_name: str = "",
     game_dir: Path | None = None,
     steam_appid: int | None = None,
+    extra_dirs: ExtraDirs | None = None,
 ) -> SaveFingerprint:
-    """Compute a deterministic fingerprint over all non-empty save files in prefix_dir."""
+    """Compute a deterministic fingerprint over all non-empty save files in prefix_dir (and extra_dirs)."""
     entries = _collect_prefix_save_entries(
         prefix_dir,
         game_name=game_name,
         game_dir=game_dir,
         steam_appid=steam_appid,
+        extra_dirs=extra_dirs,
     )
     reg_bytes = _extract_manifest_reg_bytes(prefix_dir, game_name, steam_appid)
     if not entries and not reg_bytes:
@@ -1345,7 +1400,7 @@ def _parse_sync_zip_entry(
     parts = Path(filename).parts
     if any(p in ("..", "", ".") for p in parts):
         return None
-    valid_sections = ("users", "ProgramData", "game", "registry")
+    valid_sections = ("users", "ProgramData", "game", "registry", *EXTRA_SECTIONS)
     if len(parts) >= 2 and parts[0] in valid_sections:
         return parts[0], parts[1:]
     if len(parts) >= 3 and parts[1] in valid_sections:
@@ -1403,15 +1458,6 @@ def pull_game_saves(
     return restored_files, snap_path
 
 
-def restore_prefix_saves_snapshot(
-    snapshot_zip: Path,
-    prefix_dir: Path,
-    game_dir: Path | None = None,
-) -> int:
-    """Restore a selected pre-operation snapshot, including manifest game files and registry saves."""
-    if snapshot_zip.is_symlink() or not snapshot_zip.is_file():
-        raise FileNotFoundError(f"Save snapshot not found: {snapshot_zip}")
-    return _restore_saves_archive(snapshot_zip, prefix_dir, game_dir)
 
 
 def _restore_saves_archive(
@@ -1419,14 +1465,18 @@ def _restore_saves_archive(
     prefix_dir: Path,
     game_dir: Path | None,
     remote_updated_at: float | None = None,
+    extra_dirs: ExtraDirs | None = None,
 ) -> int:
-    """Extract bounded save entries into explicitly selected prefix and game roots."""
+    """Extract bounded save entries into explicitly selected prefix, game and extra roots."""
+    extras = {name: root for name, root in (extra_dirs or ()) if name in EXTRA_SECTIONS}
+    has_prefix = prefix_dir.is_dir() or not extras  # an extras-only game (no prefix) never gets one created
     drive_c = _resolve_drive_c_target(prefix_dir)
-    if not _safe_parents_within(
-        prefix_dir, prefix_dir.resolve(), drive_c.relative_to(prefix_dir).parts
-    ):
-        raise OSError(f"Unsafe target drive_c path: {drive_c}")
-    drive_c.mkdir(parents=True, exist_ok=True)
+    if has_prefix:
+        if not _safe_parents_within(
+            prefix_dir, prefix_dir.resolve(), drive_c.relative_to(prefix_dir).parts
+        ):
+            raise OSError(f"Unsafe target drive_c path: {drive_c}")
+        drive_c.mkdir(parents=True, exist_ok=True)
     drive_c_resolved = drive_c.resolve()
     game_dir_resolved = game_dir.resolve() if game_dir is not None and game_dir.is_dir() else None
 
@@ -1479,6 +1529,17 @@ def _restore_saves_archive(
                 base_resolved = game_dir_resolved
                 check_parts = rel_parts[:-1]
                 target = game_dir.joinpath(*rel_parts)
+            elif section in EXTRA_SECTIONS:
+                extra_root = extras.get(section)
+                if extra_root is None or extra_root.is_symlink():
+                    continue
+                extra_root.mkdir(parents=True, exist_ok=True)
+                base_dir = extra_root
+                base_resolved = extra_root.resolve()
+                check_parts = rel_parts[:-1]
+                target = extra_root.joinpath(*rel_parts)
+            elif not has_prefix:
+                continue
             else:
                 base_dir = drive_c
                 base_resolved = drive_c_resolved

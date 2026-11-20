@@ -34,7 +34,7 @@ from ..optiscaler import (
     standalone_bulk_target,
 )
 from ..standalone import list_standalone_games, update_standalone_launch_options
-from ..steam_paths import SteamPaths, is_gamescope_session
+from ..steam_paths import SteamPaths
 from ..steam_vdf import (
     _strip_vdf_quotes,
     get_steam_app_launch_options,
@@ -367,7 +367,7 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
             if paths is None:
                 _finish(outcomes, None, [tr("add.steam_missing")])
                 return
-            if win.is_batch_vdf_enabled():
+            if win.should_queue_vdf_edits():
                 for source, appid, name, opts in writes:
                     op: VdfEditOp = "set_launch_options" if source == "shortcut" else "set_app_launch_options"
                     win.enqueue_vdf_edit(
@@ -397,15 +397,10 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
             vdf_worker.start()
 
         def _job() -> tuple[list[BulkOutcome], list[VdfWrite], list[Row] | None]:
-            todo = list(picked)
-            skipped: list[BulkOutcome] = []
-            if any(t.source != "deckinstall" for t in todo) and is_gamescope_session():
-                # Gaming Mode: writing Steam's launch options needs Steam closed, which ends the session.
-                skipped = [BulkOutcome(t.name, "skipped", tr("optiscaler_bulk.gaming_mode")) for t in todo
-                           if t.source != "deckinstall"]
-                todo = [t for t in todo if t.source == "deckinstall"]
-            outcomes, writes = _install_files(todo, remove, backend)
-            return outcomes + skipped, writes, (None if writes else _scan(paths))
+            # Files are copied with Steam open; the launch options then go to Steam in one write
+            # (or to the saved queue in Gaming Mode, where Steam cannot be closed).
+            outcomes, writes = _install_files(list(picked), remove, backend)
+            return outcomes, writes, (None if writes else _scan(paths))
 
         worker = SteamOpWorker(_job, need_steam_closed=False)
         win._track_worker(worker)

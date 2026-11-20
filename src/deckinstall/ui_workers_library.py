@@ -10,7 +10,6 @@ from typing import Literal
 
 from PySide6.QtCore import QThread, Signal
 
-from .artwork import SteamMatch, download_steam_artwork, search_steam_games
 from .external_actions import (
     import_external_saves_to_target,
 )
@@ -36,7 +35,6 @@ from .steam_paths import (
     SteamPaths,
     find_proton_binary,
     find_steam_root,
-    is_gamescope_session,
     is_steam_running,
     list_installed_protons,
     resolve_steam_paths,
@@ -49,12 +47,10 @@ from .steam_vdf import (
     get_compat_tool_map,
     get_shortcut_proton,
     load_shortcuts,
-    plan_bulk_migration,
     remove_shortcut,
     restore_saves_backup,
     shutdown_steam,
     start_steam,
-    sync_all_external_saves,
 )
 from .ui_cards import _format_worker_error, _is_wine_game_running
 
@@ -339,53 +335,6 @@ class LaunchPrepWorker(QThread):
             self.ready.emit("error", str(exc), [], None, None)
 
 
-class ArtSearchWorker(QThread):
-    """Search Steam games for artwork selection."""
-
-    found = Signal(list)
-    failed = Signal(str)
-
-    def __init__(self, app_name: str, limit: int = 5) -> None:
-        super().__init__()
-        self._app_name = app_name
-        self._limit = limit
-
-    def run(self) -> None:
-        try:
-            self.found.emit(search_steam_games(self._app_name, limit=self._limit))
-        except Exception as exc:
-            self.failed.emit(_format_worker_error(exc))
-
-
-class ArtDownloadWorker(QThread):
-    """Download Steam grid artwork for a shortcut."""
-
-    done = Signal(str)
-    failed = Signal(str)
-
-    def __init__(
-        self,
-        paths: SteamPaths,
-        shortcut: ShortcutEntry,
-        match: SteamMatch,
-    ) -> None:
-        super().__init__()
-        self._paths = paths
-        self._shortcut = shortcut
-        self.restart_failed = False
-        self._match = match
-
-    def run(self) -> None:
-        try:
-            res = download_steam_artwork(
-                self._match.appid, self._shortcut.appid_u32, self._paths.grid_dir
-            )
-            files_str = ", ".join(res.saved_files.keys()) or tr("art.none")
-            self.done.emit(tr("art.updated", name=self._match.name, files=files_str))
-        except Exception as exc:
-            self.failed.emit(_format_worker_error(exc))
-
-
 class SteamRunningWorker(QThread):
     """Check whether Steam is currently running."""
 
@@ -525,57 +474,6 @@ class RemoveShortcutWorker(QThread):
             except Exception:
                 logging.exception("Failed restarting Steam after RemoveShortcutWorker")
                 self.restart_failed = True
-
-
-class BulkPlanWorker(QThread):
-    """Build a bulk migration plan for non-standardized Steam shortcuts."""
-
-    ready = Signal(list, bool)
-    failed = Signal(str)
-
-    def __init__(
-        self,
-        paths: SteamPaths,
-        *,
-        load_shortcuts_fn: Callable[[Path], list[ShortcutEntry]] | None = None,
-    ) -> None:
-        super().__init__()
-        self._paths = paths
-        self._load_shortcuts = load_shortcuts_fn or load_shortcuts
-
-    def run(self) -> None:
-        try:
-            entries = self._load_shortcuts(self._paths.shortcuts_vdf)
-            plan = plan_bulk_migration(
-                entries=entries,
-                games_root=Path.home() / "Games",
-                compatdata_dir=self._paths.compatdata_dir,
-                config_vdf=self._paths.config_vdf,
-            )
-            steam_running = is_gamescope_session() and is_steam_running()
-            self.ready.emit(plan, steam_running)
-        except Exception as exc:
-            self.failed.emit(_format_worker_error(exc))
-
-
-class SaveSyncWorker(QThread):
-    """Synchronize external prefix saves back to standardized game prefixes."""
-
-    done = Signal(int, int)
-    failed = Signal(str)
-
-    def __init__(self, paths: SteamPaths) -> None:
-        super().__init__()
-        self._paths = paths
-
-    def run(self) -> None:
-        try:
-            if _is_wine_game_running():
-                raise RuntimeError(tr("migrate.wine_running"))
-            checked, copied = sync_all_external_saves(self._paths)
-            self.done.emit(checked, copied)
-        except Exception as exc:
-            self.failed.emit(_format_worker_error(exc))
 
 
 class DirStatsWorker(QThread):

@@ -19,7 +19,7 @@ import threading
 import time
 import zipfile
 import zlib
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,7 +27,7 @@ from typing import Any
 import vdf
 
 from .extractor import check_disk_space
-from .fsutil import atomic_write_bytes, file_sha256, move_dir_safely
+from .fsutil import atomic_write_bytes, file_sha256
 from .manifest import read_manifest_fields
 from .scanner import clean_game_name, detect_steam_appid
 from .steam_paths import (
@@ -996,17 +996,6 @@ _FORBIDDEN_ROOT_NAMES = {
 }
 
 
-def _rewrite_path_prefix(val: str, old_prefixes: tuple[str, ...], new_prefix: str) -> str:
-    for old_p in old_prefixes:
-        if not old_p:
-            continue
-        if val == old_p:
-            return new_prefix
-        if val.startswith(old_p + "/"):
-            return new_prefix + val[len(old_p) :]
-    return val
-
-
 def _raw_shell_tokens(s: str) -> list[str]:
     """Split shell string on unquoted whitespace while keeping quotes and escapes intact."""
     tokens: list[str] = []
@@ -1042,57 +1031,6 @@ def _raw_shell_tokens(s: str) -> list[str]:
     if cur:
         tokens.append("".join(cur))
     return tokens
-
-
-def _rewrite_launch_options(
-    launch_options: str,
-    old_root: Path,
-    new_root: Path,
-    old_compat: Path | None = None,
-    new_compat: Path | None = None,
-) -> str:
-    """Safely rewrite path tokens in LaunchOptions without altering unrelated quoting or expansions."""
-    if not launch_options:
-        return launch_options
-    old_roots = tuple(dict.fromkeys([str(old_root.resolve()), str(old_root)]))
-    new_root_str = str(new_root)
-    old_compats = (
-        tuple(dict.fromkeys([str(old_compat.resolve()), str(old_compat)]))
-        if old_compat
-        else ()
-    )
-    new_compat_str = str(new_compat) if new_compat else ""
-    try:
-        raw_tokens = _raw_shell_tokens(launch_options)
-    except ValueError:
-        return launch_options
-
-    changed = False
-    out_tokens: list[str] = []
-    for raw_tok in raw_tokens:
-        try:
-            unquoted = shlex.split(raw_tok)
-            tok = unquoted[0] if len(unquoted) == 1 else raw_tok
-        except ValueError:
-            tok = raw_tok
-        new_raw = raw_tok
-        if _is_env_assignment(tok):
-            key, val = tok.split("=", 1)
-            upd = _rewrite_path_prefix(val, old_roots, new_root_str)
-            if old_compats and new_compat_str:
-                upd = _rewrite_path_prefix(upd, old_compats, new_compat_str)
-            if upd != val:
-                new_raw = f"{key}={shlex.quote(upd)}"
-                changed = True
-        else:
-            upd = _rewrite_path_prefix(tok, old_roots, new_root_str)
-            if old_compats and new_compat_str:
-                upd = _rewrite_path_prefix(upd, old_compats, new_compat_str)
-            if upd != tok:
-                new_raw = shlex.quote(upd)
-                changed = True
-        out_tokens.append(new_raw)
-    return " ".join(out_tokens) if changed else launch_options
 
 
 def _has_proton_mapping(
@@ -1261,304 +1199,6 @@ def infer_game_root_from_exe(exe_path: Path) -> Path:
     ):
         raise ValueError(f"Raiz inferida inválida ou protegida para migração: {candidate}")
     return candidate
-
-
-def migrate_shortcut_to_games(
-    paths: SteamPaths,
-    entry: ShortcutEntry,
-    games_root: Path,
-    new_name: str | None = None,
-) -> tuple[int, Path, int | None]:
-    """Move a game folder to games_root/<clean_name>, preserve compatdata/saves, and update Steam.
-
-    Returns (new_appid_u32, new_exe_path, detected_steam_appid).
-    """
-    old_exe = Path(entry.exe.strip().strip('"'))
-    if not old_exe.is_file():
-        raise FileNotFoundError(f"Executável não encontrado: {old_exe}")
-
-    old_root = infer_game_root_from_exe(old_exe)
-    target_name = (new_name or "").strip() or clean_game_name(old_root.name)
-    if not target_name or target_name in (".", "..") or "/" in target_name or "\\" in target_name:
-        raise ValueError(f"Nome de jogo inválido: {target_name!r}")
-    new_root = games_root / target_name
-    games_root.mkdir(parents=True, exist_ok=True)
-
-    rel_exe = old_exe.resolve().relative_to(old_root.resolve())
-    new_exe = new_root / rel_exe
-    old_roots = tuple(dict.fromkeys([str(old_root.resolve()), str(old_root)]))
-    raw_start = _strip_vdf_quotes(entry.start_dir)
-    if raw_start:
-        rewritten_start = _rewrite_path_prefix(raw_start, old_roots, str(new_root))
-        new_start_dir = Path(rewritten_start)
-    else:
-        new_start_dir = new_exe.parent
-    raw_icon = _strip_vdf_quotes(entry.icon)
-    new_icon: Path | None = None
-    if raw_icon:
-        new_icon = Path(_rewrite_path_prefix(raw_icon, old_roots, str(new_root)))
-
-    predicted_appid, _ = compute_shortcut_appid(_quote_path(str(new_exe)), target_name)
-    old_compat = paths.compatdata_dir / str(entry.appid_u32)
-    new_compat = paths.compatdata_dir / str(predicted_appid)
-    new_launch = _rewrite_launch_options(
-        entry.launch_options,
-        old_root,
-        new_root,
-        old_compat=old_compat if predicted_appid != entry.appid_u32 else None,
-        new_compat=new_compat if predicted_appid != entry.appid_u32 else None,
-    )
-
-    shortcuts_snap: bytes | None = None
-    config_snap: bytes | None = None
-    other_sv_snaps: list[tuple[Path, bytes]] = []
-    moved_root = False
-    attempted_move_root = False
-    moved_compat_pair: tuple[Path, Path] | None = None
-    copied_compat_dst: Path | None = None
-    backed_compat_pair: tuple[Path, Path] | None = None
-    moved_art_pairs: list[tuple[Path, Path]] = []
-
-    other_sv_pairs: list[tuple[str, Path]] = []
-    for uid in list_steam_users(paths.steam_root):
-        if uid == paths.user_id:
-            continue
-        other_sv_pairs.append((uid, paths.steam_root / "userdata" / uid / "config" / "shortcuts.vdf"))
-
-    lock_targets_by_resolved: dict[str, Path] = {}
-    for lock_path in (paths.shortcuts_vdf, paths.config_vdf, *(sv for _, sv in other_sv_pairs)):
-        try:
-            key = str(lock_path.resolve())
-        except OSError:
-            key = str(lock_path)
-        lock_targets_by_resolved.setdefault(key, lock_path)
-    ordered_lock_targets = [lock_targets_by_resolved[k] for k in sorted(lock_targets_by_resolved)]
-
-    with ExitStack() as lock_stack:
-        for lock_target in ordered_lock_targets:
-            lock_stack.enter_context(_steam_transaction_lock(lock_target))
-        try:
-                shortcuts_snap = paths.shortcuts_vdf.read_bytes() if paths.shortcuts_vdf.is_file() else None
-                config_snap = paths.config_vdf.read_bytes() if paths.config_vdf.is_file() else None
-                if old_root.resolve() != new_root.resolve():
-                    if new_root.exists():
-                        raise FileExistsError(f"Destination folder already exists: {new_root}")
-                    try:
-                        same_dev = old_root.stat().st_dev == games_root.stat().st_dev
-                    except OSError:
-                        same_dev = False
-                    if not same_dev:
-                        check_disk_space(games_root, _dir_size_bytes(old_root))
-                    attempted_move_root = True
-                    move_dir_safely(old_root, new_root)
-                    moved_root = True
-                new_appid = add_or_update_shortcut(
-                    paths=paths,
-                    app_name=target_name,
-                    exe_path=new_exe,
-                    start_dir=new_start_dir,
-                    icon_path=new_icon,
-                    launch_options=new_launch,
-                    enable_proton=True,
-                    preserve_from_appid=entry.appid_u32,
-                )
-
-                # Update other Steam users' shortcuts that pointed into old_root
-                other_appid_migrations: list[tuple[int, int]] = []
-                for uid, other_sv in other_sv_pairs:
-                    if not other_sv.is_file() or other_sv.stat().st_size == 0:
-                        continue
-                    try:
-                        orig_other_bytes = other_sv.read_bytes()
-                        other_data = vdf.binary_loads(orig_other_bytes)
-                        other_sc = other_data.get("shortcuts", {})
-                        other_changed = False
-                        for item in other_sc.values():
-                            if not isinstance(item, dict):
-                                continue
-                            other_app_name = str(item.get("AppName") or item.get("appname") or "")
-                            old_exe_raw = str(item.get("Exe") or item.get("exe") or "")
-                            appid_raw = item.get("appid", 0)
-                            if isinstance(appid_raw, int) and not isinstance(appid_raw, bool) and appid_raw != 0:
-                                old_other_u32 = s32_to_u32(appid_raw)
-                            else:
-                                old_other_u32, _ = compute_shortcut_appid(old_exe_raw, other_app_name)
-                            exe_changed = False
-                            for field in ("Exe", "StartDir", "icon"):
-                                val = str(item.get(field) or "")
-                                cleaned = _strip_vdf_quotes(val)
-                                if not cleaned:
-                                    continue
-                                upd = _rewrite_path_prefix(cleaned, old_roots, str(new_root))
-                                if upd != cleaned:
-                                    item[field] = _quote_path(upd) if field != "icon" else upd
-                                    other_changed = True
-                                    if field == "Exe":
-                                        exe_changed = True
-                            if exe_changed:
-                                new_other_exe = str(item.get("Exe") or "")
-                                new_other_u32, new_other_s32 = compute_shortcut_appid(new_other_exe, other_app_name)
-                                item["appid"] = new_other_s32
-                                if new_other_u32 != old_other_u32:
-                                    other_appid_migrations.append((old_other_u32, new_other_u32))
-                            lo = str(item.get("LaunchOptions") or "")
-                            if lo:
-                                upd_lo = _rewrite_launch_options(lo, old_root, new_root)
-                                if upd_lo != lo:
-                                    item["LaunchOptions"] = upd_lo
-                                    other_changed = True
-                        if other_changed:
-                            other_sv_snaps.append((other_sv, orig_other_bytes))
-                            _backup_file(other_sv)
-                            _atomic_write_bytes(other_sv, vdf.binary_dumps(other_data))
-                    except Exception as exc:
-                        logging.warning("Could not update other user %s shortcuts: %s", uid, exc)
-
-                if other_appid_migrations and paths.config_vdf.is_file():
-                    remaining_appids: set[int] = {e.appid_u32 for e in load_shortcuts(paths.shortcuts_vdf)}
-                    for _, other_sv in other_sv_pairs:
-                        remaining_appids.update(e.appid_u32 for e in load_shortcuts(other_sv))
-                    config_data = _load_vdf_mapping(paths.config_vdf)
-                    mapping: Any = config_data
-                    for sec in ("InstallConfigStore", "Software", "Valve", "Steam", "CompatToolMapping"):
-                        mapping = _get_vdf_section(mapping, sec)
-                        if mapping is None:
-                            break
-                    if mapping is not None and hasattr(mapping, "__contains__"):
-                        config_changed = False
-                        for old_u32, new_u32 in other_appid_migrations:
-                            old_key = str(old_u32)
-                            new_key = str(new_u32)
-                            if old_key in mapping and new_key not in mapping:
-                                old_val = mapping[old_key]
-                                mapping[new_key] = dict(old_val) if hasattr(old_val, "items") else old_val
-                                config_changed = True
-                        for old_u32, _ in other_appid_migrations:
-                            old_key = str(old_u32)
-                            if old_u32 not in remaining_appids and old_key in mapping:
-                                del mapping[old_key]
-                                config_changed = True
-                        if config_changed:
-                            _backup_file(paths.config_vdf)
-                            _dump_vdf_mapping(paths.config_vdf, config_data)
-
-                if new_appid != entry.appid_u32:
-                    new_compat = paths.compatdata_dir / str(new_appid)
-                    used_by_other = False
-                    for _, other_sv in other_sv_pairs:
-                        if any(e.appid_u32 == entry.appid_u32 for e in load_shortcuts(other_sv)):
-                            used_by_other = True
-                            break
-                    if old_compat.is_dir():
-                        if new_compat.is_symlink() and not new_compat.exists():
-                            new_compat.unlink(missing_ok=True)
-                        elif new_compat.exists() or new_compat.is_symlink():
-                            stamp = time.strftime("%Y%m%d-%H%M%S")
-                            backup_compat = paths.compatdata_dir / f"{new_appid}.{stamp}.deckinstall.bak"
-                            counter = 1
-                            while backup_compat.exists() or backup_compat.is_symlink():
-                                backup_compat = paths.compatdata_dir / f"{new_appid}.{stamp}.{counter}.deckinstall.bak"
-                                counter += 1
-                            shutil.move(str(new_compat), str(backup_compat))
-                            backed_compat_pair = (backup_compat, new_compat)
-                        if used_by_other:
-                            copied_compat_dst = new_compat
-                            shutil.copytree(old_compat, new_compat, symlinks=True)
-                        else:
-                            shutil.move(str(old_compat), str(new_compat))
-                            moved_compat_pair = (new_compat, old_compat)
-
-                    if paths.grid_dir.is_dir():
-                        old_prefix = str(entry.appid_u32)
-                        for art_file in paths.grid_dir.iterdir():
-                            if (
-                                not art_file.is_symlink()
-                                and art_file.is_file()
-                                and art_file.name.startswith(old_prefix)
-                            ):
-                                suffix = art_file.name[len(old_prefix) :]
-                                if suffix and suffix[0] not in ("p", "_", "."):
-                                    continue
-                                dest_art = paths.grid_dir / f"{new_appid}{suffix}"
-                                if not dest_art.exists():
-                                    shutil.move(str(art_file), str(dest_art))
-                                    moved_art_pairs.append((dest_art, art_file))
-
-                    if not used_by_other:
-                        remove_compat_tool(paths.config_vdf, entry.appid_u32)
-        except Exception:
-            for dst_a, src_a in reversed(moved_art_pairs):
-                try:
-                    if dst_a.exists() and not src_a.exists():
-                        shutil.move(str(dst_a), str(src_a))
-                except OSError:
-                    pass
-            if copied_compat_dst and copied_compat_dst.exists():
-                try:
-                    shutil.rmtree(copied_compat_dst)
-                except OSError:
-                    pass
-            if moved_compat_pair and moved_compat_pair[0].exists() and not moved_compat_pair[1].exists():
-                try:
-                    shutil.move(str(moved_compat_pair[0]), str(moved_compat_pair[1]))
-                except OSError:
-                    pass
-            if (
-                backed_compat_pair
-                and (backed_compat_pair[0].exists() or backed_compat_pair[0].is_symlink())
-                and not (backed_compat_pair[1].exists() or backed_compat_pair[1].is_symlink())
-            ):
-                try:
-                    shutil.move(str(backed_compat_pair[0]), str(backed_compat_pair[1]))
-                except OSError:
-                    pass
-            for other_sv, orig_other in reversed(locals().get("other_sv_snaps", [])):
-                try:
-                    _atomic_write_bytes(other_sv, orig_other)
-                except OSError:
-                    logging.exception("Rollback failed restoring %s", other_sv)
-            try:
-                if shortcuts_snap is not None:
-                    _atomic_write_bytes(paths.shortcuts_vdf, shortcuts_snap)
-                if config_snap is not None:
-                    _atomic_write_bytes(paths.config_vdf, config_snap)
-            except OSError:
-                logging.exception("Rollback failed restoring VDF files")
-            if moved_root and new_root.exists() and not old_root.exists():
-                try:
-                    shutil.move(str(new_root), str(old_root))
-                except OSError:
-                    logging.exception("Rollback failed moving %s back to %s", new_root, old_root)
-            elif (
-                not moved_root
-                and attempted_move_root
-                and new_root.resolve() != old_root.resolve()
-                and new_root.exists()
-            ):
-                try:
-                    if new_root.is_symlink() or new_root.is_file():
-                        new_root.unlink(missing_ok=True)
-                    else:
-                        shutil.rmtree(new_root)
-                except OSError:
-                    logging.exception("Rollback failed cleaning up partial %s", new_root)
-            raise
-
-    steam_appid = detect_steam_appid(new_root)
-    try:
-        import_external_prefix_saves(
-            paths=paths,
-            shortcut_appid_u32=new_appid,
-            game_name=target_name,
-            steam_appid=steam_appid,
-        )
-    except Exception as exc:
-        logging.warning(
-            "Migration succeeded for %s, but post-migration save import failed: %s",
-            target_name,
-            exc,
-        )
-    return new_appid, new_exe, steam_appid
 
 
 _PREFIX_SKIP_DIRS = {
@@ -2096,66 +1736,6 @@ def _infer_prefix_game_name(prefix_dir: Path) -> str:
     return ""
 
 
-def _verify_save_pair_exact(
-    src_file: Path,
-    dst_file: Path,
-    src_prefix_resolved: Path | None = None,
-) -> bool:
-    """Return True if dst_file is an independent, non-symlink file with identical content."""
-    if dst_file.is_symlink() or not dst_file.is_file():
-        return False
-    dst_resolved = dst_file.resolve()
-    if os.path.samefile(src_file, dst_file) or src_file.resolve() == dst_resolved:
-        return False
-    if src_prefix_resolved is not None and dst_resolved.is_relative_to(src_prefix_resolved):
-        return False
-    src_stat = src_file.stat()
-    dst_stat = dst_file.stat()
-    if dst_stat.st_size == 0 or dst_stat.st_size != src_stat.st_size:
-        return False
-    return file_sha256(src_file) == file_sha256(dst_file)
-
-
-def _prefix_saves_verified_in_target(src_prefix: Path, dst_compatdata: Path) -> bool:
-    """Return True if src_prefix has >=1 non-empty save and all are present, identical, and independent in dst."""
-    src_users = _prefix_users_dir(src_prefix)
-    dst_users = _prefix_users_dir(dst_compatdata)
-    if src_users is None or dst_users is None:
-        return False
-    if _prefix_has_unconventional_saves(src_prefix, src_users):
-        return False
-    any_nonempty = False
-    try:
-        src_prefix_resolved = src_prefix.resolve()
-        src_progdata = _prefix_programdata_dir(src_prefix)
-        if src_progdata is not None:
-            dst_progdata = _prefix_programdata_dir(dst_compatdata)
-            if dst_progdata is None:
-                for fp, _ in _iter_programdata_save_pairs(
-                    src_progdata, src_progdata / "__unused__", raise_on_error=True
-                ):
-                    if fp.stat().st_size > 0:
-                        return False
-            else:
-                for src_file, dst_file in _iter_programdata_save_pairs(
-                    src_progdata, dst_progdata, raise_on_error=True
-                ):
-                    if src_file.stat().st_size == 0:
-                        continue
-                    any_nonempty = True
-                    if not _verify_save_pair_exact(src_file, dst_file, src_prefix_resolved):
-                        return False
-        for src_file, dst_file in _iter_prefix_save_pairs(
-            src_users, dst_users, raise_on_error=True
-        ):
-            if src_file.stat().st_size == 0:
-                continue
-            any_nonempty = True
-            if not _verify_save_pair_exact(src_file, dst_file, src_prefix_resolved):
-                return False
-    except OSError:
-        return False
-    return any_nonempty
 
 
 def _entry_steam_appid(entry: ShortcutEntry) -> int | None:
@@ -2824,9 +2404,6 @@ _PRESET_ENV_KEYS = (
     "__GLX_VENDOR_LIBRARY_NAME",
     "PROTON_ENABLE_WAYLAND",
     "WINEDLLOVERRIDES",
-)
-_OPTISCALER_PROXY_DLLS = frozenset(
-    {"dxgi", "amd_fidelityfx_dx12", "amd_fidelityfx_vk", "winmm", "version", "dbghelp"}
 )
 _SHELL_OPS = {"&&", "||", ";", "|", ">", ">>", "<", "2>&1", "1>&2", "%command%"}
 _SAFE_UNQUOTED_DOLLAR_RE = re.compile(

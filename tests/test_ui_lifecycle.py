@@ -19,14 +19,10 @@ class ThemeAndI18nTests(unittest.TestCase):
         self.assertIn("QPushButton#dangerBtn:hover", theme.DARK_QSS)
         self.assertIn("QPushButton#dangerBtn:hover", theme.LIGHT_QSS)
 
-    def test_i18n_pt_br_plural_zero_and_language_env_priority(self) -> None:
+    def test_i18n_language_env_priority(self) -> None:
         orig_lang = i18n.get_language()
         try:
             i18n.set_language("pt_BR")
-            self.assertEqual(i18n._plural_suffix("pt_BR", 0), "_one")
-            self.assertEqual(i18n._plural_suffix("pt_BR", 1), "_one")
-            self.assertEqual(i18n._plural_suffix("pt_BR", 2), "_other")
-
             with mock.patch.dict(
                 os.environ,
                 {"LANGUAGE": "pt_BR:en", "LC_ALL": "en_US.UTF-8", "LANG": "en_US.UTF-8"},
@@ -56,6 +52,7 @@ class UiLifecycleTests(unittest.TestCase):
             with self.subTest(failure=failure):
                 win = mock.Mock()
                 win._force_closing = False
+                win._skip_vdf_close_prompt = False
                 win._vdf_queue.pending_count.return_value = 1
                 if isinstance(failure, Exception):
                     win._vdf_queue.apply_all.side_effect = failure
@@ -84,15 +81,15 @@ class UiLifecycleTests(unittest.TestCase):
         win._force_closing = False
         win.paths = None
         win._vdf_queue.pending_count.return_value = 1
+        busy = mock.Mock()
+        busy.isRunning.return_value = True  # stop closeEvent before QMainWindow.closeEvent
+        win._active_workers = {busy}
         with mock.patch.object(ui, "QMessageBox") as box_type:
-            box = box_type.return_value
-            apply_button = object()
-            box.addButton.side_effect = [apply_button, object(), object()]
-            box.clickedButton.return_value = apply_button
             ev = QCloseEvent()
             ui.MainWindow.closeEvent(win, ev)
-            self.assertFalse(ev.isAccepted())
+            box_type.assert_not_called()  # no Steam: nothing about the queue is shown
             win._vdf_queue.apply_all.assert_not_called()
+            win._vdf_queue.clear.assert_not_called()  # the saved queue waits for Steam
 
     def test_worker_cancel_uses_threading_event(self) -> None:
         from PySide6.QtWidgets import QApplication

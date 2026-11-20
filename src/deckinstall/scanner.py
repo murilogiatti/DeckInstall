@@ -291,9 +291,6 @@ def detect_pe_arch(exe_path: Path) -> str:
     return "unknown"
 
 
-def _is_ignored_exe(exe: Path) -> bool:
-    low = exe.name.lower()
-    return any(pat in low for pat in IGNORED_EXE_PATTERNS)
 
 
 def _extract_steam_appid(
@@ -437,13 +434,90 @@ def _safe_is_dir(path: Path) -> bool:
         return False
 
 
+HOME_SCAN_DEPTH = 3
+# Never walked when searching the home folder: heavy, irrelevant or full of Windows exes that are not games.
+HOME_SCAN_SKIP = frozenset(
+    {
+        "compatdata", "prefixes", "pfx", "drive_c", "node_modules", "steamapps", "shadercache",
+        "deckinstall", "lost+found", "system volume information", "__pycache__", "snap",
+        # Repack / installer side folders (QuickSFV.exe, redistributables) are never the game.
+        "md5", "_redist", "redist", "_commonredist", "commonredist", "directx", "vcredist", "__installer",
+    }
+)
+# Folders that hold the exe but are not the game itself (Game/bin/Game.exe -> Game).
+_BIN_DIR_NAMES = frozenset(
+    {"bin", "bin32", "bin64", "x64", "x86", "win64", "win32", "binaries", "system", "windows", "game"}
+)
+# Folders right under home that hold many things (a loose setup.exe there is not a game): always walked into.
+_HOME_CONTAINERS = frozenset(
+    {"games", "jogos", "downloads", "desktop", "documents", "syncthing", "music", "pictures", "videos",
+     "public", "templates", "área de trabalho", "documentos", "transferências"}
+)
+
+
+def _dir_has_game_exe(path: Path) -> bool:
+    """True if the folder directly holds a game exe / native launcher, or is a GOG install root."""
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                low = entry.name.lower()
+                if low.startswith("goggame-") and low.endswith(".info"):
+                    return True  # a GOG install root, even when the exe sits in a subfolder
+                if not (low.endswith(".exe") or low == "start.sh" or low.endswith(_NATIVE_SUFFIXES)):
+                    continue
+                if low.endswith(".exe") and any(pat in low for pat in IGNORED_EXE_PATTERNS):
+                    continue
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        return True
+                except OSError:
+                    continue
+    except OSError:
+        return False
+    return False
+
+
+def find_home_game_dirs(home: Path, max_depth: int = HOME_SCAN_DEPTH) -> list[Path]:
+    """Game folders under home: the first folder (up to max_depth levels down) that holds an exe.
+
+    Hidden folders and HOME_SCAN_SKIP are never entered, symlinks are not followed, and a folder
+    that holds an exe is not walked further (the per-game scan looks inside it).
+    """
+    found: list[Path] = []
+    queue: deque[tuple[Path, int]] = deque([(home, 0)])
+    while queue:
+        cur, depth = queue.popleft()
+        try:
+            with os.scandir(cur) as it:
+                subdirs = sorted(
+                    (
+                        Path(e.path)
+                        for e in it
+                        if not e.name.startswith(".")
+                        and e.name.lower() not in HOME_SCAN_SKIP
+                        and not e.is_symlink()
+                        and e.is_dir(follow_symlinks=False)
+                    ),
+                    key=lambda p: p.name,
+                )
+        except OSError:
+            continue
+        for sub in subdirs:
+            container = depth == 0 and sub.name.lower() in _HOME_CONTAINERS
+            if not container and _dir_has_game_exe(sub):
+                game_dir = sub
+                while game_dir.name.lower() in _BIN_DIR_NAMES and game_dir.parent != home:
+                    game_dir = game_dir.parent
+                if game_dir not in found:
+                    found.append(game_dir)
+            elif depth + 1 < max_depth:
+                queue.append((sub, depth + 1))
+    return found
+
+
 def default_scan_roots() -> list[Path]:
-    """Return standard game/download directories on SteamOS."""
-    roots = [
-        Path.home() / "Games",
-        Path.home() / "Downloads",
-        Path.home() / "Syncthing",
-    ]
+    """Cards and external disks under /run/media (each child folder is a game). Home is walked separately."""
+    roots: list[Path] = []
     media_root = Path("/run/media")
     if _safe_is_dir(media_root):
         try:
@@ -507,10 +581,33 @@ def default_scan_roots() -> list[Path]:
 
 
 def scan_all_games(roots: list[Path] | None = None) -> list[DetectedGame]:
-    """Scan top-level folders in all roots for installed/extracted games."""
+    """Scan roots for installed/extracted games.
+
+    The home folder is walked up to HOME_SCAN_DEPTH levels (find_home_game_dirs); any other root is a
+    container whose top-level folders are games. None = home + cards/disks (default_scan_roots).
+    """
     seen: set[Path] = set()
     candidates: list[Path] = []
-    for root in (roots if roots is not None else default_scan_roots()):
+    home = Path.home()
+    try:
+        home_res = home.resolve()
+    except OSError:
+        home_res = home
+    for root in (roots if roots is not None else [home, *default_scan_roots()]):
+        try:
+            is_home = root.resolve() == home_res
+        except OSError:
+            is_home = False
+        if is_home:
+            for child in find_home_game_dirs(root):
+                try:
+                    resolved = child.resolve()
+                except OSError:
+                    continue
+                if resolved not in seen:
+                    seen.add(resolved)
+                    candidates.append(child)
+            continue
         try:
             with os.scandir(root) as it:
                 entries = sorted(

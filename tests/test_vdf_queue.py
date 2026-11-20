@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
@@ -223,3 +224,63 @@ def test_apply_all_retains_failed_edits(tmp_path: Path) -> None:
     assert "Missing Shortcut" in result.errors[0]
     assert queue.pending_count() == 1
     assert queue.list_pending()[0].edit_id == "fail"
+
+
+def _launch_edit(edit_id: str, appid: int, opts: str) -> QueuedVdfEdit:
+    return QueuedVdfEdit(edit_id, "set_launch_options", appid, f"Game {appid}", {"launch_options": opts})
+
+
+def test_saved_queue_survives_restart_and_keeps_coalescing(tmp_path: Path) -> None:
+    store = tmp_path / "data" / "vdf_queue.json"
+    queue = VdfEditQueue(store)
+    queue.enqueue(_launch_edit("a", 1, "A=1 %command%"))
+    queue.enqueue(_launch_edit("b", 2, "B=1 %command%"))
+    assert store.is_file()
+    data = json.loads(store.read_text(encoding="utf-8"))
+    assert data["version"] == 1 and len(data["edits"]) == 2
+
+    reopened = VdfEditQueue(store)  # the app was closed and opened again
+    assert [e.edit_id for e in reopened.list_pending()] == ["a", "b"]
+    reopened.enqueue(_launch_edit("a2", 1, "A=2 %command%"))  # same game: replaces the old edit
+    assert VdfEditQueue(store).pending_count() == 2
+    assert VdfEditQueue(store).list_pending()[-1].payload == {"launch_options": "A=2 %command%"}
+
+    reopened.remove("b")
+    reopened.clear()
+    assert not store.exists()  # empty queue = no file
+
+
+def test_saved_queue_ignores_unknown_version_and_bad_entries(tmp_path: Path) -> None:
+    store = tmp_path / "vdf_queue.json"
+    store.write_text(json.dumps({"version": 99, "edits": [{"edit_id": "x"}]}), encoding="utf-8")
+    assert VdfEditQueue(store).pending_count() == 0
+    store.write_text("{not json", encoding="utf-8")
+    assert VdfEditQueue(store).pending_count() == 0
+    good = {"edit_id": "ok", "op": "set_proton", "appid_u32": 5, "label": "G", "payload": {"tool_name": "X"}}
+    bad = [{"edit_id": "e", "op": "rm_rf", "appid_u32": 1}, {"op": "set_proton"}, "junk"]
+    store.write_text(json.dumps({"version": 1, "edits": [good, *bad]}), encoding="utf-8")
+    assert [e.edit_id for e in VdfEditQueue(store).list_pending()] == ["ok"]
+
+
+def test_apply_all_saves_only_failed_edits(tmp_path: Path) -> None:
+    paths = _make_paths(tmp_path)
+    store = tmp_path / "vdf_queue.json"
+    queue = VdfEditQueue(store)
+    queue.enqueue(_launch_edit("ok", 1, "A %command%"))
+    queue.enqueue(_launch_edit("bad", 2, "B %command%"))
+
+    @contextmanager
+    def _lock(_path: Path):  # type: ignore[no-untyped-def]
+        yield
+
+    def _update(_paths: SteamPaths, appid: int, _opts: str) -> bool:
+        return appid == 1
+
+    with (
+        patch("deckinstall.vdf_queue._steam_transaction_lock", _lock),
+        patch("deckinstall.vdf_queue._backup_file"),
+        patch("deckinstall.vdf_queue.update_shortcut_launch_options", _update),
+    ):
+        result = queue.apply_all(paths)
+    assert result.applied == 1 and len(result.errors) == 1
+    assert [e.edit_id for e in VdfEditQueue(store).list_pending()] == ["bad"]

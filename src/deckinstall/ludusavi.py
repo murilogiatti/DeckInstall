@@ -532,25 +532,14 @@ def _bounded(chunks: Iterator[bytes], limit: int, original: str) -> Iterator[byt
         yield chunk
 
 
-def import_ludusavi(
-    game_folder: Path,
-    prefix_dir: Path,
-    game_name: str,
-    *,
-    home: Path | None = None,
-    game_dir: Path | None = None,
-    steam_appid: int | None = None,
-    dest_root: Path | None = None,
-) -> ImportResult:
-    """Restore the newest backup in game_folder into prefix_dir (see the module docstring)."""
-    home = (home or Path.home()).resolve()
+def _plan_sources(
+    game_folder: Path, home: Path
+) -> tuple[str, list[tuple[_Source, str, tuple[str, ...]]], int]:
+    """(backup label, [(source, 'prefix'|'home', target parts)], files that map nowhere) for the newest backup."""
     mapping = load_mapping(game_folder)
     label, files = _newest_files(mapping)
     drives = _drive_folders(mapping)
-    drive_c = save_sync._resolve_drive_c_target(prefix_dir)
     folder = game_folder.resolve()
-
-    # 1. Map and validate every path before touching anything.
     plan: list[tuple[_Source, str, tuple[str, ...]]] = []
     skipped = 0
     for original, (backup, digest, size) in sorted(files.items()):
@@ -572,6 +561,110 @@ def import_ludusavi(
             continue
         plan.append((_Source(original, zip_path, member, file_path, digest, size), *target))
 
+    return label, plan, skipped
+
+
+def _verified_chunks(src: _Source, zips: dict[Path, zipfile.ZipFile]) -> Iterator[bytes]:
+    """The file's bytes, failing if its sha1/size do not match the mapping (checked at the end)."""
+    h = hashlib.sha1()  # noqa: S324 - format-defined hash
+    seen = 0
+    for chunk in _bounded(_source_chunks(src, zips), src.size, src.original):
+        h.update(chunk)
+        seen += len(chunk)
+        yield chunk
+    if h.hexdigest() != src.digest or seen != src.size:
+        raise LudusaviError(f"Hash mismatch for {src.original}")
+
+
+def list_backup_games(root: Path) -> list[tuple[str, Path]]:
+    """(game name, folder) for every game in a Ludusavi backup root (or root itself)."""
+    if (root / MAPPING_FILE).is_file():
+        candidates = [root]
+    else:
+        try:
+            candidates = sorted(c for c in root.iterdir() if not c.is_symlink() and (c / MAPPING_FILE).is_file())
+        except OSError:
+            return []
+    out: list[tuple[str, Path]] = []
+    for folder in candidates:
+        try:
+            name = load_mapping(folder).get("name")
+        except (LudusaviError, OSError):
+            continue
+        out.append((str(name) if isinstance(name, str) and name.strip() else folder.name, folder))
+    return out
+
+
+def import_ludusavi_to_snapshot(
+    game_folder: Path,
+    game_name: str = "",
+    *,
+    home: Path | None = None,
+    dest_root: Path | None = None,
+) -> tuple[Path | None, int, int]:
+    """Store the newest backup as a save snapshot of game_name, without touching any prefix.
+
+    For games that are not installed yet: the snapshot is restored later with the normal
+    "Restore" (which takes a safety snapshot first). Only Windows user/ProgramData files fit a
+    snapshot; anything else is counted as skipped. Every file is checked against its sha1/size.
+    Returns (snapshot zip or None when nothing fit, files stored, files skipped).
+    """
+    home = (home or Path.home()).resolve()
+    name = game_name or str(load_mapping(game_folder).get("name") or game_folder.name)
+    _, plan, skipped = _plan_sources(game_folder, home)
+    usable = [(src, parts) for src, kind, parts in plan if kind == "prefix" and parts[0] in ("users", "ProgramData")]
+    skipped += len(plan) - len(usable)
+    if not usable:
+        return None, 0, skipped
+    snap_dir = save_sync.snapshot_dir_for(name, dest_root)
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    target = snap_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-ludusavi-import.zip"
+    counter = 1
+    while target.exists():
+        target = snap_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-ludusavi-import-{counter}.zip"
+        counter += 1
+    fd, tmp_name = tempfile.mkstemp(prefix=".ludusavi-", suffix=".zip.tmp", dir=str(snap_dir))
+    os.close(fd)
+    tmp = Path(tmp_name)
+    zips: dict[Path, zipfile.ZipFile] = {}
+    total = 0
+    try:
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as out:
+            for src, parts in usable:
+                total += src.size
+                if src.size > _RESTORE_MAX_FILE_BYTES or total > _RESTORE_MAX_TOTAL_BYTES:
+                    raise LudusaviError(f"Backup too large: {src.original}")
+                if src.zip_path is not None and src.zip_path not in zips:
+                    zips[src.zip_path] = zipfile.ZipFile(src.zip_path)
+                with out.open("snap/" + "/".join(parts), "w") as dst:
+                    for chunk in _verified_chunks(src, zips):
+                        dst.write(chunk)
+        os.replace(tmp, target)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    finally:
+        for zf in zips.values():
+            zf.close()
+    save_sync.remember_snapshot_name(snap_dir, name)
+    return target, len(usable), skipped
+
+
+def import_ludusavi(
+    game_folder: Path,
+    prefix_dir: Path,
+    game_name: str,
+    *,
+    home: Path | None = None,
+    game_dir: Path | None = None,
+    steam_appid: int | None = None,
+    dest_root: Path | None = None,
+) -> ImportResult:
+    """Restore the newest backup in game_folder into prefix_dir (see the module docstring)."""
+    home = (home or Path.home()).resolve()
+    drive_c = save_sync._resolve_drive_c_target(prefix_dir)
+    # 1. Map and validate every path before touching anything.
+    label, plan, skipped = _plan_sources(game_folder, home)
     zips: dict[Path, zipfile.ZipFile] = {}
     try:
         for src, _, _ in plan:

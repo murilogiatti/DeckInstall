@@ -152,3 +152,25 @@ def test_space_card_shows_disks_and_games(tmp_path: Path) -> None:
 
     app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     app.processEvents()
+
+
+def test_top_folders_biggest_first_limited_to_five() -> None:
+    measured = {f"/d/{i}": i * 100 for i in range(8)}
+    top = space.top_folders(measured)
+    assert [n for _, n in top] == [700, 600, 500, 400, 300]  # zero-size folder never listed
+    assert space.top_folders({"/a": 0}) == []
+
+
+def test_scan_space_reports_top_folders(tmp_path: Path) -> None:
+    lib = library.ensure_library(library.internal_library_root(), internal=True)
+    big = lib.games_dir / "Big"
+    small = lib.games_dir / "Small"
+    _write(big / "Game.exe", 5000)
+    _write(small / "Game.exe", 100)
+    report = space.scan_space([lib], [_game("Big", big, tmp_path / "p1"), _game("Small", small, tmp_path / "p2")])
+    assert [n for _, n in report.top_folders] == [5000, 100]
+    from deckinstall import ui_maintenance
+
+    text = ui_maintenance._format_top_folders(report.top_folders)
+    assert text.splitlines()[0] and len(text.splitlines()) == 3
+    assert "Big" in text.splitlines()[1] and "Small" in text.splitlines()[2]

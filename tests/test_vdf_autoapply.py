@@ -150,3 +150,123 @@ def test_busy_counter_needs_every_end() -> None:
         _drain(win, app)
         win._active_workers.clear()
         win.close()
+
+
+def test_saved_queue_reloads_on_start_and_applies_when_steam_is_closed() -> None:
+    from deckinstall import vdf_queue
+
+    vdf_queue.VdfEditQueue(vdf_queue.default_queue_file()).enqueue(_edit())  # saved in Gaming Mode last time
+    app = QApplication.instance() or QApplication([])
+    win = _window(app)
+    applied: list[object] = []
+    try:
+        assert win._vdf_queue.pending_count() == 1
+        assert win.vdf_queue_banner.isHidden()  # no Steam detected: nothing of the queue shows
+        win.paths = SimpleNamespace(shortcuts_vdf=Path("/nonexistent"))  # type: ignore[assignment]
+        win._vdf_queue.apply_all = lambda paths: applied.append(paths) or SimpleNamespace(applied=1, errors=[])  # type: ignore[method-assign]
+        with (
+            mock.patch.object(ui_workers_library, "is_steam_running", return_value=False),
+            mock.patch.object(ui, "is_steam_running", return_value=False),
+            mock.patch.object(win, "_offer_steam_restart"),
+            mock.patch.object(win, "_refresh_shortcuts"),
+        ):
+            win._on_vdf_queue_paths_ready()
+            _drain(win, app)
+        assert applied == [win.paths]
+    finally:
+        win._vdf_queue.clear()
+        _drain(win, app)
+        win._active_workers.clear()
+        win.close()
+
+
+def test_gaming_mode_queues_and_hides_apply_now() -> None:
+    app = QApplication.instance() or QApplication([])
+    win = _window(app)
+    try:
+        assert not win.should_queue_vdf_edits()  # no Steam
+        win.paths = SimpleNamespace(shortcuts_vdf=Path("/nonexistent"))  # type: ignore[assignment]
+        with (
+            mock.patch.object(ui, "is_gamescope_session", return_value=True),
+            mock.patch.object(ui_workers_library, "is_steam_running", return_value=True),
+        ):
+            assert win.should_queue_vdf_edits()
+            win.enqueue_vdf_edit(_edit())
+            _drain(win, app)
+            assert not win.vdf_queue_banner.isHidden()
+            assert win.btn_vdf_apply.isHidden()
+            assert "Modo Jogo" in win.lbl_vdf_queue.text() or "Gaming Mode" in win.lbl_vdf_queue.text()
+        from deckinstall import vdf_queue
+
+        assert vdf_queue.VdfEditQueue(vdf_queue.default_queue_file()).pending_count() == 1  # persisted
+        with mock.patch.object(ui, "is_gamescope_session", return_value=False):
+            assert not win.should_queue_vdf_edits()  # Desktop: apply right away
+            win._update_vdf_queue_banner()
+            assert not win.btn_vdf_apply.isHidden()
+    finally:
+        win._vdf_queue.clear()
+        _drain(win, app)
+        win._active_workers.clear()
+        win.close()
+
+
+_UPDATE_CHOICES = ("app_update.btn_apply_update", "app_update.btn_update_only", None)
+
+
+def _pick(choice: int):  # type: ignore[no-untyped-def]
+    """Fake QMessageBox.clickedButton: the button with that label (None = the Cancel button)."""
+    key = _UPDATE_CHOICES[choice]
+
+    def _clicked(box: ui.QMessageBox) -> object:
+        for b in box.buttons():
+            if key is None and box.buttonRole(b) == ui.QMessageBox.ButtonRole.RejectRole:
+                return b
+            if key is not None and b.text() == ui.tr(key):
+                return b
+        raise AssertionError(key)
+
+    return _clicked
+
+
+def _run_update_prompt(win: ui.MainWindow, choice: int) -> tuple[mock.Mock, mock.Mock]:
+    """Answer the 'apply before updating' box (0 apply, 1 update only, 2 cancel)."""
+    with (
+        mock.patch.object(ui.QMessageBox, "exec", lambda box: 0),
+        mock.patch.object(ui.QMessageBox, "clickedButton", _pick(choice)),
+        mock.patch.object(ui, "relaunch_appimage") as relaunch,
+        mock.patch.object(ui.QApplication, "quit") as quit_app,
+        mock.patch.object(win, "_apply_vdf_queue", side_effect=lambda on_done: on_done(True)),
+    ):
+        win._ask_update_with_pending_edits(2, Path("/tmp/new.AppImage"))
+    return relaunch, quit_app
+
+
+def test_update_with_pending_edits_offers_apply_update_or_cancel() -> None:
+    app = QApplication.instance() or QApplication([])
+    win = _window(app)
+    try:
+        relaunch, quit_app = _run_update_prompt(win, 2)  # Cancel
+        relaunch.assert_not_called()
+        quit_app.assert_not_called()
+        relaunch, quit_app = _run_update_prompt(win, 1)  # update without applying: queue stays saved
+        relaunch.assert_called_once()
+        quit_app.assert_called_once()
+        assert win._skip_vdf_close_prompt
+        win._skip_vdf_close_prompt = False
+        with mock.patch.object(win, "_apply_vdf_queue") as apply_q:
+            with (
+                mock.patch.object(ui.QMessageBox, "exec", lambda box: 0),
+                mock.patch.object(ui.QMessageBox, "clickedButton", _pick(0)),
+                mock.patch.object(ui, "relaunch_appimage") as relaunch,
+            ):
+                win._ask_update_with_pending_edits(2, Path("/tmp/new.AppImage"))
+            apply_q.assert_called_once()
+            relaunch.assert_not_called()  # restarts only after the edits went in
+            apply_q.call_args.kwargs["on_done"](False)
+            relaunch.assert_not_called()  # failed apply: no restart
+    finally:
+        win._skip_vdf_close_prompt = False
+        win._vdf_queue.clear()
+        _drain(win, app)
+        win._active_workers.clear()
+        win.close()

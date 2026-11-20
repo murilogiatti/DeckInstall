@@ -1170,58 +1170,6 @@ def _child_dirs(roots: list[Path]) -> set[Path]:
     return out
 
 
-def verify_repack_md5(
-    folder: Path,
-    on_progress: Callable[[int, str], None] | None = None,
-    cancel_flag: Callable[[], bool] | None = None,
-) -> tuple[int, list[str]]:
-    """Check a repack against its .md5 lists (FitGirl ships MD5/*.md5). Returns (checked, problems).
-
-    Paths in the lists may be relative to the list or to the repack folder and use backslashes;
-    entries pointing outside the repack folder are ignored.
-    """
-    import hashlib
-
-    root = folder.resolve()
-    lists = [p for p in (*folder.glob("*.md5"), *folder.glob("MD5/*.md5")) if p.is_file() and not p.is_symlink()]
-    entries: list[tuple[str, Path, str]] = []
-    for md5_file in lists:
-        for raw in md5_file.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = raw.strip()
-            if not line or line.startswith(";"):
-                continue
-            m = re.match(r"^([0-9a-fA-F]{32})\s+\*?(.+)$", line)
-            if not m:
-                continue
-            rel = m.group(2).strip().replace("\\", "/")
-            target: Path | None = None
-            for base in (md5_file.parent, folder):
-                cand = (base / rel).resolve()
-                if cand.is_file() and (cand == root or root in cand.parents):
-                    target = cand
-                    break
-            entries.append((m.group(1).lower(), target or (folder / rel), rel))
-    total = sum(t.stat().st_size for _, t, _ in entries if t.is_file()) or 1
-    done = 0
-    problems: list[str] = []
-    for expected, target, rel in entries:
-        if not target.is_file():
-            problems.append(f"{rel}: missing")
-            continue
-        h = hashlib.md5()
-        with target.open("rb") as fh:
-            while chunk := fh.read(4 * 1024 * 1024):
-                if cancel_flag and cancel_flag():
-                    raise RuntimeError("Verification cancelled by user.")
-                h.update(chunk)
-                done += len(chunk)
-                if on_progress:
-                    on_progress(min(99, int(done * 100 / total)), f"MD5 {rel}")
-        if h.hexdigest() != expected:
-            problems.append(f"{rel}: checksum mismatch")
-    return len(entries), problems
-
-
 class ToolMissingError(RuntimeError):
     """Raised when an optional external tool (e.g. innoextract) is not installed."""
 

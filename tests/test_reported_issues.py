@@ -197,19 +197,8 @@ class UniqueLibraryActionTests(unittest.TestCase):
         ):
             win = ui.MainWindow(app)
             try:
-                def leaves(menu):
-                    result = []
-                    for action in menu.actions():
-                        if action.menu():
-                            result.extend(leaves(action.menu()))
-                        elif not action.isSeparator():
-                            result.append(action)
-                    return result
-
-                game = leaves(win._game_actions_menu)
-                library = leaves(win._tools_menu)
-                self.assertEqual(game, [])
-                self.assertEqual(library, [])
+                self.assertFalse(hasattr(win, "_game_actions_menu"))  # no hidden menus left
+                self.assertFalse(hasattr(win, "_tools_menu"))
                 self.assertEqual(win.btn_remove_game.objectName(), "dangerBtn")
                 self.assertEqual(win.btn_remove_game.text(), tr("library.btn_uninstall"))
                 self.assertIsNone(win.btn_remove_game.menu())
@@ -378,7 +367,7 @@ class LibraryColumnsFilterAndLogsTests(unittest.TestCase):
                 win = ui.MainWindow(app)
                 try:
                     self.assertEqual(win.shortcuts_list.columnCount(), 6)
-                    self.assertEqual(win.saves_list.columnCount(), 4)
+                    self.assertEqual(win.saves_list.columnCount(), 6)
                     self.assertEqual(win.saves_list.rowCount(), 1)
                     self.assertTrue(win.btn_save_restore.isEnabled())
 
@@ -508,17 +497,23 @@ class UiUxSimplificationTests(unittest.TestCase):
                 win = ui.MainWindow(app)
                 try:
                     self.assertFalse(hasattr(win, "scan_add_dialog"))
-                    self.assertTrue(win.add_advanced_box.isHidden())
+                    self.assertFalse(hasattr(win, "add_advanced_box"))
+                    self.assertFalse(hasattr(win, "btn_toggle_add_advanced"))
+                    self.assertFalse(hasattr(win, "extract_name"))  # one name field: add_name
+                    self.assertFalse(hasattr(win, "chk_verify_md5"))
                     self.assertTrue(win.extract_details_box.isHidden())
                     self.assertTrue(win.stack.widget(0).isAncestorOf(win.add_name))
                     self.assertTrue(win.stack.widget(3).isAncestorOf(win.btn_update_runtimes))
                     self.assertTrue(win.stack.widget(3).isAncestorOf(win.btn_app_update))
 
-                    win.btn_toggle_add_advanced.click()
-                    self.assertFalse(win.add_advanced_box.isHidden())
+                    for always_visible in (win.chk_keep_in_place, win.add_library_combo, win.btn_add_launch_adv,
+                                           win.chk_shortcut_menu, win.extract_dst_root):
+                        self.assertTrue(win.stack.widget(0).isAncestorOf(always_visible))
+                        self.assertFalse(always_visible.isHidden() and always_visible is not win.add_library_combo)
 
                     win._set_extract_source(str(zip_file))
                     self.assertEqual(win.extract_src.text(), str(zip_file))
+                    self.assertEqual(win.add_name.text(), "CoolGame-v1")  # extraction uses the step 2 name
                     self.assertFalse(win.extract_details_box.isHidden())
 
                     win._set_extract_source(str(game_exe))

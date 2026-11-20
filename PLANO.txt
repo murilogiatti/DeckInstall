@@ -1,7 +1,7 @@
-DeckInstall - Plano de acao v3 (2026-11-17, atualizado 2026-11-18)
+DeckInstall - Plano de acao v3 (2026-11-17, atualizado 2026-11-19)
 ==========================================================
 
-STATUS: Fases 0 a 6 concluidas (ultima release: v0.17.0; Fases 4, 5 e 6 ainda nao publicadas).
+STATUS: Fases 0 a 10 concluidas. Ultima release: v0.19.0 (2026-11-19, Fases 7 a 10 + limpeza de codigo orfao).
 
 IDEIA CENTRAL: ciclo de vida por jogo
 - Cada jogo tem um manifesto v2 que registra TUDO que o app criou:
@@ -135,6 +135,28 @@ FASE 6 - Saves e interface - CONCLUIDA (nao publicada)
    "Iniciar a Steam de novo?" (tambem apos a fila VDF automatica). Pendente: busy flags locais de dialogos
    (_set_busy em proton/prefix dialogs) continuam booleanas por serem por dialogo.
 
+LIMPEZA DE CODIGO ORFAO (publicada na v0.19.0)
+Levantamento por AST (referencias reais em src + main.py, sem build/). Removidos:
+A. Sem uso nenhum: FallbackProton10Worker (+ runtime_manager.ensure_ge_proton10, chave proton10.downloading),
+   optiscaler.scan_optiscaler_compatibility_batch, scanner._is_ignored_exe, runtime_manager._SHA512_RE,
+   standalone.STANDALONE_MANIFEST, steam_vdf._OPTISCALER_PROXY_DLLS, MainWindow._open_maintenance_page
+   (+ ui_maintenance.open_maintenance_page), MainWindow._selected_shortcut, re-exportacoes mortas em ui.py (9)
+   e ui_workers.py (5 Maint*Worker), atributos _search_worker/_preview_worker, menus vazios
+   _game_actions_menu/_tools_menu.
+B. So os testes usavam: optiscaler.bulk_optiscaler (teste passou a usar optiscaler_bulk_dialog._install_files,
+   o caminho real da tela, cobrindo bulk_optiscaler_targets), external_actions.create_standalone_from_external,
+   save_sync.restore_prefix_saves_snapshot (restaurava sem snapshot de seguranca; testes usam
+   restore_snapshot_safely / _restore_saves_archive), steam_vdf._prefix_saves_verified_in_target e
+   _verify_save_pair_exact, i18n.tr_plural e _plural_suffix (nenhuma chave _one/_other existe).
+Mantidos de proposito (pequenos, apoio a testes): i18n.get_language, AdoptWizard.set_checked,
+   VdfEditQueue.list_pending, CleanupRule.default_checked.
+[FEITO] Cache de shader orfao do DeckInstall ligado na Manutencao: regra cleanup "orphan_game_caches"
+   (grupo Jogos, marcada por padrao, categoria "Cache de jogo removido") usa standalone.find_orphan_shader_caches
+   (todas as bibliotecas + ~/Games/.caches; disco ausente mantem o cache). Apagar passa pela revalidacao do
+   delete_cleanup_candidates_checked; prune_orphan_shader_caches saiu (testes portados).
+PENDENTE: assets sem referencia:
+   assets/capsule_600x900.jpg, icon_512.png, logo.png. build/ local com 409 MB (ignorado pelo git).
+
 CONTINUO
 - Dividir steam_vdf.py (79% nao e VDF) e ui.py conforme cada area for mexida.
 - tr() em todas as mensagens; uma unica pasta de dados ~/.local/share/DeckInstall.
@@ -166,6 +188,91 @@ TESTES NO STEAM DECK (v0.18.1, SteamOS 3.9.5, AppImage) - 2026-11-19
    (o script de bootstrap aparece no pgrep e pode morrer) e roda via systemd-run --user --scope (cgroup proprio;
    antes a Steam morria junto com a sessao/processo que a abriu). Ciclo fechar 3,4 s / reabrir 3,3 s, env limpo.
    Nao verificado fora do Deck: reabertura pela GUI do app, Modo Jogo, localconfig.vdf real, dialogos no gamescope.
+   Log do Deck (crashes anteriores a v0.18.1): 14/11 SIGABRT xcb sem display :0; portal sem FileChooser (confirma tirar
+   o tema do portal); 15/11 SIGABRT "QThread destroyed while running" (scan_all_games ainda rodando ao fechar - PENDENTE);
+   15/11 SIGBUS (provavel AppImage sobrescrito enquanto aberto); 18/11 SIGSEGV apos OptiScaler, precedido de
+   "shared QObject was deleted directly" (sem stack Python; suspeita: fluxo antigo de reabrir a Steam). Reproduzir na v0.18.2.
+
+PROXIMAS FASES (pedido de 2026-11-19; prompts entregues no chat)
+FASE 7 (Sonnet) - Correcoes rapidas e textos - CONCLUIDA (publicada na v0.19.0)
+1. Alarme falso "feche o jogo Windows" no backup: _is_wine_game_running conta srt-bwrap/pressure-vessel do proprio
+   cliente Steam (steamrt64). Detectar so jogo de verdade.
+2. Botoes padrao do Qt em ingles (Yes/No): carregar QTranslator qtbase_pt_BR (conferir se o Nuitka empacota).
+3. Revisar traducoes pt_BR; reescrever mensagens de forma natural e humana.
+4. Sim/Nao sobre a Steam: botao azul em "Nao" se a Steam ja esta instalada, em "Sim" se nao esta.
+5. Medir espaco: mostrar as 5 maiores pastas.
+6. Tema automatico: ouvir styleHints().colorSchemeChanged e reaplicar sem reiniciar.
+FASE 8 (Opus) - Biblioteca e fila de edicoes - CONCLUIDA (publicada na v0.19.0)
+1. [FEITO] Checkbox "Agrupar alteracoes" removido. MainWindow.should_queue_vdf_edits() = Steam detectada e Modo Jogo.
+   Desktop: aplica na hora (pergunta curta "a Steam vai fechar e abrir de novo"). Modo Jogo: nao fecha a Steam e
+   guarda em vdf_queue.VdfEditQueue(store_path) = ~/.local/share/DeckInstall/vdf_queue.json (versao 1, escrita
+   atomica, entradas invalidas ignoradas, arquivo apagado quando a fila esvazia, so os que falharam ficam).
+   Ao detectar a Steam (_on_vdf_queue_paths_ready) recarrega e aplica se ela estiver fechada; SteamRunningWorker
+   continua aplicando quando ela fecha. Faixa so com pendencias e Steam; "Aplicar agora" so fora do Modo Jogo.
+   Fechar o app: no Modo Jogo nao pergunta; no Desktop "Aplicar e sair" / "Sair e aplicar depois" (nao descarta).
+   Enfileiram no Modo Jogo: opcoes de inicializacao (presets, OptiScaler um a um e em massa), Proton do atalho
+   (Biblioteca e Configurar jogo, snapshot antes como antes) e Proton em massa/limpar orfaos.
+   Continuam recusados no Modo Jogo (precisam da Steam fechada): criar atalho Steam, importar para a Steam,
+   migrar e remover versao do Proton.
+2. [FEITO] Update do AppImage com pendencias (Desktop): "Aplicar e atualizar" (padrao; reinicia so se tudo entrou),
+   "Atualizar sem aplicar" (fila fica no disco), Cancelar. Modo Jogo: so informa que a fila continua guardada.
+3. [FEITO] Biblioteca > "Em lote": OptiScaler em massa, Proton em massa (btn_bulk_proton, so com Steam),
+   "Mover jogos antigos para a biblioteca" e "Desfazer a ultima mudanca". Sairam da Manutencao.
+   [FEITO] "Migrar todos para ~/Games" removido (duplicava o "Adotar jogos..." e usava o layout antigo ~/Games):
+   act_bulk_migrate, cartao de lote da Manutencao, BulkPlanWorker, BulkMigrateWorker, SaveSyncWorker,
+   steam_vdf.migrate_shortcut_to_games, _rewrite_launch_options/_rewrite_path_prefix, chaves migrate.* e testes.
+   plan_bulk_migration continua (a revalidacao da Manutencao conta os atalhos fora da biblioteca e agora
+   indica "Adotar jogos...").
+4. [FEITO] Configurar jogo (DeckInstall): caixas "Atalho na area de trabalho" / "Atalho no menu de aplicativos",
+   marcadas pelo que existe de fato (standalone.find_game_launchers: .desktop que abre o launch.sh ou aponta
+   para a pasta do jogo, no Desktop do usuario e em ~/.local/share/applications). set_game_launcher cria/remove
+   e grava o manifesto (desinstalar continua removendo). Outros .desktop nunca sao tocados.
+5. [FEITO] Removidos "Atualizar artes", "Reverter artes" e "Migrar selecionado" (acoes, metodos, ArtSearchWorker,
+   ArtDownloadWorker, artwork.restore_steam_artwork_backup, chaves art.* e testes). O download de artes ao
+   criar atalho continua (com backup da grid).
+   Nao verificado fora do Deck: fila no Modo Jogo real, troca Modo Jogo -> Desktop aplicando a fila, update com
+   pendencias, .desktop no Desktop do KDE (confiavel/executavel).
+FASE 9 (Opus) - Aba Instalar - CONCLUIDA (publicada na v0.19.0)
+1. [FEITO] Pagina com 2 etapas: "1. Fonte" (arquivo/setup, "Extrair ou instalar em", Extrair/Cancelar/Continuar)
+   e "2. Jogo" (tabela de detectados, Executavel, Nome do jogo, Jogo na Steam, Procurar na Steam, Biblioteca,
+   Manter na pasta atual, Desempenho/presets, Atalhos menu/area de trabalho, opcoes so da Steam, botoes).
+   O segundo "Nome do jogo" (extract_name, do Avancado) saiu: a extracao usa o nome da etapa 2.
+2. [FEITO] Verificacao MD5 removida (extractor.verify_repack_md5, ExtractWorker.verify_md5, caixa, chaves, testes).
+   Erro do unarc continua especifico, sem citar MD5. classify.py continua ignorando a pasta MD5/QuickSFV.
+3. [FEITO] Sem "Opcoes avancadas": tudo visivel; em 1280x800 a pagina tem ~990 px (rola por toque).
+4. [FEITO] Busca padrao = pasta pessoal (scanner.find_home_game_dirs, ate 3 niveis; para na primeira pasta com
+   exe/start.sh/nativo ou goggame-*.info; sobe de bin/x64/Windows/... para a pasta do jogo; pastas "container"
+   de primeiro nivel como Downloads/Games/Desktop sao sempre percorridas) + cartoes/discos em /run/media.
+   Ignora ocultas (.local, .cache, .var), compatdata, Prefixes, pfx, drive_c, node_modules, steamapps,
+   shadercache, ~/DeckInstall, MD5, _Redist/redist, symlinks. Pastas personalizadas continuam (filhas = jogos)
+   e as padrao aparecem no dialogo "Pastas de busca" para desmarcar. Antes, sem pasta personalizada, nada era
+   buscado ("0 pasta(s) ativa(s)").
+   Medido: HOME de teste com ~24 mil pastas = 42 ms; HOME do PC = 69 ms (6 jogos); Deck (so leitura) = 5 ms (7 jogos).
+FASE 10 (Opus) - Backup/Sync - CONCLUIDA (publicada na v0.19.0)
+1. [FEITO] Importar (Ludusavi) sem jogo selecionado/instalado: escolhe a raiz do backup, lista os jogos
+   (ludusavi.list_backup_games; "Todos (N jogos)" ou um) e guarda cada um como snapshot em snapshots/<slug>/
+   (ludusavi.import_ludusavi_to_snapshot: mesma validacao de caminho e sha1/tamanho, zip atomico, so arquivos de
+   usuario/ProgramData do Windows; o resto conta como ignorado). Linha "nao instalado"; Restaurar habilita quando
+   um jogo com o mesmo nome aparece (restore_snapshot_safely, com snapshot de seguranca). Com jogo instalado
+   selecionado, o import direto de antes continua.
+2. [FEITO] Snapshots guardam o nome real no .index.json (save_sync.remember_snapshot_name / snapshot_display_name):
+   jogo desinstalado aparece como "<Nome> (nao instalado)". Snapshots antigos (sem nome) ainda mostram o slug.
+3. [FEITO] Jogos da loja Steam (save_sources.steam_save_sources): todas as bibliotecas, prefixo compatdata/<appid>/pfx
+   e nuvem local userdata/<uid>/<appid>/remote (secao nova "steamcloud" no snapshot via extra_dirs; restaurar
+   volta para remote e nunca cria prefixo para jogo nativo). Pula Proton/Runtime/Redistributables. Caches e logs
+   fora (_PREFIX_SKIP_DIRS do prefixo; shadercache/cache/logs/.log/.dxvk-cache na nuvem local).
+   Tabela: colunas Origem e "Saves agora" (tamanho atual medido em worker, antes de fazer o snapshot).
+   Nao incluido: o "Fazer backup dos saves" completo (zip unico) continua so com atalhos e jogos do DeckInstall.
+4. [FEITO] Heroic/Lutris/Bottles ja estavam (launcher_scan); Hydra e UMU entram via adopt.find_adoption_candidates.
+   Fontes externas sao buscadas em worker (_start_sources_scan) e a tabela e preenchida de novo ao chegar.
+5. [FEITO] Xodus Nexus (save_sources.nexus_save_sources): launcher-state.json (games: id, title, path,
+   runtimePrefixIdentity), dataRoot = pai de settings.runtimeRoot; layouts game (compatdata/<id>/pfx,
+   prefixes/<id>), family/build (runtime-prefixes/<familia>/(prefixes|<build>)/<id>/(compatdata/pfx|wine)),
+   sem binding so aceita experimental se houver exatamente um. Ids/familias/builds validados por regex.
+   Saves GDK (AppData/Local/Packages/*/SystemAppData/wgs) entram pelo AppData/Local. So leitura.
+   Restaurar: recusa com o Nexus aberto (/proc/*/comm = xodus-nexus, checado de novo no worker) e avisa sobre
+   a nuvem do Xbox. Testado com arvores falsas; no Deck o Nexus esta instalado sem jogos.
+   Deck (so leitura): 3 apps Steam, nenhum com saves ainda; varredura 3 ms.
 
 NAO TESTADO A MAO (so testes automaticos)
 - Instalador GOG real (innoextract nao instalado na maquina), repacks FitGirl/DODI, microSD/exFAT, Steam com link

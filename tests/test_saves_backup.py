@@ -380,7 +380,7 @@ def test_backup_sync_page_lists_games_and_snapshots_now(tmp_path: Path) -> None:
     ):
         win = ui.MainWindow(app)
         try:
-            assert win.saves_list.columnCount() == 4
+            assert win.saves_list.columnCount() == 6
             assert win.spin_save_keep.value() == save_sync.SNAPSHOT_KEEP_DEFAULT
             win._apply_shortcuts_data(None, [], [sa], [], "")
             row = next(r for r in range(win.saves_list.rowCount()) if win.saves_list.item(r, 0).text() == "Page Game")
@@ -393,7 +393,7 @@ def test_backup_sync_page_lists_games_and_snapshots_now(tmp_path: Path) -> None:
                 _wait(app, lambda: win._busy_count == 0 and info.called)
                 assert tr("saves.snapshot_done", name="Page Game", path="").split("\n")[0] in info.call_args[0][2]
                 row = next(r for r in range(win.saves_list.rowCount()) if win.saves_list.item(r, 0).text() == "Page Game")
-                assert win.saves_list.item(row, 2).text() == "1"
+                assert win.saves_list.item(row, 4).text() == "1"
                 win.saves_list.setCurrentCell(row, 0)
                 assert win.btn_save_restore_selected.isEnabled()
         finally:

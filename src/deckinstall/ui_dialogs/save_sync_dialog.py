@@ -29,12 +29,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import __app_name__
+from .. import __app_name__, save_sources
 from .. import ludusavi as lds
 from ..i18n import tr
+from ..save_sources import is_nexus_running, nexus_save_sources, saves_size, steam_save_sources
 from ..save_sync import (
     DEFAULT_SYNC_DIR,
     SNAPSHOT_KEEP_DEFAULT,
+    ExtraDirs,
     SaveArchiveEntry,
     SyncDryRunPreview,
     SyncPlanItem,
@@ -48,8 +50,10 @@ from ..save_sync import (
     restore_snapshot_safely,
     snapshot_after_play,
     snapshot_dir_for,
+    snapshot_display_name,
 )
 from ..standalone import game_log_dir
+from ..steam_paths import SteamPaths
 from ..steam_vdf import DEFAULT_SAVES_DIR
 from ..ui_cards import (
     _dialog_parent,
@@ -72,13 +76,59 @@ LUDUSAVI_DIR_KEY = "saves/ludusavi_folder"
 
 
 class SaveTarget(NamedTuple):
-    """A game whose Wine prefix holds saves."""
+    """A game whose Wine prefix (and maybe extra folders) holds saves."""
 
     name: str
     prefix_dir: Path
     game_dir: Path | None
     steam_appid: int | None
     run_log: Path | None  # launch.sh run log (library games only)
+    source: str = "deckinstall"  # deckinstall, shortcut, steam, heroic, lutris, bottles, hydra, umu, nexus
+    extra_dirs: ExtraDirs = ()  # e.g. Steam's local cloud folder
+
+
+def source_label(source: str) -> str:
+    """Name shown in the "Origin" column."""
+    labels = {
+        "deckinstall": "DeckInstall",
+        "shortcut": tr("saves.source_shortcut"),
+        "steam": "Steam",
+        "heroic": "Heroic",
+        "lutris": "Lutris",
+        "bottles": "Bottles",
+        "hydra": "Hydra",
+        "umu": "UMU",
+        "nexus": "Nexus",
+    }
+    return labels.get(source, source)
+
+
+def scan_external_save_targets(paths: SteamPaths | None, home: Path | None = None) -> list[SaveTarget]:
+    """Steam store games, Hydra/UMU prefixes and Nexus games (read only; run off the UI thread)."""
+    from ..adopt import HYDRA, UMU, find_adoption_candidates
+
+    home = home or save_sources.default_home()
+    out: list[SaveTarget] = []
+    if paths is not None:
+        try:
+            for es in steam_save_sources(paths):
+                out.append(
+                    SaveTarget(es.name, es.prefix_dir, es.game_dir, es.steam_appid, None, "steam", es.extra_dirs)
+                )
+        except Exception as exc:  # one broken source must not hide the others
+            logging.getLogger(__name__).warning("Steam save scan failed: %s", exc)
+    try:
+        for c in find_adoption_candidates(home=home, kinds=(HYDRA, UMU)):
+            if c.prefix_dir is not None and not c.native_linux and c.prefix_dir.is_dir():
+                out.append(SaveTarget(c.name, c.prefix_dir, c.game_dir, c.steam_appid, None, c.kind))
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Hydra/UMU save scan failed: %s", exc)
+    try:
+        for es in nexus_save_sources(home):
+            out.append(SaveTarget(es.name, es.prefix_dir, es.game_dir, None, None, "nexus"))
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Nexus save scan failed: %s", exc)
+    return out
 
 
 class SaveRow(NamedTuple):
@@ -114,10 +164,13 @@ def collect_save_targets(win: MainWindow) -> list[SaveTarget]:
             compat = win.paths.compatdata_dir / str(entry.appid_u32)
             pfx = compat / "pfx" if (compat / "pfx").is_dir() else compat
             raw_dir = entry.start_dir.strip().strip('"')
-            targets.append(SaveTarget(entry.app_name, pfx, Path(raw_dir) if raw_dir else None, None, None))
+            targets.append(
+                SaveTarget(entry.app_name, pfx, Path(raw_dir) if raw_dir else None, None, None, "shortcut")
+            )
     for ext in win._external_games:
         if ext.prefix_dir is not None and ext.runner != "linux":
-            targets.append(SaveTarget(ext.name, ext.prefix_dir, ext.game_dir, None, None))
+            targets.append(SaveTarget(ext.name, ext.prefix_dir, ext.game_dir, None, None, ext.source))
+    targets.extend(win._external_save_targets)
     seen: set[str] = set()
     unique: list[SaveTarget] = []
     for t in targets:
@@ -145,7 +198,7 @@ def build_save_rows(targets: list[SaveTarget], archives: list[SaveArchiveEntry])
         c, m, z = stats.pop(slug, [0, 0.0, 0])
         rows.append(SaveRow(slug, t.name, t, int(c), m, int(z)))
     for slug, (c, m, z) in sorted(stats.items()):
-        rows.append(SaveRow(slug, slug, None, int(c), m, int(z)))
+        rows.append(SaveRow(slug, snapshot_display_name(slug), None, int(c), m, int(z)))
     return rows
 
 
@@ -210,17 +263,27 @@ def build_saves_page(win: MainWindow) -> QWidget:
     buttons.addWidget(win.btn_save_refresh)
     card_layout.addLayout(buttons)
 
-    table = QTableWidget(0, 4)
+    table = QTableWidget(0, 6)
     table.setHorizontalHeaderLabels(
-        [tr("add.detected_name_column"), tr("saves.column_last"), tr("saves.column_count"), tr("maint.column_size")]
+        [
+            tr("add.detected_name_column"),
+            tr("saves.column_source"),
+            tr("saves.column_now"),
+            tr("saves.column_last"),
+            tr("saves.column_count"),
+            tr("maint.column_size"),
+        ]
     )
     table.verticalHeader().setVisible(False)
     table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
     table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-    for col in (1, 2, 3):
+    for col in (1, 2, 3, 4, 5):
         table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+    now_header = table.horizontalHeaderItem(2)
+    if now_header is not None:
+        now_header.setToolTip(tr("saves.column_now_tip"))
     table.setSortingEnabled(True)
     table.setMinimumHeight(220)
     table.currentCellChanged.connect(lambda *_a: update_saves_action_states(win))
@@ -280,17 +343,24 @@ def update_saves_action_states(win: MainWindow) -> None:
     win.btn_save_restore_selected.setEnabled(idle and has_target and row is not None and row.snapshots > 0)
     win.btn_save_open_folder.setEnabled(row is not None)
     win.btn_save_export.setEnabled(idle and has_target)
-    win.btn_save_import.setEnabled(idle and has_target)
+    win.btn_save_import.setEnabled(idle)  # without an installed game it imports into a snapshot
 
 
-def refresh_saves_page(win: MainWindow, after_play: bool = True) -> None:
-    """Reload the per-game table; with after_play, snapshot games played since the last look."""
+def refresh_saves_page(win: MainWindow, after_play: bool = True, scan_sources: bool = True) -> None:
+    """Reload the per-game table; with after_play, snapshot games played since the last look.
+
+    With scan_sources, Steam/Hydra/UMU/Nexus games and the current save sizes are looked up in a
+    worker, and the table is filled again when they arrive.
+    """
     if not hasattr(win, "saves_list"):
         return  # the page is not built yet
     targets = collect_save_targets(win)
+    if scan_sources:
+        _start_sources_scan(win)
     selected = _selected_row(win)
     rows = build_save_rows(targets, list_save_archives())
     table = win.saves_list
+    sizes: dict[str, int] = win._save_sizes
     table.setSortingEnabled(False)
     table.setRowCount(0)
     for r, row in enumerate(rows):
@@ -299,9 +369,14 @@ def refresh_saves_page(win: MainWindow, after_play: bool = True) -> None:
         name_item.setData(Qt.ItemDataRole.UserRole, row)
         last = time.strftime("%Y-%m-%d %H:%M", time.localtime(row.last_mtime)) if row.snapshots else "-"
         table.setItem(r, 0, name_item)
-        table.setItem(r, 1, _SortableTableItem(last, sort_key=row.last_mtime))
-        table.setItem(r, 2, _SortableTableItem(str(row.snapshots), sort_key=row.snapshots))
-        table.setItem(r, 3, _SortableTableItem(format_size_bytes(row.size_bytes), sort_key=row.size_bytes))
+        source = source_label(row.target.source) if row.target is not None else "-"
+        table.setItem(r, 1, QTableWidgetItem(source))
+        now = sizes.get(row.slug) if row.target is not None else None
+        now_text = format_size_bytes(now) if now is not None else ("…" if row.target is not None else "-")
+        table.setItem(r, 2, _SortableTableItem(now_text, sort_key=now or 0))
+        table.setItem(r, 3, _SortableTableItem(last, sort_key=row.last_mtime))
+        table.setItem(r, 4, _SortableTableItem(str(row.snapshots), sort_key=row.snapshots))
+        table.setItem(r, 5, _SortableTableItem(format_size_bytes(row.size_bytes), sort_key=row.size_bytes))
         if selected is not None and row.slug == selected.slug:
             table.setCurrentCell(r, 0)
     table.setSortingEnabled(True)
@@ -309,6 +384,40 @@ def refresh_saves_page(win: MainWindow, after_play: bool = True) -> None:
     update_saves_action_states(win)
     if after_play and _setting_bool(win.settings, AFTER_PLAY_KEY, True):
         _start_after_play(win, [t for t in targets if t.run_log is not None])
+
+
+def _start_sources_scan(win: MainWindow) -> None:
+    """Find Steam/Hydra/UMU/Nexus games and measure every game's saves, off the UI thread."""
+    if win._save_sources_running or win._closing_pending:
+        return
+    paths = win.paths
+    base = collect_save_targets(win)
+
+    def _job() -> object:
+        extra = scan_external_save_targets(paths)
+        sizes: dict[str, int] = {}
+        for t in [*base, *extra]:
+            slug = _slugify(t.name)
+            if slug not in sizes:
+                sizes[slug] = saves_size(t.prefix_dir, t.extra_dirs)[0]
+        return extra, sizes
+
+    worker = SteamOpWorker(_job)
+    win._track_worker(worker)
+    win._save_sources_running = True
+
+    def _done(res: object) -> None:
+        win._save_sources_running = False
+        if isinstance(res, tuple) and not win._closing_pending:
+            win._external_save_targets, win._save_sizes = res
+            refresh_saves_page(win, after_play=False, scan_sources=False)
+
+    def _err(_e: str) -> None:
+        win._save_sources_running = False
+
+    worker.finished_ok.connect(_done)
+    worker.failed.connect(_err)
+    worker.start()
 
 
 def _start_after_play(win: MainWindow, targets: list[SaveTarget]) -> None:
@@ -395,7 +504,8 @@ def _snapshot_now(win: MainWindow) -> None:
         win,
         tr("saves.snapshot_running", name=t.name),
         lambda: auto_snapshot(
-            t.prefix_dir, t.name, "manual", keep=keep, game_dir=t.game_dir, steam_appid=t.steam_appid
+            t.prefix_dir, t.name, "manual", keep=keep, game_dir=t.game_dir, steam_appid=t.steam_appid,
+            extra_dirs=t.extra_dirs,
         ),
         _ok,
     )
@@ -421,9 +531,13 @@ def _restore_selected(win: MainWindow) -> None:
     if not ok or picked not in labels:
         return
     entry = snaps[labels.index(picked)]
-    if QMessageBox.question(
-        _dialog_parent(win), __app_name__, tr("saves.confirm_restore", name=t.name, snap=entry.path.name)
-    ) != QMessageBox.StandardButton.Yes:
+    question = tr("saves.confirm_restore", name=t.name, snap=entry.path.name)
+    if t.source == "nexus":
+        if is_nexus_running():
+            QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.nexus_running"))
+            return
+        question += "\n\n" + tr("saves.nexus_cloud_warning")
+    if QMessageBox.question(_dialog_parent(win), __app_name__, question) != QMessageBox.StandardButton.Yes:
         return
 
     def _ok(res: object) -> None:
@@ -433,11 +547,17 @@ def _restore_selected(win: MainWindow) -> None:
     _run(
         win,
         tr("saves.restore_running", name=t.name),
-        lambda: restore_snapshot_safely(
-            entry.path, t.prefix_dir, t.name, state=entry.kind == "state_snapshot",
-            game_dir=t.game_dir, steam_appid=t.steam_appid,
-        ),
+        lambda: _restore_job(t, entry),
         _ok,
+    )
+
+
+def _restore_job(t: SaveTarget, entry: SaveArchiveEntry) -> object:
+    if t.source == "nexus" and is_nexus_running():  # checked again right before writing
+        raise RuntimeError(tr("saves.nexus_running"))
+    return restore_snapshot_safely(
+        entry.path, t.prefix_dir, t.name, state=entry.kind == "state_snapshot",
+        game_dir=t.game_dir, steam_appid=t.steam_appid, extra_dirs=t.extra_dirs,
     )
 
 
@@ -450,9 +570,58 @@ def _open_folder(win: MainWindow) -> None:
     QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
 
+def _import_to_snapshots(win: MainWindow, root: Path, row: SaveRow | None) -> None:
+    """Ludusavi backup of games that are not installed: keep it as snapshots to restore later."""
+    games = lds.list_backup_games(root)
+    if row is not None:
+        folder = lds.find_game_folder(root, row.name)
+        games = [(row.name, folder)] if folder is not None else []
+    if not games:
+        QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.import_none_found", path=root))
+        return
+    if len(games) > 1:
+        labels = [tr("saves.import_all", count=len(games))] + [name for name, _ in games]
+        picked, ok = QInputDialog.getItem(
+            _dialog_parent(win), __app_name__, tr("saves.import_pick_game"), labels, 0, False
+        )
+        if not ok or picked not in labels:
+            return
+        if picked != labels[0]:
+            games = [games[labels.index(picked) - 1]]
+
+    def _job() -> object:
+        done: list[tuple[str, int, int]] = []
+        for name, folder in games:
+            _snap, stored, skipped = lds.import_ludusavi_to_snapshot(folder, name)
+            done.append((name, stored, skipped))
+        return done
+
+    def _ok(res: object) -> None:
+        lines = [
+            tr("saves.import_snapshot_line", name=name, stored=stored, skipped=skipped)
+            for name, stored, skipped in (res if isinstance(res, list) else [])
+        ]
+        _info(win, tr("saves.import_snapshot_done") + "\n" + "\n".join(lines))
+
+    _run(win, tr("saves.import_running", name=root.name), _job, _ok)
+
+
 def _ludusavi_pick(win: MainWindow, *, export: bool) -> None:
     row = _selected_row(win)
-    if row is None or row.target is None or win._steam_busy:
+    if win._steam_busy or (export and (row is None or row.target is None)):
+        return
+    if row is None or row.target is None:
+        start_dir = Path(str(win.settings.value(LUDUSAVI_DIR_KEY, str(Path.home() / "ludusavi-backup"))))
+
+        def _picked_root(chosen: str) -> None:
+            if chosen:
+                win.settings.setValue(LUDUSAVI_DIR_KEY, str(Path(chosen)))
+                _import_to_snapshots(win, Path(chosen), row)
+
+        _pick_dir_async(
+            _dialog_parent(win), tr("saves.pick_import"),
+            start_dir if start_dir.is_dir() else Path.home(), _picked_root,
+        )
         return
     t = row.target
     start = Path(str(win.settings.value(LUDUSAVI_DIR_KEY, str(Path.home() / "ludusavi-backup"))))

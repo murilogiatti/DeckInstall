@@ -80,7 +80,6 @@ GAMES_DIR = _DEFAULT_GAMES_DIR
 PREFIXES_DIR = _DEFAULT_PREFIXES_DIR
 APPLICATIONS_DIR = _DEFAULT_APPLICATIONS_DIR
 UMU_RUN_PATH = Path.home() / ".local" / "share" / "DeckInstall" / "runtime" / "umu" / "umu-run"
-STANDALONE_MANIFEST = MANIFEST_V1  # legacy (schema v1) manifest filename
 _LIBRARY_INDEX_DIR = ".deckinstall-library"
 
 
@@ -1144,6 +1143,77 @@ def refresh_integration_files(game: StandaloneGame) -> None:
         )
 
 
+def _desktop_opens_game(path: Path, game: StandaloneGame) -> bool:
+    """True if this .desktop starts the game (its launch.sh, or a working dir in the game folder)."""
+    if path.is_symlink() or not path.is_file():
+        return False
+    if _desktop_points_to_game_dir(path, game.game_dir):
+        return True
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    script = str(game.launch_script)
+    return any(
+        line.strip().startswith("Exec=") and script in line for line in text.splitlines()
+    )
+
+
+def find_game_launchers(game: StandaloneGame) -> dict[str, list[Path]]:
+    """The .desktop files that really exist for this game: {"menu": [...], "desktop": [...]}.
+
+    Looks at the app menu folder and the user's Desktop, not only at what the manifest says,
+    so launchers the user deleted (or made by hand) are reported as they are.
+    """
+    found: dict[str, list[Path]] = {"menu": [], "desktop": []}
+    for where, folder in (("menu", get_applications_dir()), ("desktop", get_desktop_dir())):
+        try:
+            entries = sorted(folder.glob("*.desktop"))
+        except OSError:
+            continue
+        found[where] = [p for p in entries if _desktop_opens_game(p, game)]
+    return found
+
+
+def set_game_launcher(game: StandaloneGame, where: str, enabled: bool) -> StandaloneGame:
+    """Create (enabled) or remove the menu/Desktop launcher and record it in the manifest.
+
+    ``where`` is "menu" or "desktop". Removing deletes every .desktop there that opens this game.
+    """
+    if where not in ("menu", "desktop"):
+        raise ValueError(where)
+    existing = find_game_launchers(game)[where]
+    if enabled:
+        if existing:
+            path = existing[0]
+        elif where == "menu":
+            path = _resolve_desktop_file_path(game.name, game.game_dir)
+        else:
+            path = _resolve_desktop_shortcut_path(sanitize_dir_name(game.name), game.game_dir)
+        if not existing:
+            _write_desktop_file(
+                path,
+                game.name,
+                game.launch_script,
+                game.game_dir,
+                icon_path=resolve_game_icon(game.exe_path, game.game_dir, steam_appid=game.steam_appid),
+                executable=where == "desktop",
+                startup_wm_class=_startup_wm_class(game),
+            )
+        if where == "menu":
+            game.desktop_file = path
+        else:
+            game.desktop_shortcut = path
+    else:
+        for path in existing:
+            path.unlink(missing_ok=True)
+        if where == "desktop":
+            game.desktop_shortcut = None
+        # The menu path stays as the default name; the manifest only records it while the file exists.
+    _write_manifest(game)
+    return game
+
+
 def change_standalone_exe(game_dir: Path, new_exe: Path) -> StandaloneGame:
     """Point a game at another executable inside its folder and rewrite its launchers."""
     from .scanner import is_native_linux_exe
@@ -1699,34 +1769,6 @@ def find_orphan_shader_caches(games_dir: Path | None = None) -> list[OrphanCache
     return orphans
 
 
-def prune_orphan_shader_caches(
-    entries: list[OrphanCacheEntry] | None = None,
-    games_dir: Path | None = None,
-) -> tuple[int, int]:
-    """Delete orphaned shader cache directories safely and return (deleted_count, freed_bytes)."""
-    caches_roots = _orphan_cache_roots(games_dir)
-    targets = entries if entries is not None else find_orphan_shader_caches(games_dir=games_dir)
-    # A scan may have become stale while a game was installed or reconfigured.
-    current_orphans = {
-        entry.path.resolve()
-        for entry in (find_orphan_shader_caches(games_dir=games_dir) if entries is not None else targets)
-    }
-    deleted = 0
-    freed = 0
-    for entry in targets:
-        if not any(is_within(entry.path, d, strict=True) for d in caches_roots):
-            logging.warning("Refusing to prune cache directory outside the caches folders: %s", entry.path)
-            continue
-        if (
-            entry.path.is_dir()
-            and not entry.path.is_symlink()
-            and entry.path.resolve() in current_orphans
-        ):
-            remove_path_or_tree(entry.path)
-            if not entry.path.exists():
-                deleted += 1
-                freed += entry.size_bytes
-    return deleted, freed
 
 
 def remove_standalone_game(

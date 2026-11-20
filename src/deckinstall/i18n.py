@@ -121,21 +121,3 @@ def tr(key: str, **kwargs: object) -> str:
             return text
     return text
 
-
-def _plural_suffix(lang: str, count: int) -> str:
-    if lang in ("ja", "zh_CN"):
-        return "_other"
-    if lang in ("pt_BR", "fr"):
-        return "_one" if count in (0, 1) else "_other"
-    return "_one" if count == 1 else "_other"
-
-
-def tr_plural(key: str, count: int, **kwargs: object) -> str:
-    """Translate a count-aware key using _one/_other variants when available."""
-    if not _en_loaded:
-        set_language(DEFAULT_LANG)
-    suffix = _plural_suffix(_current_lang, count)
-    variant = f"{key}{suffix}"
-    if variant in _active_catalog or variant in _en_catalog:
-        return tr(variant, count=count, **kwargs)
-    return tr(key, count=count, **kwargs)

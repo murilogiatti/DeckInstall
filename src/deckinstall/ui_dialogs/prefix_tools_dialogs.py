@@ -612,7 +612,7 @@ def open_optiscaler_dialog(
                 return
             cur_opts = str(entry.launch_options or "")
             new_opts = _apply_winedll_to_opts(cur_opts, new_winedll, allow_dlss_upgrade=True)
-            if win.is_batch_vdf_enabled():
+            if win.should_queue_vdf_edits():
                 win.enqueue_vdf_edit(
                     QueuedVdfEdit(
                         edit_id=f"set_launch_options:{entry.appid_u32}",
@@ -660,7 +660,7 @@ def open_optiscaler_dialog(
             steam_worker.failed.connect(_steam_err)
             steam_worker.start()
 
-        if win.is_batch_vdf_enabled():
+        if win.should_queue_vdf_edits():
             _proceed_steam_winedll()
             return
 

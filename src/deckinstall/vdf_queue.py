@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import logging
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast, get_args
 
+from .fsutil import atomic_write_text
 from .steam_paths import SteamPaths
 from .steam_vdf import (
     _backup_file,
@@ -30,6 +33,13 @@ VdfEditOp = Literal[
 ]
 
 _COALESCIBLE_OPS = frozenset({"set_proton", "set_launch_options", "set_app_launch_options"})
+_KNOWN_OPS = frozenset(get_args(VdfEditOp))
+QUEUE_FILE_VERSION = 1
+
+
+def default_queue_file() -> Path:
+    """Where Gaming Mode edits wait for Steam to close (survives restarts of the app)."""
+    return Path.home() / ".local" / "share" / "DeckInstall" / "vdf_queue.json"
 
 
 @dataclass(frozen=True)
@@ -52,10 +62,34 @@ class BatchApplyResult:
 
 
 class VdfEditQueue:
-    """In-memory queue of Steam VDF edits with coalescing and single-transaction apply."""
+    """Queue of Steam VDF edits with coalescing and single-transaction apply.
 
-    def __init__(self) -> None:
+    With ``store_path`` the queue is loaded from and saved to that JSON file after every change,
+    so edits made in Gaming Mode survive closing the app until Steam is closed.
+    """
+
+    def __init__(self, store_path: Path | None = None) -> None:
         self._queue: list[QueuedVdfEdit] = []
+        self._store_path = store_path
+        if store_path is not None:
+            self._queue = _load_edits(store_path)
+
+    def _save(self) -> None:
+        if self._store_path is None:
+            return
+        try:
+            if not self._queue:
+                self._store_path.unlink(missing_ok=True)
+                return
+            data = {"version": QUEUE_FILE_VERSION, "edits": [asdict(e) for e in self._queue]}
+            atomic_write_text(self._store_path, json.dumps(data, indent=2, ensure_ascii=False, default=str))
+        except OSError as exc:
+            logging.warning("Could not save the Steam edit queue to %s: %s", self._store_path, exc)
+
+    def reload(self) -> None:
+        """Re-read the queue file (another DeckInstall instance may have changed it)."""
+        if self._store_path is not None:
+            self._queue = _load_edits(self._store_path)
 
     def enqueue(self, edit: QueuedVdfEdit) -> None:
         """Add an edit to the queue, coalescing set_proton/set_launch_options by (op, appid_u32)."""
@@ -70,16 +104,21 @@ class VdfEditQueue:
                 existing for existing in self._queue if existing.edit_id != edit.edit_id
             ]
         self._queue.append(edit)
+        self._save()
 
     def remove(self, edit_id: str) -> bool:
         """Remove a queued edit by edit_id. Returns True if an entry was removed."""
         before = len(self._queue)
         self._queue = [edit for edit in self._queue if edit.edit_id != edit_id]
-        return len(self._queue) < before
+        removed = len(self._queue) < before
+        if removed:
+            self._save()
+        return removed
 
     def clear(self) -> None:
         """Discard all pending edits."""
         self._queue.clear()
+        self._save()
 
     def pending_count(self) -> int:
         """Return the number of queued edits."""
@@ -111,6 +150,7 @@ class VdfEditQueue:
                     remaining.append(edit)
 
         self._queue = remaining
+        self._save()
         return BatchApplyResult(applied=applied, errors=errors)
 
     @staticmethod
@@ -171,3 +211,36 @@ class VdfEditQueue:
             )
         else:
             raise ValueError(f"Operação VDF desconhecida: {edit.op}")
+
+
+def _load_edits(path: Path) -> list[QueuedVdfEdit]:
+    """Read a saved queue; unreadable files or entries are skipped (and logged), never fatal."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as exc:
+        logging.warning("Ignoring unreadable Steam edit queue %s: %s", path, exc)
+        return []
+    if not isinstance(raw, dict) or raw.get("version") != QUEUE_FILE_VERSION:
+        logging.warning("Ignoring Steam edit queue %s with unknown version", path)
+        return []
+    edits: list[QueuedVdfEdit] = []
+    for item in raw.get("edits") or []:
+        try:
+            op = str(item["op"])
+            payload = item.get("payload") or {}
+            if op not in _KNOWN_OPS or not isinstance(payload, dict):
+                raise ValueError(op)
+            edits.append(
+                QueuedVdfEdit(
+                    edit_id=str(item["edit_id"]),
+                    op=cast(VdfEditOp, op),
+                    appid_u32=int(item["appid_u32"]),
+                    label=str(item.get("label") or ""),
+                    payload=payload,
+                )
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            logging.warning("Skipping invalid queued Steam edit %r: %s", item, exc)
+    return edits

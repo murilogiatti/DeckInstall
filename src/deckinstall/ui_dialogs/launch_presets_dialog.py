@@ -575,7 +575,7 @@ def edit_launch_options_presets(
     paths = win.paths
     entry = obj
 
-    if win.is_batch_vdf_enabled():
+    if win.should_queue_vdf_edits():
         win.enqueue_vdf_edit(
             QueuedVdfEdit(
                 edit_id=f"set_launch_options:{entry.appid_u32}",

@@ -10,14 +10,12 @@ from unittest.mock import patch
 import deckinstall.external_actions as external_actions
 from deckinstall.external_actions import (
     build_steam_shortcut_payload,
-    create_standalone_from_external,
     create_steam_shortcut_from_external,
     import_external_saves_to_target,
     load_external_launch_presets,
     save_external_launch_presets,
 )
 from deckinstall.launcher_scan import ExternalLauncherGame
-from deckinstall.standalone import StandaloneGame
 from deckinstall.steam_paths import SteamPaths
 
 
@@ -170,48 +168,6 @@ def test_create_steam_shortcut_from_external(tmp_path: Path) -> None:
     assert _snapshot_tree(tmp_path / "external_launcher") == before
 
 
-def test_create_standalone_from_external_keep_in_place(tmp_path: Path) -> None:
-    ext, launcher_cfg = _make_external_game(tmp_path)
-    before = _snapshot_tree(tmp_path / "external_launcher")
-
-    standalone_prefix = tmp_path / "standalone" / "ExternalRPG" / "pfx"
-    standalone_prefix.mkdir(parents=True, exist_ok=True)
-    fake_game = StandaloneGame(
-        name="External RPG",
-        game_dir=ext.game_dir,
-        exe_path=ext.exe_path,
-        prefix_dir=standalone_prefix,
-        proton_name="GE-Proton9-1",
-        steam_appid=None,
-        winedlloverrides="d3d11=n,b",
-        launch_options="gamemoderun %command%",
-        launch_script=tmp_path / "standalone" / "launch.sh",
-        desktop_file=tmp_path / "standalone" / "external-rpg.desktop",
-    )
-
-    with patch("deckinstall.external_actions.install_standalone_game", return_value=fake_game) as mock_install:
-        result = create_standalone_from_external(
-            ext,
-            create_menu_shortcut=True,
-            create_desktop_shortcut=False,
-            launch_options="gamemoderun %command%",
-            winedlloverrides="d3d11=n,b",
-        )
-
-    assert result is fake_game
-    mock_install.assert_called_once()
-    kwargs = mock_install.call_args.kwargs
-    assert kwargs["keep_in_place"] is True
-    assert kwargs["game_name"] == "External RPG"
-    assert kwargs["exe_path"] == ext.exe_path
-    assert kwargs["game_dir"] == ext.game_dir
-    assert kwargs["native_linux"] is False
-
-    assert (
-        standalone_prefix / "drive_c" / "users" / "steamuser" / "Documents" / "RPG" / "slot1.sav"
-    ).read_bytes() == b"external-save-v1"
-    assert launcher_cfg.exists()
-    assert _snapshot_tree(tmp_path / "external_launcher") == before
 
 
 def test_load_and_save_external_launch_presets_fallback_json(tmp_path: Path, monkeypatch) -> None:

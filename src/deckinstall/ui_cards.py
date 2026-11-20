@@ -203,20 +203,31 @@ class DropZoneFrame(QFrame):
                 self.file_dropped.emit(local)
 
 
-_WINE_PROC_NAMES = frozenset(
-    {
-        "umu-run",
-        "pressure-vessel-wrap",
-        "pv-bwrap",
-        "srt-bwrap",
-        "wineserver",
-    }
+# Wrappers that the Steam client itself also uses (steamrt64/pressure-vessel), so the name
+# alone says nothing: they only count when pointing at a Wine/Proton prefix.
+_WINE_WRAPPER_NAMES = frozenset(
+    {"umu-run", "pressure-vessel-wrap", "pv-bwrap", "srt-bwrap", "pressure-vessel-adverb"}
 )
+_WINE_PREFIX_MARKERS = ("/compatdata/", "/pfx/", "/pfx", "/prefixes/", "/deckinstall/")
 
 
-def _is_wine_game_running() -> bool:
-    """Return True if a Windows .exe, umu/pressure-vessel wrapper, or wineserver is running."""
-    proc = Path("/proc")
+def _proc_is_wine_game(args: list[str], environ_has_prefix: bool = False) -> bool:
+    """Decide from a lowercase argv whether a process is a real Wine/Proton game."""
+    if any(a.endswith(".exe") for a in args):
+        return True
+    names = {Path(a).name for a in args[:2]}
+    if "wineserver" in names:
+        return True
+    if not names & _WINE_WRAPPER_NAMES:
+        return False
+    joined = " ".join(args)
+    # Wrapper without a prefix is the Steam client's own runtime helper: not a game.
+    return environ_has_prefix or any(m in joined for m in _WINE_PREFIX_MARKERS)
+
+
+def _is_wine_game_running(proc_root: Path | str = "/proc") -> bool:
+    """Return True if a real Windows game (.exe, wineserver or a wrapper on a Wine prefix) is running."""
+    proc = Path(proc_root)
     if not proc.is_dir():
         return False
     uid = os.getuid()
@@ -232,7 +243,13 @@ def _is_wine_game_running() -> bool:
             args = [a.decode("utf-8", errors="ignore").lower() for a in raw_cmd.split(b"\x00") if a]
             if not args:
                 continue
-            if any(a.endswith(".exe") or Path(a).name in _WINE_PROC_NAMES for a in args):
+            env_prefix = False
+            if Path(args[0]).name in _WINE_WRAPPER_NAMES:
+                try:
+                    env_prefix = b"WINEPREFIX=" in (p / "environ").read_bytes()
+                except OSError:
+                    env_prefix = False
+            if _proc_is_wine_game(args, env_prefix):
                 return True
         except OSError:
             continue
@@ -294,6 +311,7 @@ def _format_cleanup_candidate_label(cand: CleanupCandidate) -> str:
         "Compatdata Órfão": tr("cleanup.cat_orphan"),
         "orphan_compatdata": tr("cleanup.cat_orphan"),
         "Orphan Shadercache": tr("cleanup.cat_shadercache"),
+        "Orphan Game Cache": tr("cleanup.cat_game_cache"),
         "GPU Shader Cache": tr("maint.cat_gpu_shader"),
         "Steam Logs": tr("cleanup.cat_logs"),
         "Trash": tr("cleanup.cat_trash"),

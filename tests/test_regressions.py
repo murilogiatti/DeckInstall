@@ -27,8 +27,6 @@ from deckinstall.optiscaler import (  # noqa: E402
     uninstall_optiscaler_for_game,
 )
 from deckinstall.runtime_manager import (  # noqa: E402
-    ProtonRelease,
-    ensure_ge_proton10,
     is_win32_prefix,
     list_ge_proton10_dirs,
     run_exe_in_prefix,
@@ -332,7 +330,7 @@ class Fase4RegressionTests(unittest.TestCase):
             else:
                 self.assertEqual(shlex.split(formatted), [tok])
 
-    def test_list_ge_proton10_dirs_and_ensure_ge_proton10(self) -> None:
+    def test_list_ge_proton10_dirs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             compat_root = Path(tmp) / "compatibilitytools.d"
             for name in ("GE-Proton9-20", "GE-Proton10-5", "GE-Proton10-20", "GE-Proton11-1"):
@@ -347,48 +345,6 @@ class Fase4RegressionTests(unittest.TestCase):
             ):
                 dirs = list_ge_proton10_dirs()
                 self.assertEqual([p.name for p in dirs], ["GE-Proton10-20", "GE-Proton10-5"])
-                with mock.patch("deckinstall.runtime_manager.fetch_available_proton_releases") as mock_fetch:
-                    chosen = ensure_ge_proton10(force_update=False)
-                mock_fetch.assert_not_called()
-                self.assertEqual(chosen.name, "GE-Proton10-20")
-
-            # Online mocked fetch when no GE-Proton10 is installed locally
-            empty_compat = Path(tmp) / "empty_compat"
-            empty_compat.mkdir()
-            releases = [
-                ProtonRelease(
-                    family_id="ge-proton",
-                    tag_name="GE-Proton11-1",
-                    name="GE-Proton11-1",
-                    asset_name="GE-Proton11-1.tar.gz",
-                    download_url="https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton11-1/GE-Proton11-1.tar.gz",
-                    size_bytes=100,
-                    published_at="2026-01-01T00:00:00Z",
-                    prerelease=False,
-                ),
-                ProtonRelease(
-                    family_id="ge-proton",
-                    tag_name="GE-Proton10-25",
-                    name="GE-Proton10-25",
-                    asset_name="GE-Proton10-25.tar.gz",
-                    download_url="https://github.com/GloriousEggroll/proton-ge-custom/releases/download/GE-Proton10-25/GE-Proton10-25.tar.gz",
-                    size_bytes=100,
-                    published_at="2026-01-01T00:00:00Z",
-                    prerelease=False,
-                ),
-            ]
-            installed_target = empty_compat / "GE-Proton10-25"
-            with (
-                mock.patch("deckinstall.runtime_manager.get_compat_tools_dir", return_value=empty_compat),
-                mock.patch("deckinstall.steam_paths.find_steam_root", return_value=None),
-                mock.patch("deckinstall.runtime_manager._iter_extra_compat_tool_dirs", return_value=[]),
-                mock.patch("deckinstall.runtime_manager.fetch_available_proton_releases", return_value=releases),
-                mock.patch("deckinstall.runtime_manager.install_compat_tool", return_value=installed_target) as mock_install,
-            ):
-                res = ensure_ge_proton10()
-            self.assertEqual(res, installed_target)
-            mock_install.assert_called_once()
-            self.assertEqual(mock_install.call_args[0][0].tag_name, "GE-Proton10-25")
 
     def test_scan_all_games_empty_roots_and_run_media_discovery(self) -> None:
         self.assertEqual(scan_all_games(roots=[]), [])

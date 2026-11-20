@@ -52,7 +52,6 @@ OPTISCALER_RELEASES_API = (
 UPDATE_CACHE_TTL_SECONDS = 24 * 60 * 60
 USER_AGENT = f"DeckInstall/{__version__}"
 _GE_PROTON_TAG_RE = re.compile(r"^GE-Proton(\d+)([A-Za-z0-9._-]*)$")
-_SHA512_RE = re.compile(r"\b([0-9a-fA-F]{128})\b")
 _WINETRICKS_VERB_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 _ALLOWED_URL_HOSTS = frozenset(
     {
@@ -1293,28 +1292,6 @@ def ensure_ge_proton11(
     return target_dir
 
 
-def ensure_ge_proton10(
-    force_update: bool = False,
-    progress_cb: ProgressCallback | None = None,
-) -> Path:
-    """Ensure a GE-Proton10 directory is installed in Steam compatibilitytools.d."""
-    existing = list_ge_proton10_dirs()
-    if existing and not force_update:
-        return existing[0]
-
-    _emit_progress(progress_cb, "Checking latest GE-Proton10 release...", 0)
-    releases = fetch_available_proton_releases("ge-proton", limit=50)
-    release: ProtonRelease | None = None
-    for rel in releases:
-        if rel.prerelease:
-            continue
-        if _parse_ge_proton_version(rel.tag_name, min_major=10, max_major=10) is not None:
-            release = rel
-            break
-    if release is None:
-        raise RuntimeError("No GE-Proton10 release found.")
-
-    return install_compat_tool(release, progress_cb=progress_cb)
 
 
 def _strip_tar_suffix(name: str) -> str:

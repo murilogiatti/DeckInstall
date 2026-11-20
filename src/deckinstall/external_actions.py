@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .launcher_scan import ExternalLauncherGame
-from .standalone import StandaloneGame, install_standalone_game, resolve_game_icon
+from .standalone import resolve_game_icon
 from .steam_paths import SteamPaths
 from .steam_vdf import (
     _copy_save_pair_if_newer,
@@ -183,29 +183,6 @@ def create_steam_shortcut_from_external(
     return appid_u32
 
 
-def create_standalone_from_external(
-    ext: ExternalLauncherGame,
-    create_menu_shortcut: bool = True,
-    create_desktop_shortcut: bool = False,
-    launch_options: str = "",
-    winedlloverrides: str = "",
-) -> StandaloneGame:
-    """Register an external launcher game as a DeckInstall standalone game (in-place)."""
-    game = install_standalone_game(
-        game_name=ext.name,
-        exe_path=ext.exe_path,
-        game_dir=ext.game_dir,
-        winedlloverrides=winedlloverrides,
-        launch_options=launch_options,
-        create_menu_shortcut=create_menu_shortcut,
-        create_desktop_shortcut=create_desktop_shortcut,
-        keep_in_place=True,
-        native_linux=(ext.runner == "linux"),
-        source={"kind": "adopted", "origin": str(ext.source)},
-    )
-    if ext.prefix_dir is not None and ext.prefix_dir.is_dir():
-        import_external_saves_to_target(ext, game.prefix_dir, game.name)
-    return game
 
 
 def load_external_launch_presets(ext: ExternalLauncherGame) -> str:

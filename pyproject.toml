@@ -38,7 +38,7 @@ where = ["src"]
 version = {attr = "deckinstall.__version__"}
 
 [tool.setuptools.package-data]
-deckinstall = ["locales/*.json", "assets/icon.png", "assets/icon.svg"]
+deckinstall = ["locales/*.json", "locales/qt/*.qm", "assets/icon.png", "assets/icon.svg"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -9,7 +9,7 @@ from unittest import mock
 
 import pytest
 
-from deckinstall import extractor, optiscaler, standalone
+from deckinstall import extractor, fsutil, optiscaler, standalone
 from deckinstall import steam_vdf as sv
 
 
@@ -55,10 +55,10 @@ def test_move_dir_safely_keeps_destination_when_source_cleanup_fails(tmp_path: P
     (src / "sub" / "save.dat").write_bytes(b"data")
     dst = tmp_path / "dst"
     with (
-        mock.patch.object(sv.os, "rename", side_effect=_exdev),
-        mock.patch.object(sv.shutil, "rmtree", side_effect=OSError("busy")),
+        mock.patch.object(fsutil.os, "rename", side_effect=_exdev),
+        mock.patch.object(fsutil.shutil, "rmtree", side_effect=OSError("busy")),
     ):
-        sv.move_dir_safely(src, dst)
+        fsutil.move_dir_safely(src, dst)
     assert (dst / "sub" / "save.dat").read_bytes() == b"data"
     assert (src / "sub" / "save.dat").exists()
 
@@ -68,11 +68,11 @@ def test_move_dir_safely_copy_failure_leaves_source_intact(tmp_path: Path) -> No
     src.mkdir()
     (src / "save.dat").write_bytes(b"data")
     with (
-        mock.patch.object(sv.os, "rename", side_effect=_exdev),
-        mock.patch.object(sv.shutil, "copytree", side_effect=OSError("disk full")),
+        mock.patch.object(fsutil.os, "rename", side_effect=_exdev),
+        mock.patch.object(fsutil.shutil, "copytree", side_effect=OSError("disk full")),
         pytest.raises(OSError),
     ):
-        sv.move_dir_safely(src, tmp_path / "dst")
+        fsutil.move_dir_safely(src, tmp_path / "dst")
     assert (src / "save.dat").read_bytes() == b"data"
 
 

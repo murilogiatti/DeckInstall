@@ -201,43 +201,6 @@ def backup_steam_artwork(shortcut_appid_u32: int, grid_dir: Path) -> list[str]:
     return copied
 
 
-def restore_steam_artwork_backup(shortcut_appid_u32: int, grid_dir: Path) -> list[str]:
-    """Restore previously backed-up Steam grid artwork for shortcut_appid_u32."""
-    if grid_dir.is_symlink():
-        return []
-    bak_root = grid_dir / ".deckinstall_art_bak"
-    bak_dir = bak_root / str(shortcut_appid_u32)
-    if bak_root.is_symlink() or bak_dir.is_symlink() or not bak_dir.is_dir():
-        return []
-    bak_files = [p for p in sorted(bak_dir.iterdir()) if not p.is_symlink() and p.is_file()]
-    if not bak_files:
-        return []
-    for cur in _grid_files_for_appid(shortcut_appid_u32, grid_dir):
-        try:
-            cur.unlink()
-        except OSError:
-            pass
-    restored: list[str] = []
-    for src in bak_files:
-        dst = grid_dir / src.name
-        if dst.is_symlink():
-            dst.unlink()
-        fd, tmp_name = tempfile.mkstemp(prefix=f".{src.name}.", suffix=".tmp", dir=str(grid_dir))
-        os.close(fd)
-        tmp_dst = Path(tmp_name)
-        try:
-            shutil.copy2(src, tmp_dst, follow_symlinks=False)
-            os.replace(tmp_dst, dst)
-        finally:
-            if tmp_dst.exists():
-                try:
-                    tmp_dst.unlink()
-                except OSError:
-                    pass
-        restored.append(src.name)
-    return restored
-
-
 def download_steam_artwork(
     steam_appid: int,
     shortcut_appid_u32: int,

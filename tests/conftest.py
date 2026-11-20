@@ -12,7 +12,7 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from deckinstall import library, runtime_manager, save_sync, standalone  # noqa: E402
+from deckinstall import library, runtime_manager, save_sources, save_sync, standalone, vdf_queue  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -45,5 +45,9 @@ def _isolated_libraries(tmp_path_factory: pytest.TempPathFactory, monkeypatch: p
             *runtime_manager._iter_extra_compat_tool_dirs(),
         ],
     )
+    # Other launchers (Hydra, UMU, Nexus) are looked up in an empty home, never the real one.
+    monkeypatch.setattr(save_sources, "default_home", lambda: base / "home")
+    # Never read or write the real saved Steam edit queue.
+    monkeypatch.setattr(vdf_queue, "default_queue_file", lambda: base / "data" / "vdf_queue.json")
     monkeypatch.setattr(save_sync, "DEFAULT_SNAPSHOTS_DIR", base / "home" / "Games" / "saves" / "snapshots")
     yield

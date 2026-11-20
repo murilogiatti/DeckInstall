@@ -676,6 +676,14 @@ def _find_orphan_shadercache(ctx: _ScanContext) -> Iterator[_Found]:
         yield _plain("Orphan Shadercache", f"shadercache/{child.name}", child), 1
 
 
+def _find_orphan_game_caches(_ctx: _ScanContext) -> Iterator[_Found]:
+    """DeckInstall shader caches (<library>/Caches/<id>) whose game is gone; absent disks keep theirs."""
+    from .standalone import find_orphan_shader_caches
+
+    for entry in find_orphan_shader_caches():
+        yield _plain("Orphan Game Cache", f"Caches/{entry.name}", entry.path, entry.size_bytes), None
+
+
 def _find_steam_logs(ctx: _ScanContext) -> Iterator[_Found]:
     if ctx.paths is None:
         return
@@ -861,6 +869,7 @@ RULES: tuple[CleanupRule, ...] = (
     CleanupRule("prefix_caches", "system", _find_prefix_caches, deep=True),
     CleanupRule("orphan_compatdata", "games", _find_orphan_compatdata),
     CleanupRule("orphan_shadercache", "games", _find_orphan_shadercache),
+    CleanupRule("orphan_game_caches", "games", _find_orphan_game_caches),
     CleanupRule("steam_logs", "system", _find_steam_logs),
     CleanupRule("orphan_desktop", "games", _find_orphan_desktop_files),
     CleanupRule("old_save_backups", "games", _find_old_save_backups),

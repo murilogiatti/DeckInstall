@@ -134,8 +134,16 @@ def test_bulk_install_and_remove(tmp_path: Path) -> None:
     (beta.game_dir / "dxgi.dll").write_bytes(b"RESHADE")
     payload = _payload(tmp_path)
 
+    from deckinstall.ui_dialogs.optiscaler_bulk_dialog import _install_files
+
+    def _run(games: list[standalone.StandaloneGame], remove: bool) -> list[opti.BulkOutcome]:
+        # The same path the bulk dialog uses: copy files, then save each game's DLL overrides.
+        outcomes, writes = _install_files([opti.standalone_bulk_target(g) for g in games], remove, "auto")
+        assert writes == []  # DeckInstall games never need a Steam write
+        return outcomes
+
     with mock.patch.object(opti, "ensure_optiscaler", return_value=payload):
-        out = opti.bulk_optiscaler([alpha, beta])
+        out = _run([alpha, beta], False)
     assert [(o.name, o.status, o.detail) for o in out] == [
         ("Alpha", "installed", "dxgi.dll"),
         ("Beta", "installed", "winmm.dll"),
@@ -146,7 +154,7 @@ def test_bulk_install_and_remove(tmp_path: Path) -> None:
     assert "winmm=n,b" in games["Beta"].winedlloverrides
     assert "winmm=n,b" in games["Beta"].launch_script.read_text(encoding="utf-8")
 
-    out = opti.bulk_optiscaler(list(games.values()), remove=True)
+    out = _run(list(games.values()), True)
     assert [o.status for o in out] == ["removed", "removed"]
     games = {g.name: g for g in standalone.list_standalone_games()}
     assert "dxgi" not in games["Alpha"].winedlloverrides and "winmm" not in games["Beta"].winedlloverrides

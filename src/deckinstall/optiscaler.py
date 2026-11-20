@@ -252,11 +252,6 @@ def recommend_proxy(
     return "dxgi", tuple(notes)
 
 
-def scan_optiscaler_compatibility_batch(
-    entries: list[tuple[Path, Path | None]],
-) -> list[OptiScalerCompatibility]:
-    """Assess OptiScaler compatibility for a flat batch of (exe_path, game_dir) pairs."""
-    return [check_optiscaler_compatibility(exe_path, game_dir) for exe_path, game_dir in entries]
 
 
 def _resolve_manifest_path(exe_dir: Path, raw: str) -> Path | None:
@@ -1010,39 +1005,3 @@ def standalone_bulk_target(game: Any) -> BulkTarget:
         native_linux=bool(game.native_linux),
     )
 
-
-def bulk_optiscaler(
-    games: list[object],
-    *,
-    remove: bool = False,
-    backend: str = "auto",
-    fg_mode: str = "auto",
-    spoof_mode: str = "auto",
-    overlay_menu: bool = True,
-    progress_cb: ProgressCb | None = None,
-) -> list[BulkOutcome]:
-    """Install (or remove) OptiScaler on several DeckInstall games and update their DLL overrides."""
-    from .standalone import StandaloneGame, update_standalone_launch_options
-
-    targets = [standalone_bulk_target(g) for g in games if isinstance(g, StandaloneGame)]
-    results = bulk_optiscaler_targets(
-        targets,
-        remove=remove,
-        backend=backend,
-        fg_mode=fg_mode,
-        spoof_mode=spoof_mode,
-        overlay_menu=overlay_menu,
-        progress_cb=progress_cb,
-    )
-    outcomes: list[BulkOutcome] = []
-    for t, (outcome, dll) in zip(targets, results, strict=True):
-        if dll is not None:
-            try:
-                update_standalone_launch_options(
-                    t.game_dir, winedlloverrides=dll, launch_options=t.ref.launch_options
-                )
-            except Exception as exc:
-                logging.exception("Could not save DLL overrides for %s", t.name)
-                outcome = BulkOutcome(t.name, "failed", str(exc))
-        outcomes.append(outcome)
-    return outcomes

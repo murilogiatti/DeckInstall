@@ -11,10 +11,12 @@ from typing import TypedDict, cast
 
 from PySide6.QtCore import (
     QFileSystemWatcher,
+    QLibraryInfo,
     QSettings,
     Qt,
     QThread,
     QTimer,
+    QTranslator,
     QUrl,
     qInstallMessageHandler,
 )
@@ -40,7 +42,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMenu,
     QMessageBox,
     QProgressBar,
     QProgressDialog,
@@ -56,7 +57,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __app_name__, __version__, classify
+from . import __app_name__, __version__, classify, vdf_queue
 from .app_updater import (
     GITHUB_RELEASES_URL,
     AppUpdateInfo,
@@ -64,13 +65,12 @@ from .app_updater import (
 )
 from .artwork import (
     SteamMatch,
-    restore_steam_artwork_backup,
 )
 from .external_actions import (
     create_steam_shortcut_from_external,
     load_external_launch_presets,
 )
-from .i18n import available_languages, set_language, tr
+from .i18n import LOCALES_DIR, available_languages, set_language, tr
 from .launch_presets import active_flags, apply_presets
 from .launcher_scan import ExternalLauncherGame, scan_external_launcher_games
 from .library import (
@@ -97,7 +97,7 @@ from .runtime_manager import (
 from .save_sync import auto_snapshot
 from .scanner import (
     DetectedGame,
-    clean_game_name,
+    default_scan_roots,
     detect_exe_kind,
     is_native_linux_exe,
     scan_all_games,
@@ -121,7 +121,6 @@ from .steam_paths import (
 from .steam_vdf import (
     DEFAULT_SAVES_DIR,
     CleanupCandidate,
-    MigrationPlanItem,
     ShortcutEntry,
     infer_game_root_from_exe,
     load_shortcuts,
@@ -134,20 +133,14 @@ from .touch_scroll import install_touch_scroll
 from .ui_cards import (  # noqa: F401
     DropZoneFrame,
     FlowLayout,
-    _cleanup_candidate_auto_check,
-    _dialog_guard,
     _dialog_parent,
-    _format_cleanup_candidate_label,
-    _format_worker_error,
     _is_native_linux_game,
     _is_wine_game_running,
     _make_card,
     _pick_dir_async,
     _pick_file_async,
     _resolve_asset_path,
-    _resolve_game_exe_path,
     _setting_bool,
-    _SortableTableItem,
     _start_detached_process,
     format_size_bytes,
     get_game_log_path,
@@ -181,32 +174,24 @@ from .ui_dialogs.uninstall_dialog import ask_uninstall
 from .ui_maintenance import (
     _update_maint_summary,
     build_maintenance_page,
-    open_maintenance_page,
     refresh_maintenance_health,
 )
 from .ui_workers import (  # noqa: F401
     AddToSteamWorker,
     AppUpdateCheckWorker,
     AppUpdateDownloadWorker,
-    ArtDownloadWorker,
-    ArtSearchWorker,
     BackupWorker,
-    BulkMigrateWorker,
-    BulkPlanWorker,
     DirStatsWorker,
     ExtImportSavesWorker,
     ExtractWorker,
-    FallbackProton10Worker,
     LaunchPrepWorker,
     PkexecWorker,
     PreviewWorker,
     ProtonPrepWorker,
     RemoveShortcutWorker,
     RestoreWorker,
-    RunExeInPrefixWorker,
     RuntimePreflightWorker,
     RuntimeUpdateWorker,
-    SaveSyncWorker,
     ScanWorker,
     ShortcutsRefreshWorker,
     StandaloneInstallWorker,
@@ -214,7 +199,6 @@ from .ui_workers import (  # noqa: F401
     SteamOpWorker,
     SteamRunningWorker,
     SteamSearchWorker,
-    WinetricksWorker,
     compute_library_runner_labels,
 )
 from .uninstall import GAME_FILES, UninstallPlan, UninstallResult, execute_uninstall, plan_uninstall
@@ -281,7 +265,6 @@ class MainWindow(QMainWindow):
     _maint_active_filter: str
     _maint_scanned: bool
     _maint_filter_group: QButtonGroup
-    maint_batch_card: QFrame
     maint_list: QTableWidget
     btn_maint_protons: QPushButton
     btn_maint_game_protons: QPushButton
@@ -301,6 +284,7 @@ class MainWindow(QMainWindow):
     lbl_maint_summary: QLabel
     btn_space_refresh: QPushButton
     lbl_space_status: QLabel
+    lbl_space_top: QLabel
     space_disks_layout: QVBoxLayout
     space_games_list: QTableWidget
     btn_update_runtimes: QPushButton
@@ -321,12 +305,15 @@ class MainWindow(QMainWindow):
     btn_save_export: QPushButton
     btn_save_import: QPushButton
     _after_play_running: bool = False
+    _save_sources_running: bool = False
+    _external_save_targets: list = []  # Steam/Hydra/UMU/Nexus games for Backup/Sync (filled by a worker)
+    _save_sizes: dict = {}  # slug -> bytes of saves right now
 
     def __init__(self, app: QApplication) -> None:
         super().__init__()
         self.app = app
         self.settings = QSettings(__app_name__, __app_name__)
-        set_language(str(self.settings.value("language", "auto")))
+        _install_qt_translator(app, set_language(str(self.settings.value("language", "auto"))))
         self.paths: SteamPaths | None = None
         self._steam_root_found = False
         self._gpu_profile_cache: object | None = None
@@ -342,10 +329,11 @@ class MainWindow(QMainWindow):
         self._vdf_corrupt = False
         self._initial_tab_decided = False
         self._migration_prompted = False
-        self._vdf_queue = VdfEditQueue()
+        self._vdf_queue = VdfEditQueue(vdf_queue.default_queue_file())
         self._vdf_steam_open = False  # last poll saw Steam running while edits were queued
         self._vdf_checking = False
         self._vdf_auto_paused = False  # an automatic apply failed: wait for the user
+        self._skip_vdf_close_prompt = False  # set when restarting into an update: the queue stays saved
         self._restart_prompt: QMessageBox | None = None
         self._vdf_watch_timer = QTimer(self)
         self._vdf_watch_timer.setInterval(_VDF_WATCH_MS)
@@ -361,10 +349,7 @@ class MainWindow(QMainWindow):
         self._shortcuts_req_id = 0
         self._steam_detect_req_id = 0
         self._extract_worker: ExtractWorker | None = None
-        self._search_worker: SteamSearchWorker | None = None
-        self._preview_worker: PreviewWorker | None = None
         self._add_worker: AddToSteamWorker | None = None
-        self._bulk_worker: BulkMigrateWorker | None = None
         self._scan_worker: ScanWorker | None = None
 
         self.setWindowTitle(f"{__app_name__} v{__version__}")
@@ -386,10 +371,7 @@ class MainWindow(QMainWindow):
             self._active_workers.discard(worker)
             for attr in (
                 "_extract_worker",
-                "_search_worker",
-                "_preview_worker",
                 "_add_worker",
-                "_bulk_worker",
                 "_scan_worker",
             ):
                 if getattr(self, attr, None) is worker:
@@ -440,18 +422,23 @@ class MainWindow(QMainWindow):
         if self._force_closing:
             super().closeEvent(event)
             return
-        if self._vdf_queue.pending_count() > 0:
+        if (
+            self._vdf_queue.pending_count() > 0
+            and self.paths is not None
+            and not self._skip_vdf_close_prompt
+            and not is_gamescope_session()
+        ):
             box = QMessageBox(self)
             box.setIcon(QMessageBox.Icon.Question)
             box.setWindowTitle(__app_name__)
             box.setText(tr("vdf_queue.close_prompt", count=self._vdf_queue.pending_count()))
             btn_apply = box.addButton(tr("vdf_queue.btn_apply_exit"), QMessageBox.ButtonRole.AcceptRole)
-            btn_discard = box.addButton(tr("vdf_queue.btn_discard_exit"), QMessageBox.ButtonRole.DestructiveRole)
+            btn_later = box.addButton(tr("vdf_queue.btn_later_exit"), QMessageBox.ButtonRole.RejectRole)
             btn_cancel = box.addButton(QMessageBox.StandardButton.Cancel)
             box.setDefaultButton(btn_apply)
             box.exec()
             clicked = box.clickedButton()
-            if clicked == btn_cancel or clicked not in (btn_apply, btn_discard):
+            if clicked == btn_cancel or clicked not in (btn_apply, btn_later):
                 event.ignore()
                 return
             if clicked == btn_apply:
@@ -489,9 +476,6 @@ class MainWindow(QMainWindow):
                 if apply_failed or self._vdf_queue.pending_count() > 0:
                     event.ignore()
                     return
-            elif clicked == btn_discard:
-                self._vdf_queue.clear()
-                self._update_vdf_queue_banner()
         for w in list(self._active_workers):
             if hasattr(w, "cancel") and callable(w.cancel):
                 w.cancel()
@@ -704,6 +688,7 @@ class MainWindow(QMainWindow):
                 return
             self.paths = paths
             self._steam_root_found = steam_root_found
+            self._on_vdf_queue_paths_ready()
             status_text = self._format_steam_status_text()
             self.steam_status_lbl.setText(status_text)
             self._update_steam_status_style()
@@ -747,9 +732,7 @@ class MainWindow(QMainWindow):
             btn.style().unpolish(btn)
             btn.style().polish(btn)
             btn.update()
-        self.act_bulk_migrate.setVisible(has_steam)
-        if hasattr(self, "maint_batch_card"):
-            self.maint_batch_card.setVisible(has_steam)
+        self.btn_bulk_proton.setVisible(has_steam)
         if hasattr(self, "btn_maint_revalidate"):
             self.btn_maint_revalidate.setEnabled(has_steam)
         self._update_steam_status_style()
@@ -787,6 +770,19 @@ class MainWindow(QMainWindow):
         src_row.addWidget(btn_src)
         drop_layout.addLayout(src_row)
 
+        # Only used for archives and installers; the game name comes from step 2.
+        dst_row = QHBoxLayout()
+        dst_row.addWidget(QLabel(tr("install.dest_label")))
+        self.extract_dst_root = QLineEdit()
+        self.extract_dst_root.setPlaceholderText(
+            tr("install.dest_library_placeholder") if uses_library_layout() else str(Path.home() / "Games")
+        )
+        btn_dst = QPushButton(tr("install.choose_folder"))
+        btn_dst.clicked.connect(self._pick_dest_root)
+        dst_row.addWidget(self.extract_dst_root, 1)
+        dst_row.addWidget(btn_dst)
+        drop_layout.addLayout(dst_row)
+
         btn_row = FlowLayout(spacing=8)
         self.btn_extract = QPushButton(tr("install.btn_extract"))
         self.btn_extract.setObjectName("primaryBtn")
@@ -802,28 +798,6 @@ class MainWindow(QMainWindow):
         btn_row.addWidget(self.btn_use_extracted)
         drop_layout.addLayout(btn_row)
 
-        # Extraction options live in the page's Advanced section (see _build_add_page).
-        self._extract_opts_box = QWidget()
-        form = QFormLayout(self._extract_opts_box)
-        form.setContentsMargins(0, 0, 0, 0)
-        form.setSpacing(10)
-        self.extract_name = QLineEdit()
-        self.extract_name.setPlaceholderText(tr("install.dest_placeholder"))
-        form.addRow(tr("install.folder_label"), self.extract_name)
-
-        dst_row = QHBoxLayout()
-        self.extract_dst_root = QLineEdit()
-        self.extract_dst_root.setPlaceholderText(
-            tr("install.dest_library_placeholder") if uses_library_layout() else str(Path.home() / "Games")
-        )
-        btn_dst = QPushButton(tr("install.choose_folder"))
-        btn_dst.clicked.connect(self._pick_dest_root)
-        dst_row.addWidget(self.extract_dst_root, 1)
-        dst_row.addWidget(btn_dst)
-        form.addRow(tr("install.dest_label"), dst_row)
-        self.chk_verify_md5 = QCheckBox(tr("install.verify_md5"))
-        self.chk_verify_md5.setToolTip(tr("install.verify_md5_tooltip"))
-        form.addRow("", self.chk_verify_md5)
 
         # Progress and log appear in the Source step once an extraction/setup starts.
         self.extract_details_box = QWidget()
@@ -887,7 +861,7 @@ class MainWindow(QMainWindow):
             [tr("add.detected_name_column"), tr("add.detected_folder_column")]
         )
         self.games_list.verticalHeader().setVisible(False)
-        self.games_list.setMinimumHeight(150)
+        self.games_list.setMinimumHeight(120)
         self.games_list.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.games_list.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.games_list.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -905,8 +879,7 @@ class MainWindow(QMainWindow):
         )
         list_layout.addWidget(self.games_list, 1)
 
-        # Step 2 (Exe): the name/exe/match form and the art preview share the detected-games card.
-        cfg_layout = list_layout
+        # Step 2 (Game): exe, name, Steam match, where/how to install and the shortcuts, all in one place.
         cfg_split = QSplitter(Qt.Orientation.Horizontal)
         cfg_split.setChildrenCollapsible(False)
 
@@ -914,11 +887,6 @@ class MainWindow(QMainWindow):
         form = QFormLayout(form_widget)
         form.setContentsMargins(0, 0, 8, 0)
         form.setSpacing(10)
-        self.add_name = QLineEdit()
-        self.add_name.setPlaceholderText(tr("install.game_name_placeholder"))
-        self.add_name.textChanged.connect(self._update_remove_existing_state)
-        self.add_name.textEdited.connect(self._on_add_name_edited)
-        form.addRow(tr("install.folder_label"), self.add_name)
 
         self.add_exe_combo = QComboBox()
         self.add_exe_combo.setEditable(True)
@@ -929,6 +897,12 @@ class MainWindow(QMainWindow):
         self.add_exe_combo.currentTextChanged.connect(self._on_exe_changed)
         form.addRow(tr("install.exe_label"), self.add_exe_combo)
 
+        self.add_name = QLineEdit()
+        self.add_name.setPlaceholderText(tr("install.dest_placeholder"))
+        self.add_name.textChanged.connect(self._update_remove_existing_state)
+        self.add_name.textEdited.connect(self._on_add_name_edited)
+        form.addRow(tr("install.folder_label"), self.add_name)
+
         self.steam_match_combo = QComboBox()
         self.steam_match_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
@@ -936,6 +910,66 @@ class MainWindow(QMainWindow):
         self.steam_match_combo.setMinimumContentsLength(24)
         self.steam_match_combo.currentIndexChanged.connect(self._on_steam_match_changed)
         form.addRow(tr("add.match_label"), self.steam_match_combo)
+
+        art_row = QHBoxLayout()
+        self.steam_search_input = QLineEdit()
+        self.steam_search_input.setPlaceholderText(tr("install.game_name_placeholder"))
+        self.steam_search_input.returnPressed.connect(self._search_steam_art)
+        btn_search = QPushButton(tr("install.search_steam"))
+        btn_search.clicked.connect(self._search_steam_art)
+        art_row.addWidget(self.steam_search_input, 1)
+        art_row.addWidget(btn_search)
+        form.addRow(tr("add.steam_store_label"), art_row)
+
+        self.add_library_combo = QComboBox()
+        self.add_library_combo.setToolTip(tr("add.library_tooltip"))
+        self.add_library_combo.currentIndexChanged.connect(self._remember_library_choice)
+        form.addRow(tr("add.library"), self.add_library_combo)
+        if not uses_library_layout():
+            self.add_library_combo.setVisible(False)
+            label_item = form.labelForField(self.add_library_combo)
+            if label_item is not None:
+                label_item.setVisible(False)
+
+        self.chk_keep_in_place = QCheckBox(tr("add.keep_in_place"))
+        self.chk_keep_in_place.setChecked(False)
+        form.addRow("", self.chk_keep_in_place)
+
+        self._add_launch_options = ""
+        self._add_winedlloverrides = ""
+        # One presets dialog for everything; the form only shows what is on.
+        launch_row = QHBoxLayout()
+        launch_row.setSpacing(10)
+        self.btn_add_launch_adv = QPushButton(tr("add.btn_launch_presets"))
+        self.btn_add_launch_adv.clicked.connect(self._open_add_launch_advanced)
+        self.lbl_add_presets = QLabel()
+        self.lbl_add_presets.setObjectName("MutedText")
+        self.lbl_add_presets.setWordWrap(True)
+        launch_row.addWidget(self.btn_add_launch_adv)
+        launch_row.addWidget(self.lbl_add_presets, 1)
+        form.addRow(tr("add.presets_label"), launch_row)
+
+        targets_row = QHBoxLayout()
+        self.chk_shortcut_menu = QCheckBox(tr("add.shortcut_menu"))
+        self.chk_shortcut_menu.setChecked(True)
+        self.chk_shortcut_desktop = QCheckBox(tr("add.shortcut_desktop"))
+        self.chk_shortcut_desktop.setChecked(False)
+        targets_row.addWidget(self.chk_shortcut_menu)
+        targets_row.addWidget(self.chk_shortcut_desktop)
+        targets_row.addStretch()
+        form.addRow(tr("add.shortcuts_label"), targets_row)
+
+        self.lbl_steam_opts_group = QLabel(tr("add.group_steam_opts"))
+        self.lbl_steam_opts_group.setObjectName("MutedText")
+        self.lbl_steam_opts_group.setStyleSheet("font-weight: 700; margin-top: 4px;")
+        form.addRow(self.lbl_steam_opts_group)
+        self.chk_proton = QCheckBox(tr("install.enable_proton"))
+        self.chk_proton.setChecked(True)
+        form.addRow("", self.chk_proton)
+        self.chk_restart = QCheckBox(tr("add.reopen_steam"))
+        self.chk_restart.setChecked(True)
+        self.chk_restart.setToolTip(tr("add.reopen_steam_tooltip"))
+        form.addRow("", self.chk_restart)
 
         cfg_split.addWidget(form_widget)
 
@@ -952,25 +986,8 @@ class MainWindow(QMainWindow):
         cfg_split.addWidget(preview_wrap)
         cfg_split.setStretchFactor(0, 1)
         cfg_split.setStretchFactor(1, 0)
-        cfg_split.setSizes([460, 240])
-
-        cfg_layout.addWidget(cfg_split)
-        layout.addWidget(list_card)
-
-        # Step 3 (Shortcuts): where the game gets added.
-        step3_card, step3_layout = _make_card()
-        step3_lbl = QLabel(tr("install.step_shortcuts"))
-        step3_lbl.setObjectName("SectionTitle")
-        step3_layout.addWidget(step3_lbl)
-        targets_row = QHBoxLayout()
-        self.chk_shortcut_menu = QCheckBox(tr("add.shortcut_menu"))
-        self.chk_shortcut_menu.setChecked(True)
-        self.chk_shortcut_desktop = QCheckBox(tr("add.shortcut_desktop"))
-        self.chk_shortcut_desktop.setChecked(False)
-        targets_row.addWidget(self.chk_shortcut_menu)
-        targets_row.addWidget(self.chk_shortcut_desktop)
-        targets_row.addStretch()
-        step3_layout.addLayout(targets_row)
+        cfg_split.setSizes([700, 240])
+        list_layout.addWidget(cfg_split)
 
         actions_row = FlowLayout(spacing=8)
         self.btn_add_steam = QPushButton(tr("install.btn_add_steam"))
@@ -981,102 +998,18 @@ class MainWindow(QMainWindow):
         self.btn_add_standalone = QPushButton(tr("install.btn_add_standalone"))
         self.btn_add_standalone.clicked.connect(self._add_selected_standalone)
         actions_row.addWidget(self.btn_add_standalone)
+        self.chk_keep_in_place.toggled.connect(self._update_standalone_install_label)
+        self._update_standalone_install_label()
 
         self.btn_remove_existing = QPushButton(tr("add.btn_remove_existing"))
         self.btn_remove_existing.setObjectName("dangerBtn")
         self.btn_remove_existing.clicked.connect(self._remove_existing_from_add)
         self.btn_remove_existing.setVisible(False)
         actions_row.addWidget(self.btn_remove_existing)
-
-        step3_layout.addLayout(actions_row)
-        layout.addWidget(step3_card)
-
-        # Advanced: everything else, collapsed by default.
-        self.btn_toggle_add_advanced = QPushButton(tr("add.section_advanced"))
-        self.btn_toggle_add_advanced.setCheckable(True)
-        self.btn_toggle_add_advanced.setChecked(False)
-        self.btn_toggle_add_advanced.setStyleSheet("text-align: left;")
-        layout.addWidget(self.btn_toggle_add_advanced)
-
-        self.add_advanced_box = QWidget()
-        self.add_advanced_box.setVisible(False)
-        adv_form = QFormLayout(self.add_advanced_box)
-        adv_form.setContentsMargins(0, 6, 0, 0)
-        adv_form.setSpacing(8)
-        self.btn_toggle_add_advanced.toggled.connect(self.add_advanced_box.setVisible)
-
-        art_row = QHBoxLayout()
-        self.steam_search_input = QLineEdit()
-        self.steam_search_input.setPlaceholderText(tr("install.game_name_placeholder"))
-        self.steam_search_input.returnPressed.connect(self._search_steam_art)
-        btn_search = QPushButton(tr("install.search_steam"))
-        btn_search.clicked.connect(self._search_steam_art)
-        art_row.addWidget(self.steam_search_input, 1)
-        art_row.addWidget(btn_search)
-        adv_form.addRow(tr("add.steam_store_label"), art_row)
-
-        lbl_extract_opts_group = QLabel(tr("add.group_extract_opts"))
-        lbl_extract_opts_group.setObjectName("MutedText")
-        lbl_extract_opts_group.setStyleSheet("font-weight: 700; margin-top: 4px;")
-        adv_form.addRow(lbl_extract_opts_group)
-        adv_form.addRow(self._extract_opts_box)
-
-        self.lbl_steam_opts_group = QLabel(tr("add.group_steam_opts"))
-        self.lbl_steam_opts_group.setObjectName("MutedText")
-        self.lbl_steam_opts_group.setStyleSheet("font-weight: 700; margin-top: 4px;")
-        adv_form.addRow(self.lbl_steam_opts_group)
-
-        self.chk_proton = QCheckBox(tr("install.enable_proton"))
-        self.chk_proton.setChecked(True)
-        adv_form.addRow("", self.chk_proton)
-
-        self.chk_restart = QCheckBox(tr("add.reopen_steam"))
-        self.chk_restart.setChecked(True)
-        self.chk_restart.setToolTip(tr("add.reopen_steam_tooltip"))
-        adv_form.addRow("", self.chk_restart)
-
-        lbl_standalone_opts_group = QLabel(tr("add.group_standalone_opts"))
-        lbl_standalone_opts_group.setObjectName("MutedText")
-        lbl_standalone_opts_group.setStyleSheet("font-weight: 700; margin-top: 6px;")
-        adv_form.addRow(lbl_standalone_opts_group)
-
-        self.chk_keep_in_place = QCheckBox(tr("add.keep_in_place"))
-        self.chk_keep_in_place.setChecked(False)
-        self.chk_keep_in_place.toggled.connect(self._update_standalone_install_label)
-        self._update_standalone_install_label()
-        adv_form.addRow("", self.chk_keep_in_place)
-
-        self.add_library_combo = QComboBox()
-        self.add_library_combo.setToolTip(tr("add.library_tooltip"))
-        self.add_library_combo.currentIndexChanged.connect(self._remember_library_choice)
-        adv_form.addRow(tr("add.library"), self.add_library_combo)
-        if not uses_library_layout():
-            self.add_library_combo.setVisible(False)
-            label_item = adv_form.labelForField(self.add_library_combo)
-            if label_item is not None:
-                label_item.setVisible(False)
-
-        self._add_launch_options = ""
-        self._add_winedlloverrides = ""
-        lbl_launch_opts_group = QLabel(tr("add.group_launch_opts"))
-        lbl_launch_opts_group.setObjectName("MutedText")
-        lbl_launch_opts_group.setStyleSheet("font-weight: 700; margin-top: 6px;")
-        adv_form.addRow(lbl_launch_opts_group)
-
-        # One presets dialog for everything; the form only shows what is on.
-        launch_row = QHBoxLayout()
-        launch_row.setSpacing(10)
-        self.btn_add_launch_adv = QPushButton(tr("add.btn_launch_presets"))
-        self.btn_add_launch_adv.clicked.connect(self._open_add_launch_advanced)
-        self.lbl_add_presets = QLabel()
-        self.lbl_add_presets.setObjectName("MutedText")
-        self.lbl_add_presets.setWordWrap(True)
-        launch_row.addWidget(self.btn_add_launch_adv)
-        launch_row.addWidget(self.lbl_add_presets, 1)
-        adv_form.addRow("", launch_row)
+        list_layout.addLayout(actions_row)
+        layout.addWidget(list_card)
         self._reset_add_launch_options()
 
-        layout.addWidget(self.add_advanced_box)
         layout.addStretch(1)
         return page
 
@@ -1249,7 +1182,7 @@ class MainWindow(QMainWindow):
         self.lbl_vdf_queue.setWordWrap(True)
         self.btn_vdf_apply = QPushButton(tr("vdf_queue.btn_apply"))
         self.btn_vdf_apply.setObjectName("primaryBtn")
-        self.btn_vdf_apply.clicked.connect(self._apply_vdf_queue)
+        self.btn_vdf_apply.clicked.connect(lambda: self._apply_vdf_queue())
         self.btn_vdf_clear = QPushButton(tr("vdf_queue.btn_clear"))
         self.btn_vdf_clear.clicked.connect(self._clear_vdf_queue)
         vq_lay.addWidget(self.lbl_vdf_queue, 1)
@@ -1288,16 +1221,9 @@ class MainWindow(QMainWindow):
         self.library_search_input.setPlaceholderText(tr("library.search_placeholder"))
         self.library_search_input.setClearButtonEnabled(True)
         self.library_search_input.textChanged.connect(self._filter_library_list)
-        self.chk_batch_vdf = QCheckBox(tr("vdf_queue.chk_batch"))
-        self.chk_batch_vdf.setToolTip(tr("vdf_queue.chk_batch_tip"))
-        self.chk_batch_vdf.setChecked(_setting_bool(self.settings, "vdf_queue/batch_mode", False))
-        self.chk_batch_vdf.toggled.connect(
-            lambda checked: self.settings.setValue("vdf_queue/batch_mode", bool(checked))
-        )
         self.lbl_library_count = QLabel()
         self.lbl_library_count.setObjectName("MutedText")
         filter_row.addWidget(self.library_search_input, 1)
-        filter_row.addWidget(self.chk_batch_vdf)
         filter_row.addWidget(self.lbl_library_count)
         lib_layout.addLayout(filter_row)
 
@@ -1344,16 +1270,7 @@ class MainWindow(QMainWindow):
         self.btn_play_game.setObjectName("primaryBtn")
         self.btn_play_game.clicked.connect(self._play_selected_game)
 
-        self.act_bulk_migrate = QAction(tr("library.btn_bulk_migrate"), self)
-        self.act_bulk_migrate.triggered.connect(self._bulk_migrate_shortcuts)
 
-        self._game_actions_menu = QMenu(self)
-        self.act_migrate = QAction(tr("library.btn_migrate_one"), self)
-        self.act_migrate.triggered.connect(self._migrate_selected_shortcut)
-        self.act_art = QAction(tr("library.btn_update_art"), self)
-        self.act_art.triggered.connect(self._update_selected_shortcut_art)
-        self.act_revert_art = QAction(tr("library.btn_revert_art"), self)
-        self.act_revert_art.triggered.connect(self._revert_selected_shortcut_art)
         self.act_import_steam = QAction(tr("library.btn_import_steam"), self)
         self.act_import_steam.triggered.connect(self._import_selected_to_steam)
         self.act_ext_to_steam = QAction(tr("library.btn_ext_to_steam"), self)
@@ -1371,14 +1288,18 @@ class MainWindow(QMainWindow):
         self.btn_remove_game.setObjectName("dangerBtn")
         self.btn_remove_game.clicked.connect(self._remove_selected_shortcut)
 
-        self._tools_menu = QMenu(self)
-        self.act_bulk_proton = QAction(tr("library.btn_bulk_proton"), self)
-        self.act_bulk_proton.triggered.connect(self._bulk_migrate_proton_dialog)
+        self.btn_bulk_proton = QPushButton(tr("library.btn_bulk_proton"))
+        self.btn_bulk_proton.clicked.connect(self._bulk_migrate_proton_dialog)
+        self.btn_migrate_legacy = QPushButton(tr("maint.btn_migrate_legacy"))
+        self.btn_migrate_legacy.setToolTip(tr("maint.migrate_legacy_tooltip"))
+        self.btn_migrate_legacy.clicked.connect(lambda: self._start_legacy_migration())
+        self.btn_undo_migration = QPushButton(tr("maint.btn_undo_migration"))
+        self.btn_undo_migration.clicked.connect(lambda: self._undo_last_migration())
         footer = QHBoxLayout()
         footer.setSpacing(24)
         for group_text, group_btns in (
             (tr("library.group_play"), (self.btn_play_game,)),
-            (tr("library.group_configure"), (self.btn_configure_game, self.btn_move_game, self.btn_bulk_optiscaler)),
+            (tr("library.group_configure"), (self.btn_configure_game, self.btn_move_game)),
             (tr("library.group_uninstall"), (self.btn_remove_game,)),
         ):
             col = QVBoxLayout()
@@ -1394,6 +1315,18 @@ class MainWindow(QMainWindow):
             if self.btn_configure_game in group_btns:
                 footer.addStretch()
         lib_layout.addLayout(footer)
+        batch_lbl = QLabel(tr("library.group_batch"))
+        batch_lbl.setObjectName("MutedText")
+        lib_layout.addWidget(batch_lbl)
+        batch_flow = FlowLayout(spacing=8)
+        for batch_btn in (
+            self.btn_bulk_optiscaler,
+            self.btn_bulk_proton,
+            self.btn_migrate_legacy,
+            self.btn_undo_migration,
+        ):
+            batch_flow.addWidget(batch_btn)
+        lib_layout.addLayout(batch_flow)
         my_lib_layout.addWidget(lib_card, 1)
         layout.addWidget(my_lib_page, 1)
         return page
@@ -1420,8 +1353,6 @@ class MainWindow(QMainWindow):
     def _build_maintenance_page(self) -> QWidget:
         return build_maintenance_page(self)
 
-    def _open_maintenance_page(self, *, auto_scan: bool = True) -> None:
-        open_maintenance_page(self, auto_scan=auto_scan)
 
     def _refresh_maintenance_health(self) -> None:
         refresh_maintenance_health(self)
@@ -1433,6 +1364,12 @@ class MainWindow(QMainWindow):
             self.theme_combo.setCurrentIndex(idx)
         mode: ThemeMode = cast(ThemeMode, saved) if saved in ("auto", "dark", "light") else "auto"
         apply_theme(self.app, mode)
+        self.app.styleHints().colorSchemeChanged.connect(self._on_system_scheme_changed)
+
+    def _on_system_scheme_changed(self, *_args: object) -> None:
+        """Follow the system light/dark switch live, but only while the theme is set to Auto."""
+        if str(self.theme_combo.currentData() or "auto") == "auto":
+            apply_theme(self.app, "auto")
 
     def _on_theme_changed(self) -> None:
         mode = self.theme_combo.currentData()
@@ -1519,10 +1456,14 @@ class MainWindow(QMainWindow):
                 self.btn_update_runtimes.setEnabled(True)
                 return
             if needs_confirm:
+                # Steam already installed -> installing the extras is optional: "No" is the default.
+                steam_ok = self.paths is not None or self._steam_root_found
                 ans = QMessageBox.question(
                     _dialog_parent(self),
                     __app_name__,
                     tr("runtime.confirm_optional_steamos"),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    _optional_install_default(steam_ok),
                 )
                 if ans != QMessageBox.StandardButton.Yes:
                     self.btn_update_runtimes.setEnabled(True)
@@ -1645,10 +1586,15 @@ class MainWindow(QMainWindow):
                 prog_dlg.deleteLater()
                 if self._closing_pending:
                     return
+                pending = self._vdf_queue.pending_count() if self.paths is not None else 0
                 if is_gamescope_session():
                     msg = tr("app_update.done_gamescope", latest=info.latest_version)
-                    self.status_label.setText(msg)
+                    if pending:
+                        msg += "\n\n" + tr("app_update.pending_kept", count=pending)
+                    self.status_label.setText(msg.splitlines()[0])
                     QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+                elif pending:
+                    self._ask_update_with_pending_edits(pending, updated_path)
                 else:
                     relaunch = QMessageBox.question(
                         _dialog_parent(self),
@@ -1687,7 +1633,7 @@ class MainWindow(QMainWindow):
         info = classify.classify_source(p)
         if info.needs_install and info.installer is not None:
             self.extract_src.setText(str(info.installer if info.kind != classify.ARCHIVE else p))
-            self.extract_name.setText(classify.suggest_install_name(info))
+            self.add_name.setText(classify.suggest_install_name(info))
             self.extract_details_box.setVisible(True)
             self.status_label.setText(self._detected_kind_text(info))
             return
@@ -1750,7 +1696,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(_dialog_parent(self), __app_name__, tr("install.invalid_file"))
             return
         # suggest_install_name: a repack's setup.exe is named after its folder, not "setup".
-        name = self.extract_name.text().strip() or classify.suggest_install_name(classify.classify_source(src))
+        name = self.add_name.text().strip() or classify.suggest_install_name(classify.classify_source(src))
         typed_dst = self.extract_dst_root.text().strip()
         if typed_dst:
             dst = Path(typed_dst)
@@ -1772,7 +1718,6 @@ class MainWindow(QMainWindow):
             src,
             dst,
             name,
-            verify_md5=self.chk_verify_md5.isChecked(),
         )
         self._track_worker(self._extract_worker)
         self._extract_worker.progress.connect(self._on_extract_progress)
@@ -1856,7 +1801,14 @@ class MainWindow(QMainWindow):
                         {"path": p_str, "enabled": bool(item.get("enabled", True))}
                     )
 
-        return [], custom_entries
+        raw_disabled = self.settings.value("scan_folders/disabled_defaults", "[]")
+        try:
+            disabled = {str(x) for x in json.loads(raw_disabled)} if isinstance(raw_disabled, str) else set()
+        except Exception:
+            disabled = set()
+        # Defaults: the home folder (walked a few levels down) and every card/disk under /run/media.
+        defaults = [(p, str(p) not in disabled) for p in (Path.home(), *default_scan_roots())]
+        return defaults, custom_entries
 
     def _save_scan_folders(
         self, disabled_defaults: list[str], custom_entries: list[dict[str, object]]
@@ -2160,7 +2112,6 @@ class MainWindow(QMainWindow):
         self._search_req_id += 1
         req_id = self._search_req_id
         worker = SteamSearchWorker(req_id, query)
-        self._search_worker = worker
         self._track_worker(worker)
         worker.results.connect(self._on_steam_results)
         worker.failed.connect(self._on_steam_search_failed)
@@ -2192,7 +2143,6 @@ class MainWindow(QMainWindow):
         req_id = self._preview_req_id
         self.preview_label.setText(tr("add.art_loading"))
         worker = PreviewWorker(req_id, appid)
-        self._preview_worker = worker
         self._track_worker(worker)
         worker.loaded.connect(self._set_preview_bytes)
         worker.failed.connect(self._on_preview_failed)
@@ -2736,11 +2686,6 @@ class MainWindow(QMainWindow):
             return data
         return None
 
-    def _selected_shortcut(self) -> ShortcutEntry | None:
-        sel = self._selected_library_item()
-        if sel is None or sel[0] != "steam":
-            return None
-        return sel[1] if isinstance(sel[1], ShortcutEntry) else None
 
     def _update_library_action_states(self) -> None:
         sel = self._selected_library_item()
@@ -2754,12 +2699,6 @@ class MainWindow(QMainWindow):
         self.btn_move_game.setEnabled(is_standalone and not self._steam_busy)
 
         # Hide mutually exclusive per-game actions instead of merely disabling them
-        for act in (
-            self.act_migrate,
-            self.act_art,
-            self.act_revert_art,
-        ):
-            act.setVisible(is_steam)
         self.act_import_steam.setVisible(is_standalone)
         self.act_ext_to_steam.setVisible(is_external)
         self.act_ext_import_saves.setVisible(is_external)
@@ -2770,18 +2709,15 @@ class MainWindow(QMainWindow):
             and Path(ext_prefix).is_dir()
         )
 
-        self.act_migrate.setEnabled(is_steam and can_write_vdf)
-        self.act_art.setEnabled(is_steam and bool(self.paths))
-        self.act_revert_art.setEnabled(is_steam and bool(self.paths))
         self.act_import_steam.setEnabled(is_standalone and can_write_vdf)
         self.act_ext_to_steam.setEnabled(is_external and can_write_vdf)
         self.act_ext_import_saves.setEnabled(is_external and has_ext_prefix)
         self.btn_remove_game.setEnabled((is_steam and can_write_vdf) or is_standalone)
         self.btn_remove_game.setVisible(not is_external)
 
-    def is_batch_vdf_enabled(self) -> bool:
-        """Return True if Steam VDF edits should be queued for batch application."""
-        return bool(self.chk_batch_vdf.isChecked())
+    def should_queue_vdf_edits(self) -> bool:
+        """Gaming Mode cannot close Steam: Steam edits wait in the saved queue instead of applying now."""
+        return self.paths is not None and is_gamescope_session()
 
     def enqueue_vdf_edit(self, edit: QueuedVdfEdit) -> None:
         """Enqueue a VDF edit; it is applied once Steam is closed."""
@@ -2790,18 +2726,30 @@ class MainWindow(QMainWindow):
         self._update_vdf_queue_banner()
         self._vdf_watch_tick()
 
+    def _on_vdf_queue_paths_ready(self) -> None:
+        """Steam was (re)detected: pick up edits saved earlier (e.g. in Gaming Mode) and apply if Steam is closed."""
+        if self._busy_count == 0:  # never swap the list under a running apply
+            self._vdf_queue.reload()
+        self._vdf_auto_paused = False
+        self._update_vdf_queue_banner()
+        self._vdf_watch_tick()
+
     def _update_vdf_queue_banner(self) -> None:
         count = self._vdf_queue.pending_count()
-        if count <= 0:
+        if count <= 0 or self.paths is None:
             self.vdf_queue_banner.setVisible(False)
             self._vdf_watch_timer.stop()
             self._vdf_steam_open = False
             return
-        self.lbl_vdf_queue.setText(
-            tr("vdf_queue.banner_waiting", count=count)
-            if self._vdf_steam_open
-            else tr("vdf_queue.banner_text", count=count)
-        )
+        gaming = is_gamescope_session()
+        if gaming:
+            text = tr("vdf_queue.banner_gaming", count=count)
+        elif self._vdf_steam_open:
+            text = tr("vdf_queue.banner_waiting", count=count)
+        else:
+            text = tr("vdf_queue.banner_text", count=count)
+        self.lbl_vdf_queue.setText(text)
+        self.btn_vdf_apply.setVisible(not gaming)
         self.vdf_queue_banner.setVisible(True)
         if not self._vdf_watch_timer.isActive():
             self._vdf_watch_timer.start()
@@ -2935,8 +2883,41 @@ class MainWindow(QMainWindow):
         self._update_vdf_queue_banner()
         self.status_label.setText(tr("vdf_queue.cleared"))
 
-    def _apply_vdf_queue(self) -> None:
+    def _ask_update_with_pending_edits(self, pending: int, updated_path: Path) -> None:
+        """Before restarting into the new version, offer to send the queued edits to Steam."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle(__app_name__)
+        box.setText(tr("app_update.pending_prompt", count=pending))
+        btn_apply = box.addButton(tr("app_update.btn_apply_update"), QMessageBox.ButtonRole.AcceptRole)
+        btn_update = box.addButton(tr("app_update.btn_update_only"), QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(btn_apply)
+        box.exec()
+        clicked = box.clickedButton()
+        box.deleteLater()
+
+        def _restart() -> None:
+            if self._closing_pending:
+                return
+            self._skip_vdf_close_prompt = True  # the queue is saved on disk; the new version picks it up
+            relaunch_appimage(updated_path)
+            QApplication.quit()
+
+        if clicked == btn_apply:
+            self._apply_vdf_queue(on_done=lambda ok: _restart() if ok else None)
+        elif clicked == btn_update:
+            _restart()
+
+    def _apply_vdf_queue(self, on_done: Callable[[bool], None] | None = None) -> None:
+        """Send the queued edits to Steam now (closes and reopens it).
+
+        With ``on_done`` the user already agreed to close Steam: no extra question, and
+        ``on_done(True)`` runs only when everything was applied (errors are still shown).
+        """
         if not self.paths or self._vdf_queue.pending_count() <= 0:
+            if on_done is not None:
+                on_done(True)
             return
         paths = self.paths
 
@@ -2965,7 +2946,9 @@ class MainWindow(QMainWindow):
                 else:
                     msg = tr("vdf_queue.applied_ok", applied=applied)
                     self.status_label.setText(msg)
-                    if not self._closing_pending:
+                    if on_done is not None:
+                        on_done(True)
+                    elif not self._closing_pending:
                         QMessageBox.information(_dialog_parent(self), __app_name__, msg)
 
             def _err(err: str) -> None:
@@ -2978,7 +2961,10 @@ class MainWindow(QMainWindow):
             worker.failed.connect(_err)
             worker.start()
 
-        self._confirm_close_steam_async(_proceed)
+        if on_done is not None:
+            _proceed()
+        else:
+            self._confirm_close_steam_async(_proceed)
 
     def _external_add_to_steam(self) -> None:
         sel = self._selected_library_item()
@@ -3210,9 +3196,7 @@ class MainWindow(QMainWindow):
     def _set_vdf_write_enabled(self, enabled: bool) -> None:
         for w in (
             self.btn_add_steam,
-            self.act_bulk_migrate,
-            self.act_migrate,
-            self.act_bulk_proton,
+            self.btn_bulk_proton,
             self.act_import_steam,
             self.act_ext_to_steam,
         ):
@@ -3247,8 +3231,6 @@ class MainWindow(QMainWindow):
             self.btn_save_restore,
             self.btn_save_sync,
             self.btn_save_refresh,
-            self.act_art,
-            self.act_revert_art,
             self.btn_adopt_games,
             self.btn_maint_protons,
             self.btn_maint_game_protons,
@@ -3268,122 +3250,6 @@ class MainWindow(QMainWindow):
             _update_maint_summary(self)
             self._update_saves_action_states()
         self._update_remove_existing_state()
-
-    def _update_selected_shortcut_art(self) -> None:
-        entry = self._selected_shortcut()
-        if not entry or not self.paths:
-            return
-        exe_clean = entry.exe.strip().strip('"')
-        is_flatpak_or_native = ("flatpak" in exe_clean.lower()) or (
-            bool(exe_clean) and not exe_clean.lower().endswith(".exe")
-        )
-        if is_flatpak_or_native:
-            ans = QMessageBox.question(
-                _dialog_parent(self),
-                __app_name__,
-                tr("art.flatpak_confirm", name=entry.app_name, exe=exe_clean),
-            )
-            if ans != QMessageBox.StandardButton.Yes:
-                return
-
-        self._begin_busy()
-        self.status_label.setText(tr("art.searching", name=entry.app_name))
-
-        def _on_search_found(matches: list[SteamMatch]) -> None:
-            if self._closing_pending:
-                self._end_busy()
-                return
-            if not matches:
-                self._end_busy()
-                msg = tr("art.not_found", name=entry.app_name)
-                self.status_label.setText(msg)
-                QMessageBox.information(_dialog_parent(self), __app_name__, msg)
-                return
-            labels = [tr("art.match_item", name=m.name, appid=m.appid) for m in matches]
-            choice, ok = QInputDialog.getItem(
-                _dialog_parent(self),
-                tr("art.pick_title"),
-                tr("art.pick_label", name=entry.app_name),
-                labels,
-                0,
-                False,
-            )
-            if not ok or not choice:
-                self._end_busy()
-                self.status_label.setText(tr("status.ready"))
-                return
-            chosen = matches[labels.index(choice)]
-
-            if self.paths is None:
-                return
-            dl_worker = ArtDownloadWorker(self.paths, entry, chosen)
-            self._track_worker(dl_worker)
-            dl_worker.done.connect(_ok)
-            dl_worker.failed.connect(_err)
-            dl_worker.start()
-
-        worker = ArtSearchWorker(entry.app_name, limit=5)
-        self._track_worker(worker)
-
-        def _ok(msg: str) -> None:
-            self._end_busy()
-            self.status_label.setText(msg)
-            if not self._closing_pending:
-                QMessageBox.information(_dialog_parent(self), __app_name__, msg)
-
-        def _err(err: str) -> None:
-            self._end_busy()
-            if not self._closing_pending:
-                QMessageBox.critical(_dialog_parent(self), __app_name__, tr("art.error", err=err))
-
-        worker.found.connect(_on_search_found)
-        worker.failed.connect(_err)
-        worker.start()
-
-    def _revert_selected_shortcut_art(self) -> None:
-        entry = self._selected_shortcut()
-        if not entry or not self.paths:
-            return
-        bak_dir = self.paths.grid_dir / ".deckinstall_art_bak" / str(entry.appid_u32)
-        bak_files = [p.name for p in sorted(bak_dir.iterdir()) if p.is_file()] if bak_dir.is_dir() else []
-        if not bak_files:
-            QMessageBox.information(
-                _dialog_parent(self), __app_name__, tr("art.revert_none", name=entry.app_name)
-            )
-            return
-        if (
-            QMessageBox.question(
-                _dialog_parent(self),
-                __app_name__,
-                tr("art.revert_confirm", name=entry.app_name, files=", ".join(bak_files)),
-            )
-            != QMessageBox.StandardButton.Yes
-        ):
-            return
-
-        paths = self.paths
-        self._begin_busy()
-        self.status_label.setText(tr("art.revert_confirm", name=entry.app_name, files=", ".join(bak_files)))
-
-        worker = SteamOpWorker(lambda: restore_steam_artwork_backup(entry.appid_u32, paths.grid_dir))
-        self._track_worker(worker)
-
-        def _ok(restored: object) -> None:
-            self._end_busy()
-            files_list = list(restored) if isinstance(restored, list) else []
-            msg = tr("art.revert_done", name=entry.app_name, files=", ".join(files_list))
-            self.status_label.setText(msg)
-            if not self._closing_pending:
-                QMessageBox.information(_dialog_parent(self), __app_name__, msg)
-
-        def _err(err: str) -> None:
-            self._end_busy()
-            if not self._closing_pending:
-                QMessageBox.critical(_dialog_parent(self), __app_name__, tr("art.revert_error", err=err))
-
-        worker.finished_ok.connect(_ok)
-        worker.failed.connect(_err)
-        worker.start()
 
     def _check_steam_running_async(
         self,
@@ -3419,7 +3285,7 @@ class MainWindow(QMainWindow):
         def _on_checked(running: bool) -> None:
             if alive_fn is not None and not alive_fn():
                 return
-            if running:
+            if running and not self.should_queue_vdf_edits():  # Gaming Mode queues: Steam stays open
                 ans = QMessageBox.question(
                     parent or self,
                     __app_name__,
@@ -3557,6 +3423,7 @@ class MainWindow(QMainWindow):
                 if self._closing_pending:
                     return
                 self._begin_busy()
+                queued = self.should_queue_vdf_edits()  # Gaming Mode: save it for when Steam closes
 
                 def _do_set_proton() -> None:
                     self._auto_snapshot_if_enabled(
@@ -3566,15 +3433,19 @@ class MainWindow(QMainWindow):
                         "proton",
                         enabled=auto_snap_enabled,
                     )
-                    set_shortcut_proton(paths.config_vdf, entry.appid_u32, tool_id)
+                    if not queued:
+                        set_shortcut_proton(paths.config_vdf, entry.appid_u32, tool_id)
 
-                worker = SteamOpWorker(_do_set_proton, need_steam_closed=True)
+                worker = SteamOpWorker(_do_set_proton, need_steam_closed=not queued)
                 self._track_worker(worker)
                 worker.status.connect(self.status_label.setText)
 
                 def _ok(_res: object) -> None:
                     self._end_busy()
                     msg = tr("proton.updated", name=entry.app_name, tool=tool_id)
+                    if queued:
+                        self.enqueue_vdf_edit(_proton_edit(entry.appid_u32, entry.app_name, tool_id))
+                        msg = tr("vdf_queue.enqueued", name=entry.app_name)
                     self.status_label.setText(msg)
                     if not self._closing_pending:
                         QMessageBox.information(_dialog_parent(self), __app_name__, msg)
@@ -4010,137 +3881,32 @@ class MainWindow(QMainWindow):
             return
         self._remove_steam_shortcut_async(entry)
 
-    def _migrate_selected_shortcut(self) -> None:
-        entry = self._selected_shortcut()
-        if not entry or not self.paths:
-            return
-        old_exe = Path(entry.exe.strip().strip('"'))
-        try:
-            old_root = infer_game_root_from_exe(old_exe)
-        except Exception as exc:
-            QMessageBox.critical(_dialog_parent(self), __app_name__, str(exc))
-            return
-        suggested = clean_game_name(old_root.name)
-        new_name, ok = QInputDialog.getText(
-            _dialog_parent(self),
-            __app_name__,
-            tr("migrate.prompt_name"),
-            text=suggested,
-        )
-        if not ok or not new_name.strip():
-            return
-        paths = self.paths
-        item = MigrationPlanItem(
-            entry=entry,
-            old_root=old_root,
-            new_name=new_name.strip(),
-            new_root=Path.home() / "Games" / new_name.strip(),
-            has_compatdata=(paths.compatdata_dir / str(entry.appid_u32)).is_dir(),
-        )
 
-        def _proceed_migrate() -> None:
-            if self._closing_pending:
-                return
-            self._begin_busy()
-            self._bulk_worker = BulkMigrateWorker(
-                paths,
-                [item],
-                pre_snapshot_fn=self._make_pre_snapshot_fn(),
-            )
-            self._track_worker(self._bulk_worker)
-            self._bulk_worker.status.connect(self.status_label.setText)
-            self._bulk_worker.finished_ok.connect(self._on_bulk_done)
-            self._bulk_worker.failed.connect(self._on_bulk_failed)
-            self._bulk_worker.start()
+def _proton_edit(appid_u32: int, name: str, tool_id: str) -> QueuedVdfEdit:
+    """Queued "use this Proton" for a Steam shortcut (Gaming Mode)."""
+    return QueuedVdfEdit(f"set_proton:{appid_u32}", "set_proton", appid_u32, name, {"tool_name": tool_id})
 
-        if is_gamescope_session():
-            def _on_steam_checked(running: bool) -> None:
-                if running:
-                    ans = QMessageBox.question(
-                        _dialog_parent(self),
-                        __app_name__,
-                        tr("migrate.gamescope_one"),
-                    )
-                    if ans != QMessageBox.StandardButton.Yes:
-                        return
-                _proceed_migrate()
 
-            self._check_steam_running_async(_on_steam_checked)
-            return
-        _proceed_migrate()
+def _optional_install_default(steam_installed: bool) -> QMessageBox.StandardButton:
+    """Default answer for "install the extra runtimes?": optional when Steam exists, so No."""
+    return QMessageBox.StandardButton.No if steam_installed else QMessageBox.StandardButton.Yes
 
-    def _bulk_migrate_shortcuts(self) -> None:
-        if not self.paths:
-            return
-        self._begin_busy()
-        self.status_label.setText(tr("migrate.analyzing"))
 
-        worker = BulkPlanWorker(self.paths, load_shortcuts_fn=load_shortcuts)
-        self._track_worker(worker)
-        worker.ready.connect(self._confirm_and_run_bulk_plan)
-        worker.failed.connect(self._on_bulk_failed)
-        worker.start()
+_qt_translators: list[QTranslator] = []
 
-    def _confirm_and_run_bulk_plan(
-        self, plan: list[MigrationPlanItem], steam_running_in_gamescope: bool = False
-    ) -> None:
-        if self._closing_pending or not self.paths:
-            self._end_busy()
-            return
-        if not plan:
-            self.status_label.setText(tr("migrate.sync_only"))
 
-            def _on_sync_done(checked: int, copied: int) -> None:
-                self._end_busy()
-                self.status_label.setText(tr("status.ready"))
-                if not self._closing_pending:
-                    QMessageBox.information(
-                        _dialog_parent(self),
-                        __app_name__,
-                        tr("migrate.all_standardized", checked=checked, copied=copied),
-                    )
-
-            sync_worker = SaveSyncWorker(self.paths)
-            self._track_worker(sync_worker)
-            sync_worker.done.connect(_on_sync_done)
-            sync_worker.failed.connect(self._on_bulk_failed)
-            sync_worker.start()
-            return
-
-        lines = [
-            f"• {p.entry.app_name} → {p.new_name}"
-            for p in plan
-        ]
-        msg = tr("migrate.confirm_bulk", lines="\n".join(lines))
-        if steam_running_in_gamescope:
-            msg += tr("migrate.gamescope_warn")
-        if QMessageBox.question(_dialog_parent(self), __app_name__, msg) != QMessageBox.StandardButton.Yes:
-            self._end_busy()
-            return
-
-        self._bulk_worker = BulkMigrateWorker(
-            self.paths,
-            plan,
-            pre_snapshot_fn=self._make_pre_snapshot_fn(),
-        )
-        self._track_worker(self._bulk_worker)
-        self._bulk_worker.status.connect(self.status_label.setText)
-        self._bulk_worker.finished_ok.connect(self._on_bulk_done)
-        self._bulk_worker.failed.connect(self._on_bulk_failed)
-        self._bulk_worker.start()
-
-    def _on_bulk_done(self, summary: str) -> None:
-        self._end_busy()
-        self.status_label.setText(tr("migrate.done"))
-        self._refresh_games()
-        self._refresh_shortcuts()
-        if not self._closing_pending:
-            QMessageBox.information(_dialog_parent(self), __app_name__, summary)
-
-    def _on_bulk_failed(self, err: str) -> None:
-        self._end_busy()
-        if not self._closing_pending:
-            QMessageBox.critical(_dialog_parent(self), __app_name__, tr("migrate.error", err=err))
+def _install_qt_translator(app: QApplication, lang: str) -> bool:
+    """Load Qt's own strings (Yes/No/Cancel...) for lang; looks in Qt's dir, then in the bundled one."""
+    if lang == "en":
+        return False
+    name = f"qtbase_{lang}"
+    for directory in (QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath), str(LOCALES_DIR / "qt")):
+        translator = QTranslator(app)
+        if translator.load(name, directory):
+            app.installTranslator(translator)
+            _qt_translators.append(translator)
+            return True
+    return False
 
 
 def _qt_message_handler(mode, context, message: str) -> None:

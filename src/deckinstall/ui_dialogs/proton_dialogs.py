@@ -44,6 +44,7 @@ from ..steam_vdf import (
 )
 from ..ui_cards import _dialog_parent, _format_worker_error, _SortableTableItem, format_size_bytes
 from ..ui_workers import SteamOpWorker
+from ..vdf_queue import QueuedVdfEdit
 
 if TYPE_CHECKING:
     from ..ui import MainWindow
@@ -246,17 +247,29 @@ def bulk_migrate_proton_dialog(win: MainWindow) -> None:
             if win._closing_pending:
                 return
             win._begin_busy()
+            queued = win.should_queue_vdf_edits()  # Gaming Mode: save it for when Steam closes
             if mode_kind == "clean_orphans":
                 orphan_ids = [u.appid_u32 for u in selected if u.source == "Orphan"]
                 worker = SteamOpWorker(
-                    lambda: remove_compat_tools(paths.config_vdf, orphan_ids),
-                    need_steam_closed=True,
+                    lambda: len(orphan_ids) if queued else remove_compat_tools(paths.config_vdf, orphan_ids),
+                    need_steam_closed=not queued,
                 )
                 win._track_worker(worker)
 
                 def _ok_clean(count: object) -> None:
                     win._end_busy()
                     msg = tr("proton_bulk.orphans_removed", count=count)
+                    if queued:
+                        win.enqueue_vdf_edit(
+                            QueuedVdfEdit(
+                                f"remove_compat:{','.join(map(str, sorted(orphan_ids)))}",
+                                "remove_compat",
+                                0,
+                                tr("proton_bulk.queue_label_orphans"),
+                                {"appids": orphan_ids},
+                            )
+                        )
+                        msg = tr("proton_bulk.queued", count=len(orphan_ids))
                     win.status_label.setText(msg)
                     if not win._closing_pending:
                         QMessageBox.information(win, __app_name__, msg)
@@ -274,14 +287,27 @@ def bulk_migrate_proton_dialog(win: MainWindow) -> None:
                             "proton",
                             enabled=auto_snap_enabled,
                         )
+                    if queued:
+                        return len(ids)
                     return bulk_migrate_compat_tool(paths.config_vdf, ids, target_tool)
 
-                worker = SteamOpWorker(_do_bulk_proton, need_steam_closed=True)
+                worker = SteamOpWorker(_do_bulk_proton, need_steam_closed=not queued)
                 win._track_worker(worker)
 
                 def _ok_mig(count: object) -> None:
                     win._end_busy()
                     msg = tr("proton_bulk.migrated", count=count, tool=target_tool)
+                    if queued:
+                        win.enqueue_vdf_edit(
+                            QueuedVdfEdit(
+                                f"bulk_migrate_compat:{target_tool}:{','.join(map(str, sorted(ids)))}",
+                                "bulk_migrate_compat",
+                                0,
+                                tr("proton_bulk.queue_label", tool=target_tool),
+                                {"appids": ids, "target_tool": target_tool},
+                            )
+                        )
+                        msg = tr("proton_bulk.queued", count=len(ids))
                     win.status_label.setText(msg)
                     if not win._closing_pending:
                         QMessageBox.information(win, __app_name__, msg)

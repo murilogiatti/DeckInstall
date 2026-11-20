@@ -337,14 +337,20 @@ class StandaloneAndVdfTests(unittest.TestCase):
                 cache = standalone.get_game_cache_dir(source)
                 cache.mkdir(parents=True)
                 (cache / "existing.cache").write_bytes(b"keep-cache")
-                stale_entries = standalone.find_orphan_shader_caches(games_dir)
-                self.assertEqual(len(stale_entries), 1)
+                from deckinstall import cleanup
+
+                stale = [
+                    c for c in cleanup.find_cleanup_candidates(home_dir=root)
+                    if c.category == "Orphan Game Cache"
+                ]
+                self.assertEqual([c.path for c in stale], [cache])
                 standalone.install_standalone_game(
                     "My Game", exe, source, keep_in_place=True, create_menu_shortcut=False
                 )
-                self.assertEqual(
-                    standalone.prune_orphan_shader_caches(stale_entries, games_dir), (0, 0)
-                )
+                # The Maintenance delete rescans first: the cache has an owner now, so it stays.
+                deleted, freed, errors = cleanup.delete_cleanup_candidates_checked(candidates=stale, home_dir=root)
+                self.assertEqual((deleted, freed), (0, 0))
+                self.assertTrue(errors)
                 self.assertEqual((cache / "existing.cache").read_bytes(), b"keep-cache")
 
     def test_standalone_lifecycle_in_temp_dir(self) -> None:

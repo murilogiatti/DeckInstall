@@ -28,7 +28,6 @@ from deckinstall.scanner import scan_game_folder
 from deckinstall.standalone import (
     find_orphan_shader_caches,
     install_standalone_game,
-    prune_orphan_shader_caches,
     resolve_umu_game_id,
 )
 from deckinstall.steam_paths import SteamPaths, dir_size_bytes
@@ -348,7 +347,7 @@ class TestNewFeatures(unittest.TestCase):
             self.assertTrue(temp_dir.is_dir())
             self.assertFalse(junk.exists())
 
-    # 9. standalone cache_dir + find_orphan_shader_caches / prune_orphan_shader_caches
+    # 9. standalone cache_dir + orphan shader caches cleaned by the Maintenance rule
     def test_standalone_cache_dir_and_orphan_shader_caches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -390,9 +389,18 @@ class TestNewFeatures(unittest.TestCase):
                 self.assertEqual([o.name for o in orphans], ["dead-game-cache"])
                 self.assertEqual(orphans[0].size_bytes, 6)
 
-                deleted, freed = prune_orphan_shader_caches(entries=orphans, games_dir=games_dir)
-                self.assertEqual(deleted, 1)
-                self.assertEqual(freed, 6)
+                from deckinstall import cleanup
+
+                cands = [
+                    c for c in cleanup.find_cleanup_candidates(home_dir=tmp_path)
+                    if c.category == "Orphan Game Cache"
+                ]
+                self.assertEqual([c.path for c in cands], [orphan_dir])
+                self.assertTrue(cleanup.is_default_checked(cands[0]))  # caches come back by themselves
+                deleted, freed, errors = cleanup.delete_cleanup_candidates_checked(
+                    candidates=cands, home_dir=tmp_path
+                )
+                self.assertEqual((deleted, freed, errors), (1, 6, []))
                 self.assertFalse(orphan_dir.exists())
                 self.assertTrue(game.cache_dir.is_dir())
 

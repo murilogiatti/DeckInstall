@@ -40,7 +40,7 @@ class SaveIntegrityTests(unittest.TestCase):
                     prefix.mkdir()
                     (prefix / component).symlink_to(outside, target_is_directory=True)
                     with self.assertRaisesRegex(OSError, "Unsafe target drive_c"):
-                        save_sync.restore_prefix_saves_snapshot(archive, prefix)
+                        save_sync._restore_saves_archive(archive, prefix, None)
                     self.assertEqual(list(outside.iterdir()), [])
 
     def test_pull_preserves_manifest_game_files_and_registry_in_snapshot(self) -> None:
@@ -77,7 +77,13 @@ class SaveIntegrityTests(unittest.TestCase):
                 self.assertEqual(zf.read("snap/game/profile.dat"), b"local")
                 payload = json.loads(zf.read("snap/registry/registry.json"))
                 self.assertIn('"Progress"="local"', payload["entries"][0]["lines"])
-            self.assertEqual(save_sync.restore_prefix_saves_snapshot(snapshot, dst_prefix, dst_game), 2)
+            with mock.patch.object(save_sync, "DEFAULT_LUDUSAVI_MANIFEST_PATH", manifest):
+                count, safety = save_sync.restore_snapshot_safely(
+                    snapshot, dst_prefix, "Manifest Game", game_dir=dst_game, steam_appid=42,
+                    dest_root=root / "snapshots",
+                )
+            self.assertEqual(count, 2)
+            self.assertIsNotNone(safety)  # the restore always keeps a copy of what it replaces
             self.assertEqual((dst_game / "profile.dat").read_text(encoding="utf-8"), "local")
             self.assertIn('"Progress"="local"', (dst_prefix / "user.reg").read_text(encoding="utf-8"))
 
