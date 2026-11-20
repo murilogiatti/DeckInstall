@@ -1,7 +1,7 @@
 DeckInstall - Plano de acao v3 (2026-11-17, atualizado 2026-11-19)
 ==========================================================
 
-STATUS: Fases 0 a 11 concluidas (Fase 11 nao publicada). Ultima release: v0.19.2 (2026-11-20).
+STATUS: Fases 0 a 11 concluidas. Ultima release: v0.20.0 (2026-11-20, Fase 11 - auditoria).
 v0.19.0: tag enviada mas o CI abortou na saida do Python 3.10 (thread da busca de saves ainda rodando ao destruir
 as janelas dos testes); sem release. v0.19.1: a busca de fontes Steam/Hydra/UMU/Nexus so roda ao abrir a aba
 Backup/Sync (nao no inicio do app) e um teste deixava widget sem pai.
@@ -284,7 +284,7 @@ FASE 10 (Opus) - Backup/Sync - CONCLUIDA (publicada na v0.19.0)
    arquivo). Cai para o full anterior se o mais novo so tem .reg. Steam: pasta de nuvem oferecida mesmo sem existir.
    Validado com copia do backup real do Deck (49 jogos, 540 arquivos; MGS V GZ 6 e TPP 13).
 
-FASE 11 - Auditoria (2026-11-20) - CONCLUIDA (nao publicada, sem commit)
+FASE 11 - Auditoria (2026-11-20) - CONCLUIDA (publicada na v0.20.0)
 1. [FEITO] Modo Jogo: so conta sessao gamescope (comm gamescope-sessi) ou Steam filha do gamescope, lendo /proc
    (sem pgrep); gamescope solto no Desktop nao conta. Cache de 2 s, invalidado ao fechar/abrir a Steam.
    Deck em Desktop: False (correto). Modo Jogo real nao conferido no aparelho.
@@ -300,7 +300,8 @@ FASE 11 - Auditoria (2026-11-20) - CONCLUIDA (nao publicada, sem commit)
    gog_primary_exe removido (exe apos extrair GOG vem do ranking). Deck: Alien Carnage fora, 6 jogos dentro.
 5. [FEITO] Instalador isolado: prefixo descartavel sem z:->/ nem letra para a home; I: = pasta do instalador,
    D: = biblioteca, /DIR=D:\<nome>; PROTON_SET_GAME_DRIVE/STEAM_DRIVE=0. Sem isolamento o instalador nao roda.
-   So testado com mocks.
+   Validado de verdade: umu + GE-Proton11-12 no PC e Proton 11.0 da Steam no Deck (cmd.exe no lugar do
+   instalador): Z: vazio, I:/D: certos, nenhuma letra para a home, \\?\unix sem acesso. Sem isolamento Z: -> /.
 6. [FEITO] Medir espaco mede atalhos Steam (raiz via shortcut_game_dir, ignora /usr,/bin, flatpak/sh), coluna
    Origem e botao "Adotar...". Raiz de jogos Unreal (Engine/ ao lado de <Projeto>/Binaries) corrigida.
 7. [FEITO] Proton so na Biblioteca: "Gerenciar versoes do Proton" em "Em lote"; "Proton por jogo" virou aba
@@ -310,7 +311,7 @@ FASE 11 - Auditoria (2026-11-20) - CONCLUIDA (nao publicada, sem commit)
 Fora: assinatura do AppImage; dividir ui.py/steam_vdf.py.
 
 NAO TESTADO A MAO (so testes automaticos)
-- Fase 11: Modo Jogo real, instalador isolado com Proton/umu real, build com nuitka 4.3.5.
+- Fase 11: Modo Jogo real no Deck; instalador real (repack/GOG) no prefixo isolado.
 - Instalador GOG real (innoextract nao instalado na maquina), repacks FitGirl/DODI, microSD/exFAT, Steam com link
   do compatdata, OptiScaler real, telas novas da Fase 3 no app aberto.
 
