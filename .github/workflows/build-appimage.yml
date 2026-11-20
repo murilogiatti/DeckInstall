@@ -16,6 +16,11 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same branch/PR cancels the run still in progress (a release tag is never cancelled).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   validate-python:
     runs-on: ubuntu-22.04
@@ -31,15 +36,23 @@ jobs:
           cache: "pip"
       - name: Install test dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1
+          # apt only for packages the runner image does not already have.
+          missing=$(for p in libegl1 libgl1; do dpkg -s "$p" >/dev/null 2>&1 || echo "$p"; done)
+          if [ -n "$missing" ]; then sudo apt-get update && sudo apt-get install -y $missing; fi
           python -m pip install --upgrade pip
           pip install -e '.[dev]'
-      - name: Run complete test suite
-        run: QT_QPA_PLATFORM=offscreen PYTHONPATH=src python -W error::ResourceWarning -m pytest -q -W error::ResourceWarning
+      - name: Lint and check types
+        if: matrix.python-version == '3.11'
+        run: |
+          ruff check .
+          mypy src
+      - name: Run complete test suite (parallel, strict ResourceWarning + headless Qt)
+        run: QT_QPA_PLATFORM=offscreen PYTHONPATH=src python -W error::ResourceWarning -m pytest -q -n auto -W error::ResourceWarning
 
+  # The AppImage is built only for a release tag or a manual run (Actions > Run workflow).
   build-appimage:
     needs: validate-python
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -56,8 +69,9 @@ jobs:
 
       - name: Install system graphics and build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1-mesa-dev patchelf librsvg2-bin desktop-file-utils ccache
+          missing=$(for p in libegl1 libgl1-mesa-dev patchelf librsvg2-bin desktop-file-utils ccache; do
+            dpkg -s "$p" >/dev/null 2>&1 || echo "$p"; done)
+          if [ -n "$missing" ]; then sudo apt-get update && sudo apt-get install -y $missing; fi
 
       - name: Cache ccache
         uses: actions/cache@v4
@@ -90,15 +104,6 @@ jobs:
             rsvg-convert -w 256 -h 256 assets/icon.svg -o assets/icon.png
           fi
 
-      - name: Lint and check types
-        run: |
-          ruff check .
-          mypy src
-
-      - name: Run complete test suite (strict ResourceWarning + headless Qt)
-        run: |
-          QT_QPA_PLATFORM=offscreen PYTHONPATH=src python -W error::ResourceWarning -m pytest -q -W error::ResourceWarning
-
       - name: Compile standalone binary with Nuitka
         run: |
           PYTHONPATH=src python -m nuitka \
@@ -107,7 +112,7 @@ jobs:
             --include-package=deckinstall \
             --include-data-dir=src/deckinstall/locales=locales \
             --include-data-dir=assets=assets \
-            --lto=yes \
+            --lto=${{ startsWith(github.ref, 'refs/tags/v') && 'yes' || 'no' }} \
             --python-flag=no_site \
             --jobs=$(nproc) \
             --nofollow-import-to=tkinter,unittest,pytest,ruff,mypy,pip,setuptools \
