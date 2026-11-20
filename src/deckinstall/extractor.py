@@ -891,13 +891,40 @@ _UNARC_CODE_RE = re.compile(r"code\s*:?\s*(-?\d+)", re.IGNORECASE)
 _SYSTEM_DIRS = {"common files", "internet explorer", "windows media player", "windows nt", "uninstall information"}
 
 
-def to_wine_path(path: Path) -> str:
-    """Map a Linux path to the Z: drive Wine exposes for the filesystem root."""
-    return "Z:" + str(path.resolve()).replace("/", "\\")
+# Drive letters of the throwaway installer prefix. Proton manages s: (game drive) and
+# t: (Steam drive) itself on every run, so the installer gets letters Proton never touches.
+INSTALLER_SOURCE_DRIVE = "i:"
+INSTALLER_TARGET_DRIVE = "d:"
+_NO_ROOT_DIR = ".deckinstall_no_root"
+_DRIVE_RE = re.compile(r"^[a-z]:$")
+
+
+class InstallerIsolationError(RuntimeError):
+    """The throwaway installer prefix could not be cut off from / and the home folder."""
+
+
+def installer_drives(installer_exe: Path, target_dir: Path) -> dict[str, Path]:
+    """Drives the installer sees: its own folder (with setup-N.bin/.7z/MD5 parts) and the library."""
+    return {
+        INSTALLER_SOURCE_DRIVE: installer_exe.parent.resolve(),
+        INSTALLER_TARGET_DRIVE: target_dir.parent.resolve(),
+    }
+
+
+def to_wine_path(path: Path, drives: dict[str, Path]) -> str:
+    """Map a Linux path to the most specific installer drive holding it (D:\\Game, I:\\setup.exe)."""
+    resolved = path.resolve()
+    for letter, root in sorted(drives.items(), key=lambda kv: len(kv[1].parts), reverse=True):
+        try:
+            rel = resolved.relative_to(root)
+        except ValueError:
+            continue
+        return letter.upper() + "\\" + "\\".join(rel.parts)
+    raise InstallerIsolationError(f"{path} is outside the installer drives")
 
 
 def installer_arguments(installer_exe: Path, target_dir: Path) -> list[str]:
-    """Command-line switches for the installer: Inno Setup gets /DIR=.
+    """Command-line switches for the installer: Inno Setup gets /DIR= on the D: drive.
 
     Not used for repacks: FitGirl/DODI unpackers (ISDone/unarc) fail with "Unable to write
     data to disk" (-11) when the folder comes from /DIR=, but work when picked in the installer.
@@ -906,7 +933,72 @@ def installer_arguments(installer_exe: Path, target_dir: Path) -> list[str]:
 
     if not is_inno_setup(installer_exe):
         return []
-    return [f"/DIR={to_wine_path(target_dir)}"]
+    return [f"/DIR={to_wine_path(target_dir, installer_drives(installer_exe, target_dir))}"]
+
+
+def _exposes_home(path: Path, home: Path) -> bool:
+    """True if a drive pointing at path would show / or the home folder (or one of its parents)."""
+    return path == Path("/") or home == path or home.is_relative_to(path)
+
+
+def _drive_target(entry: Path) -> Path:
+    return Path(os.path.realpath(entry))
+
+
+def unsafe_prefix_drives(wine_pfx: Path, home: Path | None = None) -> list[str]:
+    """Drive letters in wine_pfx/dosdevices that reach / or the home folder."""
+    home_r = (home or Path.home()).resolve()
+    dosdevices = wine_pfx / "dosdevices"
+    try:
+        entries = sorted(dosdevices.iterdir())
+    except OSError:
+        return []
+    return [
+        e.name for e in entries
+        if _DRIVE_RE.match(e.name.lower()) and _exposes_home(_drive_target(e), home_r)
+    ]
+
+
+def isolate_installer_prefix(wine_pfx: Path, drives: dict[str, Path], home: Path | None = None) -> None:
+    """Cut the throwaway installer prefix off from / and the home folder.
+
+    Every drive letter (except c:) reaching / or home, plus z:, is removed; z: is then pointed at
+    an empty folder inside the prefix, because Proton recreates z: -> / on every run when it is
+    missing but leaves an existing one alone. The installer folder and the library get their own
+    letters (drives). Done before the installer starts, so it never sees the rest of the disk.
+    """
+    from .i18n import tr
+
+    home_r = (home or Path.home()).resolve()
+    for root in drives.values():
+        if _exposes_home(root, home_r):
+            raise InstallerIsolationError(tr("install.isolation_unsafe_folder", path=str(root)))
+    dosdevices = wine_pfx / "dosdevices"
+    empty_root = wine_pfx / _NO_ROOT_DIR
+    try:
+        dosdevices.mkdir(parents=True, exist_ok=True)
+        (wine_pfx / "drive_c").mkdir(parents=True, exist_ok=True)
+        empty_root.mkdir(exist_ok=True)
+        c_drive = dosdevices / "c:"
+        if not c_drive.exists() and not c_drive.is_symlink():
+            c_drive.symlink_to("../drive_c")
+        for entry in list(dosdevices.iterdir()):
+            name = entry.name.lower()
+            if not _DRIVE_RE.match(name) or name == "c:":
+                continue
+            if name == "z:" or name in drives or _exposes_home(_drive_target(entry), home_r):
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry)
+                else:
+                    entry.unlink()
+        (dosdevices / "z:").symlink_to(empty_root)
+        for letter, root in drives.items():
+            (dosdevices / letter).symlink_to(root)
+    except OSError as exc:
+        raise InstallerIsolationError(tr("install.isolation_failed", err=str(exc))) from exc
+    left = unsafe_prefix_drives(wine_pfx, home_r)
+    if left:
+        raise InstallerIsolationError(tr("install.isolation_failed", err=", ".join(left)))
 
 
 def _installer_prefix_parent(target_dir: Path) -> Path:
@@ -1060,7 +1152,9 @@ def run_windows_installer(
 ) -> Path:
     """Run a Windows installer in a throwaway prefix and return the folder holding the game.
 
-    Inno Setup installers (GOG) get /DIR= pointing at target_dir, so the game lands in the
+    The installer prefix sees no Z: (/) and no drive reaching the home folder: only C:, I:
+    (installer folder, with its setup-N.bin/.7z/MD5 parts) and D: (target_dir's parent).
+    Inno Setup installers (GOG) get /DIR=D:\\<target_dir name>, so the game lands in the
     library directly. Repacks (FitGirl/DODI) run as they are, with no /DIR=
     (their unarc unpacker fails with /DIR=): the user picks the folder, and a folder created
     elsewhere is moved into target_dir afterwards. If an installer ignores /DIR=, the game is
@@ -1073,6 +1167,7 @@ def run_windows_installer(
     check_disk_space(target_dir, max(data_size * 2, 512 * 1024 * 1024))
     keep = (not repack) if keep_prefix is None else keep_prefix
     args = [] if repack else installer_arguments(installer_exe, target_dir)
+    drives = installer_drives(installer_exe, target_dir)
 
     target_dir.mkdir(parents=True, exist_ok=True)
     pre_existing = _collect_regular_files(target_dir)
@@ -1084,8 +1179,22 @@ def run_windows_installer(
         cmd, env, inst_pfx = _installer_command(installer_exe, args, tmp_pfx, on_log, cancel_flag)
         if repack:
             env["WINE_LARGE_ADDRESS_AWARE"] = "0"
-        if on_log and args:
-            on_log(f"Destination: {to_wine_path(target_dir)}")
+        # Proton must not map s: (game drive) / t: (Steam drive) to a mount above the installer.
+        env["PROTON_SET_GAME_DRIVE"] = "0"
+        env["PROTON_SET_STEAM_DRIVE"] = "0"
+        try:
+            isolate_installer_prefix(inst_pfx, drives)
+        except InstallerIsolationError as exc:
+            logging.error("Installer prefix isolation failed: %s", exc)
+            if on_log:
+                on_log(str(exc))
+            raise
+        if on_log:
+            on_log(
+                f"Isolated installer prefix: {INSTALLER_SOURCE_DRIVE.upper()} = {drives[INSTALLER_SOURCE_DRIVE]}, "
+                f"{INSTALLER_TARGET_DRIVE.upper()} = {drives[INSTALLER_TARGET_DRIVE]}"
+            )
+            on_log(f"Destination: {to_wine_path(target_dir, drives)}")
         unarc_hits: list[str] = []
 
         def _handle_inst_line(line: str) -> None:
@@ -1108,6 +1217,9 @@ def run_windows_installer(
             start_new_session=True,
         )
         rc = _drain_stream_lines(proc, cancel_flag, _handle_inst_line, "Installer cancelled by user.")
+        leaked = unsafe_prefix_drives(inst_pfx)
+        if leaked:
+            logging.warning("Installer prefix drives reached / or home after the run: %s", ", ".join(leaked))
         if unarc_hits:
             code = next((c for c in unarc_hits if c), "")
             raise UnarcError(code, f"installer exit code {rc}")

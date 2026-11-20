@@ -98,8 +98,8 @@ from .save_sync import auto_snapshot
 from .scanner import (
     DetectedGame,
     default_scan_roots,
-    detect_exe_kind,
     is_native_linux_exe,
+    is_proton_exe,
     scan_all_games,
     scan_game_folder,
 )
@@ -266,8 +266,7 @@ class MainWindow(QMainWindow):
     _maint_scanned: bool
     _maint_filter_group: QButtonGroup
     maint_list: QTableWidget
-    btn_maint_protons: QPushButton
-    btn_maint_game_protons: QPushButton
+    btn_manage_protons: QPushButton
     btn_migrate_legacy: QPushButton
     btn_undo_migration: QPushButton
     btn_maint_refresh_health: QPushButton
@@ -287,6 +286,9 @@ class MainWindow(QMainWindow):
     lbl_space_top: QLabel
     space_disks_layout: QVBoxLayout
     space_games_list: QTableWidget
+    lbl_space_unmanaged: QLabel
+    btn_space_adopt: QPushButton
+    space_adopt_row: QWidget
     btn_update_runtimes: QPushButton
     btn_app_update: QPushButton
     # Backup/Sync page (ui_dialogs/save_sync_dialog.py)
@@ -1291,6 +1293,8 @@ class MainWindow(QMainWindow):
 
         self.btn_bulk_proton = QPushButton(tr("library.btn_bulk_proton"))
         self.btn_bulk_proton.clicked.connect(self._bulk_migrate_proton_dialog)
+        self.btn_manage_protons = QPushButton(tr("library.btn_manage_protons"))
+        self.btn_manage_protons.clicked.connect(self._open_proton_manager_dialog)
         self.btn_migrate_legacy = QPushButton(tr("maint.btn_migrate_legacy"))
         self.btn_migrate_legacy.setToolTip(tr("maint.migrate_legacy_tooltip"))
         self.btn_migrate_legacy.clicked.connect(lambda: self._start_legacy_migration())
@@ -1323,6 +1327,7 @@ class MainWindow(QMainWindow):
         for batch_btn in (
             self.btn_bulk_optiscaler,
             self.btn_bulk_proton,
+            self.btn_manage_protons,
             self.btn_migrate_legacy,
             self.btn_undo_migration,
         ):
@@ -1802,21 +1807,33 @@ class MainWindow(QMainWindow):
                         {"path": p_str, "enabled": bool(item.get("enabled", True))}
                     )
 
-        raw_disabled = self.settings.value("scan_folders/disabled_defaults", "[]")
-        try:
-            disabled = {str(x) for x in json.loads(raw_disabled)} if isinstance(raw_disabled, str) else set()
-        except Exception:
-            disabled = set()
-        # Defaults: the home folder (walked a few levels down) and every card/disk under /run/media.
-        defaults = [(p, str(p) not in disabled) for p in (Path.home(), *default_scan_roots())]
+        disabled = self._scan_folder_set("scan_folders/disabled_defaults")
+        removed = self._scan_folder_set("scan_folders/removed_defaults")
+        # Defaults (recomputed on every load): the home folder and every mounted card/disk.
+        defaults = [
+            (p, str(p) not in disabled) for p in (Path.home(), *default_scan_roots()) if str(p) not in removed
+        ]
         return defaults, custom_entries
 
+    def _scan_folder_set(self, key: str) -> set[str]:
+        raw = self.settings.value(key, "[]")
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else []
+        except Exception:
+            data = []
+        return {str(x) for x in data} if isinstance(data, list) else set()
+
     def _save_scan_folders(
-        self, disabled_defaults: list[str], custom_entries: list[dict[str, object]]
+        self,
+        disabled_defaults: list[str],
+        custom_entries: list[dict[str, object]],
+        removed_defaults: list[str] | None = None,
     ) -> None:
-        """Persist scan folder configuration to QSettings and refresh label."""
+        """Persist scan folder configuration to QSettings and refresh label (None keeps removed_defaults)."""
         self.settings.setValue("scan_folders/disabled_defaults", json.dumps(disabled_defaults))
         self.settings.setValue("scan_folders/custom", json.dumps(custom_entries))
+        if removed_defaults is not None:
+            self.settings.setValue("scan_folders/removed_defaults", json.dumps(sorted(set(removed_defaults))))
         self.settings.sync()
         self._update_scan_folders_label()
 
@@ -2170,8 +2187,8 @@ class MainWindow(QMainWindow):
         if not app_name or not exe_str or not exe_path.is_file():
             QMessageBox.warning(_dialog_parent(self), __app_name__, tr("add.invalid_input"))
             return None
-        if detect_exe_kind(exe_path) == "dos_mz":
-            QMessageBox.warning(_dialog_parent(self), __app_name__, tr("add.dos_unsupported", name=exe_path.name))
+        if not is_proton_exe(exe_path):
+            QMessageBox.warning(_dialog_parent(self), __app_name__, tr("add.not_proton_exe"))
             return None
         return app_name, exe_path
 
@@ -3233,8 +3250,7 @@ class MainWindow(QMainWindow):
             self.btn_save_sync,
             self.btn_save_refresh,
             self.btn_adopt_games,
-            self.btn_maint_protons,
-            self.btn_maint_game_protons,
+            self.btn_manage_protons,
             self.btn_bulk_optiscaler,
             self.btn_maint_scan,
             self.btn_maint_clean_safe,

@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from conftest import pe_exe_bytes
+
 from deckinstall.cleanup import delete_cleanup_candidates_checked, find_cleanup_candidates
 from deckinstall.runtime_manager import (
     get_umu_protonfix_status,
@@ -410,7 +412,7 @@ class TestNewFeatures(unittest.TestCase):
             tmp_path = Path(tmp)
             folder = tmp_path / "My.Cool.Game.v1.2"
             (folder / "bin").mkdir(parents=True)
-            (folder / "bin" / "CoolGame.exe").write_bytes(b"x" * 100)
+            (folder / "bin" / "CoolGame.exe").write_bytes(pe_exe_bytes(extra=b"x" * 30))
             (folder / "bin" / "unins000.exe").write_bytes(b"y" * 50)
             (folder / "steam_appid.txt").write_text("480\n", encoding="utf-8")
             # Symlink should be skipped by dir_size_bytes

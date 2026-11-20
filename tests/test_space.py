@@ -145,8 +145,10 @@ def test_space_card_shows_disks_and_games(tmp_path: Path) -> None:
     assert table.rowCount() == 3
     assert win.space_disks_layout.count() == 3  # type: ignore[attr-defined]
     texts = {table.item(r, 0).text(): r for r in range(3)}
-    assert "(" in table.item(texts["A"], 3).text()
-    assert table.item(texts["C"], 6).text()
+    assert table.item(texts["A"], 2).text() == "DeckInstall"
+    assert win.space_adopt_row.isHidden()  # type: ignore[attr-defined]
+    assert "(" in table.item(texts["A"], 4).text()
+    assert table.item(texts["C"], 7).text()
     holder.deleteLater()  # parentless widget: delete it while Qt is still up
     from PySide6.QtCore import QEvent
 
@@ -174,3 +176,105 @@ def test_scan_space_reports_top_folders(tmp_path: Path) -> None:
     text = ui_maintenance._format_top_folders(report.top_folders)
     assert text.splitlines()[0] and len(text.splitlines()) == 3
     assert "Big" in text.splitlines()[1] and "Small" in text.splitlines()[2]
+
+
+def _shortcut_env(tmp_path: Path):
+    from deckinstall import steam_vdf
+    from deckinstall.steam_paths import SteamPaths
+
+    root = tmp_path / "steam"
+    paths = SteamPaths(
+        steam_root=root,
+        user_id="1",
+        userdata_dir=root / "userdata" / "1",
+        shortcuts_vdf=root / "userdata" / "1" / "config" / "shortcuts.vdf",
+        grid_dir=root / "g",
+        config_vdf=root / "c",
+        compatdata_dir=root / "steamapps" / "compatdata",
+    )
+    return paths, steam_vdf
+
+
+def _entry(steam_vdf, appid: int, name: str, exe: Path | str, start: Path | str):
+    return steam_vdf.ShortcutEntry(str(appid), appid, name, f'"{exe}"', f'"{start}"', "", "")
+
+
+def test_steam_shortcuts_measured_at_game_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    paths, vdf = _shortcut_env(tmp_path)
+    star = tmp_path / "Games" / "STAR WARS" / "Griffin" / "Binaries" / "Win64"
+    _write(star / "Game.exe", 100)
+    _write(star.parents[2] / "data.pak", 400)
+    dup = tmp_path / "Games" / "Dup"
+    _write(dup / "Game.exe", 50)
+    other = tmp_path / "Games" / "Other"
+    _write(other / "Game.exe", 7)
+    _write(paths.compatdata_dir / "11" / "pfx.dat", 1000)
+    _write(paths.steam_root / "steamapps" / "shadercache" / "11" / "c.bin", 30)
+    entries = [
+        _entry(vdf, 11, "Star", star / "Game.exe", star),
+        _entry(vdf, 12, "Shell", "/bin/sh", "/bin"),
+        _entry(vdf, 13, "Dup", dup / "Game.exe", dup),
+        _entry(vdf, 14, "Other", other / "Game.exe", other),
+        _entry(vdf, 15, "Dup copy", other / "Game.exe", other),
+    ]
+    monkeypatch.setattr(vdf, "load_shortcuts", lambda _p: entries)
+    lib = library.ensure_library(library.internal_library_root(), internal=True)
+    own = _game("Dup", dup, tmp_path / "pfx")
+    report = space.scan_space([lib], [own], steam_paths=paths)
+    by = {g.name: g for g in report.games}
+    assert set(by) == {"Dup", "Star", "Other"}
+    assert by["Star"].source == "steam" and by["Dup"].source == "deckinstall"
+    assert by["Star"].game_bytes == 500
+    assert by["Star"].prefix_bytes == 1000 and by["Star"].cache_bytes == 30
+
+
+def test_space_card_adopt_row_only_with_steam_games(tmp_path: Path) -> None:
+    from PySide6.QtCore import QEvent
+    from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
+
+    from deckinstall import ui_maintenance
+
+    app = QApplication.instance() or QApplication([])
+    holder = QWidget()
+    opened: list[bool] = []
+
+    class _Win:
+        _closing_pending = False
+        _space_req_id = 0
+
+        def _open_adopt_wizard(self) -> None:
+            opened.append(True)
+
+    win = _Win()
+    QVBoxLayout(holder).addWidget(ui_maintenance._build_space_card(win))  # type: ignore[arg-type]
+    disks = [space.DiskSpace(tmp_path, True, 1000, 400, 600)]
+    ui_maintenance.apply_space_report(win, space.SpaceReport(disks, [space.GameSpace("S", source="steam")]))  # type: ignore[arg-type]
+    assert not win.space_adopt_row.isHidden()  # type: ignore[attr-defined]
+    assert "1" in win.lbl_space_unmanaged.text()  # type: ignore[attr-defined]
+    assert win.space_games_list.item(0, 2).text() == "Steam"  # type: ignore[attr-defined]
+    win.btn_space_adopt.click()  # type: ignore[attr-defined]
+    assert opened == [True]
+    ui_maintenance.apply_space_report(win, space.SpaceReport(disks, [space.GameSpace("D")]))  # type: ignore[arg-type]
+    assert win.space_adopt_row.isHidden()  # type: ignore[attr-defined]
+    holder.deleteLater()
+    app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    app.processEvents()
+
+
+def test_unreal_game_root_is_the_folder_with_engine(tmp_path, monkeypatch) -> None:
+    """Game/Engine + Game/Project/Binaries/Win64/x.exe: the root is Game, not Project."""
+    from deckinstall import steam_vdf
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    game = tmp_path / "home" / "Games" / "Racer"
+    exe = game / "Griffin" / "Binaries" / "Win64" / "Racer-Win64-Shipping.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_bytes(b"MZ")
+    crash = game / "Engine" / "Binaries" / "Win64" / "CrashReportClient.exe"
+    crash.parent.mkdir(parents=True)
+    crash.write_bytes(b"MZ")
+    redist = game / "_Redist" / "vc_redist.x64.exe"
+    redist.parent.mkdir()
+    redist.write_bytes(b"MZ")
+    (game / "Launcher.exe").write_bytes(b"MZ")
+    assert steam_vdf.infer_game_root_from_exe(exe) == game

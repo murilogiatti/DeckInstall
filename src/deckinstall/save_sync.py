@@ -611,6 +611,79 @@ ExtraDirs = tuple[tuple[str, Path], ...]
 _EXTRA_SKIP_DIRS = frozenset({"shadercache", "cache", "logs", "dxvk", "temp", "gpucache"})
 _EXTRA_SKIP_SUFFIXES = (".log", ".dxvk-cache", ".tmp")
 
+# "home" section (native games' saves under $HOME, from Ludusavi): only these folders, each with a
+# game folder below it; the blocked ones and the names/suffixes below are refused even inside them.
+_HOME_ALLOWED_ROOTS = (
+    (".local", "share"), (".local", "state"), (".config",), (".renpy",), ("documents", "my games"),
+    ("documents", "paradox interactive"), (".paradoxinteractive",), (".unity3d",), (".godot",),
+)
+_HOME_BLOCKED_ROOTS = (
+    (".ssh",), (".gnupg",), (".password-store",), (".mozilla",), (".steam",),
+    (".config", "autostart"), (".config", "systemd"), (".config", "environment.d"),
+    (".config", "google-chrome"), (".config", "chromium"), (".config", "fish"),
+    (".config", "plasma-workspace"), (".local", "bin"), (".local", "share", "applications"),
+    (".local", "share", "keyrings"), (".local", "share", "systemd"), (".local", "share", "dbus-1"),
+    (".local", "share", "steam"),
+    # Config read by tools that run code or change permissions (hooks, plugins, sandbox overrides).
+    (".config", "git"), (".config", "nvim"), (".config", "vim"), (".vim",), (".config", "pip"),
+    (".config", "code"), (".config", "vscodium"), (".config", "kitty"), (".config", "alacritty"),
+    (".config", "mpv"), (".config", "containers"), (".config", "pipewire"), (".config", "wireplumber"),
+    (".config", "xdg-desktop-portal"), (".config", "kservicemenus"), (".config", "menus"),
+    (".config", "gtk-3.0"), (".config", "gtk-4.0"), (".config", "dconf"),
+    (".local", "share", "flatpak"), (".local", "share", "kservices5"), (".local", "share", "kservices6"),
+    (".local", "share", "kio"), (".local", "share", "plasma"), (".local", "share", "dolphin"),
+    (".local", "share", "kwin"), (".local", "share", "trash"),
+)
+_HOME_BLOCKED_NAMES = frozenset({
+    ".bashrc", ".profile", ".bash_profile", ".bash_login", ".bash_logout", ".zshrc", ".zprofile",
+    ".zshenv", ".pam_environment", ".xprofile", ".xinitrc", ".xsession",
+})
+_HOME_BLOCKED_SUFFIXES = (".desktop", ".service", ".sh")
+
+
+def home_entry_allowed(parts: tuple[str, ...], mode: int = 0) -> bool:
+    """True when a "home" save path (relative to $HOME) may be imported, snapshotted or restored.
+
+    mode is the file's Unix mode (st_mode, or a zip entry's external_attr >> 16): executables
+    and symlinks are refused.
+    """
+    if not parts or any(p in ("", ".", "..") or "/" in p or "\\" in p or "\0" in p for p in parts):
+        return False
+    if mode & 0o111 or stat.S_ISLNK(mode):
+        return False
+    low = tuple(p.lower() for p in parts)
+    if low[-1] in _HOME_BLOCKED_NAMES or low[-1].endswith(_HOME_BLOCKED_SUFFIXES):
+        return False
+    if any(low[: len(root)] == root for root in _HOME_BLOCKED_ROOTS):
+        return False
+    return any(len(low) >= len(root) + 2 and low[: len(root)] == root for root in _HOME_ALLOWED_ROOTS)
+
+
+def _home_root() -> Path:
+    """Home folder for "home" snapshot entries (a seam for tests)."""
+    return Path.home()
+
+
+def _home_save_entries(home_files: tuple[str, ...]) -> list[tuple[str, Path, Path]]:
+    """("home", file, path under $HOME) for the game's recorded home files that exist and are allowed."""
+    if not home_files:
+        return []
+    root = _home_root()
+    root_resolved = root.resolve()
+    entries: list[tuple[str, Path, Path]] = []
+    for rel in sorted(set(home_files)):
+        parts = tuple(rel.split("/"))
+        if not home_entry_allowed(parts) or not _safe_parents_within(root, root_resolved, parts[:-1]):
+            continue
+        src = root.joinpath(*parts)
+        try:
+            st = src.lstat()
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode) and home_entry_allowed(parts, st.st_mode):
+            entries.append(("home", src, Path(*parts)))
+    return entries
+
 
 def _extra_save_entries(extra_dirs: ExtraDirs | None) -> list[tuple[str, Path, Path]]:
     """(section, file, path inside that folder) for extra save folders; caches and logs left out."""
@@ -637,9 +710,13 @@ def _collect_prefix_save_entries(
     game_dir: Path | None = None,
     steam_appid: int | None = None,
     extra_dirs: ExtraDirs | None = None,
+    home_files: tuple[str, ...] = (),
 ) -> list[tuple[str, Path, Path]]:
-    """Collect sorted (section, src_file, rel_path) tuples for save files in prefix_dir (and extra_dirs)."""
-    extras = _extra_save_entries(extra_dirs)
+    """Collect sorted (section, src_file, rel_path) tuples for save files in prefix_dir (and extra_dirs).
+
+    home_files: paths under $HOME (recorded in the snapshot index) added as the "home" section.
+    """
+    extras = _extra_save_entries(extra_dirs) + _home_save_entries(home_files)
     if not prefix_dir.is_dir():
         return sorted(extras, key=lambda item: (item[0], item[2].as_posix()))
     entries: list[tuple[str, Path, Path]] = list(extras)
@@ -706,8 +783,9 @@ def _write_saves_zip_atomic(
     game_dir: Path | None = None,
     steam_appid: int | None = None,
     extra_dirs: ExtraDirs | None = None,
+    home_files: tuple[str, ...] = (),
 ) -> int:
-    """Write prefix saves (and extra_dirs) to target_zip atomically; return count of backed-up files."""
+    """Write prefix saves (and extra_dirs, home_files) to target_zip atomically; return count of backed-up files."""
     target_zip.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{target_zip.stem}-", suffix=".zip.tmp", dir=str(target_zip.parent)
@@ -722,7 +800,7 @@ def _write_saves_zip_atomic(
             written = set(zf.namelist())
             for section, src_file, rel_path in _collect_prefix_save_entries(
                 prefix_dir, game_name=game_name, game_dir=game_dir, steam_appid=steam_appid,
-                extra_dirs=extra_dirs,
+                extra_dirs=extra_dirs, home_files=home_files,
             ):
                 arcname = f"{key_prefix}/{section}/{rel_path.as_posix()}"
                 if arcname in written:
@@ -792,6 +870,73 @@ def remember_snapshot_name(snap_dir: Path, game_name: str) -> None:
         _write_snapshot_index(snap_dir, index)
 
 
+def snapshot_home_files(snap_dir: Path) -> tuple[str, ...]:
+    """The game's files under $HOME recorded in the index (allowed relative paths only)."""
+    raw = _read_snapshot_index(snap_dir).get("home")
+    if not isinstance(raw, list):
+        return ()
+    return tuple(sorted({r for r in raw if isinstance(r, str) and home_entry_allowed(tuple(r.split("/")))}))
+
+
+def remember_home_files(snap_dir: Path, rels: list[str] | tuple[str, ...]) -> None:
+    """Add home save paths to the index, so every later snapshot (and its fingerprint) holds them."""
+    merged = set(snapshot_home_files(snap_dir)) | {r for r in rels if home_entry_allowed(tuple(r.split("/")))}
+    if not merged:
+        return
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    index = _read_snapshot_index(snap_dir)
+    if index.get("home") != sorted(merged):
+        index["home"] = sorted(merged)
+        _write_snapshot_index(snap_dir, index)
+
+
+def remember_steamcloud_appid(snap_dir: Path, zip_name: str, appid: str) -> None:
+    """Record which Steam app the "steamcloud" files of one snapshot zip belong to."""
+    index = _read_snapshot_index(snap_dir)
+    raw = index.get("steamcloud_appids")
+    known = {k: v for k, v in raw.items() if (snap_dir / k).is_file()} if isinstance(raw, dict) else {}
+    known[zip_name] = appid
+    index["steamcloud_appids"] = known
+    _write_snapshot_index(snap_dir, index)
+
+
+def snapshot_steamcloud_appid(snapshot_zip: Path) -> str | None:
+    """The Steam app id recorded for a snapshot's "steamcloud" files, or None when unknown."""
+    raw = _read_snapshot_index(snapshot_zip.parent).get("steamcloud_appids")
+    value = raw.get(snapshot_zip.name) if isinstance(raw, dict) else None
+    return value if isinstance(value, str) and value.isdigit() else None
+
+
+def _archive_home_and_cloud(archive_path: Path) -> tuple[list[str], bool]:
+    """(allowed "home" paths, has "steamcloud" files) of a snapshot zip."""
+    home: list[str] = []
+    cloud = False
+    with zipfile.ZipFile(archive_path, "r") as zf:
+        for info in zf.infolist()[:_RESTORE_MAX_ENTRIES]:
+            parsed = None if info.is_dir() else _parse_sync_zip_entry(info.filename)
+            if parsed is None:
+                continue
+            section, rel_parts = parsed
+            if section == "home" and home_entry_allowed(rel_parts, info.external_attr >> 16):
+                home.append("/".join(rel_parts))
+            cloud = cloud or section == "steamcloud"
+    return home, cloud
+
+
+def archive_has_steamcloud(archive_path: Path) -> bool:
+    """True when a snapshot zip holds Steam cloud ("steamcloud") files."""
+    return _archive_home_and_cloud(archive_path)[1]
+
+
+class SteamCloudAppMismatch(RuntimeError):
+    """A snapshot's Steam cloud files belong to another (or an unknown) Steam app."""
+
+    def __init__(self, snap_appid: str | None, target_appid: int | None) -> None:
+        super().__init__(f"Steam cloud saves of app {snap_appid or '?'} cannot go into app {target_appid or '?'}")
+        self.snap_appid = snap_appid
+        self.target_appid = target_appid
+
+
 def snapshot_display_name(slug: str, dest_root: Path | None = None) -> str:
     """The name saved with a game's snapshots, or the folder name."""
     name = _read_snapshot_index((dest_root or DEFAULT_SNAPSHOTS_DIR) / slug).get("name")
@@ -815,14 +960,15 @@ def snapshot_prefix_saves(
     With dedup, saves whose content hash matches the newest snapshot return that snapshot
     instead of writing an identical ZIP.
     """
-    if not prefix_dir.is_dir() and not extra_dirs:
-        return None
     snap_dir = snapshot_dir_for(game_name, dest_root)
+    home_files = snapshot_home_files(snap_dir)
+    if not prefix_dir.is_dir() and not extra_dirs and not home_files:
+        return None
     digest = ""
     if dedup:
         digest = compute_prefix_saves_fingerprint(
             prefix_dir, game_name=game_name, game_dir=game_dir, steam_appid=steam_appid,
-            extra_dirs=extra_dirs,
+            extra_dirs=extra_dirs, home_files=home_files,
         ).digest
         if not digest:
             return None
@@ -846,10 +992,12 @@ def snapshot_prefix_saves(
 
     written = _write_saves_zip_atomic(
         prefix_dir, target_zip, key_prefix, game_name=game_name,
-        game_dir=game_dir, steam_appid=steam_appid, extra_dirs=extra_dirs,
+        game_dir=game_dir, steam_appid=steam_appid, extra_dirs=extra_dirs, home_files=home_files,
     )
     if written == 0:
         return None
+    if steam_appid is not None and any(name == "steamcloud" for name, _ in extra_dirs or ()):
+        remember_steamcloud_appid(snap_dir, target_zip.name, str(steam_appid))
     index = _read_snapshot_index(snap_dir)
     if digest:
         index.update(digest=digest, zip=target_zip.name)
@@ -941,13 +1089,28 @@ def restore_snapshot_safely(
     steam_appid: int | None = None,
     dest_root: Path | None = None,
     extra_dirs: ExtraDirs | None = None,
+    skipped: list[str] | None = None,
 ) -> tuple[int, Path | None]:
     """Snapshot the current saves (never rotated away), then restore snapshot_zip.
 
     Returns (items restored, safety snapshot). A failed safety snapshot aborts the restore.
+    Files under $HOME are overwritten only when the safety snapshot holds them; the others are
+    left alone and their paths appended to skipped. Steam cloud files go only into the cloud
+    folder of the Steam app recorded for the snapshot (SteamCloudAppMismatch otherwise).
     """
     if snapshot_zip.is_symlink() or not snapshot_zip.is_file():
         raise FileNotFoundError(f"Snapshot not found: {snapshot_zip}")
+    home_rels: list[str] = []
+    if not state:
+        home_rels, has_cloud = _archive_home_and_cloud(snapshot_zip)
+        if has_cloud and any(name == "steamcloud" for name, _ in extra_dirs or ()):
+            want = snapshot_steamcloud_appid(snapshot_zip)
+            # Snapshots taken before the app id was recorded: only the app's own ones (never an import).
+            legacy_ok = want is None and "ludusavi-import" not in snapshot_zip.name and steam_appid is not None
+            if not legacy_ok and (want is None or want != str(steam_appid)):
+                raise SteamCloudAppMismatch(want, steam_appid)
+        if home_rels:  # the safety snapshot (and every later one) must hold the home files replaced now
+            remember_home_files(snapshot_dir_for(game_name, dest_root), home_rels)
     safety = auto_snapshot(
         prefix_dir, game_name, "pre-restore", keep=0,
         game_dir=game_dir, steam_appid=steam_appid, dest_root=dest_root, extra_dirs=extra_dirs,
@@ -955,7 +1118,14 @@ def restore_snapshot_safely(
     if state:
         files, regs = restore_prefix_state_snapshot(snapshot_zip, prefix_dir)
         return files + regs, safety
-    return _restore_saves_archive(snapshot_zip, prefix_dir, game_dir, extra_dirs=extra_dirs), safety
+    covered: set[str] = set()
+    if safety is not None and home_rels:
+        with zipfile.ZipFile(safety) as zf:
+            covered = {n.split("/", 2)[2] for n in zf.namelist() if n.count("/") >= 2 and n.split("/", 2)[1] == "home"}
+    count = _restore_saves_archive(
+        snapshot_zip, prefix_dir, game_dir, extra_dirs=extra_dirs, home_overwrite=covered, skipped=skipped
+    )
+    return count, safety
 
 
 def snapshot_prefix_state(
@@ -1163,14 +1333,16 @@ def compute_prefix_saves_fingerprint(
     game_dir: Path | None = None,
     steam_appid: int | None = None,
     extra_dirs: ExtraDirs | None = None,
+    home_files: tuple[str, ...] = (),
 ) -> SaveFingerprint:
-    """Compute a deterministic fingerprint over all non-empty save files in prefix_dir (and extra_dirs)."""
+    """Compute a deterministic fingerprint over all non-empty save files in prefix_dir (and extra_dirs, home_files)."""
     entries = _collect_prefix_save_entries(
         prefix_dir,
         game_name=game_name,
         game_dir=game_dir,
         steam_appid=steam_appid,
         extra_dirs=extra_dirs,
+        home_files=home_files,
     )
     reg_bytes = _extract_manifest_reg_bytes(prefix_dir, game_name, steam_appid)
     if not entries and not reg_bytes:
@@ -1402,10 +1574,14 @@ def _parse_sync_zip_entry(
         return None
     valid_sections = ("users", "ProgramData", "game", "registry", "home", *EXTRA_SECTIONS)
     if len(parts) >= 2 and parts[0] in valid_sections:
-        return parts[0], parts[1:]
-    if len(parts) >= 3 and parts[1] in valid_sections:
-        return parts[1], parts[2:]
-    return None
+        found = parts[0], parts[1:]
+    elif len(parts) >= 3 and parts[1] in valid_sections:
+        found = parts[1], parts[2:]
+    else:
+        return None
+    if found[0] == "home" and not home_entry_allowed(found[1]):
+        return None
+    return found
 
 
 def pull_game_saves(
@@ -1460,21 +1636,26 @@ def pull_game_saves(
 
 
 
-def _home_root() -> Path:
-    """Home folder for "home" snapshot entries (a seam for tests)."""
-    return Path.home()
-
-
 def _restore_saves_archive(
     archive_path: Path,
     prefix_dir: Path,
     game_dir: Path | None,
     remote_updated_at: float | None = None,
     extra_dirs: ExtraDirs | None = None,
+    home_overwrite: set[str] | None = None,
+    skipped: list[str] | None = None,
 ) -> int:
-    """Extract bounded save entries into explicitly selected prefix, game and extra roots."""
+    """Extract bounded save entries into explicitly selected prefix, game and extra roots.
+
+    Existing files under $HOME are replaced only when listed in home_overwrite (held by a safety
+    snapshot); the others are kept and appended to skipped.
+    """
     extras = {name: root for name, root in (extra_dirs or ()) if name in EXTRA_SECTIONS}
     has_prefix = prefix_dir.is_dir() or not extras  # an extras-only game (no prefix) never gets one created
+    if has_prefix and not prefix_dir.is_dir():  # nor a native game whose archive holds only home files
+        with zipfile.ZipFile(archive_path, "r") as zf_scan:
+            sections = {p[0] for n in zf_scan.namelist()[:_RESTORE_MAX_ENTRIES] if (p := _parse_sync_zip_entry(n))}
+        has_prefix = not sections or bool(sections - {"home"})
     drive_c = _resolve_drive_c_target(prefix_dir)
     if has_prefix:
         if not _safe_parents_within(
@@ -1535,14 +1716,20 @@ def _restore_saves_archive(
                 check_parts = rel_parts[:-1]
                 target = game_dir.joinpath(*rel_parts)
             elif section == "home":
-                # Files imported from a Ludusavi backup that live under $HOME (native games):
-                # only put them back where nothing exists yet; the safety snapshot does not cover $HOME.
+                # Native games' files under $HOME (from Ludusavi): allowed save folders only, and an
+                # existing file is replaced only when the safety snapshot holds it.
+                if not home_entry_allowed(rel_parts, info.external_attr >> 16):
+                    continue
                 home_root = _home_root()
                 base_dir = home_root
                 base_resolved = home_root.resolve()
                 check_parts = rel_parts[:-1]
                 target = home_root.joinpath(*rel_parts)
-                if target.exists() or target.is_symlink():
+                rel = "/".join(rel_parts)
+                covered = target.is_file() and rel in (home_overwrite or ())
+                if target.is_symlink() or (target.exists() and not covered):
+                    if skipped is not None:
+                        skipped.append(rel)
                     continue
             elif section in EXTRA_SECTIONS:
                 extra_root = extras.get(section)

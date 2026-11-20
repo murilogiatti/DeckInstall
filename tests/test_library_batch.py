@@ -34,11 +34,14 @@ def test_bulk_buttons_in_library_not_in_maintenance() -> None:
         for key in (
             "library.btn_bulk_optiscaler",
             "library.btn_bulk_proton",
+            "library.btn_manage_protons",
             "maint.btn_migrate_legacy",
             "maint.btn_undo_migration",
         ):
             assert lib_labels.count(tr(key)) == 1, key
             assert tr(key) not in maint_labels, key
+        assert not hasattr(win, "btn_maint_protons")
+        assert not hasattr(win, "btn_maint_game_protons")
         for gone in ("act_art", "act_revert_art", "act_migrate", "chk_batch_vdf", "act_bulk_migrate", "maint_batch_card"):
             assert not hasattr(win, gone), gone
     finally:

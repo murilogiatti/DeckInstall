@@ -53,6 +53,7 @@ def _make_dummy_pe(path: Path) -> None:
     data[0:2] = b"MZ"
     data[0x3C:0x40] = (0x80).to_bytes(4, "little")
     data[0x80:0x84] = b"PE\x00\x00"
+    data[0x84:0x86] = (0x8664).to_bytes(2, "little")
     path.write_bytes(bytes(data))
 
 
@@ -358,19 +359,11 @@ class Fase4RegressionTests(unittest.TestCase):
             game_dir = device_dir / "CoolMediaGame"
             _make_dummy_pe(game_dir / "CoolMediaGame.exe")
 
-            real_path = Path
-
-            class _PatchedPath:
-                def __new__(cls, *args, **kwargs):
-                    if args == ("/run/media",):
-                        return fake_media
-                    return real_path(*args, **kwargs)
-
-                @staticmethod
-                def home():
-                    return fake_home
-
-            with mock.patch("deckinstall.scanner.Path", _PatchedPath):
+            mountinfo = f"40 30 179:1 / {device_dir} rw,relatime - ext4 /dev/mmcblk0p1 rw\n"
+            with (
+                mock.patch("deckinstall.scanner._read_mountinfo", return_value=mountinfo),
+                mock.patch("deckinstall.scanner.Path.home", return_value=fake_home),
+            ):
                 roots = default_scan_roots()
                 self.assertIn(device_dir, roots)
                 found = scan_all_games()

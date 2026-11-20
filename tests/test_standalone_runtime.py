@@ -226,7 +226,7 @@ class ScannerTests(unittest.TestCase):
 
             dos_path = root / "dos.exe"
             dos_path.write_bytes(b"MZ" + b"\x00" * 62)
-            self.assertEqual(detect_exe_kind(dos_path), "dos_mz")
+            self.assertEqual(detect_exe_kind(dos_path), "unknown")
 
             elf_path = root / "game.x86_64"
             elf_path.write_bytes(b"\x7fELF\x02\x01\x01\x00")

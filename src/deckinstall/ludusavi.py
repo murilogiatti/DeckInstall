@@ -486,7 +486,8 @@ def _target_for(drive: str, parts: tuple[str, ...], home: Path) -> tuple[str, tu
         return windows(parts[lowered.index("drive_c") + 1:])
     home_parts = home.parts[1:]
     if len(parts) > len(home_parts) and parts[: len(home_parts)] == home_parts:
-        return "home", parts[len(home_parts):]
+        rest = parts[len(home_parts):]
+        return ("home", rest) if save_sync.home_entry_allowed(rest) else None
     return None
 
 
@@ -565,12 +566,24 @@ def _plan_sources(
         if zip_path is not None and (zip_path.is_symlink() or not zip_path.is_file()):
             raise LudusaviError(f"Missing in backup: {original}")
         target = mapper(drive, parts) if mapper is not None else _target_for(drive, parts, home)
-        if target is None:
+        src = _Source(original, zip_path, member, file_path, digest, size)
+        if target is None or (target[0] == "home" and not save_sync.home_entry_allowed(target[1], _source_mode(src))):
             skipped += 1
             continue
-        plan.append((_Source(original, zip_path, member, file_path, digest, size), *target))
+        plan.append((src, *target))
 
     return label, plan, skipped
+
+
+def _source_mode(src: _Source) -> int:
+    """Unix mode recorded for a zipped backup file (0 for plain files: exFAT/NTFS mark everything executable)."""
+    if src.zip_path is None:
+        return 0
+    try:
+        with zipfile.ZipFile(src.zip_path) as zf:
+            return zf.getinfo(src.member).external_attr >> 16
+    except (OSError, KeyError, zipfile.BadZipFile):
+        return 0
 
 
 def _verified_chunks(src: _Source, zips: dict[Path, zipfile.ZipFile]) -> Iterator[bytes]:
@@ -631,7 +644,7 @@ def _snapshot_target(drive: str, parts: tuple[str, ...]) -> tuple[str, tuple[str
     rest = parts[2:]
     if any(p.lower() in _SNAPSHOT_SKIP_HOME_DIRS for p in rest[:-1]) or "drive_c" in [p.lower() for p in rest]:
         return None
-    return "home", rest
+    return ("home", rest) if save_sync.home_entry_allowed(rest) else None
 
 
 def ludusavi_backup_path(home: Path | None = None) -> Path | None:
@@ -728,6 +741,9 @@ def import_ludusavi_to_snapshot(
         for zf in zips.values():
             zf.close()
     save_sync.remember_snapshot_name(snap_dir, name)
+    if appid:
+        save_sync.remember_steamcloud_appid(snap_dir, target.name, appid)
+    save_sync.remember_home_files(snap_dir, ["/".join(p[1:]) for _, p in usable if p[0] == "home"])
     return target, len(usable), skipped
 
 

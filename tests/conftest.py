@@ -12,7 +12,16 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from deckinstall import library, runtime_manager, save_sources, save_sync, standalone, vdf_queue  # noqa: E402
+from deckinstall import (  # noqa: E402
+    library,
+    runtime_manager,
+    save_sources,
+    save_sync,
+    scanner,
+    standalone,
+    steam_paths,
+    vdf_queue,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -21,6 +30,8 @@ def _isolated_libraries(tmp_path_factory: pytest.TempPathFactory, monkeypatch: p
     monkeypatch.setattr(library, "INTERNAL_ROOT", base / "DeckInstall")
     monkeypatch.setattr(library, "registry_path", lambda: base / "data" / "libraries.json")
     monkeypatch.setattr(library, "default_mount_search_roots", lambda: [])
+    # Never see the real mounted disks (default_scan_roots reads mountinfo through this seam).
+    monkeypatch.setattr(scanner, "_read_mountinfo", lambda: "")
     legacy_games = base / "home" / "Games"
     for attr, value in (
         ("_DEFAULT_GAMES_DIR", legacy_games),
@@ -50,4 +61,12 @@ def _isolated_libraries(tmp_path_factory: pytest.TempPathFactory, monkeypatch: p
     # Never read or write the real saved Steam edit queue.
     monkeypatch.setattr(vdf_queue, "default_queue_file", lambda: base / "data" / "vdf_queue.json")
     monkeypatch.setattr(save_sync, "DEFAULT_SNAPSHOTS_DIR", base / "home" / "Games" / "saves" / "snapshots")
+    # Cached Steam/Gaming Mode checks must not leak from one test to the next.
+    steam_paths.invalidate_process_cache()
     yield
+    steam_paths.invalidate_process_cache()
+
+
+def pe_exe_bytes(machine: int = 0x8664, extra: bytes = b"") -> bytes:
+    """Smallest header that scanner.is_proton_exe accepts: MZ, e_lfanew=64, PE\\0\\0 and the Machine field."""
+    return b"MZ" + b"\x00" * 58 + (64).to_bytes(4, "little") + b"PE\x00\x00" + machine.to_bytes(2, "little") + extra

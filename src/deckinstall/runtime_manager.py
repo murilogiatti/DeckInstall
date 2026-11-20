@@ -7,6 +7,7 @@ import contextlib
 import csv
 import fcntl
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -639,7 +640,10 @@ def _safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:
                     base = target.parent if member.issym() else dest_resolved
                     if not (base / member.linkname).resolve().is_relative_to(dest_resolved):
                         raise RuntimeError(f"Unsafe archive link target: {member.linkname}")
-                tf.extract(member, dest_dir)
+                if "filter" in inspect.signature(tf.extract).parameters:
+                    tf.extract(member, dest_dir, filter="fully_trusted")
+                else:
+                    tf.extract(member, dest_dir)
 
 
 def _fetch_latest_ge_proton11_release() -> dict[str, Any]:

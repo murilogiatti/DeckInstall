@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
-from collections.abc import Iterable
+import time
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -494,33 +494,88 @@ def configure_qt_environment(env: dict[str, str] | os._Environ[str]) -> None:
         env.setdefault("QT_QPA_PLATFORMTHEME", "xdgdesktopportal")
 
 
+_PROC_ROOT = Path("/proc")
+_PROCESS_CACHE_SECONDS = 2.0
+_process_cache: dict[str, tuple[float, bool]] = {}
+# /proc/<pid>/comm keeps only 15 characters: "gamescope-session" and "gamescope-session-plus"
+# (SteamOS, Bazzite) both show up as "gamescope-sessi".
+_SESSION_COMM_PREFIX = "gamescope-sessi"
+
+
+def _read_processes(proc_root: Path | None = None) -> dict[int, tuple[str, int]]:
+    """Map pid -> (comm, ppid) for the current user's processes, read straight from /proc."""
+    root = proc_root if proc_root is not None else _PROC_ROOT
+    uid = str(os.geteuid())
+    procs: dict[int, tuple[str, int]] = {}
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return procs
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            text = Path(entry.path, "status").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        name, ppid, owner = "", 0, ""
+        for line in text.splitlines():
+            key, _, value = line.partition(":")
+            if key == "Name":
+                name = value.strip()
+            elif key == "PPid":
+                ppid = int(value.strip() or 0)
+            elif key == "Uid":
+                fields = value.split()
+                owner = fields[1] if len(fields) > 1 else (fields[0] if fields else "")
+        if owner == uid and name:
+            procs[int(entry.name)] = (name, ppid)
+    return procs
+
+
+def _gamescope_from_processes(procs: dict[int, tuple[str, int]]) -> bool:
+    """Gaming Mode: a gamescope session process exists, or Steam runs under gamescope."""
+    if any(comm.startswith(_SESSION_COMM_PREFIX) for comm, _ in procs.values()):
+        return True
+    for pid, (comm, _) in procs.items():
+        if comm != "steam":
+            continue
+        seen: set[int] = set()
+        cur = procs.get(pid, ("", 0))[1]
+        while cur > 1 and cur not in seen and cur in procs:
+            seen.add(cur)
+            parent_comm, parent_ppid = procs[cur]
+            if parent_comm == "gamescope":
+                return True
+            cur = parent_ppid
+    return False
+
+
+def _cached(key: str, compute: Callable[[], bool]) -> bool:
+    now = time.monotonic()
+    hit = _process_cache.get(key)
+    if hit is not None and now - hit[0] < _PROCESS_CACHE_SECONDS:
+        return hit[1]
+    value = compute()
+    _process_cache[key] = (now, value)
+    return value
+
+
+def invalidate_process_cache() -> None:
+    """Forget the cached Steam/Gaming Mode checks (call around anything that closes or opens Steam)."""
+    _process_cache.clear()
+
+
 def is_gamescope_session() -> bool:
-    """Return True if currently running inside SteamOS Gaming Mode (gamescope)."""
+    """Return True if currently running inside SteamOS Gaming Mode (gamescope).
+
+    A stray gamescope process (a game wrapped in gamescope on the Desktop) does not count.
+    """
     if _env_is_gamescope(os.environ):
         return True
-    try:
-        res = subprocess.run(
-            ["pgrep", "-u", str(os.getuid()), "-x", "gamescope"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=3,
-        )
-        return res.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    return _cached("gamescope", lambda: _gamescope_from_processes(_read_processes()))
 
 
 def is_steam_running() -> bool:
-    """Return True if a Steam client process is currently running."""
-    try:
-        res = subprocess.run(
-            ["pgrep", "-u", str(os.getuid()), "-x", "steam"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=3,
-        )
-        return res.returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    """Return True if a Steam client process of this user is currently running."""
+    return _cached("steam", lambda: any(comm == "steam" for comm, _ in _read_processes().values()))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -38,9 +39,11 @@ from ..save_sync import (
     SNAPSHOT_KEEP_DEFAULT,
     ExtraDirs,
     SaveArchiveEntry,
+    SteamCloudAppMismatch,
     SyncDryRunPreview,
     SyncPlanItem,
     _slugify,
+    archive_has_steamcloud,
     auto_snapshot,
     list_save_archives,
     plan_sync_all,
@@ -53,7 +56,7 @@ from ..save_sync import (
     snapshot_display_name,
 )
 from ..standalone import game_log_dir
-from ..steam_paths import SteamPaths
+from ..steam_paths import SteamPaths, is_steam_running
 from ..steam_vdf import DEFAULT_SAVES_DIR
 from ..ui_cards import (
     _dialog_parent,
@@ -543,12 +546,18 @@ def _restore_selected(win: MainWindow) -> None:
             QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.nexus_running"))
             return
         question += "\n\n" + tr("saves.nexus_cloud_warning")
+    if _restores_steam_cloud(t, entry) and is_steam_running():
+        QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.steam_running"))
+        return
     if QMessageBox.question(_dialog_parent(win), __app_name__, question) != QMessageBox.StandardButton.Yes:
         return
 
     def _ok(res: object) -> None:
-        count, safety = res if isinstance(res, tuple) else (0, None)
-        _info(win, tr("saves.snapshot_restored", name=t.name, count=count, safety=safety or "-"))
+        count, safety, skipped = res if isinstance(res, tuple) and len(res) == 3 else (0, None, 0)
+        msg = tr("saves.snapshot_restored", name=t.name, count=count, safety=safety or "-")
+        if skipped:
+            msg += "\n" + tr("saves.home_skipped", count=skipped)
+        _info(win, msg)
 
     _run(
         win,
@@ -558,13 +567,32 @@ def _restore_selected(win: MainWindow) -> None:
     )
 
 
+def _restores_steam_cloud(t: SaveTarget, entry: SaveArchiveEntry) -> bool:
+    """True when restoring entry would write into the game's Steam cloud folder."""
+    if entry.kind == "state_snapshot" or not any(name == "steamcloud" for name, _ in t.extra_dirs):
+        return False
+    try:
+        return archive_has_steamcloud(entry.path)
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
 def _restore_job(t: SaveTarget, entry: SaveArchiveEntry) -> object:
     if t.source == "nexus" and is_nexus_running():  # checked again right before writing
         raise RuntimeError(tr("saves.nexus_running"))
-    return restore_snapshot_safely(
-        entry.path, t.prefix_dir, t.name, state=entry.kind == "state_snapshot",
-        game_dir=t.game_dir, steam_appid=t.steam_appid, extra_dirs=t.extra_dirs,
-    )
+    if _restores_steam_cloud(t, entry) and is_steam_running():  # Steam would sync over the restored files
+        raise RuntimeError(tr("saves.steam_running"))
+    skipped: list[str] = []
+    try:
+        count, safety = restore_snapshot_safely(
+            entry.path, t.prefix_dir, t.name, state=entry.kind == "state_snapshot",
+            game_dir=t.game_dir, steam_appid=t.steam_appid, extra_dirs=t.extra_dirs, skipped=skipped,
+        )
+    except SteamCloudAppMismatch as exc:
+        raise RuntimeError(
+            tr("saves.steamcloud_appid_mismatch", snap=exc.snap_appid or "?", target=exc.target_appid or "?")
+        ) from exc
+    return count, safety, len(skipped)
 
 
 def _open_folder(win: MainWindow) -> None:

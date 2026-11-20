@@ -15,11 +15,13 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from conftest import pe_exe_bytes  # noqa: E402
+
 from deckinstall import adopt, launcher_scan, library, standalone, steam_vdf  # noqa: E402
 from deckinstall.manifest import MANIFEST_V2  # noqa: E402
 from deckinstall.steam_paths import SteamPaths  # noqa: E402
 
-EXE = b"MZ" + b"\0" * 128
+EXE = pe_exe_bytes(extra=b"\0" * 64)
 
 
 @pytest.fixture

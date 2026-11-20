@@ -15,14 +15,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import standalone as _sa
+from . import steam_vdf as _vdf
 from .library import Library, discover_libraries, find_library_root, internal_library_root, list_unavailable_games
 from .standalone import StandaloneGame, list_standalone_games
+from .steam_paths import SteamPaths
 from .uninstall import _logs_dir
 
 GAMES = "games"
 PREFIXES = "prefixes"
 CACHES = "caches"
 CATEGORIES = (GAMES, PREFIXES, CACHES)
+SOURCE_DECKINSTALL = "deckinstall"
+SOURCE_STEAM = "steam"
+_SYSTEM_ROOTS = ("/usr", "/bin", "/sbin", "/opt", "/etc", "/var")
+_SYSTEM_EXES = frozenset({"flatpak", "sh", "bash", "env"})
 
 
 @dataclass
@@ -53,6 +59,7 @@ class GameSpace:
     cache_bytes: int = 0
     logs_bytes: int = 0
     shared_prefix: bool = False
+    source: str = SOURCE_DECKINSTALL
 
     @property
     def total_bytes(self) -> int:
@@ -182,6 +189,58 @@ def game_space(
     return out
 
 
+def _is_system_exe(exe: str) -> bool:
+    """True for launchers (flatpak, sh...) and anything living in system folders."""
+    path = exe.strip().strip('"')
+    return os.path.basename(path) in _SYSTEM_EXES or any(_inside(path, root) for root in _SYSTEM_ROOTS)
+
+
+def steam_game_space(
+    paths: SteamPaths,
+    libraries: list[Library],
+    known_dirs: set[str],
+    measured: dict[str, int],
+) -> list[GameSpace]:
+    """Non-Steam shortcuts of the current Steam user that DeckInstall does not manage.
+
+    known_dirs: real paths of folders already listed as DeckInstall games (skipped)."""
+    labels = {os.path.realpath(lib.root): lib.label for lib in libraries if lib.available}
+    steamapps = paths.steam_root / "steamapps"
+    home = os.path.realpath(Path.home())
+    seen: set[tuple[int, int]] = set()
+    dirs = set(known_dirs)
+    prefixes: set[str] = set()
+    out: list[GameSpace] = []
+    for entry in _vdf.load_shortcuts(paths.shortcuts_vdf):
+        if _is_system_exe(entry.exe):
+            continue
+        try:
+            folder = _sa.shortcut_game_dir(entry)
+        except ValueError:
+            continue
+        gd = _real(folder)
+        if gd is None or gd in dirs or gd in ("/", home) or find_library_root(folder) == folder:
+            continue
+        dirs.add(gd)
+        pfx = _real(paths.compatdata_dir / str(entry.appid_u32))
+        cache = _real(steamapps / "shadercache" / str(entry.appid_u32))
+        inner = [p for p in (pfx, cache) if p is not None and _inside(p, gd)]
+        lib_root = find_library_root(folder)
+        item = GameSpace(
+            entry.app_name,
+            uid=str(entry.appid_u32),
+            library=labels.get(os.path.realpath(lib_root), "") if lib_root is not None else "",
+            source=SOURCE_STEAM,
+        )
+        item.game_bytes = _measure(gd, seen, inner, measured)
+        if pfx is not None and pfx not in prefixes:
+            prefixes.add(pfx)
+            item.prefix_bytes = _measure(pfx, seen, [], measured)
+        item.cache_bytes = _measure(cache, seen, [], measured)
+        out.append(item)
+    return out
+
+
 def _dev(path: Path) -> int | None:
     try:
         return os.stat(path).st_dev
@@ -272,13 +331,19 @@ def top_folders(measured: dict[str, int], limit: int = TOP_FOLDERS) -> list[tupl
 
 
 def scan_space(
-    libraries: list[Library] | None = None, games: list[StandaloneGame] | None = None
+    libraries: list[Library] | None = None,
+    games: list[StandaloneGame] | None = None,
+    steam_paths: SteamPaths | None = None,
 ) -> SpaceReport:
-    """Disk and per-game usage; games on unmounted disks are listed without sizes."""
+    """Disk and per-game usage; games on unmounted disks are listed without sizes.
+    steam_paths adds the user's unmanaged Non-Steam shortcuts (source "steam")."""
     libs = libraries if libraries is not None else discover_libraries()
     game_list = games if games is not None else list_standalone_games()
     measured: dict[str, int] = {}
     per_game = game_space(game_list, libs, measured)
+    if steam_paths is not None:
+        known = {r for r in (_real(g.game_dir) for g in game_list) if r is not None}
+        per_game.extend(steam_game_space(steam_paths, libs, known, measured))
     for g in list_unavailable_games(libs):
         per_game.append(GameSpace(g["name"], uid=g["id"], library=g["library"], available=False))
     per_game.sort(key=lambda g: g.name.lower())

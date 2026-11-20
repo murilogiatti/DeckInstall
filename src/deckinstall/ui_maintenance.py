@@ -28,7 +28,7 @@ from . import __app_name__, __version__
 from .app_updater import get_running_appimage
 from .cleanup import GROUP_ORDER, CleanupCandidate
 from .i18n import tr
-from .space import CACHES, GAMES, PREFIXES, SpaceReport
+from .space import CACHES, GAMES, PREFIXES, SOURCE_STEAM, SpaceReport
 from .ui_cards import (
     FlowLayout,
     _cleanup_candidate_auto_check,
@@ -79,16 +79,10 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     health_top = QHBoxLayout()
     health_lbl = QLabel(tr("maint.health_title"))
     health_lbl.setObjectName("SectionTitle")
-    win.btn_maint_protons = QPushButton(tr("maint.btn_manage_protons"))
-    win.btn_maint_protons.clicked.connect(win._open_proton_manager_dialog)
-    win.btn_maint_game_protons = QPushButton(tr("maint.btn_game_protons"))
-    win.btn_maint_game_protons.clicked.connect(lambda: _open_game_protons(win))
     win.btn_maint_refresh_health = QPushButton(tr("maint.btn_refresh_health"))
     win.btn_maint_refresh_health.clicked.connect(lambda: refresh_maintenance_health(win))
     health_top.addWidget(health_lbl)
     health_top.addStretch()
-    health_top.addWidget(win.btn_maint_protons)
-    health_top.addWidget(win.btn_maint_game_protons)
     health_top.addWidget(win.btn_maint_refresh_health)
     health_layout.addLayout(health_top)
 
@@ -206,7 +200,7 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
 
 
 
-_SPACE_COLUMNS = 7
+_SPACE_COLUMNS = 8
 
 
 def _build_space_card(win: MainWindow) -> QWidget:
@@ -242,6 +236,7 @@ def _build_space_card(win: MainWindow) -> QWidget:
         [
             tr("space.col_game"),
             tr("space.col_library"),
+            tr("space.col_origin"),
             tr("space.col_files"),
             tr("space.col_prefix"),
             tr("space.col_cache"),
@@ -262,6 +257,18 @@ def _build_space_card(win: MainWindow) -> QWidget:
     table.setVisible(False)
     win.space_games_list = table
     card_layout.addWidget(table)
+    adopt_row = QWidget()
+    adopt_layout = QHBoxLayout(adopt_row)
+    adopt_layout.setContentsMargins(0, 0, 0, 0)
+    win.lbl_space_unmanaged = QLabel("")
+    win.lbl_space_unmanaged.setWordWrap(True)
+    win.btn_space_adopt = QPushButton(tr("space.btn_adopt"))
+    win.btn_space_adopt.clicked.connect(lambda: win._open_adopt_wizard())
+    adopt_layout.addWidget(win.lbl_space_unmanaged, 1)
+    adopt_layout.addWidget(win.btn_space_adopt)
+    adopt_row.setVisible(False)
+    win.space_adopt_row = adopt_row
+    card_layout.addWidget(adopt_row)
     return card
 
 
@@ -285,7 +292,7 @@ def refresh_space(win: MainWindow) -> None:
         win.btn_space_refresh.setEnabled(True)
         win.lbl_space_status.setText(tr("space.error", err=err))
 
-    worker = SpaceScanWorker(req_id)
+    worker = SpaceScanWorker(req_id, getattr(win, "paths", None))
     win._track_worker(worker)
     worker.ready.connect(_on_ready)
     worker.failed.connect(_on_failed)
@@ -350,15 +357,17 @@ def apply_space_report(win: MainWindow, report: SpaceReport) -> None:
         table.insertRow(row)
         table.setItem(row, 0, QTableWidgetItem(game.name))
         table.setItem(row, 1, QTableWidgetItem(game.library or "-"))
+        steam = game.source == SOURCE_STEAM
+        table.setItem(row, 2, QTableWidgetItem(tr("space.origin_steam") if steam else tr("space.origin_deckinstall")))
         if not game.available:
             missing = _SortableTableItem(tr("space.unavailable"), -1)
             missing.setToolTip(tr("space.unavailable_tip"))
             table.setItem(row, _SPACE_COLUMNS - 1, missing)
             continue
         sizes = (game.game_bytes, game.prefix_bytes, game.cache_bytes, game.logs_bytes, game.total_bytes)
-        for col, size in enumerate(sizes, start=2):
+        for col, size in enumerate(sizes, start=3):
             cell = _SortableTableItem(format_size_bytes(size), size)
-            if col == 3 and game.shared_prefix:
+            if col == 4 and game.shared_prefix:
                 shared = tr("space.shared")
                 cell.setText(f"{format_size_bytes(size)} ({shared})" if size else shared)
                 cell.setToolTip(tr("space.shared_tip"))
@@ -367,6 +376,9 @@ def apply_space_report(win: MainWindow, report: SpaceReport) -> None:
     table.setVisible(bool(report.games))
     win.lbl_space_status.setText("" if report.games else tr("space.games_empty"))
     win.lbl_space_status.setVisible(not report.games)
+    unmanaged = sum(1 for g in report.games if g.source == SOURCE_STEAM)
+    win.lbl_space_unmanaged.setText(tr("space.unmanaged", count=unmanaged))
+    win.space_adopt_row.setVisible(unmanaged > 0)
 
 
 def refresh_maintenance_health(win: MainWindow) -> None:
@@ -792,9 +804,3 @@ def show_maint_context_menu(win: MainWindow, pos: QPoint) -> None:
         worker.done.connect(_on_backup_done)
         worker.failed.connect(_on_backup_failed)
         worker.start()
-
-
-def _open_game_protons(win: MainWindow) -> None:
-    from .ui_dialogs.proton_dialogs import game_proton_versions_dialog
-
-    game_proton_versions_dialog(win)

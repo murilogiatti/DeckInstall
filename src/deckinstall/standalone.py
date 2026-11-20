@@ -1718,13 +1718,9 @@ def find_orphan_shader_caches(games_dir: Path | None = None) -> list[OrphanCache
     if not caches_dirs:
         return []
 
+    # Only DeckInstall's own libraries and the legacy ~/Games decide which games exist, never the
+    # user's scan folders (a disk that is not a scan folder must not make its caches look orphaned).
     active_games = list_standalone_games(games_dir=games_dir)
-    if games_dir is None:
-        from .scanner import default_scan_roots
-
-        for scan_root in default_scan_roots():
-            if scan_root != get_games_dir():
-                active_games.extend(list_standalone_games(games_dir=scan_root))
     active_caches: set[Path] = set()
     for game in active_games:
         if game.cache_dir is not None:

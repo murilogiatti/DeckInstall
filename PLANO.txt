@@ -1,7 +1,7 @@
 DeckInstall - Plano de acao v3 (2026-11-17, atualizado 2026-11-19)
 ==========================================================
 
-STATUS: Fases 0 a 10 concluidas. Ultima release: v0.19.1 (2026-11-19, Fases 7 a 10 + limpeza de codigo orfao).
+STATUS: Fases 0 a 11 concluidas (Fase 11 nao publicada). Ultima release: v0.19.2 (2026-11-20).
 v0.19.0: tag enviada mas o CI abortou na saida do Python 3.10 (thread da busca de saves ainda rodando ao destruir
 as janelas dos testes); sem release. v0.19.1: a busca de fontes Steam/Hydra/UMU/Nexus so roda ao abrir a aba
 Backup/Sync (nao no inicio do app) e um teste deixava widget sem pai.
@@ -284,7 +284,33 @@ FASE 10 (Opus) - Backup/Sync - CONCLUIDA (publicada na v0.19.0)
    arquivo). Cai para o full anterior se o mais novo so tem .reg. Steam: pasta de nuvem oferecida mesmo sem existir.
    Validado com copia do backup real do Deck (49 jogos, 540 arquivos; MGS V GZ 6 e TPP 13).
 
+FASE 11 - Auditoria (2026-11-20) - CONCLUIDA (nao publicada, sem commit)
+1. [FEITO] Modo Jogo: so conta sessao gamescope (comm gamescope-sessi) ou Steam filha do gamescope, lendo /proc
+   (sem pgrep); gamescope solto no Desktop nao conta. Cache de 2 s, invalidado ao fechar/abrir a Steam.
+   Deck em Desktop: False (correto). Modo Jogo real nao conferido no aparelho.
+2. [FEITO] Saves "home" (v0.19.2): lista de pastas permitidas (.local/share, .local/state, .config, .renpy, My Games,
+   Paradox, .unity3d, .godot) com bloqueios (.ssh, autostart, systemd, shells, git, nvim, flatpak, kservices,
+   .desktop/.service/.sh, executaveis) na importacao, restauracao e zip de sync. Sobrescrita so com snapshot de
+   seguranca; snapshots seguintes incluem os arquivos home. Steam Cloud: appid gravado e conferido; recusa com
+   a Steam aberta.
+3. [FEITO] Pastas de busca: discos vindos do /proc/self/mountinfo (/run/media, /media, /mnt, /var/mnt), sem
+   /run/media/root; home sem profundidade fixa (teto 20000 pastas, prof. 8); padroes removiveis + "Restaurar
+   padroes". Limpeza "Cache de jogo" so usa as bibliotecas (nao as pastas de busca).
+4. [FEITO] Aba Instalar: so pastas com .exe PE x86/x64 (is_proton_exe). Sem DOS/GOG/nativos na busca;
+   gog_primary_exe removido (exe apos extrair GOG vem do ranking). Deck: Alien Carnage fora, 6 jogos dentro.
+5. [FEITO] Instalador isolado: prefixo descartavel sem z:->/ nem letra para a home; I: = pasta do instalador,
+   D: = biblioteca, /DIR=D:\<nome>; PROTON_SET_GAME_DRIVE/STEAM_DRIVE=0. Sem isolamento o instalador nao roda.
+   So testado com mocks.
+6. [FEITO] Medir espaco mede atalhos Steam (raiz via shortcut_game_dir, ignora /usr,/bin, flatpak/sh), coluna
+   Origem e botao "Adotar...". Raiz de jogos Unreal (Engine/ ao lado de <Projeto>/Binaries) corrigida.
+7. [FEITO] Proton so na Biblioteca: "Gerenciar versoes do Proton" em "Em lote"; "Proton por jogo" virou aba
+   do "Proton em lote" (so aparece com jogos do DeckInstall).
+8. [FEITO] CI: testes em 3.10/3.11/3.13, nuitka==4.3.5, permissao de escrita so no job da release; tar sem
+   DeprecationWarning no Python antigo.
+Fora: assinatura do AppImage; dividir ui.py/steam_vdf.py.
+
 NAO TESTADO A MAO (so testes automaticos)
+- Fase 11: Modo Jogo real, instalador isolado com Proton/umu real, build com nuitka 4.3.5.
 - Instalador GOG real (innoextract nao instalado na maquina), repacks FitGirl/DODI, microSD/exFAT, Steam com link
   do compatdata, OptiScaler real, telas novas da Fase 3 no app aberto.
 

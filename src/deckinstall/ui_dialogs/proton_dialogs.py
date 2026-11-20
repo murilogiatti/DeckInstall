@@ -19,8 +19,10 @@ from PySide6.QtWidgets import (
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
+    QWidget,
 )
 
 from .. import __app_name__
@@ -102,17 +104,28 @@ def bulk_migrate_proton_dialog(win: MainWindow) -> None:
         win._end_busy()
         if win._closing_pending:
             return
-        if not usage:
-            QMessageBox.information(win, __app_name__, tr("proton_bulk.empty"))
-            return
-        if not protons:
-            QMessageBox.warning(win, __app_name__, tr("proton.none_found"))
+        has_games = bool(_deckinstall_proton_games())
+        if not usage or not protons:
+            if has_games:
+                _games_only_proton_dialog(win)
+            elif not usage:
+                QMessageBox.information(win, __app_name__, tr("proton_bulk.empty"))
+            else:
+                QMessageBox.warning(win, __app_name__, tr("proton.none_found"))
             return
 
         dlg = QDialog(_dialog_parent(win))
         dlg.setWindowTitle(tr("proton_bulk.title"))
         dlg.resize(780, 560)
-        lay = QVBoxLayout(dlg)
+        if has_games:
+            tabs = QTabWidget()
+            QVBoxLayout(dlg).addWidget(tabs)
+            steam_page = QWidget()
+            lay = QVBoxLayout(steam_page)
+            tabs.addTab(steam_page, tr("proton_bulk.tab_steam"))
+            tabs.addTab(_build_game_proton_widget(win, dlg, False), tr("proton_bulk.tab_games"))
+        else:
+            lay = QVBoxLayout(dlg)
 
         empty_tool_label = tr("proton_bulk.empty_tool")
         by_tool: dict[str, list[CompatMappingEntry]] = {}
@@ -811,8 +824,12 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
     dlg.exec()
 
 
-def game_proton_versions_dialog(win: MainWindow) -> None:
-    """Show each DeckInstall game's Proton (Default or pinned) and pin/unpin them in batch."""
+def _deckinstall_proton_games() -> list:
+    return [g for g in list_standalone_games() if not g.native_linux]
+
+
+def _build_game_proton_widget(win: MainWindow, dlg: QDialog, with_close: bool) -> QWidget:
+    """Table + actions to pin/unpin the Proton of each DeckInstall game in batch."""
     from ..proton_policy import (
         DEFAULT_PROTON_ID,
         effective_proton_name,
@@ -823,15 +840,9 @@ def game_proton_versions_dialog(win: MainWindow) -> None:
         use_previous_proton,
     )
 
-    games = [g for g in list_standalone_games() if not g.native_linux]
-    if not games:
-        QMessageBox.information(win, __app_name__, tr("proton_games.empty"))
-        return
-
-    dlg = QDialog(_dialog_parent(win))
-    dlg.setWindowTitle(tr("proton_games.title"))
-    dlg.resize(780, 520)
-    lay = QVBoxLayout(dlg)
+    page = QWidget()
+    lay = QVBoxLayout(page)
+    lay.setContentsMargins(0, 0, 0, 0)
     hint = QLabel(tr("proton_games.hint"))
     hint.setWordWrap(True)
     lay.addWidget(hint)
@@ -884,9 +895,10 @@ def game_proton_versions_dialog(win: MainWindow) -> None:
     for b in (btn_all, btn_apply, btn_previous):
         btn_row.addWidget(b)
     btn_row.addStretch()
-    btn_row.addWidget(btn_close)
+    if with_close:
+        btn_row.addWidget(btn_close)
+        btn_close.clicked.connect(dlg.accept)
     lay.addLayout(btn_row)
-    btn_close.clicked.connect(dlg.accept)
 
     def _checked() -> list[Path]:
         out: list[Path] = []
@@ -954,4 +966,13 @@ def game_proton_versions_dialog(win: MainWindow) -> None:
     btn_all.clicked.connect(_check_all)
     btn_apply.clicked.connect(_apply)
     btn_previous.clicked.connect(lambda: _run(_previous_all))
+    return page
+
+
+def _games_only_proton_dialog(win: MainWindow) -> None:
+    """Games-only variant for setups without Steam shortcuts."""
+    dlg = QDialog(_dialog_parent(win))
+    dlg.setWindowTitle(tr("proton_games.title"))
+    dlg.resize(780, 520)
+    QVBoxLayout(dlg).addWidget(_build_game_proton_widget(win, dlg, True))
     dlg.exec()

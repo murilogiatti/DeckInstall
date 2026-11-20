@@ -67,7 +67,7 @@ def _run(runner: _Runner, installer: Path, target: Path, **kw: Any) -> Path:
 def test_inno_arguments(tmp_path: Path) -> None:
     setup = _repack(tmp_path)
     target = tmp_path / "Lib" / "Games" / "My Game"
-    assert extractor.installer_arguments(setup, target) == [f"/DIR=Z:{str(target.resolve()).replace('/', chr(92))}"]
+    assert extractor.installer_arguments(setup, target) == ["/DIR=D:\\My Game"]
     plain = tmp_path / "nsis.exe"
     plain.write_bytes(b"MZ")
     assert extractor.installer_arguments(plain, target) == []
@@ -81,7 +81,7 @@ def test_repack_runs_without_dir_and_installs_into_dir(tmp_path: Path) -> None:
 
     def installer(_cmd: list[str], env: dict[str, str]) -> None:
         (target / "Game.exe").write_bytes(b"MZ")  # the user picked the suggested folder
-        (Path(env["WINEPREFIX"]) / "drive_c").mkdir(parents=True)
+        (Path(env["WINEPREFIX"]) / "drive_c").mkdir(parents=True, exist_ok=True)
 
     runner = _Runner(installer)
     with mock.patch.object(extractor, "check_disk_space") as space:

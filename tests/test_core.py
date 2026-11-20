@@ -26,6 +26,8 @@ except ImportError:
     fake_vdf.dumps = lambda d, pretty=True: "{}"
     sys.modules["vdf"] = fake_vdf
 
+from conftest import pe_exe_bytes  # noqa: E402
+
 from deckinstall.cleanup import find_cleanup_candidates  # noqa: E402
 from deckinstall.extractor import (  # noqa: E402
     _select_extract_cmd,
@@ -104,9 +106,9 @@ class CoreTests(unittest.TestCase):
             bin_dir.mkdir(parents=True)
             (game_dir / "unins000.exe").write_bytes(b"0" * 100)
             (game_dir / "UnityCrashHandler64.exe").write_bytes(b"0" * 100)
-            (game_dir / "Launcher.exe").write_bytes(b"0" * 100)
+            (game_dir / "Launcher.exe").write_bytes(pe_exe_bytes(extra=b"0" * 100))
             shipping = bin_dir / "SWGR-Win64-Shipping.exe"
-            shipping.write_bytes(b"0" * 200)
+            shipping.write_bytes(pe_exe_bytes(extra=b"0" * 200))
             (game_dir / "steam_appid.txt").write_text("4078430\n", encoding="utf-8")
 
             detected = scan_game_folder(game_dir)
@@ -141,10 +143,10 @@ class CoreTests(unittest.TestCase):
             root = Path(tmp)
             locked = root / "locked_dir"
             locked.mkdir()
-            (locked / "Secret.exe").write_bytes(b"123")
+            (locked / "Secret.exe").write_bytes(pe_exe_bytes())
             valid = root / "ValidGame"
             valid.mkdir()
-            (valid / "Game.exe").write_bytes(b"12345")
+            (valid / "Game.exe").write_bytes(pe_exe_bytes())
             broken_link = valid / "Broken.exe"
             broken_link.symlink_to(root / "does_not_exist.exe")
 
@@ -1119,17 +1121,10 @@ class CoreTests(unittest.TestCase):
             media_mnt = root / "card1"
             (media_mnt / "steamapps").mkdir(parents=True)
             (media_mnt / "Games").mkdir(parents=True)
-            real_iterdir = Path.iterdir
-            with (
-                mock.patch("deckinstall.scanner.Path.exists", return_value=True),
-                mock.patch("deckinstall.scanner.Path.is_dir", return_value=True),
-                mock.patch(
-                    "deckinstall.scanner.Path.iterdir",
-                    autospec=True,
-                    side_effect=lambda p: [media_mnt] if str(p) == "/run/media" else list(real_iterdir(p)),
-                ),
-            ):
+            mountinfo = f"40 30 179:1 / {media_mnt} rw - exfat /dev/mmcblk0p1 rw\n"
+            with mock.patch("deckinstall.scanner._read_mountinfo", return_value=mountinfo):
                 roots = default_scan_roots()
+            self.assertIn(media_mnt / "Games", roots)
             self.assertNotIn(media_mnt / "steamapps", roots)
 
         # 3) Numeric Proton sorting (10.0 > 9.0)
@@ -1422,7 +1417,7 @@ class CoreTests(unittest.TestCase):
                 self.assertIsNone(detect_steam_appid(g_bad_id))
                 g_good = root / "GoodGame"
                 g_good.mkdir()
-                (g_good / "game.exe").write_bytes(b"MZ")
+                (g_good / "game.exe").write_bytes(pe_exe_bytes())
                 orig_scan = scan_game_folder
 
                 def _flaky_scan(folder: Path):

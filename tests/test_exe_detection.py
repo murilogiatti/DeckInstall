@@ -1,4 +1,4 @@
-"""Executable detection after install (Fase 2.3): GOG playTasks, new folders, ranking, 1-click switch."""
+"""Executable detection: only Windows x86/x64 PE games, new folders, ranking, 1-click switch."""
 
 from __future__ import annotations
 
@@ -14,10 +14,12 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from conftest import pe_exe_bytes  # noqa: E402
+
 from deckinstall import extractor, scanner, standalone  # noqa: E402
 from deckinstall.manifest import MANIFEST_V2  # noqa: E402
 
-PE = b"MZ" + b"\x00" * 58 + (64).to_bytes(4, "little") + b"PE\x00\x00"
+PE = pe_exe_bytes()
 
 
 def _write(path: Path, data: bytes = PE) -> Path:
@@ -26,48 +28,54 @@ def _write(path: Path, data: bytes = PE) -> Path:
     return path
 
 
-def test_gog_play_task_wins_over_ranking(tmp_path: Path) -> None:
-    game = tmp_path / "Witcher"
-    _write(game / "Launcher.exe", PE + b"x" * 5000)  # bigger, at the top: ranking alone would pick it
-    main = _write(game / "bin" / "x64" / "witcher3.exe")
-    (game / "goggame-1207664663.info").write_text(json.dumps({
-        "gameId": "1207664663",
-        "playTasks": [
-            {"category": "launcher", "path": "Launcher.exe", "type": "FileTask"},
-            {"category": "game", "isPrimary": True, "path": "bin\\x64\\witcher3.exe", "type": "FileTask"},
-            {"category": "document", "type": "URLTask", "link": "https://gog.com"},
-        ],
-    }), encoding="utf-8")
-    assert scanner.gog_primary_exe(game) == main
-    detected = scanner.scan_game_folder(game)
-    assert detected is not None and detected.primary_exe == main
-    assert detected.executables.count(main) == 1
+def _header(sig: bytes) -> bytes:
+    return b"MZ" + b"\x00" * 58 + (64).to_bytes(4, "little") + sig
 
 
-def test_gog_play_task_cannot_escape_the_folder(tmp_path: Path) -> None:
-    game = tmp_path / "Game"
-    _write(tmp_path / "evil.exe")
-    _write(game / "Game.exe")
-    (game / "goggame-1.info").write_text(json.dumps({
-        "playTasks": [{"isPrimary": True, "path": "..\\evil.exe", "type": "FileTask"}],
-    }), encoding="utf-8")
-    assert scanner.gog_primary_exe(game) is None
+def test_only_x86_and_x64_pe_run_with_proton(tmp_path: Path) -> None:
+    outside = {
+        "dos.exe": b"MZ" + b"\x00" * 64,
+        "le.exe": _header(b"LE\x00\x00"),
+        "ne.exe": _header(b"NE\x00\x00"),
+        "arm64.exe": pe_exe_bytes(0xAA64),
+        "short.exe": b"MZ",
+        "elf.exe": b"\x7fELF" + b"\x00" * 60,
+    }
+    for name, data in outside.items():
+        assert not scanner.is_proton_exe(_write(tmp_path / name, data)), name
+    assert not scanner.is_proton_exe(tmp_path / "missing.exe")
+    assert scanner.is_proton_exe(_write(tmp_path / "i386.exe", pe_exe_bytes(0x14C)))
+    assert scanner.is_proton_exe(_write(tmp_path / "amd64.exe", pe_exe_bytes(0x8664)))
+    assert scanner.detect_exe_kind(tmp_path / "le.exe") == "unknown"
 
 
-def test_native_linux_candidates(tmp_path: Path) -> None:
-    gog_linux = tmp_path / "Hollow Knight"
-    start = _write(gog_linux / "start.sh", b"#!/bin/sh\nexec game/hollow_knight.x86_64\n")
-    _write(gog_linux / "game" / "hollow_knight.x86_64", b"\x7fELF" + b"\x00" * 60)
-    detected = scanner.scan_game_folder(gog_linux)
-    assert detected is not None and detected.primary_exe == start
+def test_dos_and_native_only_folders_are_not_games(tmp_path: Path) -> None:
+    dos = tmp_path / "Alien Carnage"
+    _write(dos / "CARNAGE.EXE", b"MZ" + b"\x00" * 64)
+    _write(dos / "ac-help.exe", _header(b"LE\x00\x00"))
+    assert scanner.scan_game_folder(dos) is None
+
+    native = tmp_path / "Hollow Knight"
+    start = _write(native / "start.sh", b"#!/bin/sh\nexec game/hollow_knight.x86_64\n")
+    _write(native / "game" / "hollow_knight.x86_64", b"\x7fELF" + b"\x00" * 60)
+    assert scanner.scan_game_folder(native) is None
     assert scanner.is_native_linux_exe(start)
     assert not scanner.is_native_linux_exe(_write(tmp_path / "w.exe"))
 
-    both = tmp_path / "Both"
-    exe = _write(both / "Game.exe")
-    _write(both / "Game.x86_64", b"\x7fELF" + b"\x00" * 60)
-    detected = scanner.scan_game_folder(both)
-    assert detected is not None and detected.primary_exe == exe
+    arm = tmp_path / "Arm"
+    _write(arm / "Game.exe", pe_exe_bytes(0xAA64))
+    assert scanner.scan_game_folder(arm) is None
+
+
+def test_setup_is_skipped_and_the_game_is_primary(tmp_path: Path) -> None:
+    game = tmp_path / "Jogo"
+    _write(game / "setup.exe", pe_exe_bytes(extra=b"x" * 5000))
+    jogo = _write(game / "jogo.exe")
+    _write(game / "dos.exe", b"MZ" + b"\x00" * 64)
+    _write(game / "Game.x86_64", b"\x7fELF" + b"\x00" * 60)
+    detected = scanner.scan_game_folder(game)
+    assert detected is not None and detected.primary_exe == jogo
+    assert detected.executables == [jogo]
 
 
 def test_game_root_from_new_files(tmp_path: Path) -> None:

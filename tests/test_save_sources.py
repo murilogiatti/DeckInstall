@@ -79,18 +79,22 @@ def test_cloud_only_snapshot_and_restore_never_create_a_prefix(tmp_path: Path) -
     paths = _steam(tmp_path)
     cloud = next(s for s in save_sources.steam_save_sources(paths) if s.name == "Cloud Only")
     snaps = tmp_path / "snaps"
-    snap = save_sync.auto_snapshot(cloud.prefix_dir, cloud.name, "manual", dest_root=snaps, extra_dirs=cloud.extra_dirs)
+    snap = save_sync.auto_snapshot(
+        cloud.prefix_dir, cloud.name, "manual", dest_root=snaps, extra_dirs=cloud.extra_dirs, steam_appid=cloud.steam_appid
+    )
     assert snap is not None
     with zipfile.ZipFile(snap) as zf:
         assert zf.namelist() == ["snap/steamcloud/slot.sav"]
     # same content again: deduplicated
-    again = save_sync.auto_snapshot(cloud.prefix_dir, cloud.name, "manual", dest_root=snaps, extra_dirs=cloud.extra_dirs)
+    again = save_sync.auto_snapshot(
+        cloud.prefix_dir, cloud.name, "manual", dest_root=snaps, extra_dirs=cloud.extra_dirs, steam_appid=cloud.steam_appid
+    )
     assert again == snap
 
     remote = cloud.extra_dirs[0][1]
     (remote / "slot.sav").write_bytes(b"newer-local")
     count, safety = save_sync.restore_snapshot_safely(
-        snap, cloud.prefix_dir, cloud.name, dest_root=snaps, extra_dirs=cloud.extra_dirs
+        snap, cloud.prefix_dir, cloud.name, dest_root=snaps, extra_dirs=cloud.extra_dirs, steam_appid=cloud.steam_appid
     )
     assert count == 1 and safety is not None
     assert (remote / "slot.sav").read_bytes() == b"cloud-save"

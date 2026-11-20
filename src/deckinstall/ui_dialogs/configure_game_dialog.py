@@ -100,7 +100,7 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
     folder_list.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
     folder_list.horizontalHeader().setSectionsClickable(True)
     folder_list.setSortingEnabled(True)
-    default_entries, custom_entries = win._load_scan_folders()
+    removed_defaults = set(win._scan_folder_set("scan_folders/removed_defaults"))
 
     def _add_entry(kind: str, path_str: str, enabled: bool) -> QTableWidgetItem:
         was_sorting = folder_list.isSortingEnabled()
@@ -121,12 +121,19 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
         folder_list.setSortingEnabled(was_sorting)
         return item
 
-    for path, enabled in default_entries:
-        item = _add_entry("default", str(path), enabled)
-        if path == Path.home():
-            item.setText(tr("scan_folders.home_entry", path=str(path)))
-    for entry in custom_entries:
-        _add_entry("custom", str(entry["path"]), bool(entry.get("enabled", True)))
+    def _populate() -> None:
+        folder_list.blockSignals(True)
+        folder_list.setRowCount(0)
+        default_entries, custom_entries = win._load_scan_folders()
+        for path, enabled in default_entries:
+            item = _add_entry("default", str(path), enabled)
+            if path == Path.home():
+                item.setText(tr("scan_folders.home_entry", path=str(path)))
+        for entry in custom_entries:
+            _add_entry("custom", str(entry["path"]), bool(entry.get("enabled", True)))
+        folder_list.blockSignals(False)
+
+    _populate()
 
     lay.addWidget(folder_list, 1)
 
@@ -134,8 +141,10 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
     btn_add = QPushButton(tr("scan_folders.btn_add"))
     btn_remove = QPushButton(tr("scan_folders.btn_remove"))
     btn_remove.setEnabled(False)
+    btn_restore = QPushButton(tr("scan_folders.btn_restore"))
     ctrl_row.addWidget(btn_add)
     ctrl_row.addWidget(btn_remove)
+    ctrl_row.addWidget(btn_restore)
     ctrl_row.addStretch()
     lay.addLayout(ctrl_row)
 
@@ -143,9 +152,7 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
         row = folder_list.currentRow()
         cur = folder_list.item(row, 0) if row >= 0 else None
         data = cur.data(Qt.ItemDataRole.UserRole) if cur is not None else None
-        btn_remove.setEnabled(
-            isinstance(data, tuple) and len(data) == 2 and data[0] == "custom"
-        )
+        btn_remove.setEnabled(isinstance(data, tuple) and len(data) == 2)
 
     folder_list.currentCellChanged.connect(lambda *_args: _update_remove_state())
 
@@ -176,12 +183,23 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
             return
         cur = folder_list.item(row, 0)
         data = cur.data(Qt.ItemDataRole.UserRole) if cur is not None else None
-        if isinstance(data, tuple) and data[0] == "custom":
+        if isinstance(data, tuple) and len(data) == 2:
+            if data[0] == "default":
+                removed_defaults.add(str(data[1]))
             folder_list.removeRow(row)
             _apply()
+            _update_remove_state()
+
+    def _on_restore_defaults() -> None:
+        removed_defaults.clear()
+        win._save_scan_folders([], win._load_scan_folders()[1], [])
+        _populate()
+        _update_remove_state()
+        win._refresh_games()
 
     btn_add.clicked.connect(_on_add_folder)
     btn_remove.clicked.connect(_on_remove_folder)
+    btn_restore.clicked.connect(_on_restore_defaults)
 
     buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
 
@@ -202,7 +220,7 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
                     new_disabled.append(str(p_str))
             elif kind == "custom":
                 new_custom.append({"path": str(p_str), "enabled": checked})
-        win._save_scan_folders(new_disabled, new_custom)
+        win._save_scan_folders(new_disabled, new_custom, sorted(removed_defaults))
         win._refresh_games()
 
     folder_list.itemChanged.connect(lambda _item: _apply())

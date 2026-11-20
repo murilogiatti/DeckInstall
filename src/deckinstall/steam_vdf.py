@@ -34,6 +34,7 @@ from .steam_paths import (
     SteamPaths,
     dir_size_bytes,
     find_default_proton_name,
+    invalidate_process_cache,
     is_flatpak_steam,
     is_gamescope_session,
     is_steam_running,
@@ -255,6 +256,14 @@ def shutdown_steam(timeout_seconds: int = 15, steam_root: Path | None = None) ->
 
     Raises SteamGamingModeError in SteamOS Gaming Mode: closing Steam there ends the session.
     """
+    invalidate_process_cache()
+    try:
+        return _shutdown_steam(timeout_seconds, steam_root)
+    finally:
+        invalidate_process_cache()
+
+
+def _shutdown_steam(timeout_seconds: int, steam_root: Path | None) -> bool:
     if not is_steam_running():
         return True
     if is_gamescope_session():
@@ -277,6 +286,7 @@ def shutdown_steam(timeout_seconds: int = 15, steam_root: Path | None = None) ->
         pass
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
+        invalidate_process_cache()
         if not is_steam_running():
             return True
         time.sleep(0.5)
@@ -303,6 +313,7 @@ def shutdown_steam(timeout_seconds: int = 15, steam_root: Path | None = None) ->
         except (OSError, subprocess.TimeoutExpired):
             pass
     time.sleep(2.0)
+    invalidate_process_cache()
     return not is_steam_running()
 
 
@@ -342,6 +353,14 @@ def start_steam(steam_root: Path | None = None, wait_seconds: float = 20.0) -> b
 
     Inside Gaming Mode the session restarts Steam by itself, so nothing is launched there.
     """
+    invalidate_process_cache()
+    try:
+        return _start_steam(steam_root, wait_seconds)
+    finally:
+        invalidate_process_cache()
+
+
+def _start_steam(steam_root: Path | None, wait_seconds: float) -> bool:
     if is_steam_running():
         return True
     if is_gamescope_session():
@@ -374,6 +393,7 @@ def start_steam(steam_root: Path | None = None, wait_seconds: float = 20.0) -> b
     seen_since: float | None = None
     while time.monotonic() < deadline:
         now = time.monotonic()
+        invalidate_process_cache()
         if is_steam_running():
             # The bootstrap script also matches for a moment and may exit (e.g. no display):
             # only count Steam as up once it is still running a few seconds later.
@@ -1084,6 +1104,22 @@ def _dir_has_game_exe(directory: Path, max_depth: int = 3) -> bool:
     return False
 
 
+def _is_unreal_game_root(directory: Path) -> bool:
+    """An Unreal Engine game root: Engine/ next to <Project>/Binaries (one game, not a container)."""
+    try:
+        if not (directory / "Engine").is_dir():
+            return False
+        with os.scandir(directory) as it:
+            return any(
+                entry.is_dir(follow_symlinks=False)
+                and entry.name != "Engine"
+                and (Path(entry.path) / "Binaries").is_dir()
+                for entry in it
+            )
+    except OSError:
+        return False
+
+
 def _looks_like_multi_game_container(directory: Path) -> bool:
     """Return True if directory is a Syncthing root or contains multiple game subfolders."""
     if directory == directory.parent:
@@ -1093,6 +1129,8 @@ def _looks_like_multi_game_container(directory: Path) -> bool:
             return True
     except OSError:
         pass
+    if _is_unreal_game_root(directory):
+        return False
     game_subdirs = 0
     try:
         with os.scandir(directory) as it:

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+
+from .library import _unescape_mount
 
 IGNORED_EXE_PATTERNS = (
     "unins",
@@ -145,22 +146,18 @@ def detect_steam_appid(game_dir: Path) -> int | None:
 
 
 def detect_exe_kind(exe_path: Path) -> str:
-    """Inspect executable magic bytes and return windows_pe, dos_mz, linux_elf, or unknown."""
+    """Inspect executable magic bytes and return windows_pe, linux_elf, or unknown."""
     try:
         with open(exe_path, "rb") as handle:
             header = handle.read(64)
             if header.startswith(b"\x7fELF"):
                 return "linux_elf"
-            if header.startswith(b"MZ"):
-                if len(header) < 64:
-                    return "dos_mz"
+            if header.startswith(b"MZ") and len(header) == 64:
                 e_lfanew = int.from_bytes(header[60:64], "little")
-                if e_lfanew < 4:
-                    return "dos_mz"
-                handle.seek(e_lfanew)
-                if handle.read(4) == b"PE\x00\x00":
-                    return "windows_pe"
-                return "dos_mz"
+                if e_lfanew >= 4:
+                    handle.seek(e_lfanew)
+                    if handle.read(4) == b"PE\x00\x00":
+                        return "windows_pe"
     except OSError:
         return "unknown"
     return "unknown"
@@ -175,38 +172,6 @@ def is_native_linux_exe(path: Path) -> bool:
             return handle.read(2) == b"#!"
     except OSError:
         return False
-
-
-def gog_primary_exe(game_dir: Path) -> Path | None:
-    """Return the primary executable declared in a GOG goggame-*.info file (playTasks), if any."""
-    infos: list[Path] = []
-    for pattern in ("goggame-*.info", "*/goggame-*.info"):
-        infos.extend(p for p in sorted(game_dir.glob(pattern)) if p.is_file() and not p.is_symlink())
-    for info in infos:
-        try:
-            if info.stat().st_size > 1024 * 1024:
-                continue
-            data = json.loads(info.read_text(encoding="utf-8-sig", errors="replace"))
-        except (OSError, ValueError):
-            continue
-        tasks = data.get("playTasks") if isinstance(data, dict) else None
-        if not isinstance(tasks, list):
-            continue
-        ordered = sorted(
-            (t for t in tasks if isinstance(t, dict) and t.get("type", "FileTask") == "FileTask"),
-            key=lambda t: (not t.get("isPrimary", False), t.get("category", "game") != "game"),
-        )
-        for task in ordered:
-            raw = str(task.get("path") or "").replace("\\", "/").strip()
-            if not raw or raw.startswith("/") or ".." in Path(raw).parts:
-                continue
-            cand = info.parent / raw
-            try:
-                if cand.is_file() and not cand.is_symlink() and cand.resolve().is_relative_to(game_dir.resolve()):
-                    return cand
-            except OSError:
-                continue
-    return None
 
 
 def gog_product_id(game_dir: Path) -> str:
@@ -260,9 +225,6 @@ def detect_steam_emulator(exe_path: Path, game_dir: Path) -> tuple[str, str]:
     return "", ""
 
 
-_NATIVE_SUFFIXES = (".x86_64", ".x86", ".amd64")
-
-
 def detect_pe_arch(exe_path: Path) -> str:
     """Inspect executable header and return 'x64', 'x86', 'linux_elf', or 'unknown'."""
     try:
@@ -291,6 +253,9 @@ def detect_pe_arch(exe_path: Path) -> str:
     return "unknown"
 
 
+def is_proton_exe(path: Path) -> bool:
+    """True for a Windows PE x86/x64 executable (what Proton runs); DOS, ARM64 or unreadable -> False."""
+    return detect_pe_arch(path) in ("x86", "x64")
 
 
 def _extract_steam_appid(
@@ -368,18 +333,8 @@ def _scan_game_tree_scandir(
                         continue
 
                     low = name.lower()
-                    if collect_exes and dir_depth < 2 and (
-                        low == "start.sh" or low.endswith(_NATIVE_SUFFIXES)
-                    ):
-                        try:
-                            size_neg = -entry.stat(follow_symlinks=False).st_size
-                        except OSError:
-                            size_neg = 0
-                        # Native launchers rank after Windows executables of the same folder.
-                        native_rank = 0 if low == "start.sh" else 1
-                        exe_scored.append(((2, native_rank, 0, rel_depth, size_neg), Path(entry.path)))
-                    elif collect_exes and low.endswith(".exe"):
-                        if not any(pat in low for pat in IGNORED_EXE_PATTERNS):
+                    if collect_exes and low.endswith(".exe"):
+                        if not any(pat in low for pat in IGNORED_EXE_PATTERNS) and is_proton_exe(Path(entry.path)):
                             try:
                                 size_neg = -entry.stat(follow_symlinks=False).st_size
                             except OSError:
@@ -413,9 +368,6 @@ def scan_game_folder(game_dir: Path) -> DetectedGame | None:
     if not game_dir.is_dir():
         return None
     exes, steam_appid = _scan_game_tree_scandir(game_dir)
-    gog_exe = gog_primary_exe(game_dir)
-    if gog_exe is not None:
-        exes = [gog_exe, *(e for e in exes if e != gog_exe)]
     if not exes:
         return None
     return DetectedGame(
@@ -434,7 +386,9 @@ def _safe_is_dir(path: Path) -> bool:
         return False
 
 
-HOME_SCAN_DEPTH = 3
+# The home walk goes down until it meets each game folder, within these safety limits.
+HOME_SCAN_MAX_DEPTH = 8
+HOME_SCAN_MAX_DIRS = 20000
 # Never walked when searching the home folder: heavy, irrelevant or full of Windows exes that are not games.
 HOME_SCAN_SKIP = frozenset(
     {
@@ -456,19 +410,15 @@ _HOME_CONTAINERS = frozenset(
 
 
 def _dir_has_game_exe(path: Path) -> bool:
-    """True if the folder directly holds a game exe / native launcher, or is a GOG install root."""
+    """True if the folder directly holds a Windows x86/x64 exe that is not an ignored installer/tool."""
     try:
         with os.scandir(path) as it:
             for entry in it:
                 low = entry.name.lower()
-                if low.startswith("goggame-") and low.endswith(".info"):
-                    return True  # a GOG install root, even when the exe sits in a subfolder
-                if not (low.endswith(".exe") or low == "start.sh" or low.endswith(_NATIVE_SUFFIXES)):
-                    continue
-                if low.endswith(".exe") and any(pat in low for pat in IGNORED_EXE_PATTERNS):
+                if not low.endswith(".exe") or any(pat in low for pat in IGNORED_EXE_PATTERNS):
                     continue
                 try:
-                    if entry.is_file(follow_symlinks=False):
+                    if entry.is_file(follow_symlinks=False) and is_proton_exe(Path(entry.path)):
                         return True
                 except OSError:
                     continue
@@ -477,16 +427,21 @@ def _dir_has_game_exe(path: Path) -> bool:
     return False
 
 
-def find_home_game_dirs(home: Path, max_depth: int = HOME_SCAN_DEPTH) -> list[Path]:
-    """Game folders under home: the first folder (up to max_depth levels down) that holds an exe.
+def find_home_game_dirs(
+    home: Path, max_depth: int = HOME_SCAN_MAX_DEPTH, max_dirs: int = HOME_SCAN_MAX_DIRS
+) -> list[Path]:
+    """Game folders under home: walks down until the first folder that holds an exe.
 
     Hidden folders and HOME_SCAN_SKIP are never entered, symlinks are not followed, and a folder
-    that holds an exe is not walked further (the per-game scan looks inside it).
+    that holds an exe is not walked further (the per-game scan looks inside it). The walk stops
+    after max_dirs folders and never goes deeper than max_depth levels.
     """
     found: list[Path] = []
     queue: deque[tuple[Path, int]] = deque([(home, 0)])
-    while queue:
+    visited = 0
+    while queue and visited < max_dirs:
         cur, depth = queue.popleft()
+        visited += 1
         try:
             with os.scandir(cur) as it:
                 subdirs = sorted(
@@ -515,56 +470,110 @@ def find_home_game_dirs(home: Path, max_depth: int = HOME_SCAN_DEPTH) -> list[Pa
     return found
 
 
-def default_scan_roots() -> list[Path]:
-    """Cards and external disks under /run/media (each child folder is a game). Home is walked separately."""
-    roots: list[Path] = []
-    media_root = Path("/run/media")
-    if _safe_is_dir(media_root):
+# Filesystems that live on a real disk / card (pseudo, network and overlay mounts are ignored).
+_DISK_FSTYPES = frozenset({"ext4", "btrfs", "xfs", "f2fs", "exfat", "vfat", "ntfs", "ntfs3", "fuseblk"})
+# System mount points (the system disk itself, not a games disk).
+_SYSTEM_MOUNTS = frozenset(
+    {"/", "/home", "/boot", "/efi", "/var", "/tmp", "/usr", "/opt", "/srv", "/nix", "/snap", "/root",
+     "/etc", "/sysroot", "/esp"}
+)
+# Nothing under these is a games disk (except /run/media and /var/mnt).
+_SYSTEM_TREES = ("/proc", "/sys", "/dev", "/run", "/boot", "/efi", "/usr", "/nix", "/snap", "/var", "/sysroot", "/esp")
+_DISK_TREE_EXCEPTIONS = ("/run/media", "/var/mnt")
+_SKIP_DISK_CHILDREN = frozenset({"steamapps", "lost+found", "System Volume Information"})
+
+
+def _read_mountinfo() -> str:
+    """Raw /proc/self/mountinfo (a seam: tests replace it)."""
+    try:
+        return Path("/proc/self/mountinfo").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _mount_usable(mount: str) -> bool:
+    """The mount point is a folder this user can list and enter (not e.g. root's 0750 folder)."""
+    return os.path.isdir(mount) and os.access(mount, os.R_OK | os.X_OK)
+
+
+def _under(path: str, tree: str) -> bool:
+    return path == tree or path.startswith(tree.rstrip("/") + "/")
+
+
+def mounted_disks(mountinfo: str | None = None) -> list[Path]:
+    """Mount points of real disks and cards (SD, USB, extra disks), read from mountinfo."""
+    text = _read_mountinfo() if mountinfo is None else mountinfo
+    home = str(Path.home())
+    disks: list[Path] = []
+    seen_src: set[tuple[str, str]] = set()
+    seen_real: set[str] = set()
+    for line in text.splitlines():
+        fields = line.split()
         try:
-            with os.scandir(media_root) as it:
-                media_entries = sorted(
-                    (entry for entry in it if not entry.name.startswith(".")),
-                    key=lambda e: e.name,
-                )
+            sep = fields.index("-", 6)
+        except ValueError:
+            continue
+        if len(fields) < sep + 2:
+            continue
+        fstype = fields[sep + 1].lower()
+        if fstype not in _DISK_FSTYPES:
+            continue
+        mount = os.path.normpath(_unescape_mount(fields[4]))
+        if mount in _SYSTEM_MOUNTS or _under(mount, home) or _under(home, mount):
+            continue
+        if any(_under(mount, t) for t in _SYSTEM_TREES) and not any(
+            _under(mount, e) for e in _DISK_TREE_EXCEPTIONS
+        ):
+            continue
+        # The same btrfs subvolume (or bind mount) mounted twice is one disk.
+        src = (fields[2], _unescape_mount(fields[3]))
+        try:
+            real = os.path.realpath(mount)
         except OSError:
-            media_entries = []
-        for entry in media_entries:
-            try:
-                is_dir = entry.is_dir(follow_symlinks=True)
-                is_symlink = entry.is_symlink()
-            except OSError:
+            real = mount
+        if src in seen_src or real in seen_real:
+            continue
+        if not _mount_usable(mount):
+            continue
+        seen_src.add(src)
+        seen_real.add(real)
+        disks.append(Path(mount))
+    disks.sort(key=str)
+    return disks
+
+
+def _visible_subdirs(path: Path) -> list[Path]:
+    try:
+        with os.scandir(path) as it:
+            entries = sorted((e for e in it if not e.name.startswith(".")), key=lambda e: e.name)
+    except OSError:
+        return []
+    out: list[Path] = []
+    for entry in entries:
+        try:
+            if entry.is_symlink() or not entry.is_dir(follow_symlinks=True):
                 continue
-            if not is_dir or is_symlink:
-                continue
-            child = Path(entry.path)
-            if entry.name not in {"steamapps", "lost+found", "System Volume Information"}:
-                roots.append(child)
-            games_sub = child / "Games"
-            if _safe_is_dir(games_sub):
-                roots.append(games_sub)
-            try:
-                with os.scandir(child) as sub_it:
-                    sub_entries = sorted(
-                        (sub for sub in sub_it if not sub.name.startswith(".")),
-                        key=lambda e: e.name,
-                    )
-            except OSError:
-                sub_entries = []
-            for sub_entry in sub_entries:
-                try:
-                    sub_is_dir = sub_entry.is_dir(follow_symlinks=True)
-                    sub_is_symlink = sub_entry.is_symlink()
-                except OSError:
-                    continue
-                if (
-                    not sub_is_dir
-                    or sub_is_symlink
-                    or sub_entry.name in {"steamapps", "lost+found", "System Volume Information"}
-                ):
-                    continue
-                sub = Path(sub_entry.path)
-                sub_games = sub / "Games"
-                roots.append(sub_games if _safe_is_dir(sub_games) else sub)
+        except OSError:
+            continue
+        if entry.name not in _SKIP_DISK_CHILDREN:
+            out.append(Path(entry.path))
+    return out
+
+
+def default_scan_roots() -> list[Path]:
+    """Mounted cards and disks (each child folder is a game), plus their Games and first-level folders.
+
+    Only disks really mounted (mountinfo) and readable are used. Home is walked separately.
+    """
+    roots: list[Path] = []
+    for disk in mounted_disks():
+        roots.append(disk)
+        games_sub = disk / "Games"
+        if _safe_is_dir(games_sub):
+            roots.append(games_sub)
+        for sub in _visible_subdirs(disk):
+            sub_games = sub / "Games"
+            roots.append(sub_games if _safe_is_dir(sub_games) else sub)
     deduped: list[Path] = []
     seen_roots: set[Path] = set()
     for r in roots:
@@ -583,7 +592,7 @@ def default_scan_roots() -> list[Path]:
 def scan_all_games(roots: list[Path] | None = None) -> list[DetectedGame]:
     """Scan roots for installed/extracted games.
 
-    The home folder is walked up to HOME_SCAN_DEPTH levels (find_home_game_dirs); any other root is a
+    The home folder is walked down to each game folder (find_home_game_dirs); any other root is a
     container whose top-level folders are games. None = home + cards/disks (default_scan_roots).
     """
     seen: set[Path] = set()
