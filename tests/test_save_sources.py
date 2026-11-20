@@ -183,3 +183,37 @@ def test_scan_external_targets_marks_origins(tmp_path: Path) -> None:
     targets = ssd.scan_external_save_targets(paths, home)
     assert {(t.name, t.source) for t in targets} == {("Proton Game", "steam"), ("Cloud Only", "steam"), ("Halo", "nexus")}
     assert ssd.source_label("steam") == "Steam" and ssd.source_label("nexus") == "Nexus"
+
+
+def test_sources_scan_waits_for_the_backup_tab(tmp_path: Path) -> None:
+    import time
+
+    from PySide6.QtCore import QSettings
+    from PySide6.QtWidgets import QApplication
+
+    from deckinstall import ui
+    from deckinstall.ui_dialogs import save_sync_dialog as ssd
+
+    app = QApplication.instance() or QApplication([])
+    with (
+        mock.patch.object(ui, "QSettings", return_value=QSettings(str(tmp_path / "p.ini"), QSettings.Format.IniFormat)),
+        mock.patch.object(ui.MainWindow, "_refresh_games"),
+        mock.patch.object(ui.MainWindow, "_redetect_steam"),
+        mock.patch.object(ssd, "scan_external_save_targets", return_value=[]) as scan,
+    ):
+        win = ui.MainWindow(app)
+        try:
+            app.processEvents()
+            assert not win._save_sources_running and not scan.called  # nothing scanned at startup
+            win.stack.setCurrentIndex(2)  # the user opens Backup/Sync
+            deadline = time.monotonic() + 10
+            while (win._save_sources_running or not scan.called) and time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(0.01)
+            assert scan.called and not win._save_sources_running
+        finally:
+            for worker in list(win._active_workers):
+                worker.wait(5000)
+            win.close()
+            win.deleteLater()
+            app.processEvents()

@@ -88,6 +88,7 @@ def test_configure_checkboxes_reflect_and_toggle(tmp_path: Path) -> None:
         dlg = QDialog()
         try:
             box = cgd._launcher_checkboxes(win, dlg, game)  # type: ignore[arg-type]
+            box.setParent(dlg)  # deleted with the dialog: no parentless widget left at exit
             chk_desktop, chk_menu = box.findChildren(QCheckBox)
             assert not chk_desktop.isChecked() and chk_menu.isChecked()
             chk_desktop.setChecked(True)

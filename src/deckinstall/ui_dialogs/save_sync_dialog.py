@@ -315,7 +315,8 @@ def build_saves_page(win: MainWindow) -> QWidget:
     card_layout.addLayout(footer)
 
     layout.addWidget(card, 1)
-    refresh_saves_page(win)
+    # Steam/Nexus sources and save sizes are looked up when the tab is opened, not at startup.
+    refresh_saves_page(win, scan_sources=False)
     return page
 
 
