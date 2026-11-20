@@ -277,6 +277,13 @@ FASE 10 (Opus) - Backup/Sync - CONCLUIDA (publicada na v0.19.0)
    a nuvem do Xbox. Testado com arvores falsas; no Deck o Nexus esta instalado sem jogos.
    Deck (so leitura): 3 apps Steam, nenhum com saves ainda; varredura 3 ms.
 
+6. [FEITO v0.19.2] Importar Ludusavi de backups feitos no Linux (Deck): "Importar todos" ignora a linha selecionada
+   (botao separado "Importar neste jogo"); pasta inicial vem do config.yaml do Ludusavi (nativo/Flatpak).
+   Snapshot agora guarda: prefixo (drive_c/users|ProgramData de qualquer prefixo Steam/Heroic/Epic/Nexus),
+   steamcloud (userdata/<uid>/<appid>/remote, uid descartado) e home (/home/<user>/..., so restaura onde nao existe
+   arquivo). Cai para o full anterior se o mais novo so tem .reg. Steam: pasta de nuvem oferecida mesmo sem existir.
+   Validado com copia do backup real do Deck (49 jogos, 540 arquivos; MGS V GZ 6 e TPP 13).
+
 NAO TESTADO A MAO (so testes automaticos)
 - Instalador GOG real (innoextract nao instalado na maquina), repacks FitGirl/DODI, microSD/exFAT, Steam com link
   do compatdata, OptiScaler real, telas novas da Fase 3 no app aberto.

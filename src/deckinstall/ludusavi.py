@@ -37,7 +37,7 @@ import shutil
 import tempfile
 import time
 import zipfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -412,12 +412,15 @@ def find_game_folder(root: Path, game_name: str) -> Path | None:
     return None
 
 
-def _newest_files(mapping: dict[str, Any]) -> tuple[str, dict[str, tuple[str, str, int]]]:
-    """(label, {original path: (backup name, sha1, size)}) for the newest full backup + child."""
+def _newest_files(mapping: dict[str, Any], older: int = 0) -> tuple[str, dict[str, tuple[str, str, int]]]:
+    """(label, {original path: (backup name, sha1, size)}) for the newest full backup + child.
+
+    older=1 takes the full backup before the newest, and so on.
+    """
     backups = [b for b in mapping["backups"] if isinstance(b, dict)]
-    if not backups:
+    if len(backups) <= older:
         raise LudusaviError("The backup holds no full backup")
-    full = backups[-1]
+    full = backups[-1 - older]
     chain = [full]
     children = full.get("children")
     if isinstance(children, list) and children and isinstance(children[-1], dict):
@@ -533,11 +536,17 @@ def _bounded(chunks: Iterator[bytes], limit: int, original: str) -> Iterator[byt
 
 
 def _plan_sources(
-    game_folder: Path, home: Path
+    game_folder: Path,
+    home: Path,
+    mapper: Callable[[str, tuple[str, ...]], tuple[str, tuple[str, ...]] | None] | None = None,
+    older: int = 0,
 ) -> tuple[str, list[tuple[_Source, str, tuple[str, ...]]], int]:
-    """(backup label, [(source, 'prefix'|'home', target parts)], files that map nowhere) for the newest backup."""
+    """(backup label, [(source, kind, target parts)], files that map nowhere) for the newest backup.
+
+    mapper(drive, parts) -> (kind, parts) | None; the default maps into a prefix or under home.
+    """
     mapping = load_mapping(game_folder)
-    label, files = _newest_files(mapping)
+    label, files = _newest_files(mapping, older)
     drives = _drive_folders(mapping)
     folder = game_folder.resolve()
     plan: list[tuple[_Source, str, tuple[str, ...]]] = []
@@ -555,7 +564,7 @@ def _plan_sources(
             raise LudusaviError(f"Missing in backup: {original}")
         if zip_path is not None and (zip_path.is_symlink() or not zip_path.is_file()):
             raise LudusaviError(f"Missing in backup: {original}")
-        target = _target_for(drive, parts, home)
+        target = mapper(drive, parts) if mapper is not None else _target_for(drive, parts, home)
         if target is None:
             skipped += 1
             continue
@@ -595,6 +604,63 @@ def list_backup_games(root: Path) -> list[tuple[str, Path]]:
     return out
 
 
+_SNAPSHOT_SKIP_HOME_DIRS = frozenset({"shadercache", "cache", "logs", "compatdata", "proton", ".cache"})
+
+
+def _snapshot_target(drive: str, parts: tuple[str, ...]) -> tuple[str, tuple[str, ...]] | None:
+    """Where a backed-up file goes inside a snapshot: (section, parts under it), or None.
+
+    Sections: "prefix" (parts start with users/ProgramData, any Windows user becomes steamuser),
+    "steamcloud" (Steam userdata/<uid>/<appid>/remote, the user id is dropped) and "home"
+    (a Unix path under /home/<user>/, the user name is dropped).
+    """
+    lowered = [p.lower() for p in parts]
+    if drive == "C:" or (drive == "" and "drive_c" in lowered):
+        rest = parts if drive == "C:" else parts[lowered.index("drive_c") + 1:]
+        if len(rest) >= 3 and rest[0].lower() == "users":
+            user = "Public" if rest[1].lower() == "public" else "steamuser"
+            return "prefix", ("users", user, *rest[2:])
+        if len(rest) >= 2 and rest[0].lower() == "programdata":
+            return "prefix", ("ProgramData", *rest[1:])
+        return None
+    if drive or len(parts) < 3 or parts[0] != "home":
+        return None
+    for i in range(len(parts) - 4):
+        if parts[i] == "userdata" and parts[i + 1].isdigit() and parts[i + 2].isdigit() and parts[i + 3] == "remote":
+            return "steamcloud", parts[i + 4:]
+    rest = parts[2:]
+    if any(p.lower() in _SNAPSHOT_SKIP_HOME_DIRS for p in rest[:-1]) or "drive_c" in [p.lower() for p in rest]:
+        return None
+    return "home", rest
+
+
+def ludusavi_backup_path(home: Path | None = None) -> Path | None:
+    """The backup folder set in Ludusavi's own config.yaml (native or Flatpak), when it exists."""
+    home = home or Path.home()
+    for cfg in (
+        home / ".config" / "ludusavi" / "config.yaml",
+        home / ".var" / "app" / "com.github.mtkennerly.ludusavi" / "config" / "ludusavi" / "config.yaml",
+    ):
+        try:
+            if cfg.is_symlink() or cfg.stat().st_size > 1024 * 1024:
+                continue
+            lines = cfg.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        in_backup = False
+        for line in lines:
+            if line.startswith("backup:"):
+                in_backup = True
+            elif in_backup and line and not line.startswith(" "):
+                break
+            elif in_backup and line.startswith("  path:"):
+                value = _unquote_yaml_scalar(_strip_yaml_comment(line.split(":", 1)[1]).strip())
+                if value and Path(value).expanduser().is_dir():
+                    return Path(value).expanduser()
+                break
+    return None
+
+
 def import_ludusavi_to_snapshot(
     game_folder: Path,
     game_name: str = "",
@@ -611,9 +677,24 @@ def import_ludusavi_to_snapshot(
     """
     home = (home or Path.home()).resolve()
     name = game_name or str(load_mapping(game_folder).get("name") or game_folder.name)
-    _, plan, skipped = _plan_sources(game_folder, home)
-    usable = [(src, parts) for src, kind, parts in plan if kind == "prefix" and parts[0] in ("users", "ProgramData")]
-    skipped += len(plan) - len(usable)
+    # The newest full backup can hold only registry/config files; fall back to an older full one.
+    n_full = len([b for b in load_mapping(game_folder)["backups"] if isinstance(b, dict)])
+    for older in range(max(1, n_full)):
+        _, plan, skipped = _plan_sources(game_folder, home, _snapshot_target, older)
+        if plan:
+            break
+    usable: list[tuple[_Source, tuple[str, ...]]] = []
+    appid = ""
+    for src, kind, parts in plan:
+        if kind == "steamcloud":
+            m = re.search(r"/userdata/\d+/(\d+)/remote/", src.original)
+            if m is not None and appid in ("", m.group(1)):  # one Steam app per snapshot
+                appid = m.group(1)
+                usable.append((src, (kind, *parts)))
+            else:
+                skipped += 1
+        else:
+            usable.append((src, (parts if kind == "prefix" else (kind, *parts))))
     if not usable:
         return None, 0, skipped
     snap_dir = save_sync.snapshot_dir_for(name, dest_root)

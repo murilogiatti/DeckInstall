@@ -66,9 +66,11 @@ def test_steam_sources_prefix_and_cloud_without_caches(tmp_path: Path) -> None:
     found = {s.name: s for s in save_sources.steam_save_sources(paths)}
     assert set(found) == {"Proton Game", "Cloud Only"}  # tools and games without saves are left out
     proton, cloud = found["Proton Game"], found["Cloud Only"]
-    assert proton.steam_appid == 100 and proton.extra_dirs == ()
+    assert proton.steam_appid == 100
+    assert proton.extra_dirs == (("steamcloud", paths.userdata_dir / "100" / "remote"),)  # offered for restores
     assert cloud.extra_dirs == (("steamcloud", paths.userdata_dir / "200" / "remote"),)
     assert not cloud.prefix_dir.exists()
+    assert not (paths.userdata_dir / "100" / "remote").exists()  # nothing is created by looking
     assert save_sources.saves_size(proton.prefix_dir, proton.extra_dirs) == (len(b"proton-save"), 1)
     assert save_sources.saves_size(cloud.prefix_dir, cloud.extra_dirs) == (len(b"cloud-save"), 1)
 

@@ -130,3 +130,84 @@ def test_page_imports_backup_of_games_not_installed(tmp_path: Path) -> None:
             win.close()
             win.deleteLater()
             app.processEvents()
+
+
+def _unix_backup(tmp_path: Path, name: str, files: dict[str, bytes]) -> Path:
+    """A Linux-made Ludusavi backup: absolute /home/deck/... paths under drive-0 (as on the Steam Deck)."""
+    import hashlib
+
+    folder = tmp_path / "linux-backup" / name
+    lines = [f"name: {name}", "drives:", '  drive-0: ""', "backups:", '  - name: "."', '    when: "2025-12-04T15:02:54Z"',
+             "    os: linux", "    files:"]
+    for original, data in files.items():
+        dst = folder / "drive-0" / original.lstrip("/")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(data)
+        lines += [f"      {original}:", f"        hash: {hashlib.sha1(data).hexdigest()}", f"        size: {len(data)}"]  # noqa: S324
+    lines += ["    registry:", "      hash: ~", "    children: []"]
+    (folder / "mapping.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return folder
+
+
+def test_import_keeps_unix_paths_steam_cloud_heroic_and_home(tmp_path: Path) -> None:
+    deck = "/home/deck"
+    folder = _unix_backup(tmp_path, "Mixed", {
+        f"{deck}/.local/share/Steam/userdata/6890423/311340/remote/TPP_GAME_DATA": b"steam-cloud",
+        f"{deck}/Games/Heroic/Prefixes/default/Mixed/drive_c/users/deck/AppData/Local/Mixed/s.sav": b"heroic",
+        f"{deck}/Games/Heroic/Prefixes/default/Mixed/drive_c/Program Files/Mixed/game.dll": b"x",
+        f"{deck}/Syncthing/Mixed/game/saves/auto-1.save": b"native",
+        f"{deck}/.local/share/Steam/steamapps/shadercache/1/x.bin": b"cache",
+    })
+    snaps = tmp_path / "snaps"
+    snap, stored, skipped = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "other-home", dest_root=snaps)
+    assert snap is not None and (stored, skipped) == (3, 2)
+    with zipfile.ZipFile(snap) as zf:
+        assert {n: zf.read(n) for n in zf.namelist()} == {
+            "snap/steamcloud/TPP_GAME_DATA": b"steam-cloud",
+            "snap/users/steamuser/AppData/Local/Mixed/s.sav": b"heroic",
+            "snap/home/Syncthing/Mixed/game/saves/auto-1.save": b"native",
+        }
+
+    # Restore into an installed game: Steam cloud and prefix files land, home files never overwrite.
+    prefix, cloud, home = tmp_path / "pfx", tmp_path / "userdata" / "311340" / "remote", tmp_path / "home"
+    (prefix / "drive_c").mkdir(parents=True)
+    (home / "Syncthing/Mixed/game/saves").mkdir(parents=True)
+    (home / "Syncthing/Mixed/game/saves/auto-1.save").write_bytes(b"mine")
+    orig = save_sync._home_root
+    save_sync._home_root = lambda: home
+    try:
+        count, _safety = save_sync.restore_snapshot_safely(
+            snap, prefix, "Mixed", dest_root=snaps, extra_dirs=(("steamcloud", cloud),)
+        )
+    finally:
+        save_sync._home_root = orig
+    assert count == 2
+    assert (cloud / "TPP_GAME_DATA").read_bytes() == b"steam-cloud"
+    assert (prefix / "drive_c/users/steamuser/AppData/Local/Mixed/s.sav").read_bytes() == b"heroic"
+    assert (home / "Syncthing/Mixed/game/saves/auto-1.save").read_bytes() == b"mine"
+
+
+def test_ludusavi_backup_path_from_config(tmp_path: Path) -> None:
+    store = tmp_path / "bk"
+    store.mkdir()
+    cfg = tmp_path / ".var/app/com.github.mtkennerly.ludusavi/config/ludusavi/config.yaml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(f"roots:\n- store: steam\n  path: /nope\nbackup:\n  path: {store}\n  format:\n    chosen: simple\n")
+    assert lds.ludusavi_backup_path(tmp_path) == store
+    assert lds.ludusavi_backup_path(tmp_path / "empty") is None
+
+
+def test_import_falls_back_to_older_full_backup_when_newest_has_no_saves(tmp_path: Path) -> None:
+    folder = _unix_backup(tmp_path, "Old", {"/home/deck/.local/share/Steam/userdata/1/2/remote/slot": b"save"})
+    text = (folder / "mapping.yaml").read_text(encoding="utf-8").replace("    children: []\n", "    children: []\n", 1)
+    text += (
+        '  - name: backup-20261102T160642Z\n    when: "2026-11-02T16:06:42Z"\n    os: linux\n    files:\n'
+        "      /home/deck/.local/share/Steam/steamapps/compatdata/9/pfx/system.reg:\n"
+        "        hash: da39a3ee5e6b4b0d3255bfef95601890afd80709\n        size: 0\n    children: []\n"
+    )
+    bk = folder / "backup-20261102T160642Z" / "drive-0" / "home/deck/.local/share/Steam/steamapps/compatdata/9/pfx"
+    bk.mkdir(parents=True)
+    (bk / "system.reg").write_bytes(b"")
+    (folder / "mapping.yaml").write_text(text, encoding="utf-8")
+    snap, stored, skipped = lds.import_ludusavi_to_snapshot(folder, home=Path("/home/deck"), dest_root=tmp_path / "s")
+    assert snap is not None and (stored, skipped) == (1, 0)

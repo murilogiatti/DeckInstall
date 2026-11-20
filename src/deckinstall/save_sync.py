@@ -1400,7 +1400,7 @@ def _parse_sync_zip_entry(
     parts = Path(filename).parts
     if any(p in ("..", "", ".") for p in parts):
         return None
-    valid_sections = ("users", "ProgramData", "game", "registry", *EXTRA_SECTIONS)
+    valid_sections = ("users", "ProgramData", "game", "registry", "home", *EXTRA_SECTIONS)
     if len(parts) >= 2 and parts[0] in valid_sections:
         return parts[0], parts[1:]
     if len(parts) >= 3 and parts[1] in valid_sections:
@@ -1458,6 +1458,11 @@ def pull_game_saves(
     return restored_files, snap_path
 
 
+
+
+def _home_root() -> Path:
+    """Home folder for "home" snapshot entries (a seam for tests)."""
+    return Path.home()
 
 
 def _restore_saves_archive(
@@ -1529,6 +1534,16 @@ def _restore_saves_archive(
                 base_resolved = game_dir_resolved
                 check_parts = rel_parts[:-1]
                 target = game_dir.joinpath(*rel_parts)
+            elif section == "home":
+                # Files imported from a Ludusavi backup that live under $HOME (native games):
+                # only put them back where nothing exists yet; the safety snapshot does not cover $HOME.
+                home_root = _home_root()
+                base_dir = home_root
+                base_resolved = home_root.resolve()
+                check_parts = rel_parts[:-1]
+                target = home_root.joinpath(*rel_parts)
+                if target.exists() or target.is_symlink():
+                    continue
             elif section in EXTRA_SECTIONS:
                 extra_root = extras.get(section)
                 if extra_root is None or extra_root.is_symlink():

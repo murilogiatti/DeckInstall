@@ -83,9 +83,11 @@ def steam_save_sources(paths: SteamPaths) -> list[ExternalSaves]:
                 sa / "compatdata" / str(appid) / "pfx",
             )
             cloud = paths.userdata_dir / str(appid) / "remote"
-            extra: ExtraDirs = (("steamcloud", cloud),) if cloud.is_dir() and not cloud.is_symlink() else ()
-            if not prefix.is_dir() and not extra:
+            if not prefix.is_dir() and not cloud.is_dir():
                 continue
+            # The cloud folder is offered even before it exists, so imported saves can be restored into it.
+            offer_cloud = not cloud.is_symlink() and paths.userdata_dir.is_dir()
+            extra: ExtraDirs = (("steamcloud", cloud),) if offer_cloud else ()
             installdir = str(state.get("installdir") or "")
             game_dir = sa / "common" / installdir if installdir else None
             seen.add(appid)

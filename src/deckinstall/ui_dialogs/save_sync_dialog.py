@@ -307,10 +307,13 @@ def build_saves_page(win: MainWindow) -> QWidget:
     win.btn_save_export.clicked.connect(lambda: _ludusavi_pick(win, export=True))
     win.btn_save_import = QPushButton(tr("saves.btn_import"))
     win.btn_save_import.clicked.connect(lambda: _ludusavi_pick(win, export=False))
+    win.btn_save_import_one = QPushButton(tr("saves.btn_import_one"))
+    win.btn_save_import_one.clicked.connect(lambda: _ludusavi_pick(win, export=False, one=True))
     for b in (win.btn_save_snapshot_now, win.btn_save_restore_selected, win.btn_save_open_folder):
         footer.addWidget(b)
     footer.addStretch()
     footer.addWidget(win.btn_save_export)
+    footer.addWidget(win.btn_save_import_one)
     footer.addWidget(win.btn_save_import)
     card_layout.addLayout(footer)
 
@@ -327,6 +330,7 @@ def save_row_buttons(win: MainWindow) -> tuple[QPushButton, ...]:
         win.btn_save_open_folder,
         win.btn_save_export,
         win.btn_save_import,
+        win.btn_save_import_one,
     )
 
 
@@ -344,7 +348,8 @@ def update_saves_action_states(win: MainWindow) -> None:
     win.btn_save_restore_selected.setEnabled(idle and has_target and row is not None and row.snapshots > 0)
     win.btn_save_open_folder.setEnabled(row is not None)
     win.btn_save_export.setEnabled(idle and has_target)
-    win.btn_save_import.setEnabled(idle)  # without an installed game it imports into a snapshot
+    win.btn_save_import.setEnabled(idle)  # every game of a backup folder, installed or not
+    win.btn_save_import_one.setEnabled(idle and has_target)
 
 
 def refresh_saves_page(win: MainWindow, after_play: bool = True, scan_sources: bool = True) -> None:
@@ -607,25 +612,34 @@ def _import_to_snapshots(win: MainWindow, root: Path, row: SaveRow | None) -> No
     _run(win, tr("saves.import_running", name=root.name), _job, _ok)
 
 
-def _ludusavi_pick(win: MainWindow, *, export: bool) -> None:
+def _ludusavi_start_dir(win: MainWindow) -> Path:
+    """Last folder used, else the backup folder from Ludusavi's own config, else ~/ludusavi-backup."""
+    saved = str(win.settings.value(LUDUSAVI_DIR_KEY, "") or "")
+    for cand in (Path(saved) if saved else None, lds.ludusavi_backup_path(), Path.home() / "ludusavi-backup"):
+        if cand is not None and cand.is_dir():
+            return cand
+    return Path.home()
+
+
+def _ludusavi_pick(win: MainWindow, *, export: bool, one: bool = False) -> None:
+    """Export/import-one work on the selected game; plain import takes every game of a backup folder."""
     row = _selected_row(win)
-    if win._steam_busy or (export and (row is None or row.target is None)):
+    if win._steam_busy or ((export or one) and (row is None or row.target is None)):
         return
-    if row is None or row.target is None:
-        start_dir = Path(str(win.settings.value(LUDUSAVI_DIR_KEY, str(Path.home() / "ludusavi-backup"))))
+    if not export and not one:
+        row = None
+        start_dir = _ludusavi_start_dir(win)
 
         def _picked_root(chosen: str) -> None:
             if chosen:
                 win.settings.setValue(LUDUSAVI_DIR_KEY, str(Path(chosen)))
                 _import_to_snapshots(win, Path(chosen), row)
 
-        _pick_dir_async(
-            _dialog_parent(win), tr("saves.pick_import"),
-            start_dir if start_dir.is_dir() else Path.home(), _picked_root,
-        )
+        _pick_dir_async(_dialog_parent(win), tr("saves.pick_import"), start_dir, _picked_root)
         return
+    assert row is not None and row.target is not None
     t = row.target
-    start = Path(str(win.settings.value(LUDUSAVI_DIR_KEY, str(Path.home() / "ludusavi-backup"))))
+    start = _ludusavi_start_dir(win)
     title = tr("saves.pick_export") if export else tr("saves.pick_import")
 
     def _picked(chosen: str) -> None:
@@ -670,7 +684,7 @@ def _ludusavi_pick(win: MainWindow, *, export: bool) -> None:
             _ok,
         )
 
-    _pick_dir_async(_dialog_parent(win), title, start if start.is_dir() else Path.home(), _picked)
+    _pick_dir_async(_dialog_parent(win), title, start, _picked)
 
 
 def open_save_sync_dialog(win: MainWindow) -> None:
