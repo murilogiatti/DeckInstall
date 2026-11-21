@@ -65,27 +65,41 @@ def cpu_short_name() -> str:
     return ""
 
 
-def _gpu_models() -> list[str]:
-    """Display-controller models from lspci, in bus order."""
+def _gpus() -> list[tuple[str, str]]:
+    """(PCI address, model) of each display controller from lspci, in bus order."""
     try:
         out = subprocess.run(
-            ["lspci", "-mm"], capture_output=True, text=True, timeout=3, check=False
+            ["lspci", "-D", "-mm"], capture_output=True, text=True, timeout=3, check=False
         ).stdout
     except (OSError, subprocess.TimeoutExpired):
         return []
-    models: list[str] = []
+    gpus: list[tuple[str, str]] = []
     for line in out.splitlines():
         parts = re.findall(r'"([^"]*)"', line)
         if len(parts) >= 3 and re.search(r"VGA|3D|Display", parts[0], re.I):
-            models.append(parts[2])
-    return models
+            gpus.append((line.split(maxsplit=1)[0], parts[2]))
+    return gpus
 
 
-@lru_cache(maxsize=1)
-def gpu_short_name() -> str:
-    """Short name of the main GPU: a discrete one when there is also an integrated GPU."""
-    models = _gpu_models()
-    if not models:
-        return ""
-    discrete = [m for m in models if re.search(r"RTX|GTX|\bRX\b|Arc|GeForce", m, re.I)]
-    return shorten_gpu((discrete or models)[0])
+def _is_discrete(model: str) -> bool:
+    return bool(re.search(r"RTX|GTX|\bRX\b|Arc|GeForce|Quadro", model, re.I))
+
+
+@lru_cache(maxsize=2)
+def game_gpu(prime_offload: bool = False) -> tuple[str, str]:
+    """(short name, PCI address) of the GPU the game runs on; the address is "" with a single GPU.
+
+    Hybrid laptops render on the integrated GPU unless PRIME offload sends the game to the
+    discrete one. MangoHud shows every GPU (GPU0, GPU1...) and puts gpu_text on the first, so the
+    address goes to pci_dev to make the overlay follow, and name, the right GPU.
+    """
+    gpus = _gpus()
+    if not gpus:
+        return "", ""
+    if len(gpus) == 1:
+        return shorten_gpu(gpus[0][1]), ""
+    discrete = [g for g in gpus if _is_discrete(g[1])]
+    integrated = [g for g in gpus if not _is_discrete(g[1])]
+    pool = (discrete or gpus) if prime_offload or not integrated else integrated
+    addr, model = pool[0]
+    return shorten_gpu(model), addr

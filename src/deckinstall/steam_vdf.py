@@ -2590,13 +2590,15 @@ def _is_managed_mangohud_config(value: str) -> bool:
     ):
         return True
     parts = [p.strip() for p in cleaned.split(",") if p.strip()]
-    return bool(parts) and all(p.startswith(("position=", "fps_limit=", "cpu_text=", "gpu_text=")) for p in parts)
+    managed = ("position=", "fps_limit=", "cpu_text=", "gpu_text=", "pci_dev=")
+    return bool(parts) and all(p.startswith(managed) for p in parts)
 
 
 def _build_mangohud_config_parts(
     mangohud_level: int | None,
     mangohud_position: str,
     mangohud_fps_limit: int | None,
+    prime_offload: bool = False,
 ) -> list[str]:
     """Build managed MANGOHUD_CONFIG key-value parts from level, position, and FPS limit."""
     pos = mangohud_position.strip()
@@ -2624,13 +2626,15 @@ def _build_mangohud_config_parts(
 
     if mangohud_level in (2, 3, 4):
         # Real hardware names instead of the generic "CPU" / "GPU" labels.
-        from .hwnames import cpu_short_name, gpu_short_name
+        from .hwnames import cpu_short_name, game_gpu
 
-        cpu, gpu = cpu_short_name(), gpu_short_name()
+        cpu, (gpu, pci) = cpu_short_name(), game_gpu(prime_offload)
         if cpu:
             parts.append(f"cpu_text={cpu}")
         if gpu:
             parts.append(f"gpu_text={gpu}")
+        if pci:  # several GPUs: follow the one the game runs on (gpu_text names it)
+            parts.append(f"pci_dev={pci}")
 
     if mangohud_fps_limit and mangohud_fps_limit > 0:
         parts.append(f"fps_limit={mangohud_fps_limit}")
@@ -2666,7 +2670,7 @@ def apply_launch_presets(
         tokens = launch_options.split()
 
     mh_parts = (
-        _build_mangohud_config_parts(mangohud_level, mangohud_position, mangohud_fps_limit)
+        _build_mangohud_config_parts(mangohud_level, mangohud_position, mangohud_fps_limit, prime_offload)
         if mangohud
         else []
     )
