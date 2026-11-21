@@ -7,6 +7,7 @@ import os
 import sys
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -272,3 +273,50 @@ def test_import_result_text_counters() -> None:
     assert "1" in summary and details.count("\n") == 2
     summary, details = ssd.import_result_text([("A", 2, 0, True), ("B", 1, 0, True)])
     assert details == "" and summary == ssd.tr("saves.import_all_already")
+
+
+def test_existing_snapshots_match_the_installed_game_by_name(tmp_path: Path) -> None:
+    snaps = tmp_path / "snaps"
+    first, *_ = lds.import_ludusavi_to_snapshot(_backup(tmp_path, "Returnal™"), home=tmp_path / "h", dest_root=snaps)
+    assert first is not None
+    archives = save_sync.list_save_archives(tmp_path / "x", tmp_path / "legacy")  # empty roots: nothing
+    assert ssd.existing_snapshots_for("Returnal", archives) == []
+    entry = save_sync.SaveArchiveEntry(first, "save_snapshot", "", first.parent.name, 1.0, 1)
+    with mock.patch.object(save_sync, "DEFAULT_SNAPSHOTS_DIR", snaps):
+        assert ssd.existing_snapshots_for("Returnal", [entry]) == [entry]  # "Returnal™" == "Returnal"
+        assert ssd.existing_snapshots_for("Other Game", [entry]) == []
+        state = save_sync.SaveArchiveEntry(first, "state_snapshot", "", first.parent.name, 2.0, 1)
+        assert ssd.existing_snapshots_for("Returnal", [state]) == []  # only save snapshots are offered
+
+
+def test_ludusavi_backup_for_checks_the_game_name(tmp_path: Path) -> None:
+    folder = _backup(tmp_path, "My Game")
+    win = mock.Mock()
+    win.settings.value.return_value = str(tmp_path / "ludusavi")
+    with mock.patch.object(lds, "ludusavi_backup_path", return_value=None):
+        assert ssd.ludusavi_backup_for(win, "My Game") == folder
+        assert ssd.ludusavi_backup_for(win, "Another") is None
+        win.settings.value.return_value = str(folder)  # the saved root is one game's own backup
+        assert ssd.ludusavi_backup_for(win, "Another") is None
+
+
+def test_offer_existing_saves_restores_the_newest_when_accepted(tmp_path: Path) -> None:
+    game = mock.Mock(native_linux=False, prefix_dir=tmp_path / "pfx", game_dir=tmp_path / "g", steam_appid=None)
+    game.name = "My Game"
+    win = mock.Mock(_steam_busy=False, _closing_pending=False)
+    old = save_sync.SaveArchiveEntry(tmp_path / "a.zip", "save_snapshot", "", "my-game", 1.0, 1)
+    new = save_sync.SaveArchiveEntry(tmp_path / "b.zip", "save_snapshot", "", "my-game", 9.0, 1)
+    with (
+        mock.patch.object(ssd, "list_save_archives", return_value=[old, new]),
+        mock.patch.object(ssd, "game_log_dir", return_value=tmp_path / "logs"),
+        mock.patch.object(ssd, "_dialog_parent", return_value=None),
+        mock.patch.object(ssd.QMessageBox, "question", return_value=ssd.QMessageBox.StandardButton.No) as ask,
+        mock.patch.object(ssd, "_run") as run,
+    ):
+        ssd.offer_existing_saves(win, game)
+        assert ask.called and not run.called  # declined: nothing restored
+        ask.return_value = ssd.QMessageBox.StandardButton.Yes
+        with mock.patch.object(ssd, "_restore_job", return_value=(1, None, 0)) as job:
+            ssd.offer_existing_saves(win, game)
+            run.call_args.args[2]()  # the job given to the worker
+            assert job.call_args.args[1] is new

@@ -860,5 +860,7 @@
   "nav.maintenance": "Manutenção",
   "nav.back": "← Biblioteca",
   "maint.app_settings_title": "Aplicativo e Steam",
-  "play.hung": "O jogo fechou (provavelmente travou), mas o Proton/umu ficou preso esperando por ele. Os processos que sobraram foram encerrados."
+  "play.hung": "O jogo fechou (provavelmente travou), mas o Proton/umu ficou preso esperando por ele. Os processos que sobraram foram encerrados.",
+  "saves.offer_restore": "Encontrei {count} save(s) guardado(s) de '{name}' (o mais recente é de {date}).\n\nRestaurar o mais recente agora? Antes é feita uma cópia de segurança do que estiver no jogo.",
+  "saves.offer_ludusavi": "Encontrei um backup do Ludusavi de '{name}' em:\n{path}\n\nImportar os saves agora? Arquivos diferentes só são sobrescritos com cópia de segurança."
 }

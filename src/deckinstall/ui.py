@@ -169,6 +169,7 @@ from .ui_dialogs.relocate_dialog import move_game_to_disk
 from .ui_dialogs.save_sync_dialog import (
     AUTO_SNAPSHOT_KEY,
     build_saves_page,
+    offer_existing_saves,
     refresh_saves_page,
     save_row_buttons,
     snapshot_keep,
@@ -2304,6 +2305,7 @@ class MainWindow(QMainWindow):
                 if bwrap_warn:
                     self._show_bwrap_warning_dialog(bwrap_warn)
                 QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+                offer_existing_saves(self, game)  # a save from before (snapshot or Ludusavi)? offer it now
 
             def _err(err: str) -> None:
                 self._end_busy()

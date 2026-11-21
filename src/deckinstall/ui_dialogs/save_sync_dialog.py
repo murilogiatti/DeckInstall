@@ -55,7 +55,7 @@ from ..save_sync import (
     snapshot_dir_for,
     snapshot_display_name,
 )
-from ..standalone import game_log_dir
+from ..standalone import StandaloneGame, game_log_dir
 from ..steam_paths import SteamPaths, is_steam_running
 from ..steam_vdf import DEFAULT_SAVES_DIR
 from ..ui_cards import (
@@ -696,6 +696,87 @@ def _remove_import_duplicates(win: MainWindow) -> None:
             logging.getLogger(__name__).warning("Could not remove %s: %s", p, exc)
     refresh_saves_page(win, after_play=False)
     _info(win, tr("saves.dedup_done", count=removed))
+
+
+def existing_snapshots_for(name: str, archives: list[SaveArchiveEntry]) -> list[SaveArchiveEntry]:
+    """Save snapshots kept for a game with this name (same folder, or same name ignoring case/symbols)."""
+    slug, key = _slugify(name), lds._norm_key(name)
+    return sorted(
+        (
+            a for a in archives
+            if a.kind == "save_snapshot"
+            and (a.game_slug == slug or (key and lds._norm_key(snapshot_display_name(a.game_slug)) == key))
+        ),
+        key=lambda a: a.mtime,
+        reverse=True,
+    )
+
+
+def ludusavi_backup_for(win: MainWindow, name: str) -> Path | None:
+    """The game's folder in the Ludusavi backup last used (or set in Ludusavi), when there is one."""
+    saved = str(win.settings.value(LUDUSAVI_DIR_KEY, "") or "")
+    for root in (Path(saved) if saved else None, lds.ludusavi_backup_path()):
+        if root is None or not root.is_dir():
+            continue
+        folder = lds.find_game_folder(root, name)
+        if folder is None:
+            continue
+        try:
+            found = str(lds.load_mapping(folder).get("name") or folder.name)
+        except (lds.LudusaviError, OSError):
+            continue
+        if lds._norm_key(found) == lds._norm_key(name):  # root may itself be another game's backup
+            return folder
+    return None
+
+
+def offer_existing_saves(win: MainWindow, game: StandaloneGame) -> None:
+    """Right after an install: offer the saves DeckInstall already has (snapshot or Ludusavi backup)."""
+    if game.native_linux or win._steam_busy or win._closing_pending:
+        return
+    parent = _dialog_parent(win)
+    target = SaveTarget(game.name, game.prefix_dir, game.game_dir, game.steam_appid, game_log_dir(game) / "run.log")
+    snaps = existing_snapshots_for(game.name, list_save_archives())
+    if snaps:
+        newest = snaps[0]
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(newest.mtime))
+        if QMessageBox.question(
+            parent, __app_name__, tr("saves.offer_restore", name=game.name, count=len(snaps), date=when)
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        def _restored(res: object) -> None:
+            count, safety, skipped = res if isinstance(res, tuple) and len(res) == 3 else (0, None, 0)
+            msg = tr("saves.snapshot_restored", name=game.name, count=count, safety=safety or "-")
+            if skipped:
+                msg += "\n" + tr("saves.home_skipped", count=skipped)
+            _info(win, msg)
+
+        _run(win, tr("saves.restore_running", name=game.name), lambda: _restore_job(target, newest), _restored)
+        return
+    folder = ludusavi_backup_for(win, game.name)
+    if folder is None:
+        return
+    if QMessageBox.question(
+        parent, __app_name__, tr("saves.offer_ludusavi", name=game.name, path=folder)
+    ) != QMessageBox.StandardButton.Yes:
+        return
+
+    def _imported(res: object) -> None:
+        if isinstance(res, lds.ImportResult):
+            _info(win, tr(
+                "saves.import_done", name=game.name, restored=res.restored, unchanged=res.unchanged,
+                kept=res.kept, skipped=res.skipped, safety=res.snapshot or "-",
+            ))
+
+    _run(
+        win,
+        tr("saves.import_running", name=game.name),
+        lambda: lds.import_ludusavi(
+            folder, game.prefix_dir, game.name, game_dir=game.game_dir, steam_appid=game.steam_appid
+        ),
+        _imported,
+    )
 
 
 def _ludusavi_start_dir(win: MainWindow) -> Path:

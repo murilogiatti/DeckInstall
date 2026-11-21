@@ -860,5 +860,7 @@
   "nav.maintenance": "Maintenance",
   "nav.back": "← Library",
   "maint.app_settings_title": "App and Steam",
-  "play.hung": "The game closed (it probably crashed), but Proton/umu stayed stuck waiting for it. The leftover processes were closed."
+  "play.hung": "The game closed (it probably crashed), but Proton/umu stayed stuck waiting for it. The leftover processes were closed.",
+  "saves.offer_restore": "Found {count} kept save(s) of '{name}' (newest from {date}).\n\nRestore the newest now? A safety copy of what the game has is made first.",
+  "saves.offer_ludusavi": "Found a Ludusavi backup of '{name}' in:\n{path}\n\nImport the saves now? Different files are only overwritten with a safety copy."
 }
