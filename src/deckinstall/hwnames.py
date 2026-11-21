@@ -6,6 +6,7 @@ launch options, e.g. "R5-5600H" or "RTX-3050".
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from functools import lru_cache
@@ -85,13 +86,28 @@ def _is_discrete(model: str) -> bool:
     return bool(re.search(r"RTX|GTX|\bRX\b|Arc|GeForce|Quadro", model, re.I))
 
 
+def _mangohud_index(pci_addr: str, drm_root: str = "/sys/class/drm") -> str:
+    """MangoHud's number for a GPU: its position among the renderD* nodes ("" when not found)."""
+    try:
+        nodes = sorted(
+            (n for n in os.listdir(drm_root) if n.startswith("renderD") and n[7:].isdigit()), key=lambda n: int(n[7:])
+        )
+    except OSError:
+        return ""
+    for idx, node in enumerate(nodes):
+        if os.path.basename(os.path.realpath(f"{drm_root}/{node}/device")) == pci_addr:
+            return str(idx)
+    return ""
+
+
 @lru_cache(maxsize=2)
 def game_gpu(prime_offload: bool = False) -> tuple[str, str]:
-    """(short name, PCI address) of the GPU the game runs on; the address is "" with a single GPU.
+    """(short name, MangoHud GPU number) of the GPU the game runs on; the number is "" with a single GPU.
 
     Hybrid laptops render on the integrated GPU unless PRIME offload sends the game to the
     discrete one. MangoHud shows every GPU (GPU0, GPU1...) and puts gpu_text on the first, so the
-    address goes to pci_dev to make the overlay follow, and name, the right GPU.
+    number goes to gpu_list to make the overlay follow, and name, the right GPU (pci_dev cannot be
+    used: ':' separates options in MANGOHUD_CONFIG).
     """
     gpus = _gpus()
     if not gpus:
@@ -102,4 +118,4 @@ def game_gpu(prime_offload: bool = False) -> tuple[str, str]:
     integrated = [g for g in gpus if not _is_discrete(g[1])]
     pool = (discrete or gpus) if prime_offload or not integrated else integrated
     addr, model = pool[0]
-    return shorten_gpu(model), addr
+    return shorten_gpu(model), _mangohud_index(addr)

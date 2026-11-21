@@ -2590,7 +2590,7 @@ def _is_managed_mangohud_config(value: str) -> bool:
     ):
         return True
     parts = [p.strip() for p in cleaned.split(",") if p.strip()]
-    managed = ("position=", "fps_limit=", "cpu_text=", "gpu_text=", "pci_dev=")
+    managed = ("position=", "fps_limit=", "cpu_text=", "gpu_text=", "gpu_list=")
     return bool(parts) and all(p.startswith(managed) for p in parts)
 
 
@@ -2628,13 +2628,13 @@ def _build_mangohud_config_parts(
         # Real hardware names instead of the generic "CPU" / "GPU" labels.
         from .hwnames import cpu_short_name, game_gpu
 
-        cpu, (gpu, pci) = cpu_short_name(), game_gpu(prime_offload)
+        cpu, (gpu, index) = cpu_short_name(), game_gpu(prime_offload)
         if cpu:
             parts.append(f"cpu_text={cpu}")
         if gpu:
             parts.append(f"gpu_text={gpu}")
-        if pci:  # several GPUs: follow the one the game runs on (gpu_text names it)
-            parts.append(f"pci_dev={pci}")
+        if index:  # several GPUs: show only the one the game runs on (gpu_text names it)
+            parts.append(f"gpu_list={index}")
 
     if mangohud_fps_limit and mangohud_fps_limit > 0:
         parts.append(f"fps_limit={mangohud_fps_limit}")
