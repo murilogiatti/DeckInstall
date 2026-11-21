@@ -32,6 +32,10 @@ _UE_VERSION_W_RE = re.compile(
 )
 # Stripped builds only keep the file version resource, "UE5-CL-0": the major version.
 _UE_MAJOR_RE = re.compile(rb"U\x00E\x00([45])\x00-\x00C\x00L\x00")
+# Crash client tag in Core of modular UE4 builds without a version string ("UE4CC-Windows-...").
+_UE_CC_RE = re.compile(rb"U\x00E\x00([45])\x00C\x00C\x00-\x00")
+# Modular Unreal builds keep each graphics backend in its own module: <Game>-D3D12RHI-Win64-Shipping.dll.
+_UE_RHI_RE = re.compile(r"(?:^|-)(d3d11|d3d12|vulkan)rhi(?:-win64-shipping)?\.dll$")
 _GODOT_VERSION_RE = re.compile(rb"Godot Engine v(\d+\.\d+(?:\.\d+)?)")
 
 _cache: dict[tuple[str, int, int], tuple[str, str]] = {}
@@ -130,6 +134,9 @@ def _unreal(tree: _Tree, exe: Path) -> tuple[str, Path | None] | None:
     crash = tree.files.get("crashreportclient.exe")
     if crash is not None:
         probes.append(crash)
+    core = next((p for n, p in tree.files.items() if n.endswith("-core-win64-shipping.dll")), None)
+    if core is not None:  # modular build: the engine version lives in Core, not in the .exe
+        probes.append(core)
     for probe in probes:
         m = _find_regex(probe, _UE_VERSION_RE)
         if m:
@@ -138,7 +145,7 @@ def _unreal(tree: _Tree, exe: Path) -> tuple[str, Path | None] | None:
         if w:
             minor = w[2].decode() + (w[3].decode() if w[3] else "")
             return f"UE{w[0].decode()} {w[1].decode()}.{minor}", shipping
-        major = _find_regex(probe, _UE_MAJOR_RE)
+        major = _find_regex(probe, _UE_MAJOR_RE) or _find_regex(probe, _UE_CC_RE)
         if major:
             return f"UE{major[0].decode()}", shipping
     return "Unreal Engine", shipping
@@ -224,6 +231,11 @@ def detect_game_tech(exe_path: Path, game_dir: Path | None = None) -> tuple[str,
             apis.add("dx12")
         elif name in ("d3d11.dll", "d3d10.dll", "d3d9.dll", "d3d8.dll"):
             apis.add("dx" + name[3:].split(".")[0])
+    rhis = {m.group(1) for name in tree.files if (m := _UE_RHI_RE.search(name))}
+    if rhis - {"vulkan"}:  # every UE build ships Vulkan/OpenGL too: on Windows the game runs on Direct3D
+        apis |= {"dx" + r[3:] for r in rhis if r != "vulkan"}
+    elif rhis:
+        apis.add("vulkan")
     if engine.startswith("Unity"):
         apis = apis or {"dx11"}  # Unity's player carries every backend, so only the default is claimed
     else:

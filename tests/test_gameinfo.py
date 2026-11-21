@@ -29,3 +29,25 @@ def test_unreal_version_and_directx_from_binary(tmp_path: Path) -> None:
 def test_unknown_game(tmp_path: Path) -> None:
     (tmp_path / "x.exe").write_bytes(b"MZ")
     assert detect_game_tech(tmp_path / "x.exe", None) == ("-", "Other")
+
+
+def test_modular_unreal_build_takes_api_from_rhi_modules(tmp_path: Path) -> None:
+    """Returnal-like build: the .exe imports no graphics DLL, each backend is its own module."""
+    bins = tmp_path / "Returnal" / "Binaries" / "Win64"
+    bins.mkdir(parents=True)
+    (tmp_path / "Engine").mkdir()
+    exe = bins / "Returnal-Win64-Shipping.exe"
+    exe.write_bytes(b"MZ UE4Game")
+    (bins / "Returnal-Core-Win64-Shipping.dll").write_bytes(b"MZ " + "UE4CC-Windows".encode("utf-16-le"))
+    for rhi in ("D3D11RHI", "D3D12RHI", "VulkanRHI", "OpenGLDrv"):
+        (bins / f"Returnal-{rhi}-Win64-Shipping.dll").write_bytes(b"MZ")
+    assert detect_game_tech(exe, tmp_path) == ("DirectX 11/12", "UE4")
+
+
+def test_vulkan_only_unreal_build(tmp_path: Path) -> None:
+    bins = tmp_path / "Game" / "Binaries" / "Win64"
+    bins.mkdir(parents=True)
+    exe = bins / "Game-Win64-Shipping.exe"
+    exe.write_bytes(b"MZ")
+    (bins / "Game-VulkanRHI-Win64-Shipping.dll").write_bytes(b"MZ")
+    assert detect_game_tech(exe, tmp_path)[0] == "Vulkan"
