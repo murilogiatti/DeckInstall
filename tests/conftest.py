@@ -61,6 +61,8 @@ def _isolated_libraries(tmp_path_factory: pytest.TempPathFactory, monkeypatch: p
     # Never read or write the real saved Steam edit queue.
     monkeypatch.setattr(vdf_queue, "default_queue_file", lambda: base / "data" / "vdf_queue.json")
     monkeypatch.setattr(save_sync, "DEFAULT_SNAPSHOTS_DIR", base / "home" / "Games" / "saves" / "snapshots")
+    # Cleanup scans default to Path.home() (~/Games/saves/backups etc.): use the empty test home.
+    monkeypatch.setenv("HOME", str(base / "home"))
     # Cached Steam/Gaming Mode checks must not leak from one test to the next.
     steam_paths.invalidate_process_cache()
     yield
