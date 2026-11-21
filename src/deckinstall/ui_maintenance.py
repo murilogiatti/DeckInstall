@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import os
 import sys
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QPoint, Qt, QUrl
@@ -16,7 +14,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QMenu,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -28,7 +25,6 @@ from . import __app_name__, __version__
 from .app_updater import get_running_appimage
 from .cleanup import GROUP_ORDER, CleanupCandidate
 from .i18n import tr
-from .space import CACHES, GAMES, PREFIXES, SOURCE_STEAM, SpaceReport
 from .ui_cards import (
     FlowLayout,
     _cleanup_candidate_auto_check,
@@ -45,7 +41,6 @@ from .ui_workers_maint import (
     MaintHealthWorker,
     MaintRevalWorker,
     MaintScanWorker,
-    SpaceScanWorker,
 )
 
 if TYPE_CHECKING:
@@ -110,7 +105,6 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     health_actions.addWidget(win.btn_app_update)
     health_layout.addLayout(health_actions)
     layout.addWidget(health_card)
-    layout.addWidget(_build_space_card(win))
 
     clean_card, clean_layout = _make_card()
     clean_top = QHBoxLayout()
@@ -168,8 +162,7 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     win.maint_list.horizontalHeader().setSectionResizeMode(
         2, QHeaderView.ResizeMode.ResizeToContents
     )
-    win.maint_list.horizontalHeader().setSectionsClickable(True)
-    win.maint_list.setSortingEnabled(True)
+    win.maint_list.horizontalHeader().setSectionsClickable(False)  # always largest first (_visible_maint_candidates)
     win.maint_list.setMinimumHeight(220)
     win.maint_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
     win.maint_list.customContextMenuRequested.connect(
@@ -198,187 +191,6 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     return page
 
 
-
-
-_SPACE_COLUMNS = 8
-
-
-def _build_space_card(win: MainWindow) -> QWidget:
-    """Space card: one usage bar per disk and a size table per game (filled by refresh_space)."""
-    card, card_layout = _make_card()
-    top = QHBoxLayout()
-    title = QLabel(tr("space.title"))
-    title.setObjectName("SectionTitle")
-    win.btn_space_refresh = QPushButton(tr("space.btn_refresh"))
-    win.btn_space_refresh.clicked.connect(lambda: refresh_space(win))
-    top.addWidget(title)
-    top.addStretch()
-    top.addWidget(win.btn_space_refresh)
-    card_layout.addLayout(top)
-
-    win.lbl_space_status = QLabel(tr("space.prompt"))
-    win.lbl_space_status.setObjectName("MutedText")
-    win.lbl_space_status.setWordWrap(True)
-    card_layout.addWidget(win.lbl_space_status)
-    disks_box = QWidget()
-    win.space_disks_layout = QVBoxLayout(disks_box)
-    win.space_disks_layout.setContentsMargins(0, 0, 0, 0)
-    win.space_disks_layout.setSpacing(4)
-    card_layout.addWidget(disks_box)
-    win.lbl_space_top = QLabel("")
-    win.lbl_space_top.setWordWrap(True)
-    win.lbl_space_top.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-    win.lbl_space_top.setVisible(False)
-    card_layout.addWidget(win.lbl_space_top)
-
-    table = QTableWidget(0, _SPACE_COLUMNS)
-    table.setHorizontalHeaderLabels(
-        [
-            tr("space.col_game"),
-            tr("space.col_library"),
-            tr("space.col_origin"),
-            tr("space.col_files"),
-            tr("space.col_prefix"),
-            tr("space.col_cache"),
-            tr("space.col_logs"),
-            tr("space.col_total"),
-        ]
-    )
-    table.verticalHeader().setVisible(False)
-    table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-    table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-    header = table.horizontalHeader()
-    header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-    for col in range(1, _SPACE_COLUMNS):
-        header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
-    table.setSortingEnabled(True)
-    table.setMinimumHeight(160)
-    table.setMaximumHeight(260)
-    table.setVisible(False)
-    win.space_games_list = table
-    card_layout.addWidget(table)
-    adopt_row = QWidget()
-    adopt_layout = QHBoxLayout(adopt_row)
-    adopt_layout.setContentsMargins(0, 0, 0, 0)
-    win.lbl_space_unmanaged = QLabel("")
-    win.lbl_space_unmanaged.setWordWrap(True)
-    win.btn_space_adopt = QPushButton(tr("space.btn_adopt"))
-    win.btn_space_adopt.clicked.connect(lambda: win._open_adopt_wizard())
-    adopt_layout.addWidget(win.lbl_space_unmanaged, 1)
-    adopt_layout.addWidget(win.btn_space_adopt)
-    adopt_row.setVisible(False)
-    win.space_adopt_row = adopt_row
-    card_layout.addWidget(adopt_row)
-    return card
-
-
-def refresh_space(win: MainWindow) -> None:
-    """Measure disks and games in a worker; only the latest request updates the card."""
-    win._space_req_id += 1
-    req_id = win._space_req_id
-    win.btn_space_refresh.setEnabled(False)
-    win.lbl_space_status.setText(tr("space.scanning"))
-    win.lbl_space_status.setVisible(True)
-
-    def _on_ready(r_id: int, report: SpaceReport) -> None:
-        if win._closing_pending or r_id != win._space_req_id:
-            return
-        win.btn_space_refresh.setEnabled(True)
-        apply_space_report(win, report)
-
-    def _on_failed(r_id: int, err: str) -> None:
-        if win._closing_pending or r_id != win._space_req_id:
-            return
-        win.btn_space_refresh.setEnabled(True)
-        win.lbl_space_status.setText(tr("space.error", err=err))
-
-    worker = SpaceScanWorker(req_id, getattr(win, "paths", None))
-    win._track_worker(worker)
-    worker.ready.connect(_on_ready)
-    worker.failed.connect(_on_failed)
-    worker.start()
-
-
-def _format_top_folders(folders: list[tuple[str, int]]) -> str:
-    """Biggest folders as plain text, one per line, sizes readable and paths shortened to ~."""
-    if not folders:
-        return ""
-    home = str(Path.home())
-    lines = [tr("space.top_title", count=len(folders))]
-    for path, size in folders:
-        short = "~" + path[len(home) :] if path == home or path.startswith(home + os.sep) else path
-        lines.append(tr("space.top_item", size=format_size_bytes(size), path=short))
-    return "\n".join(lines)
-
-
-def apply_space_report(win: MainWindow, report: SpaceReport) -> None:
-    """Show one bar per disk and one row per game."""
-    box = win.space_disks_layout
-    while box.count():
-        item = box.takeAt(0)
-        old = item.widget() if item is not None else None
-        if old is not None:
-            old.deleteLater()
-    for disk in report.disks:
-        names = ([tr("space.disk_internal")] if disk.internal else []) + disk.labels
-        head = QLabel(tr("space.disk_title", name=" / ".join(names) or disk.mount.name, mount=str(disk.mount)))
-        bar = QProgressBar()
-        bar.setRange(0, 1000)
-        bar.setValue(int(1000 * disk.used / disk.total) if disk.total else 0)
-        bar.setFormat(
-            tr(
-                "space.disk_bar",
-                used=format_size_bytes(disk.used),
-                total=format_size_bytes(disk.total),
-                free=format_size_bytes(disk.free),
-            ).replace("%", "%%")
-        )
-        detail = QLabel(
-            tr(
-                "space.disk_deckinstall",
-                total=format_size_bytes(disk.deckinstall_bytes),
-                games=format_size_bytes(disk.deckinstall[GAMES]),
-                prefixes=format_size_bytes(disk.deckinstall[PREFIXES]),
-                caches=format_size_bytes(disk.deckinstall[CACHES]),
-            )
-        )
-        detail.setObjectName("MutedText")
-        detail.setWordWrap(True)
-        for widget in (head, bar, detail):
-            box.addWidget(widget)
-
-    win.lbl_space_top.setText(_format_top_folders(report.top_folders))
-    win.lbl_space_top.setVisible(bool(report.top_folders))
-
-    table = win.space_games_list
-    table.setSortingEnabled(False)
-    table.setRowCount(0)
-    for row, game in enumerate(report.games):
-        table.insertRow(row)
-        table.setItem(row, 0, QTableWidgetItem(game.name))
-        table.setItem(row, 1, QTableWidgetItem(game.library or "-"))
-        steam = game.source == SOURCE_STEAM
-        table.setItem(row, 2, QTableWidgetItem(tr("space.origin_steam") if steam else tr("space.origin_deckinstall")))
-        if not game.available:
-            missing = _SortableTableItem(tr("space.unavailable"), -1)
-            missing.setToolTip(tr("space.unavailable_tip"))
-            table.setItem(row, _SPACE_COLUMNS - 1, missing)
-            continue
-        sizes = (game.game_bytes, game.prefix_bytes, game.cache_bytes, game.logs_bytes, game.total_bytes)
-        for col, size in enumerate(sizes, start=3):
-            cell = _SortableTableItem(format_size_bytes(size), size)
-            if col == 4 and game.shared_prefix:
-                shared = tr("space.shared")
-                cell.setText(f"{format_size_bytes(size)} ({shared})" if size else shared)
-                cell.setToolTip(tr("space.shared_tip"))
-            table.setItem(row, col, cell)
-    table.setSortingEnabled(True)
-    table.setVisible(bool(report.games))
-    win.lbl_space_status.setText("" if report.games else tr("space.games_empty"))
-    win.lbl_space_status.setVisible(not report.games)
-    unmanaged = sum(1 for g in report.games if g.source == SOURCE_STEAM)
-    win.lbl_space_unmanaged.setText(tr("space.unmanaged", count=unmanaged))
-    win.space_adopt_row.setVisible(unmanaged > 0)
 
 
 def refresh_maintenance_health(win: MainWindow) -> None:
@@ -444,10 +256,10 @@ def on_maint_item_changed(win: MainWindow, item: QTableWidgetItem) -> None:
 
 
 def _visible_maint_candidates(win: MainWindow) -> list[CleanupCandidate]:
-    """Return candidates of the active group pill ("all" = every group), ordered by group."""
+    """Return candidates of the active group pill ("all" = every group), largest first."""
     key = win._maint_active_filter
     cands = [c for c in win._maint_candidates if key == "all" or c.group == key]
-    return sorted(cands, key=lambda c: _GROUP_RANK.get(c.group, len(GROUP_ORDER)))
+    return sorted(cands, key=lambda c: (-c.size_bytes, _GROUP_RANK.get(c.group, len(GROUP_ORDER)), str(c.path)))
 
 
 def toggle_maint_filter_selection(win: MainWindow) -> None:
@@ -465,7 +277,6 @@ def toggle_maint_filter_selection(win: MainWindow) -> None:
 def _populate_maint_list(win: MainWindow) -> None:
     visible = _visible_maint_candidates(win)
     win.maint_list.blockSignals(True)
-    win.maint_list.setSortingEnabled(False)
     win.maint_list.clearSpans()
     win.maint_list.setRowCount(0)
     if not visible:
@@ -499,7 +310,6 @@ def _populate_maint_list(win: MainWindow) -> None:
                 format_size_bytes(cand.size_bytes), cand.size_bytes
             )
             win.maint_list.setItem(row, 2, size_item)
-    win.maint_list.setSortingEnabled(True)
     win.maint_list.blockSignals(False)
     _update_maint_summary(win)
 

@@ -282,14 +282,6 @@ class MainWindow(QMainWindow):
     lbl_maint_steamrt4: QLabel
     lbl_maint_disk: QLabel
     lbl_maint_summary: QLabel
-    btn_space_refresh: QPushButton
-    lbl_space_status: QLabel
-    lbl_space_top: QLabel
-    space_disks_layout: QVBoxLayout
-    space_games_list: QTableWidget
-    lbl_space_unmanaged: QLabel
-    btn_space_adopt: QPushButton
-    space_adopt_row: QWidget
     btn_update_runtimes: QPushButton
     btn_app_update: QPushButton
     # Backup/Sync page (ui_dialogs/save_sync_dialog.py)
@@ -350,7 +342,6 @@ class MainWindow(QMainWindow):
         self._search_req_id = 0
         self._preview_req_id = 0
         self._maint_health_req_id = 0
-        self._space_req_id = 0
         self._shortcuts_req_id = 0
         self._steam_detect_req_id = 0
         self._extract_worker: ExtractWorker | None = None

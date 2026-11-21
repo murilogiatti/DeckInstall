@@ -16,7 +16,6 @@ from .runtime_manager import (
     list_ge_proton11_dirs,
     validate_steamrt4_integrity,
 )
-from .space import scan_space
 from .steam_paths import SteamPaths, dir_size_bytes_many, find_proton_binary, find_steam_root
 from .steam_vdf import (
     ShortcutEntry,
@@ -123,24 +122,6 @@ class MaintHealthWorker(QThread):
                 "caches_bytes": self._cached_bytes,
             },
         )
-
-
-class SpaceScanWorker(QThread):
-    """Measure disk and per-game usage (space.scan_space) off the UI thread."""
-
-    ready = Signal(int, object)
-    failed = Signal(int, str)
-
-    def __init__(self, req_id: int, steam_paths: SteamPaths | None = None) -> None:
-        super().__init__()
-        self._req_id = req_id
-        self._steam_paths = steam_paths
-
-    def run(self) -> None:
-        try:
-            self.ready.emit(self._req_id, scan_space(steam_paths=self._steam_paths))
-        except Exception as exc:
-            self.failed.emit(self._req_id, _format_worker_error(exc))
 
 
 class MaintScanWorker(QThread):

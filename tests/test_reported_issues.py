@@ -256,9 +256,31 @@ class SortableTablesTests(unittest.TestCase):
         ):
             win = ui.MainWindow(app)
             try:
-                for widget in (win.games_list, win.shortcuts_list, win.maint_list):
+                for widget in (win.games_list, win.shortcuts_list):
                     self.assertIsInstance(widget, QTableWidget)
                     self.assertTrue(widget.isSortingEnabled())
+                # Cleanup list: always largest first, the header does not re-sort it.
+                from deckinstall import ui_maintenance
+                from deckinstall.cleanup import CleanupCandidate
+
+                self.assertFalse(win.maint_list.isSortingEnabled())
+                self.assertFalse(win.maint_list.horizontalHeader().sectionsClickable())
+
+                def _cand(name: str, size: int, group: str) -> CleanupCandidate:
+                    return CleanupCandidate("orphan", name, Path(tmp) / name, size, False, group=group)
+
+                cands = [_cand("a", 10, "games"), _cand("b", 3000, "system"), _cand("c", 500, "games")]
+
+                def _sizes() -> list[str]:
+                    return [win.maint_list.item(r, 1).text().rsplit("/", 1)[-1] for r in range(win.maint_list.rowCount())]
+
+                ui_maintenance._apply_maint_scan_results(win, cands)
+                self.assertEqual(_sizes(), ["b", "c", "a"])
+                ui_maintenance.on_maint_filter_changed(win, "games")
+                self.assertEqual(_sizes(), ["c", "a"])
+                ui_maintenance.on_maint_filter_changed(win, "all")
+                ui_maintenance._apply_maint_scan_results(win, cands[:1] + [_cand("d", 99999, "games")])
+                self.assertEqual(_sizes(), ["d", "a"])
             finally:
                 for worker in list(win._active_workers):
                     worker.wait(5000)
