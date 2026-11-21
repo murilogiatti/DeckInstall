@@ -2598,24 +2598,32 @@ def _build_mangohud_config_parts(
     mangohud_level: int | None,
     mangohud_position: str,
     mangohud_fps_limit: int | None,
-    prime_offload: bool = False,
 ) -> list[str]:
     """Build managed MANGOHUD_CONFIG key-value parts from level, position, and FPS limit."""
     pos = mangohud_position.strip()
     if mangohud_level == 2:
+        # One line at the top, like MangoHud's preset 2 (the Steam Deck "horizontal" level) plus temperatures:
+        # FPS + frame time graph, GPU and CPU load/temp/watts, VRAM/RAM and battery (hidden without one).
         parts = [
             "legacy_layout=0",
             "horizontal",
             "hud_compact",
+            "table_columns=20",
             f"position={pos or 'top-center'}",
             "fps",
             "frametime",
+            "frame_timing",
             "gpu_stats",
             "gpu_temp",
+            "gpu_power",
             "cpu_stats",
             "cpu_temp",
+            "cpu_power",
             "vram",
             "ram",
+            "battery",
+            "battery_watt",
+            "battery_time",
         ]
     elif mangohud_level in (1, 3, 4):
         parts = [f"preset={mangohud_level}"]
@@ -2626,15 +2634,13 @@ def _build_mangohud_config_parts(
 
     if mangohud_level in (2, 3, 4):
         # Real hardware names instead of the generic "CPU" / "GPU" labels.
-        from .hwnames import cpu_short_name, game_gpu
+        from .hwnames import cpu_short_name, mangohud_gpu_text
 
-        cpu, (gpu, index) = cpu_short_name(), game_gpu(prime_offload)
+        cpu, gpu = cpu_short_name(), mangohud_gpu_text()
         if cpu:
             parts.append(f"cpu_text={cpu}")
         if gpu:
-            parts.append(f"gpu_text={gpu}")
-        if index:  # several GPUs: show only the one the game runs on (gpu_text names it)
-            parts.append(f"gpu_list={index}")
+            parts.append(f"gpu_text={gpu}")  # one name per GPU: "RTX-3050+Radeon-Vega" on hybrid laptops
 
     if mangohud_fps_limit and mangohud_fps_limit > 0:
         parts.append(f"fps_limit={mangohud_fps_limit}")
@@ -2670,7 +2676,7 @@ def apply_launch_presets(
         tokens = launch_options.split()
 
     mh_parts = (
-        _build_mangohud_config_parts(mangohud_level, mangohud_position, mangohud_fps_limit, prime_offload)
+        _build_mangohud_config_parts(mangohud_level, mangohud_position, mangohud_fps_limit)
         if mangohud
         else []
     )

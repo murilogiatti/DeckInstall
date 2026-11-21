@@ -33,43 +33,55 @@ def test_gpu(raw: str, short: str) -> None:
     assert shorten_gpu(raw) == short
 
 
-def test_game_gpu_follows_prime_offload_on_hybrid_laptops(monkeypatch: pytest.MonkeyPatch) -> None:
+def _drm(tmp_path, nodes) -> str:
+    """Fake /sys/class/drm: renderD node -> (PCI address, driver)."""
+    for node, (addr, driver) in nodes.items():
+        dev = tmp_path / "devices" / addr
+        (dev / "drv").mkdir(parents=True)
+        (tmp_path / "drivers" / driver).mkdir(parents=True, exist_ok=True)
+        (tmp_path / node).mkdir()
+        (tmp_path / node / "device").symlink_to(dev)
+        (dev / "driver").symlink_to(tmp_path / "drivers" / driver)
+    return str(tmp_path)
+
+
+def test_mangohud_gpus_follow_render_nodes_and_drivers(tmp_path) -> None:
     from deckinstall import hwnames
 
-    hybrid = [
+    root = _drm(tmp_path, {
+        "renderD129": ("0000:06:00.0", "amdgpu"),
+        "renderD128": ("0000:01:00.0", "nvidia"),
+        "renderD130": ("0000:07:00.0", "nouveau"),  # MangoHud skips this driver: no number
+    })
+    assert hwnames._mangohud_gpus(root) == ["0000:01:00.0", "0000:06:00.0"]
+
+
+def test_gpu_text_names_every_gpu_in_mangohud_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    from deckinstall import hwnames
+
+    monkeypatch.setattr(hwnames, "_gpus", lambda: [
         ("0000:01:00.0", "GA107M [GeForce RTX 3050 Mobile]"),
         ("0000:06:00.0", "Cezanne [Radeon Vega Series / Radeon Vega Mobile Series]"),
-    ]
-    monkeypatch.setattr(hwnames, "_gpus", lambda: hybrid)
-    monkeypatch.setattr(hwnames, "_mangohud_index", lambda addr: {"0000:01:00.0": "0", "0000:06:00.0": "1"}[addr])
-    hwnames.game_gpu.cache_clear()
-    assert hwnames.game_gpu(True) == ("RTX-3050", "0")
-    assert hwnames.game_gpu(False) == ("Radeon-Vega", "1")
+    ])
+    monkeypatch.setattr(hwnames, "_mangohud_gpus", lambda: ["0000:06:00.0", "0000:01:00.0"])
+    hwnames.mangohud_gpu_text.cache_clear()
+    assert hwnames.mangohud_gpu_text() == "Radeon-Vega+RTX-3050"  # GPU0 is whatever renderD128 is
     monkeypatch.setattr(hwnames, "_gpus", lambda: [("0000:04:00.0", "VanGogh [AMD Custom GPU 0405]")])
-    hwnames.game_gpu.cache_clear()
-    assert hwnames.game_gpu(True) == ("GPU-0405", "")  # Steam Deck: one GPU, no pci_dev
-    hwnames.game_gpu.cache_clear()
+    monkeypatch.setattr(hwnames, "_mangohud_gpus", lambda: ["0000:04:00.0"])
+    hwnames.mangohud_gpu_text.cache_clear()
+    assert hwnames.mangohud_gpu_text() == "GPU-0405"  # Steam Deck: one GPU
+    hwnames.mangohud_gpu_text.cache_clear()
 
 
-def test_mangohud_config_names_and_pins_the_game_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_level_2_is_the_full_top_bar(monkeypatch: pytest.MonkeyPatch) -> None:
     from deckinstall import hwnames, steam_vdf
 
     monkeypatch.setattr(hwnames, "cpu_short_name", lambda: "R5-5600H")
-    monkeypatch.setattr(hwnames, "game_gpu", lambda prime=False: ("RTX-3050", "0") if prime else ("Radeon-Vega", "1"))
-    on = steam_vdf.apply_launch_presets("%command%", False, True, False, False, False, mangohud_level=2, prime_offload=True)
-    assert "gpu_text=RTX-3050,gpu_list=0" in on and "__NV_PRIME_RENDER_OFFLOAD=1" in on
-    off = steam_vdf.apply_launch_presets(on, False, True, False, False, False, mangohud_level=2, prime_offload=False)
-    assert "gpu_text=Radeon-Vega,gpu_list=1" in off and "RTX-3050" not in off and off.count("MANGOHUD_CONFIG") == 1
-
-
-def test_mangohud_index_follows_render_nodes(tmp_path) -> None:
-    from deckinstall import hwnames
-
-    for node, addr in (("renderD129", "0000:06:00.0"), ("renderD128", "0000:01:00.0")):
-        (tmp_path / "devices" / addr).mkdir(parents=True)
-        (tmp_path / node).mkdir()
-        (tmp_path / node / "device").symlink_to(tmp_path / "devices" / addr)
-    (tmp_path / "card1").mkdir()
-    assert hwnames._mangohud_index("0000:01:00.0", str(tmp_path)) == "0"
-    assert hwnames._mangohud_index("0000:06:00.0", str(tmp_path)) == "1"
-    assert hwnames._mangohud_index("0000:09:00.0", str(tmp_path)) == ""
+    monkeypatch.setattr(hwnames, "mangohud_gpu_text", lambda: "RTX-3050+Radeon-Vega")
+    old = "MANGOHUD=1 MANGOHUD_CONFIG=legacy_layout=0,horizontal,hud_compact,gpu_text=RTX-3050,gpu_list=0 %command%"
+    opts = steam_vdf.apply_launch_presets(old, False, True, False, False, False, mangohud_level=2)
+    assert opts.count("MANGOHUD_CONFIG") == 1 and "gpu_list" not in opts
+    cfg = opts.split("MANGOHUD_CONFIG=")[1].split()[0].split(",")
+    for key in ("fps", "frame_timing", "gpu_power", "cpu_power", "vram", "ram", "battery", "battery_watt"):
+        assert key in cfg
+    assert "gpu_text=RTX-3050+Radeon-Vega" in cfg and "cpu_text=R5-5600H" in cfg

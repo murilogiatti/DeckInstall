@@ -82,40 +82,34 @@ def _gpus() -> list[tuple[str, str]]:
     return gpus
 
 
-def _is_discrete(model: str) -> bool:
-    return bool(re.search(r"RTX|GTX|\bRX\b|Arc|GeForce|Quadro", model, re.I))
+# GPU drivers MangoHud reads (gpu.cpp); a GPU on another driver (e.g. nouveau) gets no number.
+_MANGOHUD_DRIVERS = frozenset({"amdgpu", "nvidia", "i915", "xe", "panfrost", "panthor", "msm_dpu", "msm_drm"})
 
 
-def _mangohud_index(pci_addr: str, drm_root: str = "/sys/class/drm") -> str:
-    """MangoHud's number for a GPU: its position among the renderD* nodes ("" when not found)."""
+def _mangohud_gpus(drm_root: str = "/sys/class/drm") -> list[str]:
+    """PCI addresses of the GPUs MangoHud shows, in its order (GPU0, GPU1...: renderD* node order)."""
     try:
-        nodes = sorted(
-            (n for n in os.listdir(drm_root) if n.startswith("renderD") and n[7:].isdigit()), key=lambda n: int(n[7:])
-        )
+        nodes = sorted(n for n in os.listdir(drm_root) if n.startswith("renderD") and n[7:].isdigit())
     except OSError:
-        return ""
-    for idx, node in enumerate(nodes):
-        if os.path.basename(os.path.realpath(f"{drm_root}/{node}/device")) == pci_addr:
-            return str(idx)
-    return ""
+        return []
+    out: list[str] = []
+    for node in nodes:
+        driver = os.path.basename(os.path.realpath(f"{drm_root}/{node}/device/driver"))
+        if driver in _MANGOHUD_DRIVERS:
+            out.append(os.path.basename(os.path.realpath(f"{drm_root}/{node}/device")))
+    return out
 
 
-@lru_cache(maxsize=2)
-def game_gpu(prime_offload: bool = False) -> tuple[str, str]:
-    """(short name, MangoHud GPU number) of the GPU the game runs on; the number is "" with a single GPU.
+@lru_cache(maxsize=1)
+def mangohud_gpu_text() -> str:
+    """gpu_text for MangoHud: one name per GPU it shows, joined with '+' ("RTX-3050+Radeon-Vega").
 
-    Hybrid laptops render on the integrated GPU unless PRIME offload sends the game to the
-    discrete one. MangoHud shows every GPU (GPU0, GPU1...) and puts gpu_text on the first, so the
-    number goes to gpu_list to make the overlay follow, and name, the right GPU (pci_dev cannot be
-    used: ':' separates options in MANGOHUD_CONFIG).
+    MangoHud shows every GPU (like the Steam Deck overlay shows its one GPU) and takes gpu_text as
+    a list, one entry per GPU number; without it a hybrid laptop reads "GPU0 / GPU1".
     """
-    gpus = _gpus()
-    if not gpus:
-        return "", ""
-    if len(gpus) == 1:
-        return shorten_gpu(gpus[0][1]), ""
-    discrete = [g for g in gpus if _is_discrete(g[1])]
-    integrated = [g for g in gpus if not _is_discrete(g[1])]
-    pool = (discrete or gpus) if prime_offload or not integrated else integrated
-    addr, model = pool[0]
-    return shorten_gpu(model), _mangohud_index(addr)
+    models = dict(_gpus())
+    order = _mangohud_gpus()
+    if not order:  # no sysfs (containers, tests): lspci order is the best guess
+        order = list(models)
+    names = [shorten_gpu(models.get(addr, "")) or "GPU" for addr in order]
+    return "+".join(names)
