@@ -49,6 +49,9 @@ GE_PROTON_RELEASES_URL = (
 OPTISCALER_RELEASES_API = (
     "https://api.github.com/repos/optiscaler/OptiScaler/releases/latest"
 )
+MANGOHUD_RELEASES_API = (
+    "https://api.github.com/repos/flightlessmango/MangoHud/releases/latest"
+)
 
 UPDATE_CACHE_TTL_SECONDS = 24 * 60 * 60
 USER_AGENT = f"DeckInstall/{__version__}"
@@ -69,6 +72,7 @@ UMU_DATABASE_URL = "https://raw.githubusercontent.com/Open-Wine-Components/umu-d
 UMU_DATABASE_TTL_SECONDS = 7 * 24 * 60 * 60
 _VERSIONS_LOCK = threading.Lock()
 _OPTISCALER_LOCK = threading.Lock()
+_MANGOHUD_LOCK = threading.Lock()
 
 WINETRICKS_PRESETS: dict[str, str] = {
     "vcrun2022": "Visual C++ 2015-2022 Redistributable",
@@ -253,6 +257,109 @@ def get_versions_file() -> Path:
 def get_optiscaler_dir() -> Path:
     """Return the directory containing the cached OptiScaler runtime payload."""
     return get_runtime_dir() / "optiscaler" / "current"
+
+
+def get_mangohud_dir() -> Path:
+    """Official MangoHud build kept by DeckInstall (lib32/, lib64/ and the layer manifests)."""
+    return get_runtime_dir() / "mangohud"
+
+
+def get_user_vulkan_layer_dir() -> Path:
+    """User Vulkan implicit layers: searched before the system ones, also inside Steam's runtime."""
+    data_home = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(data_home) / "vulkan" / "implicit_layer.d"
+
+
+_MANGOHUD_LAYERS = (("MangoHud.x86_64.json", "lib64"), ("MangoHud.x86.json", "lib32"))
+
+
+def official_mangohud_installed() -> bool:
+    """True when the user layers point at DeckInstall's official MangoHud and its libraries exist."""
+    for json_name, lib in _MANGOHUD_LAYERS:
+        expected = get_mangohud_dir() / lib / "libMangoHud.so"
+        try:
+            layer = json.loads((get_user_vulkan_layer_dir() / json_name).read_text(encoding="utf-8"))
+            path = Path(str(layer["layer"]["library_path"]))
+        except (OSError, ValueError, KeyError, TypeError):
+            return False
+        if path != expected or not expected.is_file():
+            return False
+    return True
+
+
+def _write_mangohud_layers(mh_dir: Path) -> None:
+    """User layer manifests copied from the release, pointing at mh_dir (same layer names: they win)."""
+    layer_dir = get_user_vulkan_layer_dir()
+    layer_dir.mkdir(parents=True, exist_ok=True)
+    for json_name, lib in _MANGOHUD_LAYERS:
+        layer = json.loads((mh_dir / "layers" / json_name).read_text(encoding="utf-8"))
+        layer["layer"]["library_path"] = str(mh_dir / lib / "libMangoHud.so")
+        atomic_write_text(layer_dir / json_name, json.dumps(layer, indent=4) + "\n")
+
+
+def _pick_mangohud_asset(release: dict[str, Any]) -> dict[str, Any]:
+    for asset in release.get("assets") or []:
+        name = str(asset.get("name", "")) if isinstance(asset, dict) else ""
+        if re.fullmatch(r"MangoHud-[\w.+-]+\.tar\.gz", name) and "Source" not in name:
+            return asset
+    raise RuntimeError("No MangoHud binary package in the latest GitHub release.")
+
+
+def ensure_mangohud(force_update: bool = False, progress_cb: ProgressCb | None = None) -> Path:
+    """Install (or update) the official MangoHud from GitHub for this user, on any distro, without root.
+
+    Distro packages can be built without NVIDIA support (Debian/Ubuntu "DFSG": NVML removed), so
+    DeckInstall always uses the upstream build: libraries under runtime/mangohud and the Vulkan
+    layer manifests in ~/.local/share/vulkan/implicit_layer.d, which win over a system MangoHud.
+    """
+    mh_dir = get_mangohud_dir()
+    mh_dir.parent.mkdir(parents=True, exist_ok=True)
+    with _MANGOHUD_LOCK:
+        if not force_update and (mh_dir / "lib64" / "libMangoHud.so").is_file():
+            _write_mangohud_layers(mh_dir)
+            return mh_dir
+        _emit_progress(progress_cb, "Checking latest MangoHud release...", 0)
+        release = _fetch_json(MANGOHUD_RELEASES_API)
+        if not isinstance(release, dict):
+            raise RuntimeError("Unexpected GitHub release response for MangoHud.")
+        tag = str(release.get("tag_name", "")).strip()
+        asset = _pick_mangohud_asset(release)
+        asset_name = _sanitize_asset_name(str(asset["name"]))
+        with tempfile.TemporaryDirectory(prefix="deckinstall_mangohud_", dir=str(mh_dir.parent)) as tmp:
+            tmp_path = Path(tmp)
+            archive = tmp_path / asset_name
+            _download_file(str(asset.get("browser_download_url", "")), archive, asset_name, progress_cb)
+            _verify_release_asset_integrity(release, asset, archive, tmp_path, label="MangoHud")
+            _emit_progress(progress_cb, "Extracting MangoHud...", 90)
+            outer, inner = tmp_path / "outer", tmp_path / "pkg"
+            outer.mkdir()
+            inner.mkdir()
+            _safe_extract_tar(archive, outer)
+            package = next(outer.rglob("MangoHud-package.tar"), None)
+            if package is None:
+                raise RuntimeError("MangoHud-package.tar missing from the MangoHud release.")
+            _safe_extract_tar(package, inner)
+            staged = tmp_path / "mangohud"
+            (staged / "layers").mkdir(parents=True)
+            for json_name, lib in _MANGOHUD_LAYERS:
+                src_lib = inner / "usr" / "lib" / "mangohud" / lib
+                if not (src_lib / "libMangoHud.so").is_file():
+                    raise RuntimeError(f"MangoHud release has no {lib}/libMangoHud.so.")
+                shutil.copytree(src_lib, staged / lib, symlinks=False)
+                shutil.copy2(inner / "usr" / "share" / "vulkan" / "implicit_layer.d" / json_name, staged / "layers")
+            old = tmp_path / "old"
+            if mh_dir.exists():
+                os.replace(mh_dir, old)
+            os.replace(staged, mh_dir)
+        _write_mangohud_layers(mh_dir)
+
+        def _record(versions: dict[str, Any]) -> None:
+            versions["mangohud_installed_version"] = tag
+            versions["mangohud_last_check"] = int(time.time())
+
+        _update_versions(_record)
+        _emit_progress(progress_cb, f"MangoHud {tag} installed.", 100)
+        return mh_dir
 
 
 def get_umu_database_path() -> Path:
@@ -1718,12 +1825,6 @@ _SYSTEM_PACKAGE_MAP: dict[str, dict[str, list[str]]] = {
         "dnf": ["gamemode"],
         "pacman": ["gamemode"],
         "zypper": ["gamemode"],
-    },
-    "mangohud": {
-        "apt-get": ["mangohud"],
-        "dnf": ["mangohud"],
-        "pacman": ["mangohud"],
-        "zypper": ["mangohud"],
     },
     "winetricks": {
         "apt-get": ["winetricks"],

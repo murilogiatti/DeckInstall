@@ -20,10 +20,12 @@ from .launcher_scan import ExternalLauncherGame, scan_external_launcher_games
 from .optiscaler import inspect_optiscaler_state
 from .runtime_manager import (
     build_umu_env,
+    ensure_mangohud,
     get_umu_run_path,
     is_win32_prefix,
     list_ge_proton11_dirs,
     list_installed_compat_tools,
+    official_mangohud_installed,
 )
 from .standalone import (
     StandaloneGame,
@@ -258,6 +260,12 @@ class LaunchPrepWorker(QThread):
 
     def run(self) -> None:
         try:
+            wants_mangohud = "MANGOHUD=1" in str(getattr(self._obj, "launch_options", "") or "")
+            if wants_mangohud and not official_mangohud_installed():
+                try:  # the overlay always comes from the official build (distro ones may lack NVIDIA)
+                    ensure_mangohud()
+                except Exception as exc:
+                    logging.warning("Could not get the official MangoHud: %s", exc)
             if self._kind == "standalone":
                 obj = self._obj
                 assert isinstance(obj, StandaloneGame)

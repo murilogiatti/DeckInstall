@@ -143,14 +143,12 @@ class RuntimeManagerTests(unittest.TestCase):
                 runtime_manager.get_system_package_install_cmd("gamemoderun"),
                 ["apt-get", "install", "-y", "gamemode"],
             )
-            self.assertEqual(
-                runtime_manager.get_system_package_install_cmd("mangohud"),
-                ["apt-get", "install", "-y", "mangohud"],
-            )
+            # MangoHud never comes from the distro (Debian/Ubuntu builds lack NVIDIA support).
+            self.assertIsNone(runtime_manager.get_system_package_install_cmd("mangohud"))
         with mock.patch("shutil.which", side_effect=lambda b: "/usr/bin/pacman" if b == "pacman" else None):
             self.assertEqual(
-                runtime_manager.get_system_package_install_cmd("mangohud"),
-                ["pacman", "-S", "--noconfirm", "mangohud"],
+                runtime_manager.get_system_package_install_cmd("winetricks"),
+                ["pacman", "-S", "--noconfirm", "winetricks"],
             )
         with mock.patch("shutil.which", return_value=None):
             ok_unconfirmed, _ = runtime_manager.fix_bwrap_userns()

@@ -415,9 +415,11 @@ class MaintenanceTests(unittest.TestCase):
 
         with mock.patch("shutil.which", side_effect=lambda b: "/usr/bin/apt-get" if b == "apt-get" else None):
             self.assertEqual(
-                runtime_manager.get_system_package_install_cmd("mangohud"),
-                ["apt-get", "install", "-y", "mangohud"],
+                runtime_manager.get_system_package_install_cmd("gamemoderun"),
+                ["apt-get", "install", "-y", "gamemode"],
             )
+            # MangoHud comes from the official build (runtime_manager.ensure_mangohud), never the distro.
+            self.assertIsNone(runtime_manager.get_system_package_install_cmd("mangohud"))
             self.assertIsNone(runtime_manager.get_system_package_install_cmd("gamescope"))
 
     def test_gpu_presets_and_unverified_prefix_cleanup(self) -> None:

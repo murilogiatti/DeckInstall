@@ -31,7 +31,12 @@ from ..i18n import tr
 from ..launch_presets import apply_presets
 from ..launcher_scan import ExternalLauncherGame
 from ..optiscaler import inspect_optiscaler_state
-from ..runtime_manager import get_system_package_install_cmd, install_system_package
+from ..runtime_manager import (
+    ensure_mangohud,
+    get_system_package_install_cmd,
+    install_system_package,
+    official_mangohud_installed,
+)
 from ..standalone import StandaloneGame, update_standalone_launch_options
 from ..steam_vdf import (
     ShortcutEntry,
@@ -308,12 +313,15 @@ def open_launch_presets_dialog(
         lay.addWidget(_muted_hint(hint_text))
         if extra_row is not None:
             lay.addLayout(extra_row)
-        if shutil.which(bin_name) is None:
+        official_mh = bin_name == "mangohud"  # always the upstream build, never the distro package
+        if (not official_mangohud_installed()) if official_mh else shutil.which(bin_name) is None:
             warn_row = QWidget()
             warn_lay = QHBoxLayout(warn_row)
             warn_lay.setContentsMargins(20, 0, 0, 4)
             warn_lay.setSpacing(8)
-            warn_lbl = QLabel(tr("launch.missing_bin_warn", bin=bin_name))
+            warn_lbl = QLabel(
+                tr("launch.mangohud_official_missing") if official_mh else tr("launch.missing_bin_warn", bin=bin_name)
+            )
             warn_lbl.setWordWrap(True)
             warn_lbl.setStyleSheet("color: #ffd180;")
             warn_lay.addWidget(warn_lbl, 1)
@@ -321,6 +329,12 @@ def open_launch_presets_dialog(
             install_btn = QPushButton(tr("launch.btn_install_bin", bin=bin_name))
 
             def _on_install_bin() -> None:
+                if official_mh:
+                    if QMessageBox.question(
+                        dlg, __app_name__, tr("launch.mangohud_official_confirm")
+                    ) == QMessageBox.StandardButton.Yes:
+                        _start_install(_do_install_official_mangohud)
+                    return
                 cmd = get_system_package_install_cmd(bin_name)
                 if not cmd:
                     QMessageBox.information(
@@ -336,6 +350,16 @@ def open_launch_presets_dialog(
                 )
                 if ans != QMessageBox.StandardButton.Yes:
                     return
+                _start_install(lambda: install_system_package(bin_name))
+
+            def _do_install_official_mangohud() -> tuple[bool, str]:
+                try:
+                    ensure_mangohud(force_update=True)
+                except Exception as exc:
+                    return False, str(exc)
+                return True, ""
+
+            def _start_install(job: Callable[[], tuple[bool, str]]) -> None:
                 install_btn.setEnabled(False)
                 install_btn.setText(tr("launch.installing_bin", bin=bin_name))
                 win.status_label.setText(tr("launch.installing_bin", bin=bin_name))
@@ -371,11 +395,8 @@ def open_launch_presets_dialog(
                             tr("launch.install_bin_error", bin=bin_name, err=err),
                         )
 
-                def _do_install_pkg() -> tuple[bool, str]:
-                    return install_system_package(bin_name)
-
                 win._run_pkexec(
-                    _do_install_pkg,
+                    job,
                     on_result=_on_pkg_done,
                     on_error=_on_pkg_err,
                 )
