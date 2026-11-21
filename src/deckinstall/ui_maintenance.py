@@ -29,6 +29,7 @@ from .i18n import tr
 from .ui_cards import (
     FlowLayout,
     _cleanup_candidate_auto_check,
+    _dialog_guard,
     _dialog_parent,
     _format_cleanup_candidate_label,
     _is_wine_game_running,
@@ -646,6 +647,17 @@ def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
         dlg = QDialog(_dialog_parent(win))
         dlg.setWindowTitle(tr("runtime.uninstall_title"))
         dlg.resize(760, 420)
+        dlg_alive = _dialog_guard(dlg)
+        op_state = {"busy": False}
+        orig_close_event = dlg.closeEvent
+
+        def _close_event(event) -> None:
+            if op_state["busy"]:
+                event.ignore()
+                return
+            orig_close_event(event)
+
+        dlg.closeEvent = _close_event  # type: ignore[method-assign]
         lay = QVBoxLayout(dlg)
         hint = QLabel(tr("runtime.uninstall_hint"))
         hint.setWordWrap(True)
@@ -706,8 +718,10 @@ def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
                 dlg, __app_name__, tr("runtime.uninstall_confirm", count=len(chosen), items=listing)
             ) != QMessageBox.StandardButton.Yes:
                 return
-            btn_remove.setEnabled(False)
-            btn_close.setEnabled(False)
+            op_state["busy"] = True
+            for b in (btn_all, btn_none, btn_remove, btn_close):
+                b.setEnabled(False)
+            win._begin_busy()
 
             def _uninstall() -> tuple[list[str], list[str]]:
                 if _is_wine_game_running():
@@ -718,6 +732,8 @@ def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
             win._track_worker(worker)
 
             def _done(result: object) -> None:
+                op_state["busy"] = False
+                win._end_busy()
                 removed, errors = result if isinstance(result, tuple) else ([], [])
                 msg = tr("runtime.uninstall_done", count=len(removed))
                 if errors:
@@ -725,12 +741,25 @@ def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
                 win.status_label.setText(tr("runtime.uninstall_done", count=len(removed)))
                 refresh_maintenance_health(win)
                 win._refresh_shortcuts()
+                if not dlg_alive():
+                    if not win._closing_pending:
+                        QMessageBox.information(_dialog_parent(win), __app_name__, msg)
+                    return
+                for b in (btn_all, btn_none, btn_remove, btn_close):
+                    b.setEnabled(True)
                 QMessageBox.information(dlg, __app_name__, msg)
-                dlg.accept()
+                if not errors:
+                    dlg.accept()
 
             def _fail(err: str) -> None:
-                btn_remove.setEnabled(True)
-                btn_close.setEnabled(True)
+                op_state["busy"] = False
+                win._end_busy()
+                if not dlg_alive():
+                    if not win._closing_pending:
+                        QMessageBox.critical(_dialog_parent(win), __app_name__, tr("runtime.error", err=err))
+                    return
+                for b in (btn_all, btn_none, btn_remove, btn_close):
+                    b.setEnabled(True)
                 QMessageBox.critical(dlg, __app_name__, tr("runtime.error", err=err))
 
             worker.finished_ok.connect(_done)

@@ -2658,7 +2658,11 @@ def get_shortcut_proton(config_vdf: Path, appid_u32: int) -> str:
 
 def set_shortcut_proton(config_vdf: Path, appid_u32: int, tool_name: str) -> None:
     """Set compatibility tool for a Steam shortcut in config.vdf atomically."""
-    set_compat_tool(config_vdf, appid_u32, tool_name, create_if_missing=True)
+    cleaned = tool_name.strip()
+    if not cleaned:
+        remove_compat_tool(config_vdf, appid_u32)
+        return
+    set_compat_tool(config_vdf, appid_u32, cleaned, create_if_missing=True)
 
 
 _PRESET_ENV_KEYS = (

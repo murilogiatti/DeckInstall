@@ -468,8 +468,7 @@ class LibraryColumnsFilterAndLogsTests(unittest.TestCase):
                     ]
                     self.assertEqual(visible_names, ["Lutris Game"])
 
-                    # The Steam shortcut of the DeckInstall game and a Lutris entry adopted into it:
-                    # still one row each (the game, marked as also in Steam).
+                    # The adopted game belongs only to the Steam filter and uses its Steam shortcut.
                     win._on_library_source_filter_changed("all")
                     owned_sc = ShortcutEntry(
                         index="1", appid_u32=3000000002, app_name="Standalone Game",
@@ -488,9 +487,24 @@ class LibraryColumnsFilterAndLogsTests(unittest.TestCase):
                         for r in range(win.shortcuts_list.rowCount())
                     }
                     self.assertEqual(win.shortcuts_list.rowCount(), 3)
-                    from deckinstall.i18n import tr
-
-                    self.assertEqual(rows["Standalone Game"], tr("library.tag_standalone_steam"))
+                    self.assertEqual(rows["Standalone Game"], "Steam")
+                    win._on_library_source_filter_changed("steam")
+                    visible_names = {
+                        win.shortcuts_list.item(r, 0).text()
+                        for r in range(win.shortcuts_list.rowCount())
+                        if not win.shortcuts_list.isRowHidden(r)
+                    }
+                    self.assertEqual(visible_names, {"Steam Game", "Standalone Game"})
+                    adopted_row = next(
+                        r for r in range(win.shortcuts_list.rowCount())
+                        if win.shortcuts_list.item(r, 0).text() == "Standalone Game"
+                    )
+                    win.shortcuts_list.setCurrentCell(adopted_row, 0)
+                    self.assertEqual(win._selected_library_item(), ("steam", owned_sc))
+                    self.assertFalse(win.act_import_steam.isVisible())
+                    self.assertEqual(win._managed_library_game(owned_sc), sa)
+                    win._on_library_source_filter_changed("standalone")
+                    self.assertTrue(all(win.shortcuts_list.isRowHidden(r) for r in range(3)))
 
                     win._on_library_source_filter_changed("all")
                     self.assertEqual(
@@ -565,9 +579,13 @@ class UiUxSimplificationTests(unittest.TestCase):
                     self.assertTrue(win.stack.widget(3).isAncestorOf(win.btn_app_update))
 
                     for always_visible in (win.chk_keep_in_place, win.add_library_combo, win.btn_add_launch_adv,
-                                           win.chk_shortcut_menu, win.extract_dst_root):
+                                           win.btn_shortcut_menu, win.extract_dst_root):
                         self.assertTrue(win.stack.widget(0).isAncestorOf(always_visible))
                         self.assertFalse(always_visible.isHidden() and always_visible is not win.add_library_combo)
+                    self.assertTrue(win.btn_shortcut_menu.isCheckable())
+                    self.assertTrue(win.btn_shortcut_menu.isChecked())
+                    self.assertTrue(win.btn_shortcut_desktop.isCheckable())
+                    self.assertTrue(win.btn_shortcut_steam.isHidden())
 
                     win._set_extract_source(str(zip_file))
                     self.assertEqual(win.extract_src.text(), str(zip_file))

@@ -325,6 +325,16 @@ def _format_cleanup_candidate_label(cand: CleanupCandidate) -> str:
     return f"[{cat_disp}] {cand.label}{hint} — {size_str}{save_tag}"
 
 
+def shortcut_target_button(label: str, selected: bool = False) -> QPushButton:
+    """A checkable button for a shortcut destination selected before installation."""
+    button = QPushButton(label)
+    button.setObjectName("FilterPill")
+    button.setCheckable(True)
+    button.setAutoDefault(False)
+    button.setChecked(selected)
+    return button
+
+
 class FlowLayout(QLayout):
     """Responsive wrapping layout so action buttons never clip horizontally."""
 
@@ -333,13 +343,6 @@ class FlowLayout(QLayout):
         self.setContentsMargins(margin, margin, margin, margin)
         self._spacing = spacing
         self._items: list = []
-
-    def __del__(self) -> None:
-        try:
-            while self._items:
-                self.takeAt(0)
-        except RuntimeError:
-            self._items.clear()
 
     def addItem(self, item) -> None:
         self._items.append(item)

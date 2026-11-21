@@ -574,11 +574,13 @@ def edit_launch_options_presets(
 
     if isinstance(obj, StandaloneGame):
         try:
-            update_standalone_launch_options(
+            updated = update_standalone_launch_options(
                 obj.game_dir,
                 winedlloverrides=new_dll,
                 launch_options=new_opts,
             )
+            obj.launch_options = updated.launch_options
+            obj.winedlloverrides = updated.winedlloverrides
         except Exception as exc:
             QMessageBox.critical(box_parent(), __app_name__, str(exc))
             return
@@ -595,8 +597,25 @@ def edit_launch_options_presets(
         return
     paths = win.paths
     entry = obj
+    managed_game = win._managed_library_game(entry)
+
+    def _sync_managed_launch_opts() -> None:
+        if managed_game is None:
+            return
+        updated = update_standalone_launch_options(
+            managed_game.game_dir,
+            winedlloverrides=new_dll,
+            launch_options=new_opts,
+        )
+        managed_game.launch_options = updated.launch_options
+        managed_game.winedlloverrides = updated.winedlloverrides
 
     if win.should_queue_vdf_edits():
+        try:
+            _sync_managed_launch_opts()
+        except Exception as exc:
+            QMessageBox.critical(box_parent(), __app_name__, str(exc))
+            return
         win.enqueue_vdf_edit(
             QueuedVdfEdit(
                 edit_id=f"set_launch_options:{entry.appid_u32}",
@@ -606,6 +625,7 @@ def edit_launch_options_presets(
                 payload={"launch_options": new_opts},
             )
         )
+        win._refresh_shortcuts()
         msg = tr("vdf_queue.enqueued", name=title_name)
         win.status_label.setText(msg)
         if on_saved is not None:
@@ -616,10 +636,12 @@ def edit_launch_options_presets(
         if win._closing_pending:
             return
         win._begin_busy()
-        worker = SteamOpWorker(
-            lambda: update_shortcut_launch_options(paths, entry.appid_u32, new_opts),
-            need_steam_closed=True,
-        )
+
+        def _do_update() -> None:
+            _sync_managed_launch_opts()
+            update_shortcut_launch_options(paths, entry.appid_u32, new_opts)
+
+        worker = SteamOpWorker(_do_update, need_steam_closed=True)
         win._track_worker(worker)
         worker.status.connect(win.status_label.setText)
 
@@ -642,4 +664,8 @@ def edit_launch_options_presets(
         worker.failed.connect(_err)
         worker.start()
 
-    win._confirm_close_steam_async(_proceed_update_steam_opts)
+    win._confirm_close_steam_async(
+        _proceed_update_steam_opts,
+        parent=box_parent(),
+        alive_fn=lambda: bool(win and not win._closing_pending),
+    )

@@ -69,10 +69,11 @@ def test_steam_shortcuts_owned_by_a_game_are_not_listed_twice(tmp_path: Path) ->
     ):
         rows, orphans, _ = pbd.collect_rows(paths)
     assert [(r.name, r.source, r.current) for r in rows] == [
-        ("Alpha", "deckinstall", "GE-Proton11-2"),
+        ("Alpha", "shortcut", "proton_11"),
         ("Other", "shortcut", "proton_9"),
     ]
     assert rows[0].steam_tools == ((0x80000001, "proton_11"),) and not rows[0].newest
+    assert rows[0].game_dir is None
     assert orphans == [0x80000099]
 
 

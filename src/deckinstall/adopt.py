@@ -174,6 +174,7 @@ class AdoptOptions:
     create_desktop_shortcut: bool = False
     remove_from_steam: bool = False  # Steam shortcuts only
     link_steam_compatdata: bool = True  # Steam shortcut kept: compatdata/<appid> links to the new prefix
+    add_to_steam: bool = False  # requested after the adoption succeeds
 
 
 @dataclass
@@ -220,6 +221,7 @@ class AdoptionResult:
     steam_link: Path | None = None
     removed_from_steam: bool = False
     warnings: list[str] = field(default_factory=list)
+    add_to_steam: bool = False
 
 
 class AdoptionError(RuntimeError):
@@ -1185,4 +1187,5 @@ def adopt(
         steam_link=steam_link,
         removed_from_steam=removed,
         warnings=result_warnings,
+        add_to_steam=opts.add_to_steam,
     )

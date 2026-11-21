@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -37,7 +37,7 @@ from ..proton_policy import (
     use_previous_proton,
 )
 from ..runtime_manager import check_runtime_updates, ensure_ge_proton11
-from ..standalone import list_standalone_games, match_owned_shortcuts
+from ..standalone import list_standalone_games, match_owned_shortcuts, primary_owned_shortcuts
 from ..steam_paths import SteamPaths
 from ..steam_vdf import (
     _strip_vdf_quotes,
@@ -47,7 +47,7 @@ from ..steam_vdf import (
     orphan_shortcut_mappings,
     remove_orphan_shortcut_mappings,
 )
-from ..ui_cards import _dialog_parent, _format_worker_error
+from ..ui_cards import _dialog_guard, _dialog_parent, _format_worker_error
 from ..ui_workers import SteamOpWorker
 from ..vdf_queue import QueuedVdfEdit
 
@@ -70,7 +70,23 @@ def collect_rows(paths: SteamPaths | None) -> tuple[list[ProtonRow], list[int], 
     """(rows, orphan Steam mappings, newest local GE-Proton name) for the dialog."""
     newest = newest_ge_proton()
     newest_name = newest.name if newest is not None else ""
-    games = [g for g in list_standalone_games() if not g.native_linux]
+    games = list_standalone_games()
+    orphans: list[int] = []
+    shortcuts = []
+    compat: dict[int, str] = {}
+    if paths is not None:
+        try:
+            shortcuts = load_shortcuts(paths.shortcuts_vdf)
+            compat = get_compat_tool_map(paths.config_vdf)
+        except Exception:
+            logging.exception("Could not read Steam shortcuts for bulk Proton")
+        try:
+            orphans = orphan_shortcut_mappings(paths)
+        except (OSError, ValueError):
+            logging.exception("Could not verify all Steam shortcut files for orphan cleanup")
+    owned = match_owned_shortcuts(shortcuts, games, paths.user_id if paths else None)
+    primary = primary_owned_shortcuts(shortcuts, owned)
+    chosen_appids = {entry.appid_u32 for entry in primary.values()}
     rows = [
         ProtonRow(
             name=g.name,
@@ -80,37 +96,19 @@ def collect_rows(paths: SteamPaths | None) -> tuple[list[ProtonRow], list[int], 
             game_dir=g.game_dir,
             has_previous=bool(str(g.meta.get("proton_previous") or "").strip()),
         )
-        for g in games
+        for g in games if not g.native_linux and g.game_dir not in primary
     ]
-    orphans: list[int] = []
-    if paths is not None:
-        try:
-            shortcuts = load_shortcuts(paths.shortcuts_vdf)
-            compat = get_compat_tool_map(paths.config_vdf)
-        except Exception:
-            logging.exception("Could not read Steam shortcuts for bulk Proton")
-            shortcuts, compat = [], {}
-        owned = match_owned_shortcuts(shortcuts, games, paths.user_id)  # already listed as DeckInstall games
-        attached: dict[Path, list[tuple[int, str]]] = {}
-        for sc in shortcuts:
-            if not _strip_vdf_quotes(sc.exe).lower().endswith((".exe", ".bat")):
-                continue  # native Linux shortcuts do not run Proton
-            tool = compat.get(sc.appid_u32, "")
-            if game := owned.get(sc.appid_u32):
-                attached.setdefault(game.game_dir, []).append((sc.appid_u32, tool))
-                continue
-            rows.append(
-                ProtonRow(sc.app_name, "shortcut", tool, bool(newest_name) and tool == newest_name,
-                          steam_tools=((sc.appid_u32, tool),))
-            )
-        for index, row in enumerate(rows):
-            if row.game_dir is not None and (tools := attached.get(row.game_dir)):
-                rows[index] = replace(row, steam_tools=tuple(tools),
-                                      newest=row.newest and all(tool == newest_name for _, tool in tools))
-        try:
-            orphans = orphan_shortcut_mappings(paths)
-        except (OSError, ValueError):
-            logging.exception("Could not verify all Steam shortcut files for orphan cleanup")
+    for sc in shortcuts:
+        if not _strip_vdf_quotes(sc.exe).lower().endswith((".exe", ".bat")):
+            continue  # native Linux shortcuts do not run Proton
+        game = owned.get(sc.appid_u32)
+        if game is not None and sc.appid_u32 not in chosen_appids:
+            continue
+        tool = compat.get(sc.appid_u32, "")
+        rows.append(
+            ProtonRow(game.name if game is not None else sc.app_name, "shortcut", tool,
+                      bool(newest_name) and tool == newest_name, steam_tools=((sc.appid_u32, tool),))
+        )
     rows.sort(key=lambda r: r.name.lower())
     return rows, orphans, newest_name
 
@@ -201,6 +199,17 @@ def _show(win: MainWindow, rows: list[ProtonRow], orphans: list[int], newest: st
     dlg = QDialog(_dialog_parent(win))
     dlg.setWindowTitle(tr("proton_bulk.title"))
     dlg.resize(900, 560)
+    dlg_alive = _dialog_guard(dlg)
+    busy_state = {"active": False}
+    orig_close_event = dlg.closeEvent
+
+    def _close_event(event) -> None:
+        if busy_state["active"]:
+            event.ignore()
+            return
+        orig_close_event(event)
+
+    dlg.closeEvent = _close_event  # type: ignore[method-assign]
     lay = QVBoxLayout(dlg)
     hint = QLabel(tr("proton_bulk.hint", name=newest or "GE-Proton"))
     hint.setWordWrap(True)
@@ -237,10 +246,6 @@ def _show(win: MainWindow, rows: list[ProtonRow], orphans: list[int], newest: st
                 proton = r.current or tr("proton.steam_default_label")
             else:
                 proton = r.current or tr("proton.default_label")
-                if r.steam_tools:
-                    steam = ", ".join(dict.fromkeys(tool or tr("proton.steam_default_label")
-                                                   for _, tool in r.steam_tools))
-                    proton = tr("proton_bulk.linked_tools", deck=proton, steam=steam)
             tbl.setItem(row, 2, QTableWidgetItem(proton))
             tbl.setItem(row, 3, QTableWidgetItem(
                 tr("proton_bulk.state_newest") if r.newest else tr("proton_bulk.state_outdated")
@@ -270,7 +275,16 @@ def _show(win: MainWindow, rows: list[ProtonRow], orphans: list[int], newest: st
     row2.addWidget(btn_close)
     lay.addLayout(row1)
     lay.addLayout(row2)
-    actions = (btn_update, btn_update_all, btn_previous, btn_orphans)
+    actions = (
+        btn_update,
+        btn_update_all,
+        btn_previous,
+        btn_orphans,
+        btn_versions,
+        btn_select_all,
+        btn_select_none,
+        btn_close,
+    )
     btn_close.clicked.connect(dlg.accept)
 
     def _checked() -> list[ProtonRow]:
@@ -286,20 +300,25 @@ def _show(win: MainWindow, rows: list[ProtonRow], orphans: list[int], newest: st
                 it.setCheckState(state)
 
     def _busy(on: bool) -> None:
+        busy_state["active"] = on
+        if not dlg_alive():
+            return
         for b in actions:
             b.setEnabled(not on)
 
     def _reload(extra: list[str]) -> None:
         win._refresh_shortcuts()
         fresh = collect_rows(win.paths)
-        if dlg.isVisible():
+        if dlg_alive():
             _fill(fresh[0])
             btn_orphans.setText(tr("proton_bulk.btn_clean_orphans", count=len(fresh[1])))
             btn_orphans.setVisible(bool(fresh[1]))
             hint.setText(tr("proton_bulk.hint", name=fresh[2] or "GE-Proton"))
         _busy(False)
         if extra:
-            QMessageBox.information(dlg, __app_name__, "\n".join(extra))
+            parent = dlg if dlg_alive() else _dialog_parent(win)
+            if dlg_alive() or not win._closing_pending:
+                QMessageBox.information(parent, __app_name__, "\n".join(extra))
 
     def _steam_write(job_name: str, appids: list[int], tool: str, lines: list[str]) -> None:
         """Steam shortcuts: one write with Steam closed, or the queue in Gaming Mode."""
@@ -332,17 +351,23 @@ def _show(win: MainWindow, rows: list[ProtonRow], orphans: list[int], newest: st
         auto_snap = win._is_auto_snapshot_enabled()
 
         def _go() -> None:
+            if not dlg_alive() or win._closing_pending:
+                _busy(False)
+                return
+            win._begin_busy()
             worker = SteamOpWorker(_write, need_steam_closed=True)
             win._track_worker(worker)
             worker.status.connect(win.status_label.setText)
 
             def _ok(count: object) -> None:
+                win._end_busy()
                 if job_name == "remove":
                     _reload([*lines, tr("proton_bulk.orphans_removed", count=count)])
                 else:
                     _reload([*lines, tr("proton_bulk.migrated", count=count, tool=tool)])
 
             def _err(err: str) -> None:
+                win._end_busy()
                 _reload([*lines, tr("proton.error", err=err)])
 
             worker.finished_ok.connect(_ok)
@@ -350,7 +375,10 @@ def _show(win: MainWindow, rows: list[ProtonRow], orphans: list[int], newest: st
             worker.start()
 
         win._confirm_close_steam_async(
-            _go, on_cancelled=lambda: _reload([*lines, tr("proton_bulk.steam_skipped")]), parent=dlg
+            _go,
+            on_cancelled=lambda: _reload([*lines, tr("proton_bulk.steam_skipped")]),
+            parent=dlg,
+            alive_fn=dlg_alive,
         )
 
     def _update(selection: list[ProtonRow]) -> None:
@@ -366,6 +394,9 @@ def _show(win: MainWindow, rows: list[ProtonRow], orphans: list[int], newest: st
 
         def _done(name: str, changed: int, errors: list[str]) -> None:
             win.status_label.setText(tr("status.ready"))
+            if not dlg_alive():
+                _busy(False)
+                return
             lines = [tr("proton_bulk.games_updated", count=changed, name=name)] if dirs else []
             _steam_write("migrate", appids, name, lines + errors)
 

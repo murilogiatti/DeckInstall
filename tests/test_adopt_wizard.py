@@ -7,6 +7,7 @@ import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -97,7 +98,7 @@ def _result(plan: ad.AdoptionPlan) -> ad.AdoptionResult:
         launch_script=plan.game_dir / "launch.sh",
         desktop_file=plan.game_dir / "x.desktop",
     )
-    return ad.AdoptionResult(game=g)
+    return ad.AdoptionResult(game=g, add_to_steam=plan.options.add_to_steam)
 
 
 def test_wizard_lists_plans_blocks_and_adopts_in_batch(
@@ -125,7 +126,7 @@ def test_wizard_lists_plans_blocks_and_adopts_in_batch(
 
     monkeypatch.setattr(ui_workers_adopt, "adopt", fake_adopt)
     lib_a, lib_b = tmp_path / "LibA" / "DeckInstall", tmp_path / "LibB" / "DeckInstall"
-    dlg = aw.AdoptWizard(None, [("Internal", lib_a), ("SD", lib_b)], steam_writable=True)
+    dlg = aw.AdoptWizard(mock.Mock(), [("Internal", lib_a), ("SD", lib_b)], steam_writable=False)
     try:
         _wait(app, lambda: bool(dlg.all_candidates()))
         # One group per source kind, games underneath.
@@ -151,11 +152,20 @@ def test_wizard_lists_plans_blocks_and_adopts_in_batch(
         dlg.game_list.setCurrentRow(3)
         assert tr("adopt.block_no_space") in dlg.lbl_blockers.text()
         assert dlg.steam_box.isVisibleTo(dlg) and dlg.rb_steam_link.isChecked()
+        assert not dlg.btn_shortcut_steam.isEnabled() and dlg.btn_shortcut_steam.text() == tr("add.shortcut_steam_linked")
         assert dlg.btn_next.text() == tr("adopt.btn_adopt", count=3)
 
         # Changing an option replans that game with the new library.
         dlg.game_list.setCurrentRow(0)
         assert dlg.cmb_proton.currentData() == "source"
+        assert dlg.btn_shortcut_steam.isEnabled() and dlg.btn_shortcut_steam.isCheckable()
+        dlg.btn_shortcut_steam.click()
+        dlg.btn_shortcut_desktop.click()
+        assert dlg.items[0].opts.add_to_steam and dlg.items[0].opts.create_desktop_shortcut
+        dlg.game_list.setCurrentRow(2)
+        assert not dlg.btn_shortcut_steam.isChecked() and not dlg.btn_shortcut_desktop.isChecked()
+        dlg.game_list.setCurrentRow(0)
+        assert dlg.btn_shortcut_steam.isChecked() and dlg.btn_shortcut_desktop.isChecked()
         dlg.cmb_library.setCurrentIndex(1)
         _wait(app, lambda: dlg.items[0].plan is not None)
         assert dlg.items[0].plan is not None and dlg.items[0].plan.library_root == lib_b
@@ -166,6 +176,7 @@ def test_wizard_lists_plans_blocks_and_adopts_in_batch(
         assert calls == ["Alpha", "Broken", "Cross"]  # one after the other, blocked one skipped
         assert [it.status for it in dlg.items] == ["ok", "failed", "ok", "skipped"]
         assert [r.game.name for r in dlg.adopted] == ["Alpha", "Cross"]
+        assert [r.add_to_steam for r in dlg.adopted] == [True, False]
         assert dlg.lbl_summary.text().startswith(tr("adopt.summary", ok=2, failed=1, skipped=1))
         assert "disk error" in dlg.lbl_summary.text()
         assert dlg.btn_cancel.isEnabled() and not dlg.btn_next.isVisible()
@@ -230,8 +241,6 @@ def test_real_batch_adoption_of_loose_folders(app: QApplication, tmp_path: Path,
 
 
 def test_main_window_has_one_adopt_entry(app: QApplication, tmp_path: Path) -> None:
-    from unittest import mock
-
     from PySide6.QtCore import QSettings
 
     from deckinstall import ui
@@ -250,8 +259,14 @@ def test_main_window_has_one_adopt_entry(app: QApplication, tmp_path: Path) -> N
                 assert not hasattr(win, gone)
             seen: dict[str, object] = {}
 
-            def fake_open(parent, paths, libraries, steam_writable, steam_note="", track_worker=None, snapshot_fn=None):
-                seen.update(libraries=libraries, writable=steam_writable, note=steam_note, snap=snapshot_fn)
+            def fake_open(
+                parent, paths, libraries, steam_writable, steam_note="", track_worker=None,
+                snapshot_fn=None, steam_add_allowed=True,
+            ):
+                seen.update(
+                    libraries=libraries, writable=steam_writable, note=steam_note, snap=snapshot_fn,
+                    add=steam_add_allowed,
+                )
                 return []
 
             with (
@@ -259,9 +274,13 @@ def test_main_window_has_one_adopt_entry(app: QApplication, tmp_path: Path) -> N
                 mock.patch.object(win, "_check_steam_running_async", lambda cb: cb(True)),
             ):
                 win.paths = mock.Mock()
+                win._update_steam_mode_ui()
+                assert not win.btn_shortcut_steam.isHidden() and win.btn_shortcut_steam.isCheckable()
+                assert not win.btn_shortcut_steam.isChecked()
                 win._vdf_corrupt = False
                 win._open_adopt_wizard()
             assert seen["writable"] is False and seen["note"] == tr("adopt.steam_running_note")
+            assert seen["add"] is True
             assert callable(seen["snap"])
             libs = seen["libraries"]
             assert isinstance(libs, list) and libs and all(isinstance(p, Path) for _, p in libs)

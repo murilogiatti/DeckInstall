@@ -41,6 +41,7 @@ from ..steam_vdf import (
 )
 from ..ui_cards import _dialog_parent, _format_worker_error, _SortableTableItem, format_size_bytes
 from ..ui_workers import SteamOpWorker
+from ..vdf_queue import QueuedVdfEdit
 
 if TYPE_CHECKING:
     from ..ui import MainWindow
@@ -74,10 +75,19 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
     dlg.resize(640, 580)
     lay = QVBoxLayout(dlg)
     dlg_alive = {"open": True}
+    busy_state = {"active": False}
+    orig_close_event = dlg.closeEvent
 
     def _on_finished(_r: int) -> None:
         dlg_alive["open"] = False
 
+    def _close_event(event) -> None:
+        if busy_state["active"]:
+            event.ignore()
+            return
+        orig_close_event(event)
+
+    dlg.closeEvent = _close_event  # type: ignore[method-assign]
     dlg.finished.connect(_on_finished)
 
     lay.addWidget(QLabel(tr("proton_mgr.installed_label")))
@@ -155,7 +165,8 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
     lay.addLayout(footer)
 
     def _set_busy(busy: bool, text: str = "") -> None:
-        for w in (btn_refresh_inst, btn_fetch, family_combo):
+        busy_state["active"] = busy
+        for w in (btn_refresh_inst, btn_fetch, family_combo, installed_list, releases_list, btn_close):
             w.setEnabled(not busy)
         btn_remove_inst.setEnabled(
             (not busy) and isinstance(_selected_table_data(installed_list), tuple)
@@ -253,12 +264,12 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
 
     installed_list.currentCellChanged.connect(
         lambda *_args: btn_remove_inst.setEnabled(
-            isinstance(_selected_table_data(installed_list), tuple)
+            not busy_state["active"] and isinstance(_selected_table_data(installed_list), tuple)
         )
     )
     releases_list.currentCellChanged.connect(
         lambda *_args: btn_install.setEnabled(
-            isinstance(_selected_table_data(releases_list), ProtonRelease)
+            not busy_state["active"] and isinstance(_selected_table_data(releases_list), ProtonRelease)
         )
     )
 
@@ -404,14 +415,18 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
 
             class _ListProtonsWorker(QThread):
                 ready = Signal(list)
+                failed = Signal(str)
 
                 def run(self) -> None:
-                    protons = [
-                        (tid, disp)
-                        for tid, disp in list_installed_protons(paths.steam_root)
-                        if tid not in (tool.tool_id, tool.folder_name)
-                    ]
-                    self.ready.emit(protons)
+                    try:
+                        protons = [
+                            (tid, disp)
+                            for tid, disp in list_installed_protons(paths.steam_root)
+                            if tid not in (tool.tool_id, tool.folder_name)
+                        ]
+                        self.ready.emit(protons)
+                    except Exception as exc:
+                        self.failed.emit(_format_worker_error(exc))
 
             def _on_protons_loaded(protons: list[tuple[str, str]]) -> None:
                 if not dlg_alive["open"] or win._closing_pending:
@@ -440,6 +455,8 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
                 def _proceed_migrate_and_remove() -> None:
                     if not dlg_alive["open"] or win._closing_pending:
                         return
+                    queued = win.should_queue_vdf_edits()
+                    win._begin_busy()
                     progress.setRange(0, 0)
                     _set_busy(True, tr("proton_mgr.migrating_removing", name=tool.folder_name))
 
@@ -452,13 +469,25 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
                                 "proton",
                                 enabled=auto_snap_enabled,
                             )
-                        bulk_migrate_compat_tool(paths.config_vdf, ids, target_tool)
+                        if not queued:
+                            bulk_migrate_compat_tool(paths.config_vdf, ids, target_tool)
                         remove_compat_tool(tool.path)
 
-                    worker = SteamOpWorker(_do_migrate_and_remove, need_steam_closed=True)
+                    worker = SteamOpWorker(_do_migrate_and_remove, need_steam_closed=not queued)
                     win._track_worker(worker)
 
                     def _ok_mig(_res: object) -> None:
+                        win._end_busy()
+                        if queued:
+                            win.enqueue_vdf_edit(
+                                QueuedVdfEdit(
+                                    f"bulk_migrate_compat:{target_tool}:{','.join(map(str, ids))}",
+                                    "bulk_migrate_compat",
+                                    0,
+                                    tr("proton_bulk.queue_label", tool=target_tool),
+                                    {"appids": ids, "target_tool": target_tool},
+                                )
+                            )
                         if not dlg_alive["open"]:
                             return
                         progress.setRange(0, 100)
@@ -467,6 +496,7 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
                         win._refresh_maintenance_health()
 
                     def _err_mig(err: str) -> None:
+                        win._end_busy()
                         if not dlg_alive["open"]:
                             return
                         progress.setRange(0, 100)
@@ -483,9 +513,14 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
                     alive_fn=lambda: dlg_alive["open"],
                 )
 
+            def _on_protons_failed(err: str) -> None:
+                if dlg_alive["open"] and not win._closing_pending:
+                    QMessageBox.critical(dlg, __app_name__, tr("proton_mgr.error", err=err))
+
             protons_worker = _ListProtonsWorker()
             win._track_worker(protons_worker)
             protons_worker.ready.connect(_on_protons_loaded)
+            protons_worker.failed.connect(_on_protons_failed)
             protons_worker.start()
             return
 
@@ -544,3 +579,4 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
     btn_remove_inst.clicked.connect(_on_remove)
     _refresh_installed()
     dlg.exec()
+    dlg.deleteLater()

@@ -12,7 +12,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
-    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -58,6 +57,7 @@ from ..ui_cards import (
     _format_worker_error,
     _is_native_linux_game,
     _parse_launch_preset_state,
+    _pick_file_async,
     _resolve_game_exe_path,
 )
 from ..ui_workers import RunExeInPrefixWorker, SteamOpWorker, WinetricksWorker
@@ -90,34 +90,37 @@ def run_exe_in_prefix_dialog(
     if win._warn_if_win32_prefix(prefix_dir):
         return
 
-    start_dir = str(obj.game_dir) if isinstance(obj, StandaloneGame) else str(Path.home())
-    exe_path_str, _ = QFileDialog.getOpenFileName(
+    start_dir = obj.game_dir if isinstance(obj, StandaloneGame) else Path.home()
+
+    def _on_picked(exe_path_str: str) -> None:
+        if not exe_path_str or win._closing_pending:
+            return
+        exe_path = Path(exe_path_str)
+        worker = RunExeInPrefixWorker(prefix_dir, exe_path, proton_dir=proton_dir)
+        win._track_worker(worker)
+        worker.status.connect(win.status_label.setText)
+
+        def _ok() -> None:
+            msg = tr("run_exe.done", exe=exe_path.name)
+            win.status_label.setText(msg)
+            if not win._closing_pending:
+                QMessageBox.information(_dialog_parent(win), __app_name__, msg)
+
+        def _err(err: str) -> None:
+            if not win._closing_pending:
+                QMessageBox.critical(_dialog_parent(win), __app_name__, tr("run_exe.error", err=err))
+
+        worker.finished_ok.connect(_ok)
+        worker.failed.connect(_err)
+        worker.start()
+
+    _pick_file_async(
         win,
         tr("run_exe.pick_title"),
         start_dir,
         tr("run_exe.filter"),
+        _on_picked,
     )
-    if not exe_path_str:
-        return
-
-    exe_path = Path(exe_path_str)
-    worker = RunExeInPrefixWorker(prefix_dir, exe_path, proton_dir=proton_dir)
-    win._track_worker(worker)
-    worker.status.connect(win.status_label.setText)
-
-    def _ok() -> None:
-        msg = tr("run_exe.done", exe=exe_path.name)
-        win.status_label.setText(msg)
-        if not win._closing_pending:
-            QMessageBox.information(win, __app_name__, msg)
-
-    def _err(err: str) -> None:
-        if not win._closing_pending:
-            QMessageBox.critical(win, __app_name__, tr("run_exe.error", err=err))
-
-    worker.finished_ok.connect(_ok)
-    worker.failed.connect(_err)
-    worker.start()
 
 
 def open_winetricks_dialog(

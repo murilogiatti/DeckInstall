@@ -15,6 +15,7 @@ from deckinstall.steam_paths import SteamPaths
 from deckinstall.steam_vdf import (
     ShortcutEntry,
     bulk_migrate_compat_tool,
+    compute_shortcut_appid,
     load_shortcuts,
     orphan_shortcut_mappings,
     update_shortcut_paths,
@@ -68,6 +69,12 @@ def test_owned_shortcuts_by_manifest_appid_or_exe(tmp_path: Path) -> None:
     }
     repairs = standalone.shortcut_path_repairs(entries, [adopted, imported, by_exe, other_origin])
     assert [(e.appid_u32, g.name) for e, g in repairs] == [(3000000001, "Adopted")]  # old folder is gone
+
+    current = _sc(3000000006, "Adopted", str(adopted.exe_path))
+    entries.append(current)
+    owned = standalone.match_owned_shortcuts(entries, [adopted, imported, by_exe, other_origin])
+    primary = standalone.primary_owned_shortcuts(entries, owned)
+    assert primary[adopted.game_dir] == current
 
 
 def test_update_shortcut_paths_keeps_the_appid(tmp_path: Path) -> None:
@@ -125,6 +132,45 @@ def test_queue_applies_the_repoint(tmp_path: Path) -> None:
     assert queue.apply_all(paths).applied == 1
     assert load_shortcuts(paths.shortcuts_vdf)[0].exe == '"/old/G.exe"'
     assert load_shortcuts(other)[0].exe == f'"{new_exe}"'
+
+
+def test_queued_install_shortcut_shares_prefix_and_preserves_same_name(tmp_path: Path) -> None:
+    game = _game(tmp_path, "Indie")
+    paths = _paths(tmp_path, {"0": {
+        "appid": 3000000001 - (1 << 32), "AppName": game.name, "Exe": '"/old/other.exe"',
+    }})
+    appid, _ = compute_shortcut_appid(f'"{game.exe_path}"', game.name)
+    queue_path = tmp_path / "queue.json"
+    edit = QueuedVdfEdit(
+        "add-installed", "add_installed_game", 0, game.name,
+        {"game_dir": str(game.game_dir), "uid": game.uid, "user_id": paths.user_id,
+         "steam_root": str(paths.steam_root)},
+    )
+    VdfEditQueue(queue_path).enqueue(edit)
+    queue = VdfEditQueue(queue_path)
+    with mock.patch.object(standalone, "resolve_game_icon", return_value=None):
+        assert queue.apply_all(paths).applied == 1
+    assert {e.appid_u32 for e in load_shortcuts(paths.shortcuts_vdf)} == {3000000001, appid}
+    compat = paths.compatdata_dir / str(appid)
+    assert compat.is_symlink() and compat.resolve() == game.prefix_dir.resolve()
+
+    unchanged = paths.shortcuts_vdf.read_bytes()
+    queue.enqueue(edit)
+    assert queue.apply_all(paths).applied == 1
+    assert paths.shortcuts_vdf.read_bytes() == unchanged
+
+
+def test_steam_add_failure_rolls_back_shortcut_and_config(tmp_path: Path) -> None:
+    game = _game(tmp_path, "Indie")
+    paths = _paths(tmp_path, {})
+    original = paths.shortcuts_vdf.read_bytes()
+    with (
+        mock.patch.object(standalone, "resolve_game_icon", return_value=None),
+        mock.patch.object(standalone, "link_compatdata_to_prefix", side_effect=OSError("cannot link")),
+        pytest.raises(OSError, match="cannot link"),
+    ):
+        standalone.add_installed_game_to_steam(paths, game.game_dir, game.uid)
+    assert paths.shortcuts_vdf.read_bytes() == original and not paths.config_vdf.exists()
 
 
 def test_runtime_uninstall_lists_and_removes(tmp_path: Path) -> None:

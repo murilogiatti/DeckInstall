@@ -12,7 +12,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
@@ -52,6 +51,7 @@ from ..standalone import (
     change_standalone_exe,
     find_game_launchers,
     game_run_logs,
+    repaired_shortcut_start_dir,
     set_game_launcher,
 )
 from ..steam_paths import list_installed_protons
@@ -61,6 +61,7 @@ from ..steam_vdf import (
     get_shortcut_proton,
     list_microsd_compatdata_targets,
     migrate_compatdata_to_microsd,
+    remove_compat_tool,
     restore_compatdata_from_microsd,
     set_shortcut_proton,
 )
@@ -70,10 +71,13 @@ from ..ui_cards import (
     _dialog_parent,
     _format_worker_error,
     _is_native_linux_game,
+    _pick_dir_async,
     get_game_log_path,
 )
 from ..ui_workers import SteamOpWorker
 from ..vdf_queue import QueuedVdfEdit
+
+STEAM_DEFAULT_PROTON_ID = "__steam_default__"
 
 if TYPE_CHECKING:
     from ..ui import MainWindow
@@ -157,25 +161,27 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
     folder_list.currentCellChanged.connect(lambda *_args: _update_remove_state())
 
     def _on_add_folder() -> None:
-        chosen = QFileDialog.getExistingDirectory(
-            dlg, tr("scan_folders.pick_title"), str(Path.home())
-        )
-        if not chosen:
-            return
-        chosen_str = str(Path(chosen))
-        for i in range(folder_list.rowCount()):
-            existing = folder_list.item(i, 0)
-            if existing is None:
-                continue
-            data = existing.data(Qt.ItemDataRole.UserRole)
-            if isinstance(data, tuple) and data[1] == chosen_str:
-                folder_list.selectRow(i)
+        def _picked(chosen: str) -> None:
+            if not chosen or not dlg_alive_sf():
                 return
-        item = _add_entry("custom", chosen_str, True)
-        found_row = folder_list.row(item)
-        if found_row >= 0:
-            folder_list.selectRow(found_row)
-        _apply()
+            chosen_str = str(Path(chosen))
+            for i in range(folder_list.rowCount()):
+                existing = folder_list.item(i, 0)
+                if existing is None:
+                    continue
+                data = existing.data(Qt.ItemDataRole.UserRole)
+                if isinstance(data, tuple) and data[1] == chosen_str:
+                    folder_list.selectRow(i)
+                    return
+            item = _add_entry("custom", chosen_str, True)
+            found_row = folder_list.row(item)
+            if found_row >= 0:
+                folder_list.selectRow(found_row)
+            _apply()
+
+        _pick_dir_async(dlg, tr("scan_folders.pick_title"), Path.home(), _picked)
+
+    dlg_alive_sf = _dialog_guard(dlg)
 
     def _on_remove_folder() -> None:
         row = folder_list.currentRow()
@@ -228,6 +234,7 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
     lay.addWidget(buttons)
 
     dlg.exec()
+    dlg.deleteLater()
 
 
 def _launcher_checkboxes(win: MainWindow, dlg: QDialog, game: StandaloneGame) -> QWidget:
@@ -276,11 +283,15 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     is_steam = kind == "steam" and isinstance(obj, ShortcutEntry)
     is_standalone = kind == "standalone" and isinstance(obj, StandaloneGame)
     is_external = kind == "external" and isinstance(obj, ExternalLauncherGame)
+    managed_game = (
+        win._managed_library_game(obj) if is_steam and isinstance(obj, ShortcutEntry) else None
+    )
+    sa_obj: StandaloneGame | None = obj if isinstance(obj, StandaloneGame) else managed_game
     is_native = _is_native_linux_game(kind, obj)
     if isinstance(obj, ShortcutEntry):
-        title_name = obj.app_name
-        exe_str = str(obj.exe)
-        dir_str = str(obj.start_dir)
+        title_name = sa_obj.name if sa_obj is not None else obj.app_name
+        exe_str = str(sa_obj.exe_path) if sa_obj is not None else str(obj.exe)
+        dir_str = str(sa_obj.game_dir) if sa_obj is not None else str(obj.start_dir)
     else:
         title_name = obj.name
         exe_str = str(obj.exe_path)
@@ -305,19 +316,19 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     lbl_exe.setWordWrap(True)
     lbl_dir = QLabel(dir_str)
     lbl_dir.setWordWrap(True)
-    if isinstance(obj, StandaloneGame):
+    if sa_obj is not None:
         # One click switches the game to another executable found in its folder.
         exe_combo = QComboBox()
         exe_combo.setToolTip(tr("configure.exe_switch_tooltip"))
-        detected = scan_game_folder(obj.game_dir)
-        candidates = [obj.exe_path, *(e for e in (detected.executables if detected else []) if e != obj.exe_path)]
+        detected = scan_game_folder(sa_obj.game_dir)
+        candidates = [sa_obj.exe_path, *(e for e in (detected.executables if detected else []) if e != sa_obj.exe_path)]
         for cand in candidates[:40]:
             try:
-                label = str(cand.relative_to(obj.game_dir))
+                label = str(cand.relative_to(sa_obj.game_dir))
             except ValueError:
                 label = str(cand)
             exe_combo.addItem(label, str(cand))
-        game_obj = obj
+        game_obj = sa_obj
 
         def _on_exe_activated(idx: int) -> None:
             new_exe = Path(str(exe_combo.itemData(idx)))
@@ -330,6 +341,22 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                 exe_combo.setCurrentIndex(exe_combo.findData(str(game_obj.exe_path)))
                 return
             game_obj.exe_path = updated.exe_path
+            if is_steam and isinstance(obj, ShortcutEntry) and win.paths is not None:
+                win.enqueue_vdf_edit(
+                    QueuedVdfEdit(
+                        f"update_shortcut_paths:{win.paths.user_id}:{obj.appid_u32}",
+                        "update_shortcut_paths",
+                        obj.appid_u32,
+                        obj.app_name,
+                        {
+                            "exe_path": str(updated.exe_path),
+                            "start_dir": str(repaired_shortcut_start_dir(obj, updated)),
+                            "expected_exe": obj.exe,
+                            "user_id": win.paths.user_id,
+                            "steam_root": str(win.paths.steam_root),
+                        },
+                    )
+                )
             msg = tr("configure.exe_switched", name=new_exe.name)
             if updated.meta.get("steam"):
                 msg += " " + tr("configure.exe_switched_steam_note")
@@ -341,8 +368,8 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     else:
         game_form.addRow(tr("configure.lbl_exe"), lbl_exe)
     game_form.addRow(tr("configure.lbl_dir"), lbl_dir)
-    if isinstance(obj, StandaloneGame):
-        game_form.addRow(tr("configure.lbl_launchers"), _launcher_checkboxes(win, dlg, obj))
+    if sa_obj is not None:
+        game_form.addRow(tr("configure.lbl_launchers"), _launcher_checkboxes(win, dlg, sa_obj))
 
     initial_opts_text = (
         load_external_launch_presets(obj)
@@ -369,11 +396,11 @@ def open_configure_game_dialog(win: MainWindow) -> None:
 
     legacy_log = get_game_log_path(title_name)
     run_logs = (
-        game_run_logs(obj)
-        if isinstance(obj, StandaloneGame)
+        game_run_logs(sa_obj)
+        if sa_obj is not None
         else ([legacy_log] if legacy_log.is_file() else [])
     )
-    if isinstance(obj, StandaloneGame) and legacy_log.is_file():
+    if sa_obj is not None and legacy_log.is_file():
         run_logs.append(legacy_log)  # last run started before logs moved into launch.sh
     btn_view_log = QPushButton(tr("configure.btn_view_log"))
     btn_view_log.setEnabled(bool(run_logs))
@@ -437,8 +464,6 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     lbl_cur_proton: QLabel | None = None
     lbl_umu_badge: QLabel | None = None
     proton_combo: QComboBox | None = None
-    btn_change_proton: QPushButton | None = None
-    btn_fallback10: QPushButton | None = None
     btn_previous_proton: QPushButton | None = None
     active_proton_ref: list[str] = [""]
 
@@ -456,17 +481,14 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         else:
             lbl_cur_proton = QLabel(tr("configure.loading"))
             runner_form.addRow(tr("configure.lbl_current_proton"), lbl_cur_proton)
-        if is_standalone:
+        if sa_obj is not None:
             lbl_umu_badge = QLabel(tr("configure.loading"))
             lbl_umu_badge.setWordWrap(True)
             runner_form.addRow(tr("configure.lbl_umu_status"), lbl_umu_badge)
         game_tab_lay.addLayout(runner_form)
 
         proton_btns = QHBoxLayout()
-        btn_change_proton = QPushButton(tr("library.btn_proton"))
-        btn_change_proton.setEnabled((is_steam and bool(win.paths)) or is_standalone)
-        proton_btns.addWidget(btn_change_proton)
-        if is_standalone:
+        if sa_obj is not None:
             btn_previous_proton = QPushButton(tr("configure.btn_previous_proton"))
             btn_previous_proton.setEnabled(False)
             proton_btns.addWidget(btn_previous_proton)
@@ -496,7 +518,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         pfx_label.setWordWrap(True)
         pfx_form = QFormLayout()
         pfx_form.addRow(tr("configure.lbl_prefix_path"), pfx_label)
-        if is_steam and win.paths:
+        if is_steam and win.paths and managed_game is None:
             lbl_compat_storage = QLabel(tr("configure.loading"))
             lbl_compat_storage.setWordWrap(True)
             pfx_form.addRow(tr("configure.lbl_compat_storage"), lbl_compat_storage)
@@ -532,7 +554,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         )
         tools_flow.addWidget(btn_open_pfx)
 
-        if is_steam and win.paths and isinstance(obj, ShortcutEntry):
+        if is_steam and win.paths and isinstance(obj, ShortcutEntry) and managed_game is None:
             btn_compat_migrate = QPushButton(tr("configure.btn_compat_migrate"))
             btn_compat_migrate.setEnabled(False)
             tools_flow.addWidget(btn_compat_migrate)
@@ -578,69 +600,77 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                 raw_proton = ""
                 tools: list[tuple[str, str]] = []
                 seen_ids: set[str] = set()
-                if isinstance(obj, ShortcutEntry) and is_steam and paths_snap:
-                    raw_proton = get_shortcut_proton(paths_snap.config_vdf, obj.appid_u32)
-                    proton_text = raw_proton or tr("proton.default_label")
-                    for tid, disp in list_installed_protons(paths_snap.steam_root):
-                        if tid not in seen_ids:
-                            seen_ids.add(tid)
-                            tools.append((tid, disp))
-                elif isinstance(obj, StandaloneGame) and is_standalone:
-                    newest = newest_ge_proton()
-                    raw_proton = obj.proton_name or DEFAULT_PROTON_ID
-                    proton_text = obj.proton_name or tr("proton.default_label")
-                    tools.append((
-                        DEFAULT_PROTON_ID,
-                        tr("proton.default_newest", name=newest.name if newest else "GE-Proton"),
-                    ))
-                    seen_ids.add(DEFAULT_PROTON_ID)
-                    for ct in list_installed_compat_tools():
-                        if ct.tool_id not in seen_ids:
-                            seen_ids.add(ct.tool_id)
-                            tools.append((ct.tool_id, ct.folder_name or ct.tool_id))
-                    if paths_snap:
+                proton_text = tr("proton.default_label")
+                resolved_pfx: Path | None = None
+                win32_flag = False
+                pfx_exists = False
+                umu_text = ""
+                compat_state = "missing"
+                compat_targets: list[Path] = []
+                try:
+                    if isinstance(obj, ShortcutEntry) and is_steam and paths_snap:
+                        raw_proton = get_shortcut_proton(paths_snap.config_vdf, obj.appid_u32)
+                        proton_text = raw_proton or tr("proton.default_label")
+                        tools.append((STEAM_DEFAULT_PROTON_ID, tr("proton.default_label")))
+                        seen_ids.add(STEAM_DEFAULT_PROTON_ID)
                         for tid, disp in list_installed_protons(paths_snap.steam_root):
                             if tid not in seen_ids:
                                 seen_ids.add(tid)
                                 tools.append((tid, disp))
-                else:
-                    proton_text = str(getattr(obj, "runner", "") or tr("proton.default_label"))
-
-                if raw_proton and raw_proton not in seen_ids:
-                    tools.insert(0, (raw_proton, raw_proton))
-                elif not raw_proton:
-                    tools.insert(0, ("", tr("proton.default_label")))
-
-                resolved_pfx: Path | None = None
-                try:
-                    resolved_pfx, _ = resolve_game_prefix(kind, obj, paths_snap)
-                except Exception:
-                    resolved_pfx = getattr(obj, "prefix_dir", None)
-                win32_flag = resolved_pfx is not None and is_win32_prefix(resolved_pfx)
-                pfx_exists = resolved_pfx is not None and resolved_pfx.is_dir()
-
-                umu_text = ""
-                if isinstance(obj, StandaloneGame) and is_standalone:
-                    game_id = f"umu-{obj.steam_appid}" if obj.steam_appid else "umu-default"
-                    st_umu = get_umu_protonfix_status(game_id)
-                    if st_umu.get("has_protonfix"):
-                        umu_text = tr(
-                            "configure.umu_protonfix_active",
-                            game_id=str(st_umu.get("umu_id") or game_id),
-                        )
-                    elif st_umu.get("found"):
-                        umu_text = tr(
-                            "configure.umu_db_found",
-                            game_id=str(st_umu.get("umu_id") or game_id),
-                        )
+                        if raw_proton and raw_proton not in seen_ids:
+                            tools.insert(1, (raw_proton, raw_proton))
+                        raw_proton = raw_proton or STEAM_DEFAULT_PROTON_ID
+                    elif isinstance(obj, StandaloneGame) and is_standalone:
+                        newest = newest_ge_proton()
+                        raw_proton = obj.proton_name or DEFAULT_PROTON_ID
+                        proton_text = obj.proton_name or tr("proton.default_label")
+                        tools.append((
+                            DEFAULT_PROTON_ID,
+                            tr("proton.default_newest", name=newest.name if newest else "GE-Proton"),
+                        ))
+                        seen_ids.add(DEFAULT_PROTON_ID)
+                        for ct in list_installed_compat_tools():
+                            if ct.tool_id not in seen_ids:
+                                seen_ids.add(ct.tool_id)
+                                tools.append((ct.tool_id, ct.folder_name or ct.tool_id))
+                        if paths_snap:
+                            for tid, disp in list_installed_protons(paths_snap.steam_root):
+                                if tid not in seen_ids:
+                                    seen_ids.add(tid)
+                                    tools.append((tid, disp))
+                        if raw_proton and raw_proton not in seen_ids:
+                            tools.insert(0, (raw_proton, raw_proton))
                     else:
-                        umu_text = tr("configure.umu_default", game_id=game_id)
+                        proton_text = str(getattr(obj, "runner", "") or tr("proton.default_label"))
 
-                compat_state = "missing"
-                compat_targets: list[Path] = []
-                if isinstance(obj, ShortcutEntry) and is_steam and paths_snap:
-                    compat_state, _ = get_compatdata_migration_state(paths_snap, obj.appid_u32)
-                    compat_targets = list_microsd_compatdata_targets(steam_root=paths_snap.steam_root)
+                    try:
+                        resolved_pfx, _ = resolve_game_prefix(kind, obj, paths_snap)
+                    except Exception:
+                        resolved_pfx = getattr(obj, "prefix_dir", None)
+                    win32_flag = resolved_pfx is not None and is_win32_prefix(resolved_pfx)
+                    pfx_exists = resolved_pfx is not None and resolved_pfx.is_dir()
+
+                    if sa_obj is not None:
+                        game_id = f"umu-{sa_obj.steam_appid}" if sa_obj.steam_appid else "umu-default"
+                        st_umu = get_umu_protonfix_status(game_id)
+                        if st_umu.get("has_protonfix"):
+                            umu_text = tr(
+                                "configure.umu_protonfix_active",
+                                game_id=str(st_umu.get("umu_id") or game_id),
+                            )
+                        elif st_umu.get("found"):
+                            umu_text = tr(
+                                "configure.umu_db_found",
+                                game_id=str(st_umu.get("umu_id") or game_id),
+                            )
+                        else:
+                            umu_text = tr("configure.umu_default", game_id=game_id)
+
+                    if isinstance(obj, ShortcutEntry) and is_steam and paths_snap and managed_game is None:
+                        compat_state, _ = get_compatdata_migration_state(paths_snap, obj.appid_u32)
+                        compat_targets = list_microsd_compatdata_targets(steam_root=paths_snap.steam_root)
+                except Exception:
+                    pass
 
                 self.ready.emit(
                     proton_text,
@@ -679,22 +709,16 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                 if cur_idx >= 0:
                     proton_combo.setCurrentIndex(cur_idx)
                 proton_combo.blockSignals(False)
-                has_real_tools = any(bool(tid) for tid, _ in tools)
+                has_real_tools = len(tools) > 1 or any(
+                    tid not in ("", STEAM_DEFAULT_PROTON_ID, DEFAULT_PROTON_ID) for tid, _ in tools
+                )
                 proton_combo.setEnabled(
                     has_real_tools
                     and not win32_flag
                     and ((is_steam and bool(win.paths)) or is_standalone)
                 )
-            if btn_change_proton is not None:
-                btn_change_proton.setEnabled(
-                    not win32_flag and ((is_steam and bool(win.paths)) or is_standalone)
-                )
-            if btn_fallback10 is not None:
-                btn_fallback10.setEnabled(
-                    not win32_flag and ((is_steam and bool(win.paths)) or is_standalone)
-                )
-            if btn_previous_proton is not None and isinstance(obj, StandaloneGame):
-                previous = previous_proton_name(obj)
+            if btn_previous_proton is not None and sa_obj is not None:
+                previous = previous_proton_name(sa_obj)
                 btn_previous_proton.setEnabled(bool(previous) and not win32_flag)
                 btn_previous_proton.setToolTip(
                     tr("configure.previous_proton_tip", name=previous) if previous else ""
@@ -751,17 +775,13 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                 if not dlg_alive():
                     return
                 proton_combo.setEnabled(enabled)
-                if btn_change_proton is not None:
-                    btn_change_proton.setEnabled(enabled)
-                if btn_fallback10 is not None:
-                    btn_fallback10.setEnabled(enabled)
                 if btn_previous_proton is not None:
                     btn_previous_proton.setEnabled(enabled)
 
             def _on_proton_combo_activated(idx: int, use_previous: bool = False) -> None:
                 tool_id = "" if use_previous else str(proton_combo.itemData(idx) or "")
-                if use_previous and isinstance(obj, StandaloneGame):
-                    tool_id = previous_proton_name(obj)
+                if use_previous and sa_obj is not None:
+                    tool_id = previous_proton_name(sa_obj)
                 if not tool_id or tool_id == active_proton_ref[0]:
                     return
                 auto_snap_enabled = win._is_auto_snapshot_enabled()
@@ -819,13 +839,27 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                     entry = obj
                     paths_local_p = paths_snap
                     pfx_dir = paths_local_p.compatdata_dir / str(entry.appid_u32) / "pfx"
+                    target_steam_tool = "" if tool_id == STEAM_DEFAULT_PROTON_ID else tool_id
+                    display_tool = target_steam_tool or tr("proton.default_label")
                     _set_proton_controls_enabled(False)
+
+                    def _sync_managed_proton() -> None:
+                        if managed_game is None:
+                            return
+                        changed = (
+                            use_previous_proton(managed_game.game_dir)
+                            if use_previous
+                            else set_game_proton(managed_game.game_dir, target_steam_tool)
+                        )
+                        managed_game.proton_name = changed.proton_name
+                        managed_game.meta = changed.meta
 
                     def _proceed_steam_proton() -> None:
                         if not dlg_alive() or win._closing_pending:
                             return
 
                         queued = win.should_queue_vdf_edits()  # Gaming Mode: save it for when Steam closes
+                        win._begin_busy()
 
                         def _do_steam() -> None:
                             win._auto_snapshot_if_enabled(
@@ -835,16 +869,21 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                                 "proton",
                                 enabled=auto_snap_enabled,
                             )
+                            _sync_managed_proton()
                             if not queued:
-                                set_shortcut_proton(paths_local_p.config_vdf, entry.appid_u32, tool_id)
+                                if target_steam_tool:
+                                    set_shortcut_proton(paths_local_p.config_vdf, entry.appid_u32, target_steam_tool)
+                                else:
+                                    remove_compat_tool(paths_local_p.config_vdf, entry.appid_u32)
 
                         worker = SteamOpWorker(_do_steam, need_steam_closed=not queued)
                         win._track_worker(worker)
                         worker.status.connect(win.status_label.setText)
 
                         def _st_ok(_res: object) -> None:
+                            win._end_busy()
                             active_proton_ref[0] = tool_id
-                            msg = tr("proton.updated", name=entry.app_name, tool=tool_id)
+                            msg = tr("proton.updated", name=entry.app_name, tool=display_tool)
                             if queued:
                                 win.enqueue_vdf_edit(
                                     QueuedVdfEdit(
@@ -852,7 +891,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                                         "set_proton",
                                         entry.appid_u32,
                                         entry.app_name,
-                                        {"tool_name": tool_id},
+                                        {"tool_name": target_steam_tool},
                                     )
                                 )
                                 msg = tr("vdf_queue.enqueued", name=entry.app_name)
@@ -864,6 +903,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                                 QMessageBox.information(dlg, __app_name__, msg)
 
                         def _st_err(err: str) -> None:
+                            win._end_busy()
                             if dlg_alive():
                                 _set_proton_controls_enabled(True)
                                 _start_config_loader()
@@ -977,14 +1017,6 @@ def open_configure_game_dialog(win: MainWindow) -> None:
 
             btn_compat_migrate.clicked.connect(_on_compat_migrate_clicked)
 
-        if btn_change_proton is not None:
-
-            def _on_change_proton() -> None:
-                win._change_selected_proton()
-                if dlg_alive():
-                    _start_config_loader()
-
-            btn_change_proton.clicked.connect(_on_change_proton)
         _start_config_loader()
 
     btn_close = QPushButton(tr("configure.btn_close"))
@@ -995,3 +1027,4 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     root_lay.addLayout(close_row)
 
     dlg.exec()
+    dlg.deleteLater()

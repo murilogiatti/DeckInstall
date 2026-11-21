@@ -344,6 +344,8 @@ class AddToSteamWorker(QThread):
     def run(self) -> None:
         was_running = False
         shortcut_written = False
+        done_msg: str | None = None
+        err_msg: str | None = None
         try:
             was_running = is_steam_running()
             if was_running:
@@ -399,14 +401,16 @@ class AddToSteamWorker(QThread):
                     files=", ".join(art.saved_files.keys()) or tr("art.none"),
                 )
 
-            self.finished_ok.emit(
-                tr("add.done", name=self.app_name, appid=shortcut_id, art=art_msg)
-            )
+            done_msg = tr("add.done", name=self.app_name, appid=shortcut_id, art=art_msg)
         except Exception as exc:
-            self.failed.emit(_format_worker_error(exc), shortcut_written)
+            err_msg = _format_worker_error(exc)
         finally:
             if was_running and self.restart_steam and not is_steam_running():
                 restart_steam_after_op(self, self.status)
+        if err_msg is not None:
+            self.failed.emit(err_msg, shortcut_written)
+        elif done_msg is not None:
+            self.finished_ok.emit(done_msg)
 
 
 class RuntimeUpdateWorker(QThread):

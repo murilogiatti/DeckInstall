@@ -14,7 +14,6 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
-    QFileDialog,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -1014,12 +1013,12 @@ def open_save_sync_dialog(win: MainWindow) -> None:
         worker.start()
 
     def _on_browse() -> None:
-        picked = QFileDialog.getExistingDirectory(
-            dlg, tr("save_sync.pick_folder"), str(_current_sync_root())
-        )
-        if picked:
-            sync_dir_edit.setText(picked)
-            _refresh_plan()
+        def _picked(picked: str) -> None:
+            if picked and dlg_alive["open"] and not win._closing_pending:
+                sync_dir_edit.setText(picked)
+                _refresh_plan()
+
+        _pick_dir_async(dlg, tr("save_sync.pick_folder"), _current_sync_root(), _picked)
 
     class _FolderSaveSyncWorker(QThread):
         status = Signal(str)

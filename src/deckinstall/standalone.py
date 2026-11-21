@@ -62,14 +62,17 @@ from .steam_vdf import (
     _atomic_write_text,
     _is_env_assignment,
     _raw_shell_tokens,
+    _steam_transaction_lock,
     _strip_vdf_quotes,
     _validate_launch_options,
     add_or_update_shortcut,
     apply_launch_presets,
+    compute_shortcut_appid,
     infer_game_root_from_exe,
     load_shortcuts,
     set_shortcut_proton,
     sync_prefix_symlinks,
+    update_shortcut_paths,
 )
 
 _DEFAULT_GAMES_DIR = Path.home() / "Games"
@@ -1635,6 +1638,23 @@ def match_owned_shortcuts(
     return owned
 
 
+def primary_owned_shortcuts(
+    entries: list[ShortcutEntry], owned: dict[int, StandaloneGame],
+) -> dict[Path, ShortcutEntry]:
+    """Choose one Steam entry per managed game, preferring its current executable."""
+    primary: dict[Path, ShortcutEntry] = {}
+    priorities: dict[Path, bool] = {}
+    for entry in entries:
+        game = owned.get(entry.appid_u32)
+        if game is None:
+            continue
+        current = Path(os.path.normpath(_strip_vdf_quotes(entry.exe))) == game.exe_path
+        if game.game_dir not in primary or (current and not priorities[game.game_dir]):
+            primary[game.game_dir] = entry
+            priorities[game.game_dir] = current
+    return primary
+
+
 def shortcut_path_repairs(
     entries: list[ShortcutEntry], games: list[StandaloneGame], user_id: str | None = None,
 ) -> list[tuple[ShortcutEntry, StandaloneGame]]:
@@ -2073,6 +2093,8 @@ def import_standalone_to_steam(
     game: StandaloneGame,
     compat_tool: str = "",
     remove_standalone_files: bool = False,
+    *,
+    match_existing_name: bool = True,
 ) -> int:
     """Import a standalone game into Steam shortcuts.vdf and compatdata/<appid>/pfx."""
     env_pairs, wrappers, _, _ = _parse_launch_tokens(game.launch_options, game.winedlloverrides)
@@ -2112,6 +2134,7 @@ def import_standalone_to_steam(
         icon_path=resolved_icon,
         launch_options=steam_launch or None,
         enable_proton=not game.native_linux,
+        match_existing_name=match_existing_name,
     )
 
     target_tool = compat_tool.strip() or game.proton_name.strip()
@@ -2147,3 +2170,58 @@ def import_standalone_to_steam(
 
     sync_prefix_symlinks(paths)
     return appid_u32
+
+
+def add_installed_game_to_steam(paths: SteamPaths, game_dir: Path, uid: str) -> int:
+    """Add a managed game, keeping existing shortcuts and any foreign compatdata."""
+    from .runtime_manager import is_win32_prefix
+
+    if not paths.userdata_dir.is_dir():
+        raise ValueError("The Steam account for this shortcut is unavailable")
+    manifest_path = find_manifest(game_dir)
+    if manifest_path is None:
+        raise ValueError(f"Game manifest is unavailable: {game_dir}")
+    game = _load_manifest(manifest_path)
+    if game is None or not uid or uid != game.uid or not game.exe_path.is_file():
+        raise ValueError(f"Installed game is unavailable or changed: {game_dir}")
+
+    tracked = (paths.shortcuts_vdf, paths.config_vdf, manifest_path)
+    with _steam_transaction_lock(paths.shortcuts_vdf), _steam_transaction_lock(paths.config_vdf):
+        if any(path.is_symlink() for path in tracked):
+            raise ValueError("Refusing to replace a symlinked Steam file or game manifest")
+        entries = load_shortcuts(paths.shortcuts_vdf, strict=True)
+        existing = match_owned_shortcuts(entries, [game], paths.user_id)
+        if existing:
+            for entry, _ in shortcut_path_repairs(entries, [game], paths.user_id):
+                if not update_shortcut_paths(
+                    paths, entry.appid_u32, game.exe_path, repaired_shortcut_start_dir(entry, game),
+                    expected_exe=entry.exe,
+                ):
+                    raise RuntimeError(f"Could not update existing Steam shortcut {entry.appid_u32}")
+            return next(iter(existing))
+        appid, _ = compute_shortcut_appid(f'"{game.exe_path}"', game.name)
+        if any(entry.appid_u32 == appid for entry in entries):
+            raise ValueError(f"Steam AppID {appid} already belongs to another shortcut")
+
+        compat = paths.compatdata_dir / str(appid)
+        had_link = compat.is_symlink()
+        if not game.native_linux:
+            if game.prefix_dir.is_symlink() or is_win32_prefix(game.prefix_dir):
+                raise ValueError(f"Unsupported game prefix: {game.prefix_dir}")
+            if (compat.exists() or had_link) and not (
+                had_link and compat.resolve() == game.prefix_dir.resolve()
+            ):
+                raise ValueError(f"Steam compatdata {appid} already contains a different prefix")
+
+        before = {path: path.read_bytes() if path.is_file() else None for path in tracked}
+        try:
+            return import_standalone_to_steam(paths, game, match_existing_name=False)
+        except Exception:
+            for path, original in before.items():
+                if original is None:
+                    path.unlink(missing_ok=True)
+                elif not path.is_file() or path.read_bytes() != original:
+                    atomic_write_bytes(path, original)
+            if not had_link and compat.is_symlink() and compat.resolve() == game.prefix_dir.resolve():
+                compat.unlink()
+            raise

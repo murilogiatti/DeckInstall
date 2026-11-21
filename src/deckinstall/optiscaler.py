@@ -918,6 +918,7 @@ class BulkTarget:
     source: str
     ref: Any = None
     native_linux: bool = False
+    steam_shortcut: Any = None
 
 
 def bulk_optiscaler_targets(

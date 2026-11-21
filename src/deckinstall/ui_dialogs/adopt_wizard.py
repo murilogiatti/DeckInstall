@@ -39,8 +39,8 @@ from PySide6.QtWidgets import (
 
 from .. import adopt as ad
 from ..i18n import tr
-from ..steam_paths import SteamPaths
-from ..ui_cards import format_size_bytes
+from ..steam_paths import SteamPaths, is_gamescope_session
+from ..ui_cards import FlowLayout, _pick_dir_async, _pick_file_async, format_size_bytes, shortcut_target_button
 from ..ui_workers_adopt import AdoptPlanWorker, AdoptScanWorker, AdoptWorker
 
 TrackFn = Callable[[QThread], None]
@@ -152,6 +152,7 @@ class AdoptWizard(QDialog):
         track_worker: TrackFn | None = None,
         parent: QWidget | None = None,
         snapshot_fn: ad.SnapshotFn | None = None,
+        steam_add_allowed: bool = True,
     ) -> None:
         super().__init__(parent)
         self._snapshot_fn = snapshot_fn
@@ -161,6 +162,7 @@ class AdoptWizard(QDialog):
         self._libraries = libraries or []
         self._steam_writable = steam_writable
         self._steam_note = steam_note
+        self._steam_add_allowed = steam_add_allowed
         self._track = track_worker
         self._req = 0
         self._scan_req = 0
@@ -323,16 +325,21 @@ class AdoptWizard(QDialog):
         return [c for c in self.all_candidates() if c.key in self._checked_keys]
 
     def _add_folder(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, tr("adopt.pick_folder"), str(Path.home()))
-        if not folder:
-            return
-        cand = ad.candidate_from_folder(Path(folder))
-        if cand.exe is None:
-            exe, _ = QFileDialog.getOpenFileName(self, tr("adopt.pick_exe"), folder)
-            if not exe:
+        def _on_dir(folder: str) -> None:
+            if not folder:
                 return
-            cand = ad.candidate_from_folder(Path(folder), exe=Path(exe))
-        self.add_candidate(cand)
+            cand = ad.candidate_from_folder(Path(folder))
+            if cand.exe is not None:
+                self.add_candidate(cand)
+                return
+
+            def _on_exe(exe: str) -> None:
+                if exe:
+                    self.add_candidate(ad.candidate_from_folder(Path(folder), exe=Path(exe)))
+
+            _pick_file_async(self, tr("adopt.pick_exe"), Path(folder), "", _on_exe)
+
+        _pick_dir_async(self, tr("adopt.pick_folder"), Path.home(), _on_dir)
 
     def add_candidate(self, cand: ad.AdoptionCandidate) -> None:
         self._extra = [c for c in self._extra if c.key != cand.key] + [cand]
@@ -387,12 +394,15 @@ class AdoptWizard(QDialog):
         self.cmb_proton = QComboBox()
         self.cmb_proton.currentIndexChanged.connect(self._on_options_changed)
         form.addRow(tr("adopt.proton"), self.cmb_proton)
-        self.chk_menu = QCheckBox(tr("adopt.chk_menu"))
-        self.chk_menu.toggled.connect(self._on_options_changed)
-        self.chk_desktop = QCheckBox(tr("adopt.chk_desktop"))
-        self.chk_desktop.toggled.connect(self._on_options_changed)
-        form.addRow("", self.chk_menu)
-        form.addRow("", self.chk_desktop)
+        targets = FlowLayout(spacing=8)
+        self.btn_shortcut_menu = shortcut_target_button(tr("add.shortcut_menu"))
+        self.btn_shortcut_desktop = shortcut_target_button(tr("add.shortcut_desktop"))
+        self.btn_shortcut_steam = shortcut_target_button(tr("add.shortcut_steam"))
+        for button in (self.btn_shortcut_menu, self.btn_shortcut_desktop, self.btn_shortcut_steam):
+            button.toggled.connect(self._on_options_changed)
+            targets.addWidget(button)
+        self.btn_shortcut_steam.setVisible(self._paths is not None)
+        form.addRow(tr("add.shortcuts_label"), targets)
 
         self.steam_box = QWidget()
         slay = QVBoxLayout(self.steam_box)
@@ -543,8 +553,9 @@ class AdoptWizard(QDialog):
             self.chk_move_game,
             self.chk_move_prefix,
             self.cmb_proton,
-            self.chk_menu,
-            self.chk_desktop,
+            self.btn_shortcut_menu,
+            self.btn_shortcut_desktop,
+            self.btn_shortcut_steam,
             self.rb_steam_link,
             self.rb_steam_remove,
             self.chk_confirm_folder,
@@ -574,9 +585,12 @@ class AdoptWizard(QDialog):
             0 if (it.opts.proton_name is None or it.opts.proton_name) and c.proton_hint else self.cmb_proton.count() - 1
         )
         self.cmb_proton.setEnabled(not native)
-        self.chk_menu.setChecked(it.opts.create_menu_shortcut)
-        self.chk_desktop.setChecked(it.opts.create_desktop_shortcut)
+        self.btn_shortcut_menu.setChecked(it.opts.create_menu_shortcut)
+        self.btn_shortcut_desktop.setChecked(it.opts.create_desktop_shortcut)
         is_steam = c.kind == ad.STEAM
+        self.btn_shortcut_steam.setEnabled(self._steam_add_allowed and not is_steam)
+        self.btn_shortcut_steam.setText(tr("add.shortcut_steam_linked") if is_steam else tr("add.shortcut_steam"))
+        self.btn_shortcut_steam.setChecked(it.opts.add_to_steam and not is_steam)
         self.steam_box.setVisible(is_steam)
         steam_label = self._plan_form.labelForField(self.steam_box)
         if steam_label is not None:
@@ -642,10 +656,12 @@ class AdoptWizard(QDialog):
             name=it.opts.name,
             exe=it.opts.exe,
             proton_name=None if proton_data == "source" else "",
-            create_menu_shortcut=self.chk_menu.isChecked(),
-            create_desktop_shortcut=self.chk_desktop.isChecked(),
+            create_menu_shortcut=self.btn_shortcut_menu.isChecked(),
+            create_desktop_shortcut=self.btn_shortcut_desktop.isChecked(),
             remove_from_steam=it.cand.kind == ad.STEAM and self.rb_steam_remove.isChecked() and self._steam_writable,
             link_steam_compatdata=not self.rb_steam_remove.isChecked(),
+            add_to_steam=self._paths is not None and self.btn_shortcut_steam.isEnabled()
+            and self.btn_shortcut_steam.isChecked(),
         )
         self._replan(idx)
         self._render_plan(it)
@@ -660,17 +676,35 @@ class AdoptWizard(QDialog):
     def _pick_game_folder(self) -> None:
         if not 0 <= self._current < len(self.items):
             return
-        it = self.items[self._current]
+        idx = self._current
+        it = self.items[idx]
         start = it.cand.game_dir or it.cand.prefix_dir or Path.home()
-        folder = QFileDialog.getExistingDirectory(self, tr("adopt.pick_game_folder"), str(start))
-        if folder:
-            self.set_game_folder(self._current, Path(folder))
+
+        def _on_dir(folder: str) -> None:
+            if not folder or not 0 <= idx < len(self.items):
+                return
+            folder_path = Path(folder)
+            cand = ad.candidate_with_folder(self.items[idx].cand, folder_path, None)
+            if cand.exe is not None:
+                self.set_game_folder(idx, folder_path, cand.exe)
+                return
+
+            def _on_exe(picked: str) -> None:
+                if picked and 0 <= idx < len(self.items):
+                    self.set_game_folder(idx, folder_path, Path(picked))
+
+            _pick_file_async(self, tr("adopt.pick_exe"), folder_path, "", _on_exe)
+
+        _pick_dir_async(self, tr("adopt.pick_game_folder"), start, _on_dir)
 
     def set_game_folder(self, idx: int, folder: Path, exe: Path | None = None) -> None:
         it = self.items[idx]
         cand = ad.candidate_with_folder(it.cand, folder, exe)
         if cand.exe is None:
-            picked, _ = QFileDialog.getOpenFileName(self, tr("adopt.pick_exe"), str(folder))
+            opts = QFileDialog.Option.DontUseNativeDialog if is_gamescope_session() else QFileDialog.Option(0)
+            picked, _ = QFileDialog.getOpenFileName(
+                self, tr("adopt.pick_exe"), str(folder), options=opts
+            )
             if not picked:
                 return
             cand = ad.candidate_with_folder(it.cand, folder, Path(picked))
@@ -850,9 +884,12 @@ def open_adopt_wizard(
     steam_note: str = "",
     track_worker: TrackFn | None = None,
     snapshot_fn: ad.SnapshotFn | None = None,
+    steam_add_allowed: bool = True,
 ) -> list[ad.AdoptionResult]:
     """Show the wizard modally; return the successful adoptions."""
-    dlg = AdoptWizard(paths, libraries, steam_writable, steam_note, track_worker, parent, snapshot_fn)
+    dlg = AdoptWizard(
+        paths, libraries, steam_writable, steam_note, track_worker, parent, snapshot_fn, steam_add_allowed,
+    )
     try:
         dlg.exec()
         return list(dlg.adopted)

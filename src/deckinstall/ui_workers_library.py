@@ -469,17 +469,22 @@ class RemoveShortcutWorker(QThread):
         super().__init__()
         self._paths = paths
         self._shortcut = shortcut
+        self.restart_failed = False
+        self.closed_steam = False
+        self.restart_if_was_running = True
 
     def run(self) -> None:
         was_running = False
+        removed = False
+        err_msg: str | None = None
         try:
             was_running = is_steam_running()
             if was_running and not shutdown_steam():
                 raise RuntimeError(tr("add.close_steam_timeout"))
+            self.closed_steam = was_running
             removed = remove_shortcut(self._paths, self._shortcut.appid_u32)
-            self.done.emit(removed)
         except Exception as exc:
-            self.failed.emit(_format_worker_error(exc))
+            err_msg = _format_worker_error(exc)
         finally:
             try:
                 if was_running and not is_steam_running() and not start_steam():
@@ -487,6 +492,10 @@ class RemoveShortcutWorker(QThread):
             except Exception:
                 logging.exception("Failed restarting Steam after RemoveShortcutWorker")
                 self.restart_failed = True
+        if err_msg is not None:
+            self.failed.emit(err_msg)
+        else:
+            self.done.emit(removed)
 
 
 class DirStatsWorker(QThread):
