@@ -859,5 +859,6 @@
   "nav.saves": "Backup & sync",
   "nav.maintenance": "Maintenance",
   "nav.back": "← Library",
-  "maint.app_settings_title": "App and Steam"
+  "maint.app_settings_title": "App and Steam",
+  "play.hung": "The game closed (it probably crashed), but Proton/umu stayed stuck waiting for it. The leftover processes were closed."
 }

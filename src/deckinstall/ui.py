@@ -3238,7 +3238,7 @@ class MainWindow(QMainWindow):
             log_path = game_log_dir(obj) / "run.log" if isinstance(obj, StandaloneGame) else log_file
             self._play.launch(
                 key, title_name, cmd, cwd=cwd, env=env, log_file=log_file, log_path=log_path,
-                watch=watch_paths(obj.game_dir, obj.prefix_dir),
+                watch=watch_paths(obj.game_dir, obj.prefix_dir), exe_name=Path(obj.exe_path).name,
             )
             self.status_label.setText(tr("play.launched", name=title_name))
 

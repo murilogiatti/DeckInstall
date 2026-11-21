@@ -91,6 +91,26 @@ def find_game_pids(watch: tuple[str, ...], proc_root: str = "/proc") -> set[int]
     return found
 
 
+def exe_process_state(exe_name: str, proc_root: str = "/proc") -> tuple[bool, bool]:
+    """(alive, zombie): processes named like the game's .exe (Wine sets comm to its first 15 chars)."""
+    comm = exe_name[:15].encode()
+    alive = zombie = False
+    try:
+        entries = [e.name for e in os.scandir(proc_root) if e.name.isdigit()]
+    except OSError:
+        return False, False
+    for name in entries:
+        stat = _read(f"{proc_root}/{name}/stat")
+        start, end = stat.find(b"("), stat.rfind(b")")
+        if start < 0 or end < 0 or stat[start + 1:end] != comm:
+            continue
+        if stat[end + 2:end + 3] == b"Z":
+            zombie = True
+        else:
+            alive = True
+    return alive, zombie
+
+
 def log_tail(path: Path | None, lines: int = _LOG_TAIL_LINES) -> str:
     """The last lines of a run log ("" when there is none)."""
     if path is None:
@@ -120,6 +140,9 @@ class _Run:
     stopping: bool = False
     misses: int = 0
     pids: set[int] = field(default_factory=set)
+    exe_name: str = ""
+    zombie_since: float | None = None
+    hung: bool = False
 
 
 class PlayMonitor(QObject):
@@ -134,6 +157,7 @@ class PlayMonitor(QObject):
     RUNNING_AFTER_S = 3.0  # our process alive this long: the game is running
     CHILD_GRACE_S = 15.0  # after a quick exit 0, how long to look for the real game process
     GONE_TICKS = 4  # consecutive empty /proc scans before a followed game counts as closed
+    HUNG_AFTER_S = 10.0  # game .exe dead (zombie) but Proton/umu still up this long: it hung after a crash
     TICK_MS = 500
 
     def __init__(self, parent: QObject) -> None:
@@ -145,6 +169,7 @@ class PlayMonitor(QObject):
         self.frame = 0
         self.clock = time.monotonic
         self.scan = find_game_pids
+        self.exe_state = exe_process_state
 
     def state(self, key: str) -> str:
         run = self._runs.get(key)
@@ -172,8 +197,12 @@ class PlayMonitor(QObject):
         log_file: Path | None = None,
         watch: tuple[str, ...] = (),
         log_path: Path | None = None,
+        exe_name: str = "",
     ) -> None:
-        """Start cmd and follow it (log_file: where its output goes; log_path: the log shown on errors)."""
+        """Start cmd and follow it (log_file: where its output goes; log_path: the log shown on errors).
+
+        exe_name: the game's .exe file name, to notice a game that died while Proton stays hung.
+        """
         proc = QProcess(self)
         proc.setProgram(cmd[0])
         proc.setArguments(cmd[1:])
@@ -196,7 +225,7 @@ class PlayMonitor(QObject):
         proc.setStandardOutputFile(out, QProcess.OpenModeFlag.Append)
         proc.setStandardErrorFile(out, QProcess.OpenModeFlag.Append)
         proc.setUnixProcessParameters(QProcess.UnixProcessFlag.CreateNewSession)
-        self._runs[key] = _Run(name, LOADING, self.clock(), watch, log_path or log_file, proc)
+        self._runs[key] = _Run(name, LOADING, self.clock(), watch, log_path or log_file, proc, exe_name=exe_name)
         proc.errorOccurred.connect(lambda err, k=key, p=proc: self._on_error(k, p, err))
         proc.finished.connect(lambda code, status, k=key, p=proc: self._on_finished(k, p, code, status))
         proc.started.connect(lambda k=key: self._changed(k))
@@ -214,6 +243,10 @@ class PlayMonitor(QObject):
         if run is None or run.state != RUNNING:
             return
         run.stopping = True
+        self._terminate(run)
+
+    def _terminate(self, run: _Run) -> None:
+        """SIGTERM to our session and to every process found for the game."""
         pids = set(run.pids) | self.scan(run.watch)
         if run.proc is not None and run.proc.state() != QProcess.ProcessState.NotRunning:
             pid = int(run.proc.processId())
@@ -282,6 +315,9 @@ class PlayMonitor(QObject):
         run.proc = None
         proc.deleteLater()
         now = self.clock()
+        if run.hung:
+            self._fail(key, tr("play.hung"))
+            return
         if run.stopping:
             self._finish(key)
             return
@@ -294,6 +330,18 @@ class PlayMonitor(QObject):
         else:
             run.exited_at = now  # quick exit 0: look for the real game process
             self._tick_run(key, run, now)
+
+    def _check_hung(self, run: _Run, now: float) -> None:
+        """The game .exe is a zombie and nothing alive has its name: Proton hung after the game died."""
+        alive, zombie = self.exe_state(run.exe_name)
+        if not zombie or alive:
+            run.zombie_since = None
+            return
+        if run.zombie_since is None:
+            run.zombie_since = now
+        elif now - run.zombie_since >= self.HUNG_AFTER_S:
+            run.hung = True
+            self._terminate(run)  # nothing of the game is left to lose; finished() then shows the error
 
     def _tick(self) -> None:
         self.frame += 1
@@ -316,6 +364,8 @@ class PlayMonitor(QObject):
                 self._changed(key)
             elif run.state == LOADING:
                 self.changed.emit(key)
+            elif run.exe_name and not run.hung and not run.stopping:
+                self._check_hung(run, now)
             return
         pids = self.scan(run.watch)
         if pids:

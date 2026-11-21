@@ -190,3 +190,30 @@ def test_play_button_follows_selected_game_state(tmp_path: Path) -> None:
             win.close()
             win.deleteLater()
             app.processEvents()
+
+
+def test_exe_process_state_reads_comm_and_zombie(tmp_path: Path) -> None:
+    root = tmp_path / "proc"
+    for pid, stat in (("20", "20 (Returnal-Win64-) Z 1 1"), ("21", "21 (bash) S 1 1"), ("22", "22 (Other (x)) S 1")):
+        (root / pid).mkdir(parents=True)
+        (root / pid / "stat").write_text(stat)
+    assert pm.exe_process_state("Returnal-Win64-Shipping.exe", str(root)) == (False, True)
+    (root / "23").mkdir()
+    (root / "23" / "stat").write_text("23 (Returnal-Win64-) S 1 1")
+    assert pm.exe_process_state("Returnal-Win64-Shipping.exe", str(root)) == (True, True)
+    assert pm.exe_process_state("Nope.exe", str(root)) == (False, False)
+
+
+def test_game_dead_but_proton_hung_is_an_error_and_cleaned_up(mon: pm.PlayMonitor) -> None:
+    mon.HUNG_AFTER_S = 0.3
+    dead = {"on": False}
+    mon.exe_state = lambda name: (False, True) if dead["on"] else (True, False)
+    mon.scan = lambda watch: set()
+    mon.launch("g", "Game", ["sleep", "30"], exe_name="Game.exe")
+    _wait(mon, lambda: mon.state("g") == pm.RUNNING)
+    pid = int(mon._runs["g"].proc.processId())
+    dead["on"] = True  # the game crashed; its launcher (sleep here) stays up like a hung Proton
+    _wait(mon, lambda: mon.state("g") == pm.ERROR)
+    (_k, _n, diag), = mon.events["failed"]  # type: ignore[attr-defined]
+    assert diag.startswith(pm.tr("play.hung"))
+    assert not os.path.exists(f"/proc/{pid}") or open(f"/proc/{pid}/stat").read().split(") ")[1][0] == "Z"
