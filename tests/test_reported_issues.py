@@ -204,10 +204,18 @@ class UniqueLibraryActionTests(unittest.TestCase):
                 self.assertIsNone(win.btn_remove_game.menu())
                 self.assertIsNone(win.btn_save_sync.menu())
                 self.assertEqual(win.stack.count(), 4)
+                self.assertFalse(hasattr(win, "_nav_buttons"))  # no navigation in the sidebar
                 self.assertEqual(
-                    [b.text() for b in win._nav_buttons],
-                    [tr("tabs.install"), tr("tabs.library"), tr("tabs.saves"), tr("tabs.maintenance")],
+                    [b.text() for b in win._hub_buttons],
+                    [tr("nav.install"), tr("nav.saves"), tr("nav.maintenance")],
                 )
+                for button, page in zip(win._hub_buttons, (ui.PAGE_INSTALL, ui.PAGE_SAVES, ui.PAGE_MAINT), strict=True):
+                    button.click()
+                    self.assertEqual(win.stack.currentIndex(), page)
+                    backs = [b for b in win.stack.currentWidget().findChildren(QPushButton) if b.text() == tr("nav.back")]
+                    self.assertEqual(len(backs), 1)
+                    backs[0].click()
+                    self.assertEqual(win.stack.currentIndex(), ui.PAGE_LIBRARY)
                 self.assertFalse(hasattr(win, "btn_game_actions"))
                 self.assertFalse(hasattr(win, "btn_tools_menu"))
                 self.assertNotEqual(win.shortcuts_list.contextMenuPolicy(), Qt.ContextMenuPolicy.CustomContextMenu)

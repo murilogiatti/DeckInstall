@@ -10,9 +10,6 @@
   "status.ready": "Ready.",
   "status.steam_id": "Steam ID: {id}",
   "status.steam_not_detected": "Standalone Mode (No Steam)",
-  "tabs.install": "Install",
-  "tabs.library": "Library",
-  "tabs.saves": "Backup/Sync",
   "table.name": "Name",
   "table.source": "Source",
   "table.executable": "Executable",
@@ -281,7 +278,6 @@
   "app_update.manual_not_writable": "New version available: v{latest} (current: v{current}).\nThe current AppImage is not writable ({path}). Download at:\n{url}",
   "app_update.manual_no_asset": "New version v{latest} found, but no compatible AppImage asset was found.\nCheck:\n{url}",
   "app_update.error": "Error updating DeckInstall: {err}",
-  "tabs.maintenance": "Maintenance",
   "maint.page_title": "Maintenance & Cleanup",
   "maint.page_subtitle": "Monitor runtime health and safely clean orphan prefixes, caches, shaders, and old Proton versions.",
   "maint.health_title": "System Health & Disk Usage",
@@ -858,5 +854,9 @@
   "play.closed_at_once": "The game closed as soon as it opened (exit code 0) and none of its processes kept running.",
   "play.log_tail": "Last lines of the log ({path}):",
   "play.timeout": "'{name}' showed no sign of life in 60 s. Check the log under Configure game.",
-  "play.steam_timeout": "Could not confirm that Steam opened '{name}'."
+  "play.steam_timeout": "Could not confirm that Steam opened '{name}'.",
+  "nav.install": "Install game",
+  "nav.saves": "Backup & sync",
+  "nav.maintenance": "Maintenance",
+  "nav.back": "← Library"
 }

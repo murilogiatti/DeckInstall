@@ -261,6 +261,9 @@ def _setting_int(settings: QSettings, key: str, default: int = 0) -> int:
     return default
 
 
+PAGE_INSTALL, PAGE_LIBRARY, PAGE_SAVES, PAGE_MAINT = range(4)
+
+
 class MainWindow(QMainWindow):
     """Main DeckInstall application window."""
 
@@ -525,11 +528,28 @@ class MainWindow(QMainWindow):
             sa.setWidget(w)
             return sa
 
+        def _subpage(w: QWidget) -> QWidget:
+            """A page opened from the Library: "← Library" on top, the page scrolls below it."""
+            page = QWidget()
+            lay = QVBoxLayout(page)
+            lay.setContentsMargins(0, 0, 0, 0)
+            lay.setSpacing(8)
+            back = QPushButton(tr("nav.back"), page)
+            back.setObjectName("BackBtn")
+            back.clicked.connect(lambda: self._show_page(PAGE_LIBRARY))
+            row = QHBoxLayout()
+            row.addWidget(back)
+            row.addStretch()
+            lay.addLayout(row)
+            lay.addWidget(_wrap_scroll(w), 1)
+            return page
+
+        # Library is the hub; Install, Backup/Sync and Maintenance open from its buttons.
         self.stack = QStackedWidget()
-        self.stack.addWidget(_wrap_scroll(self._build_extract_page()))
-        self.stack.addWidget(_wrap_scroll(self._build_library_page()))
-        self.stack.addWidget(_wrap_scroll(self._build_saves_page()))
-        self.stack.addWidget(_wrap_scroll(self._build_maintenance_page()))
+        self.stack.addWidget(_subpage(self._build_extract_page()))  # PAGE_INSTALL
+        self.stack.addWidget(_wrap_scroll(self._build_library_page()))  # PAGE_LIBRARY
+        self.stack.addWidget(_subpage(self._build_saves_page()))  # PAGE_SAVES
+        self.stack.addWidget(_subpage(self._build_maintenance_page()))  # PAGE_MAINT
         self.stack.currentChanged.connect(self._on_stack_tab_changed)
         right_layout.addWidget(self.stack)
 
@@ -577,22 +597,6 @@ class MainWindow(QMainWindow):
         brand_row.addStretch()
         layout.addLayout(brand_row)
         layout.addSpacing(18)
-
-        self._nav_buttons: list[QPushButton] = []
-        nav_items = [
-            tr("tabs.install"),
-            tr("tabs.library"),
-            tr("tabs.saves"),
-            tr("tabs.maintenance"),
-        ]
-        for idx, label in enumerate(nav_items):
-            btn = QPushButton(label)
-            btn.setCheckable(True)
-            btn.setAutoExclusive(True)
-            btn.clicked.connect(lambda _=False, i=idx: self.stack.setCurrentIndex(i))
-            layout.addWidget(btn)
-            self._nav_buttons.append(btn)
-        self._nav_buttons[0].setChecked(True)
 
         layout.addStretch()
 
@@ -654,11 +658,14 @@ class MainWindow(QMainWindow):
             color = "#64b5f6"
         self.steam_status_lbl.setStyleSheet(f"color: {color}; font-size: 11px;")
 
+    def _show_page(self, idx: int) -> None:
+        self.stack.setCurrentIndex(idx)
+
     def _on_stack_tab_changed(self, idx: int) -> None:
-        """Refresh Saves list or Maintenance metrics when switching tabs."""
-        if idx == 2:
+        """Refresh Saves list or Maintenance metrics when their page opens."""
+        if idx == PAGE_SAVES:
             self._refresh_saves_list()
-        elif idx == 3:
+        elif idx == PAGE_MAINT:
             refresh_maintenance_health(self)
 
     def _format_steam_status_text(self) -> str:
@@ -1117,8 +1124,7 @@ class MainWindow(QMainWindow):
     def _switch_library_subview(self, idx: int) -> None:
         """Switch to unified Install / Add Game view (Tab 0) and focus game name."""
         if idx == 1:
-            self._nav_buttons[0].setChecked(True)
-            self.stack.setCurrentIndex(0)
+            self._show_page(PAGE_INSTALL)
             self.add_name.setFocus()
 
     def _build_library_page(self) -> QWidget:
@@ -1139,6 +1145,22 @@ class MainWindow(QMainWindow):
         sub.setWordWrap(True)
         my_lib_layout.addWidget(title)
         my_lib_layout.addWidget(sub)
+
+        hub = QHBoxLayout()
+        hub.setSpacing(10)
+        self._hub_buttons: list[QPushButton] = []
+        for label, idx in (
+            (tr("nav.install"), PAGE_INSTALL),
+            (tr("nav.saves"), PAGE_SAVES),
+            (tr("nav.maintenance"), PAGE_MAINT),
+        ):
+            btn = QPushButton(label)
+            btn.setObjectName("HubBtn")
+            btn.setMinimumHeight(56)
+            btn.clicked.connect(lambda _=False, i=idx: self._show_page(i))
+            hub.addWidget(btn, 1)
+            self._hub_buttons.append(btn)
+        my_lib_layout.addLayout(hub)
 
         lib_card, lib_layout = _make_card()
         top = QHBoxLayout()
@@ -1649,14 +1671,12 @@ class MainWindow(QMainWindow):
             game = scan_game_folder(p)
             if game is not None:
                 self._populate_game_form(game)
-                self._nav_buttons[0].setChecked(True)
-                self.stack.setCurrentIndex(0)
+                self._show_page(PAGE_INSTALL)
                 self.add_name.setFocus()
             return
         if p.is_file():
             self._on_manual_exe_picked(str(p))
-            self._nav_buttons[0].setChecked(True)
-            self.stack.setCurrentIndex(0)
+            self._show_page(PAGE_INSTALL)
 
     def _detected_kind_text(self, info: classify.SourceInfo) -> str:
         texts = {
@@ -2490,11 +2510,10 @@ class MainWindow(QMainWindow):
             self._initial_tab_decided = True
             if (
                 (entries or standalone_games or external_games)
-                and self.stack.currentIndex() == 0
+                and self.stack.currentIndex() == PAGE_INSTALL
                 and self._extract_worker is None
             ):
-                self._nav_buttons[1].setChecked(True)
-                self.stack.setCurrentIndex(1)
+                self._show_page(PAGE_LIBRARY)
         self._maybe_prompt_migration(standalone_games)
 
     def _maybe_prompt_migration(self, standalone_games: list[StandaloneGame]) -> None:

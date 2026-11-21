@@ -10,9 +10,6 @@
   "status.ready": "Pronto.",
   "status.steam_id": "ID Steam: {id}",
   "status.steam_not_detected": "Modo Autônomo (sem Steam)",
-  "tabs.install": "Instalar",
-  "tabs.library": "Biblioteca",
-  "tabs.saves": "Backup e sincronização",
   "table.name": "Nome",
   "table.source": "Origem",
   "table.executable": "Executável",
@@ -281,7 +278,6 @@
   "app_update.manual_not_writable": "Nova versão disponível: v{latest} (atual: v{current}).\nO AppImage atual não tem permissão de escrita ({path}). Baixe em:\n{url}",
   "app_update.manual_no_asset": "Nova versão v{latest} encontrada, mas nenhum AppImage compatível foi publicado ainda.\nConfira em:\n{url}",
   "app_update.error": "Erro ao atualizar DeckInstall: {err}",
-  "tabs.maintenance": "Manutenção",
   "maint.page_title": "Manutenção e limpeza",
   "maint.page_subtitle": "Veja se os runtimes estão em dia e limpe com segurança prefixos sem uso, caches e versões antigas do Proton.",
   "maint.health_title": "Saúde do sistema e espaço",
@@ -858,5 +854,9 @@
   "play.closed_at_once": "O jogo fechou assim que abriu (código 0) e nenhum processo dele ficou rodando.",
   "play.log_tail": "Últimas linhas do log ({path}):",
   "play.timeout": "'{name}' não deu sinal de vida em 60 s. Confira o log em Configurar jogo.",
-  "play.steam_timeout": "Não deu para confirmar se a Steam abriu '{name}'."
+  "play.steam_timeout": "Não deu para confirmar se a Steam abriu '{name}'.",
+  "nav.install": "Instalar jogo",
+  "nav.saves": "Backup e sincronização",
+  "nav.maintenance": "Manutenção",
+  "nav.back": "← Biblioteca"
 }
