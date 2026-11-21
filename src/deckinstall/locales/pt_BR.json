@@ -858,5 +858,6 @@
   "nav.install": "Instalar jogo",
   "nav.saves": "Backup e sincronização",
   "nav.maintenance": "Manutenção",
-  "nav.back": "← Biblioteca"
+  "nav.back": "← Biblioteca",
+  "maint.app_settings_title": "Aplicativo e Steam"
 }

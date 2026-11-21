@@ -21,28 +21,6 @@ QMainWindow, QDialog, #ContentArea {
     color: $fg_text;
     font-size: 12px;
 }
-#Sidebar {
-    background-color: $bg_surface;
-    border-right: 1px solid $border_subtle;
-}
-#Sidebar QPushButton {
-    background-color: transparent;
-    color: $sidebar_fg;
-    text-align: left;
-    padding: 11px 14px;
-    border: none;
-    border-radius: 8px;
-    font-size: 12px;
-    font-weight: 600;
-}
-#Sidebar QPushButton:hover {
-    background-color: $sidebar_hover_bg;
-    color: $sidebar_hover_fg;
-}
-#Sidebar QPushButton:checked {
-    background-color: #1d6fa5;
-    color: #ffffff;
-}
 QFrame#Card, QFrame#DropZone {
     background-color: $bg_surface;
     border: 1px solid $border_subtle;
@@ -138,7 +116,7 @@ QPushButton {
 QPushButton:hover {
     background-color: $btn_hover_bg;
 }
-QPushButton:focus, #Sidebar QPushButton:focus {
+QPushButton:focus {
     border: 2px solid $focus_border;
 }
 QPushButton:disabled {
@@ -218,9 +196,6 @@ _DARK_TOKENS: dict[str, str] = {
     "fg_text": "#e6ebf5",
     "bg_surface": "#1a1e28",
     "border_subtle": "#282f3e",
-    "sidebar_fg": "#9aa6be",
-    "sidebar_hover_bg": "#242a38",
-    "sidebar_hover_fg": "#ffffff",
     "dropzone_border": "#344157",
     "title_fg": "#ffffff",
     "muted_fg": "#8f9bb3",
@@ -262,9 +237,6 @@ _LIGHT_TOKENS: dict[str, str] = {
     "fg_text": "#1b2230",
     "bg_surface": "#ffffff",
     "border_subtle": "#dde3ee",
-    "sidebar_fg": "#556178",
-    "sidebar_hover_bg": "#edf1f7",
-    "sidebar_hover_fg": "#111622",
     "dropzone_border": "#b9c5d8",
     "title_fg": "#0f141e",
     "muted_fg": "#5e6a82",

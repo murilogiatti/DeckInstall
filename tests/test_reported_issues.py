@@ -183,7 +183,7 @@ class ProtonUsageTests(unittest.TestCase):
 class UniqueLibraryActionTests(unittest.TestCase):
     def test_library_has_one_visible_entry_for_each_action(self) -> None:
         from PySide6.QtCore import QSettings, Qt
-        from PySide6.QtWidgets import QApplication, QPushButton
+        from PySide6.QtWidgets import QApplication, QPushButton, QWidget
 
         from deckinstall import ui
         from deckinstall.i18n import tr
@@ -204,7 +204,11 @@ class UniqueLibraryActionTests(unittest.TestCase):
                 self.assertIsNone(win.btn_remove_game.menu())
                 self.assertIsNone(win.btn_save_sync.menu())
                 self.assertEqual(win.stack.count(), 4)
-                self.assertFalse(hasattr(win, "_nav_buttons"))  # no navigation in the sidebar
+                self.assertFalse(hasattr(win, "_nav_buttons"))  # no sidebar
+                self.assertEqual(win.findChildren(QWidget, "Sidebar"), [])
+                self.assertEqual(win.stack.currentIndex(), ui.PAGE_LIBRARY)
+                self.assertTrue(win.stack.widget(ui.PAGE_MAINT).isAncestorOf(win.theme_combo))
+                self.assertTrue(win.stack.widget(ui.PAGE_MAINT).isAncestorOf(win.btn_redetect_steam))
                 self.assertEqual(
                     [b.text() for b in win._hub_buttons],
                     [tr("nav.install"), tr("nav.saves"), tr("nav.maintenance")],
@@ -593,7 +597,7 @@ class UiUxSimplificationTests(unittest.TestCase):
                 win_empty = ui.MainWindow(app)
                 try:
                     win_empty._apply_shortcuts_data(None, [], [], [], "", runner_labels={})
-                    self.assertEqual(win_empty.stack.currentIndex(), 0)
+                    self.assertEqual(win_empty.stack.currentIndex(), ui.PAGE_LIBRARY)  # always opens on the Library
                 finally:
                     for worker in list(win_empty._active_workers):
                         worker.wait(5000)

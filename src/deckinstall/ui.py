@@ -330,7 +330,6 @@ class MainWindow(QMainWindow):
         self._close_force_timer: QTimer | None = None
         self._busy_count = 0
         self._vdf_corrupt = False
-        self._initial_tab_decided = False
         self._migration_prompted = False
         self._vdf_queue = VdfEditQueue(vdf_queue.default_queue_file())
         self._vdf_steam_open = False  # last poll saw Steam running while edits were queued
@@ -512,10 +511,6 @@ class MainWindow(QMainWindow):
         shell.setContentsMargins(0, 0, 0, 0)
         shell.setSpacing(0)
 
-        main_splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_splitter.setChildrenCollapsible(False)
-        main_splitter.addWidget(self._build_sidebar())
-
         right = QWidget()
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(22, 20, 22, 14)
@@ -550,6 +545,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(_wrap_scroll(self._build_library_page()))  # PAGE_LIBRARY
         self.stack.addWidget(_subpage(self._build_saves_page()))  # PAGE_SAVES
         self.stack.addWidget(_subpage(self._build_maintenance_page()))  # PAGE_MAINT
+        self.stack.setCurrentIndex(PAGE_LIBRARY)  # always open on the Library (no jump after the scan)
         self.stack.currentChanged.connect(self._on_stack_tab_changed)
         right_layout.addWidget(self.stack)
 
@@ -558,70 +554,32 @@ class MainWindow(QMainWindow):
         self.status_label.setWordWrap(True)
         right_layout.addWidget(self.status_label)
 
-        main_splitter.addWidget(right)
-        main_splitter.setStretchFactor(0, 0)
-        main_splitter.setStretchFactor(1, 1)
-        main_splitter.setSizes([225, 755])
-        shell.addWidget(main_splitter)
+        shell.addWidget(right)
         self.setCentralWidget(central)
         self._update_steam_mode_ui()
 
-    def _build_sidebar(self) -> QWidget:
-        sidebar = QWidget()
-        sidebar.setObjectName("Sidebar")
-        sidebar.setMinimumWidth(180)
-        sidebar.setMaximumWidth(360)
-        layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(14, 20, 14, 16)
-        layout.setSpacing(6)
+    def _build_app_settings_card(self) -> QWidget:
+        """Maintenance card with what used to be the sidebar: Steam status, theme, language and About."""
+        card, layout = _make_card()
+        title = QLabel(tr("maint.app_settings_title"))
+        title.setObjectName("SectionTitle")
+        layout.addWidget(title)
 
-        brand_row = QHBoxLayout()
-        icon_lbl = QLabel()
-        icon_path = _resolve_asset_path("icon.png")
-        if icon_path is not None:
-            pix = QPixmap(str(icon_path)).scaled(
-                36, 36, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
-            )
-            icon_lbl.setPixmap(pix)
-        brand_text = QVBoxLayout()
-        brand_text.setSpacing(0)
-        title = QLabel(f"<b>{__app_name__}</b>")
-        title.setStyleSheet("font-size: 15px;")
-        ver = QLabel(f"v{__version__}")
-        ver.setObjectName("MutedText")
-        brand_text.addWidget(title)
-        brand_text.addWidget(ver)
-        brand_row.addWidget(icon_lbl)
-        brand_row.addSpacing(8)
-        brand_row.addLayout(brand_text)
-        brand_row.addStretch()
-        layout.addLayout(brand_row)
-        layout.addSpacing(18)
-
-        layout.addStretch()
-
+        steam_row = QHBoxLayout()
         self.steam_status_lbl = QLabel(self._format_steam_status_text())
-        self.steam_status_lbl.setObjectName("MutedText")
         self.steam_status_lbl.setWordWrap(True)
-        layout.addWidget(self.steam_status_lbl)
-
         self.btn_redetect_steam = QPushButton(tr("sidebar.redetect_steam"))
         self.btn_redetect_steam.clicked.connect(self._redetect_steam)
-        layout.addWidget(self.btn_redetect_steam)
+        steam_row.addWidget(self.steam_status_lbl, 1)
+        steam_row.addWidget(self.btn_redetect_steam)
+        layout.addLayout(steam_row)
 
-        theme_lbl = QLabel(tr("header.theme"))
-        theme_lbl.setObjectName("MutedText")
-        layout.addWidget(theme_lbl)
+        prefs = FlowLayout(spacing=8)
         self.theme_combo = QComboBox()
         self.theme_combo.addItem(tr("header.theme.auto"), "auto")
         self.theme_combo.addItem(tr("header.theme.dark"), "dark")
         self.theme_combo.addItem(tr("header.theme.light"), "light")
         self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
-        layout.addWidget(self.theme_combo)
-
-        lang_lbl = QLabel(tr("header.language"))
-        lang_lbl.setObjectName("MutedText")
-        layout.addWidget(lang_lbl)
         self.lang_combo = QComboBox()
         self.lang_combo.addItem(tr("header.language.auto"), "auto")
         for code, disp in available_languages():
@@ -631,22 +589,19 @@ class MainWindow(QMainWindow):
         if lidx >= 0:
             self.lang_combo.setCurrentIndex(lidx)
         self.lang_combo.currentIndexChanged.connect(self._on_language_changed)
-        layout.addWidget(self.lang_combo)
-
         btn_about = QPushButton(tr("header.about"))
         btn_about.clicked.connect(self._show_about_dialog)
-        layout.addWidget(btn_about)
+        for label, combo in ((tr("header.theme"), self.theme_combo), (tr("header.language"), self.lang_combo)):
+            box = QWidget()
+            row = QHBoxLayout(box)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.addWidget(QLabel(label))
+            row.addWidget(combo)
+            prefs.addWidget(box)
+        prefs.addWidget(btn_about)
+        layout.addLayout(prefs)
         self._update_steam_status_style()
-
-        sidebar_scroll = QScrollArea()
-        sidebar_scroll.setObjectName("Sidebar")
-        sidebar_scroll.setWidgetResizable(True)
-        sidebar_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        sidebar_scroll.setMinimumWidth(180)
-        sidebar_scroll.setMaximumWidth(360)
-        sidebar_scroll.setWidget(sidebar)
-        return sidebar_scroll
+        return card
 
     def _update_steam_status_style(self) -> None:
         """Apply subtle semantic color to the sidebar Steam status label."""
@@ -1381,7 +1336,11 @@ class MainWindow(QMainWindow):
         refresh_saves_page(self)
 
     def _build_maintenance_page(self) -> QWidget:
-        return build_maintenance_page(self)
+        page = build_maintenance_page(self)
+        layout = page.layout()
+        assert isinstance(layout, QVBoxLayout)
+        layout.insertWidget(3, self._build_app_settings_card())  # after the title, subtitle and health card
+        return page
 
 
     def _refresh_maintenance_health(self) -> None:
@@ -2506,14 +2465,6 @@ class MainWindow(QMainWindow):
 
         self._filter_library_list()
         self._update_library_action_states()
-        if not self._initial_tab_decided:
-            self._initial_tab_decided = True
-            if (
-                (entries or standalone_games or external_games)
-                and self.stack.currentIndex() == PAGE_INSTALL
-                and self._extract_worker is None
-            ):
-                self._show_page(PAGE_LIBRARY)
         self._maybe_prompt_migration(standalone_games)
 
     def _maybe_prompt_migration(self, standalone_games: list[StandaloneGame]) -> None:

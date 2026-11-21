@@ -325,8 +325,10 @@ FASE 12 - Navegacao, Jogar e faxina (2026-11-21) - CONCLUIDA (v0.21.0, sem relea
    /proc (cmdline, cwd, WINEPREFIX/STEAM_COMPAT_DATA_PATH); 60 s sem sinal de vida -> aviso. steam://rungameid:
    Carregando ate aparecer o processo (melhor esforco). QProcess em sessao propria; fechar o app nao mata o jogo
    (main.py e o comando "deckinstall" do pip saem por ui.run -> os._exit, sem o teardown do PySide).
-4. [FEITO] Navegacao: lateral sem os 4 botoes; Biblioteca com "Instalar jogo", "Backup e sincronizacao" e
-   "Manutencao" (subpaginas com "<- Biblioteca"). Chaves tabs.* removidas.
+4. [FEITO] Navegacao: sem barra lateral (status da Steam, "Procurar a Steam de novo", tema, idioma e Sobre foram
+   para o card "Aplicativo e Steam" da Manutencao); Biblioteca com "Instalar jogo", "Backup e sincronizacao" e
+   "Manutencao" (subpaginas com "<- Biblioteca"). O app sempre abre na Biblioteca (antes abria em Instalar e
+   pulava para a Biblioteca depois da busca). Chaves tabs.* removidas.
 5. [FEITO] Faxina: ruff F401/F811/F841 e vulture (venv temporario) sem achados reais alem de _start_detached_process
    e um campo do play_monitor; locales en/pt_BR com as mesmas chaves e placeholders; assets sem uso removidos.
 
