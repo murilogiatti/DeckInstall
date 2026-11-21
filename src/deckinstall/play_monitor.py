@@ -117,7 +117,6 @@ class _Run:
     preparing: bool = False
     steam: bool = False
     exited_at: float | None = None
-    exit_code: int = 0
     stopping: bool = False
     misses: int = 0
     pids: set[int] = field(default_factory=set)
@@ -293,7 +292,7 @@ class PlayMonitor(QObject):
         elif failed or not quick:
             self._finish(key)  # played for a while, then closed (or crashed later): back to Play
         else:
-            run.exited_at, run.exit_code = now, code  # quick exit 0: look for the real game process
+            run.exited_at = now  # quick exit 0: look for the real game process
             self._tick_run(key, run, now)
 
     def _tick(self) -> None:

@@ -1,7 +1,8 @@
 DeckInstall - Plano de acao v3 (2026-11-17, atualizado 2026-11-19)
 ==========================================================
 
-STATUS: Fases 0 a 11 concluidas. Ultima release: v0.20.1 (2026-11-20, crash ao fechar o app).
+STATUS: Fases 0 a 12 concluidas. Versao 0.21.0 (Fase 12, 2026-11-21, sem tag nem release ainda).
+Ultima release: v0.20.1 (2026-11-20, crash ao fechar o app).
 v0.20.1: o app caia ao fechar (SIGBUS/SIGSEGV em QObject::~QObject na limpeza do PySide no fim do Python,
 visto no core do Deck: QPushButton ja liberado). Agora main() sincroniza o QSettings e sai com os._exit.
 v0.19.0: tag enviada mas o CI abortou na saida do Python 3.10 (thread da busca de saves ainda rodando ao destruir
@@ -159,8 +160,8 @@ Mantidos de proposito (pequenos, apoio a testes): i18n.get_language, AdoptWizard
    (grupo Jogos, marcada por padrao, categoria "Cache de jogo removido") usa standalone.find_orphan_shader_caches
    (todas as bibliotecas + ~/Games/.caches; disco ausente mantem o cache). Apagar passa pela revalidacao do
    delete_cleanup_candidates_checked; prune_orphan_shader_caches saiu (testes portados).
-PENDENTE: assets sem referencia:
-   assets/capsule_600x900.jpg, icon_512.png, logo.png. build/ local com 409 MB (ignorado pelo git).
+[FEITO na Fase 12] assets sem referencia removidos (capsule_600x900.jpg, icon_512.png, logo.png).
+   build/ local com 409 MB (ignorado pelo git).
 
 CONTINUO
 - Dividir steam_vdf.py (79% nao e VDF) e ui.py conforme cada area for mexida.
@@ -311,6 +312,23 @@ FASE 11 - Auditoria (2026-11-20) - CONCLUIDA (publicada na v0.20.0)
 8. [FEITO] CI: testes em 3.10/3.11/3.13, nuitka==4.3.5, permissao de escrita so no job da release; tar sem
    DeprecationWarning no Python antigo.
 Fora: assinatura do AppImage; dividir ui.py/steam_vdf.py.
+
+FASE 12 - Navegacao, Jogar e faxina (2026-11-21) - CONCLUIDA (v0.21.0, sem release)
+1. [FEITO] Importacao Ludusavi sem duplicar: impressao digital (destino, sha1, tamanho) no .index.json do jogo
+   (import_fingerprints); importar o mesmo conteudo nao cria zip; zips antigos sem impressao sao calculados uma
+   vez. Resultado em dialogo dentro da janela (3 contadores + lista rolavel); "Tudo ja foi importado".
+   "Remover duplicados de importacao" (Backup) mantem a copia mais antiga, so com confirmacao listando os zips.
+2. [FEITO] Manutencao enxuta: saiu "Medir espaco" (space.py, SpaceScanWorker, chaves space.*); lista de limpeza
+   sempre do maior para o menor (sem clique no cabecalho), reaplicada apos varrer/revalidar/apagar/filtrar.
+3. [FEITO] Botao Jogar dinamico (play_monitor.py): Jogar -> Carregando... -> Parar -> Jogar; Erro + ultimas linhas
+   do log quando nao inicia ou sai com codigo != 0 em < 20 s. Saida rapida com 0 segue os processos do jogo em
+   /proc (cmdline, cwd, WINEPREFIX/STEAM_COMPAT_DATA_PATH); 60 s sem sinal de vida -> aviso. steam://rungameid:
+   Carregando ate aparecer o processo (melhor esforco). QProcess em sessao propria; fechar o app nao mata o jogo
+   (depende da saida por os._exit do main.py; o script "deckinstall" do pip sai pelo Python normal).
+4. [FEITO] Navegacao: lateral sem os 4 botoes; Biblioteca com "Instalar jogo", "Backup e sincronizacao" e
+   "Manutencao" (subpaginas com "<- Biblioteca"). Chaves tabs.* removidas.
+5. [FEITO] Faxina: ruff F401/F811/F841 e vulture (venv temporario) sem achados reais alem de _start_detached_process
+   e um campo do play_monitor; locales en/pt_BR com as mesmas chaves e placeholders; assets sem uso removidos.
 
 NAO TESTADO A MAO (so testes automaticos)
 - Fase 11: Modo Jogo real no Deck; instalador real (repack/GOG) no prefixo isolado.
