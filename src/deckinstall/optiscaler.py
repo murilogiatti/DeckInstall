@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .fsutil import atomic_copy_file, atomic_write_text
+from .fsutil import atomic_copy_file, atomic_write_text, prune_empty_parents
 from .runtime_manager import ProgressCb, _load_versions, ensure_optiscaler
 from .scanner import detect_exe_kind, detect_pe_arch
 
@@ -732,6 +732,8 @@ def install_optiscaler_for_game(
                 low_name = fname.lower()
                 if src_file.suffix.lower() in _SKIPPED_SCRIPT_SUFFIXES:
                     continue
+                if is_payload_root and "readme" in low_name and src_file.suffix.lower() in (".txt", ".md"):
+                    continue  # the release's "extract all files" note is not part of OptiScaler
 
                 if is_payload_root and low_name == "optiscaler.dll":
                     dst_file = target_proxy_path
@@ -817,6 +819,7 @@ def uninstall_optiscaler_for_game(exe_path: Path) -> OptiScalerResult:
         if installed.is_file() or installed.is_symlink():
             installed.unlink(missing_ok=True)
             removed_count += 1
+        prune_empty_parents(installed, [state.exe_dir])  # e.g. D3D12_Optiscaler/, Licenses/
 
     restored_count = 0
     for orig in state.backed_up_files:

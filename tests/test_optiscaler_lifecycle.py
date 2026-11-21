@@ -191,3 +191,24 @@ def test_bulk_dialog_lists_compatibility(tmp_path: Path) -> None:
     app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
     app.processEvents()
     assert seen and seen[0][0] == "Alpha" and seen[0][1] is True and "DLSS" in seen[0][2]
+
+
+def test_readme_is_not_installed_and_remove_leaves_no_empty_folders(tmp_path: Path) -> None:
+    game = _game_dir(tmp_path)
+    (game / "Licenses").mkdir()
+    (game / "Licenses" / "game_eula.txt").write_text("game", encoding="utf-8")  # the game's own folder
+    payload = _payload(tmp_path)
+    (payload / "!! README_EXTRACT ALL FILES TO GAME FOLDER !!.txt").write_text("extract", encoding="utf-8")
+    (payload / "Licenses").mkdir()
+    (payload / "Licenses" / "XeSS_LICENSE.txt").write_text("xess", encoding="utf-8")
+    (payload / "Extras").mkdir()
+    (payload / "Extras" / "fakenvapi.ini").write_text("[x]\n", encoding="utf-8")
+    state = opti.install_optiscaler_for_game(game / "Game.exe", proxy_dll="dxgi", payload_dir=payload)
+    names = {p.name for p in state.installed_files}
+    assert not any("README" in n for n in names) and not list(game.glob("*README*"))
+    assert {"XeSS_LICENSE.txt", "D3D12Core.dll", "fakenvapi.ini"} <= names
+
+    opti.uninstall_optiscaler_for_game(game / "Game.exe")
+    assert not (game / "D3D12_Optiscaler").exists() and not (game / "Extras").exists()
+    assert (game / "Licenses" / "game_eula.txt").exists()  # a folder that still has game files stays
+    assert (game / "Game.exe").exists()
