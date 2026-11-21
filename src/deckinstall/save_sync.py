@@ -115,12 +115,34 @@ def _slugify(value: str, fallback: str = "game") -> str:
     return cleaned.lower()
 
 
+_PREFIX_SYSTEM_PREFIXES = ("/usr", "/bin", "/sbin", "/opt", "/etc", "/lib", "/lib64", "/boot", "/proc", "/sys", "/dev")
+
+
+def _unwrap_prefix_root(prefix_dir: Path) -> Path:
+    """Follow prefix_dir only when it is a symlink to a real Wine/Proton prefix directory."""
+    if not prefix_dir.is_symlink():
+        return prefix_dir
+    try:
+        real = prefix_dir.resolve()
+    except OSError:
+        return prefix_dir
+    s = str(real)
+    if s == "/" or any(s == r or s.startswith(r + "/") for r in _PREFIX_SYSTEM_PREFIXES):
+        return prefix_dir
+    if s == "/var" or (s.startswith("/var/") and not s.startswith(("/var/home/", "/var/mnt/", "/var/tmp/"))):
+        return prefix_dir
+    if real.is_dir() and ((real / "drive_c").is_dir() or (real / "pfx" / "drive_c").is_dir()):
+        return real
+    return prefix_dir
+
+
 def _resolve_wine_root(prefix_dir: Path) -> Path:
     """Return the Wine prefix root containing .reg files (pfx/ or prefix_dir)."""
-    pfx_dir = prefix_dir / "pfx"
+    root = _unwrap_prefix_root(prefix_dir)
+    pfx_dir = root / "pfx"
     if pfx_dir.is_dir() and not pfx_dir.is_symlink():
         return pfx_dir
-    return prefix_dir
+    return root
 
 
 def _find_child_ci(parent: Path, name_lower: str) -> Path | None:
@@ -140,10 +162,11 @@ def _collect_prefix_state_entries(
     prefix_dir: Path, include_system_dlls: bool = True,
 ) -> list[tuple[str, Path, Path]]:
     """Collect sorted (kind, src_file, rel_path) tuples for prefix .reg and system DLL files."""
-    if not prefix_dir.is_dir() or prefix_dir.is_symlink():
+    root = _unwrap_prefix_root(prefix_dir)
+    if not root.is_dir() or root.is_symlink():
         return []
     entries: list[tuple[str, Path, Path]] = []
-    wine_root = _resolve_wine_root(prefix_dir)
+    wine_root = _resolve_wine_root(root)
     if wine_root.is_dir() and not wine_root.is_symlink():
         try:
             for item in sorted(wine_root.iterdir()):
@@ -152,7 +175,7 @@ def _collect_prefix_state_entries(
         except OSError:
             pass
 
-    drive_c = _resolve_drive_c_target(prefix_dir)
+    drive_c = _resolve_drive_c_target(root)
     windows_dir = _find_child_ci(drive_c, "windows") if include_system_dlls else None
     if windows_dir is not None:
         for sys_name in ("system32", "syswow64"):
@@ -448,7 +471,7 @@ def _parse_wine_reg_sections(reg_text: str) -> list[tuple[str, str, list[str]]]:
                 cur_header = ""
                 cur_lines = []
                 continue
-            if stripped.startswith("#") or stripped.startswith(";"):
+            if stripped.startswith(";"):
                 continue
             cur_lines.append(line)
             continuing = line.endswith("\\")
@@ -485,7 +508,8 @@ def _extract_registry_saves(prefix_dir: Path, reg_paths: list[str]) -> bytes | N
             continue
         sections = _parse_wine_reg_sections(text)
         for sec_subkey, _, val_lines in sections:
-            if not val_lines:
+            value_only_lines = [ln for ln in val_lines if not ln.lstrip().startswith("#")]
+            if not value_only_lines:
                 continue
             sec_low = sec_subkey.lower()
             matched_hive: str | None = None
@@ -499,7 +523,7 @@ def _extract_registry_saves(prefix_dir: Path, reg_paths: list[str]) -> bytes | N
                     {
                         "hive": matched_hive,
                         "subkey": sec_subkey,
-                        "lines": val_lines,
+                        "lines": value_only_lines,
                     }
                 )
 
@@ -591,8 +615,10 @@ def _restore_registry_saves(prefix_dir: Path, reg_json_bytes: bytes) -> int:
                 out_lines.append("")
 
         for subkey, new_lines in items:
-            if subkey.lower() in replaced_keys:
+            sec_low = subkey.lower()
+            if sec_low in replaced_keys:
                 continue
+            replaced_keys.add(sec_low)
             escaped_subkey = subkey.replace("\\", "\\\\")
             out_lines.append(f"[{escaped_subkey}] {stamp}")
             out_lines.extend(new_lines)
@@ -1128,13 +1154,17 @@ def restore_snapshot_safely(
                 raise SteamCloudAppMismatch(want, steam_appid)
         if home_rels:  # the safety snapshot (and every later one) must hold the home files replaced now
             remember_home_files(snapshot_dir_for(game_name, dest_root), home_rels)
+    if state:
+        state_snap = snapshot_prefix_state(
+            prefix_dir, game_name, "pre-restore", dest_root=dest_root,
+        )
+        safety = state_snap.snapshot_zip if state_snap is not None else None
+        files, regs = restore_prefix_state_snapshot(snapshot_zip, prefix_dir)
+        return files + regs, safety
     safety = auto_snapshot(
         prefix_dir, game_name, "pre-restore", keep=0,
         game_dir=game_dir, steam_appid=steam_appid, dest_root=dest_root, extra_dirs=extra_dirs,
     )
-    if state:
-        files, regs = restore_prefix_state_snapshot(snapshot_zip, prefix_dir)
-        return files + regs, safety
     covered: set[str] = set()
     if safety is not None and home_rels:
         with zipfile.ZipFile(safety) as zf:
@@ -1155,9 +1185,10 @@ def snapshot_prefix_state(
     include_system_dlls: bool = True,
 ) -> PrefixStateSnapshot | None:
     """Create a rotated ZIP snapshot of prefix .reg files and system DLLs."""
-    if not prefix_dir.is_dir() or prefix_dir.is_symlink():
+    root = _unwrap_prefix_root(prefix_dir)
+    if not root.is_dir() or root.is_symlink():
         return None
-    entries = _collect_prefix_state_entries(prefix_dir, include_system_dlls=include_system_dlls)
+    entries = _collect_prefix_state_entries(root, include_system_dlls=include_system_dlls)
     if not entries:
         return None
 
@@ -1244,8 +1275,9 @@ def restore_prefix_state_snapshot(snapshot_zip: Path, prefix_dir: Path) -> tuple
     if not snapshot_zip.is_file() or snapshot_zip.is_symlink():
         raise FileNotFoundError(f"Prefix state snapshot not found: {snapshot_zip}")
 
-    wine_root = _resolve_wine_root(prefix_dir)
-    drive_c = _resolve_drive_c_target(prefix_dir)
+    root = _unwrap_prefix_root(prefix_dir)
+    wine_root = _resolve_wine_root(root)
+    drive_c = _resolve_drive_c_target(root)
     wine_root.mkdir(parents=True, exist_ok=True)
     drive_c.mkdir(parents=True, exist_ok=True)
     wine_root_resolved = wine_root.resolve()
@@ -1570,11 +1602,20 @@ def push_game_saves(
 
 def _resolve_drive_c_target(prefix_dir: Path) -> Path:
     """Return the drive_c directory for extraction, supporting Proton pfx/drive_c or drive_c."""
-    pfx_dir = prefix_dir / "pfx"
+    root = _unwrap_prefix_root(prefix_dir)
+    pfx_dir = root / "pfx"
+    if pfx_dir.is_symlink():
+        try:
+            # Our self-link pfx -> . stores files directly in root/drive_c.
+            if pfx_dir.resolve() == root.resolve():
+                return root / "drive_c"
+        except OSError:
+            pass
+        return pfx_dir / "drive_c"  # external symlink: _safe_parents_within rejects it safely
     pfx_drive_c = pfx_dir / "drive_c"
     if pfx_drive_c.is_dir() or pfx_dir.is_dir():
         return pfx_drive_c
-    return prefix_dir / "drive_c"
+    return root / "drive_c"
 
 
 def _parse_sync_zip_entry(
@@ -1667,16 +1708,17 @@ def _restore_saves_archive(
     Existing files under $HOME are replaced only when listed in home_overwrite (held by a safety
     snapshot); the others are kept and appended to skipped.
     """
+    root_prefix = _unwrap_prefix_root(prefix_dir)
     extras = {name: root for name, root in (extra_dirs or ()) if name in EXTRA_SECTIONS}
-    has_prefix = prefix_dir.is_dir() or not extras  # an extras-only game (no prefix) never gets one created
-    if has_prefix and not prefix_dir.is_dir():  # nor a native game whose archive holds only home files
+    has_prefix = root_prefix.is_dir() or not extras  # an extras-only game (no prefix) never gets one created
+    if has_prefix and not root_prefix.is_dir():  # nor a native game whose archive holds only home files
         with zipfile.ZipFile(archive_path, "r") as zf_scan:
             sections = {p[0] for n in zf_scan.namelist()[:_RESTORE_MAX_ENTRIES] if (p := _parse_sync_zip_entry(n))}
         has_prefix = not sections or bool(sections - {"home"})
-    drive_c = _resolve_drive_c_target(prefix_dir)
+    drive_c = _resolve_drive_c_target(root_prefix)
     if has_prefix:
         if not _safe_parents_within(
-            prefix_dir, prefix_dir.resolve(), drive_c.relative_to(prefix_dir).parts
+            root_prefix, root_prefix.resolve(), drive_c.relative_to(root_prefix).parts
         ):
             raise OSError(f"Unsafe target drive_c path: {drive_c}")
         drive_c.mkdir(parents=True, exist_ok=True)
@@ -1721,7 +1763,7 @@ def _restore_saves_archive(
                                 f"Decompression limit exceeded on {info.filename}"
                             )
                         chunks.append(chunk)
-                if _restore_registry_saves(prefix_dir, b"".join(chunks)) > 0:
+                if _restore_registry_saves(root_prefix, b"".join(chunks)) > 0:
                     restored_files += 1
                 continue
 

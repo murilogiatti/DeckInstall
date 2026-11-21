@@ -8,13 +8,20 @@ import logging
 import os
 import re
 import shutil
+import stat
 import tempfile
 from pathlib import Path
 
 
-def atomic_write_bytes(path: Path, data: bytes) -> None:
+def atomic_write_bytes(path: Path, data: bytes, *, mode: int | None = None) -> None:
     """Write bytes to a unique temp file next to path, fsync, then atomically replace path."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    preserved_mode = mode
+    if preserved_mode is None and not path.is_symlink() and path.is_file():
+        try:
+            preserved_mode = stat.S_IMODE(path.stat().st_mode)
+        except OSError:
+            preserved_mode = None
     fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     tmp = Path(tmp_name)
     try:
@@ -22,6 +29,8 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
             fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
+        if preserved_mode is not None:
+            os.chmod(tmp, preserved_mode)
         os.replace(tmp, path)
     except Exception:
         tmp.unlink(missing_ok=True)
@@ -36,9 +45,9 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
         pass
 
 
-def atomic_write_text(path: Path, text: str) -> None:
+def atomic_write_text(path: Path, text: str, *, mode: int | None = None) -> None:
     """Write UTF-8 text atomically (see atomic_write_bytes)."""
-    atomic_write_bytes(path, text.encode("utf-8"))
+    atomic_write_bytes(path, text.encode("utf-8"), mode=mode)
 
 
 def atomic_copy_file(src: Path, dst: Path) -> None:
@@ -74,7 +83,23 @@ def short_hash(value: str, length: int = 8) -> str:
 
 def sanitize_dir_name(name: str) -> str:
     """Return a filesystem-safe folder name (illegal characters replaced by spaces)."""
-    return re.sub(r'[\\/:*?"<>|]+', " ", name).strip() or "Game"
+    cleaned = re.sub(r'[\\/:*?"<>|]+', " ", name).strip()
+    if cleaned in ("", ".", ".."):
+        return "Game"
+    return cleaned
+
+
+def symlink_points_to(link: Path, target: Path) -> bool:
+    """Return True if link is a symlink whose resolved target matches target.resolve()."""
+    if not link.is_symlink():
+        return False
+    try:
+        raw = Path(os.readlink(link))
+        if not raw.is_absolute():
+            raw = link.parent / raw
+        return raw.resolve() == target.resolve()
+    except OSError:
+        return False
 
 
 def slugify(name: str) -> str:

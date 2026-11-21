@@ -329,10 +329,13 @@ def export_ludusavi(
     if len(entries) > _RESTORE_MAX_ENTRIES:
         raise LudusaviError(f"Too many save files ({len(entries)})")
     target = dest_root / escape_folder_name(game_name)
-    if target.is_symlink() or (target.exists() and not (target / MAPPING_FILE).is_file()):
+    if target.is_symlink() or (
+        target.exists() and ((target / MAPPING_FILE).is_symlink() or not (target / MAPPING_FILE).is_file())
+    ):
         raise LudusaviError(f"{target} exists and is not a Ludusavi backup")
     dest_root.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(dest_root)))
+    old_backup: Path | None = None
     try:
         files: dict[str, Any] = {}
         total = 0
@@ -366,8 +369,20 @@ def export_ludusavi(
         }
         (tmp / MAPPING_FILE).write_text(dump_yaml(mapping), encoding="utf-8")
         if target.exists():
-            shutil.rmtree(target)
-        os.replace(tmp, target)
+            old_backup = Path(
+                tempfile.mkdtemp(prefix=f".{target.name}.", suffix=".old", dir=str(dest_root))
+            )
+            # Remove empty temp placeholder so os.replace can move the directory atomically.
+            old_backup.rmdir()
+            os.replace(target, old_backup)
+        try:
+            os.replace(tmp, target)
+        except Exception:
+            if old_backup is not None and old_backup.exists() and not target.exists():
+                os.replace(old_backup, target)
+            raise
+        if old_backup is not None and old_backup.exists():
+            shutil.rmtree(old_backup, ignore_errors=True)
     except Exception:
         shutil.rmtree(tmp, ignore_errors=True)
         raise
@@ -559,12 +574,21 @@ def _plan_sources(
             raise LudusaviError(f"Unsafe path in backup: {original!r}")
         dfolder = drives.get(drive) or ("drive-0" if drive == "" else f"drive-{drive[:1]}")
         base = folder if backup == "." else folder / backup
-        zip_path = folder / f"{backup}.zip" if backup != "." and not base.is_dir() else None
+        if backup == ".":
+            zip_path = None
+        elif base.is_dir():
+            zip_path = None
+        elif base.is_file() and backup.lower().endswith(".zip"):
+            zip_path = base
+        else:
+            zip_path = folder / f"{backup}.zip"
         member = "/".join((dfolder, *parts))
         file_path = base.joinpath(dfolder, *parts)
         if zip_path is None and (not is_within(file_path, folder, strict=True) or not file_path.is_file()):
             raise LudusaviError(f"Missing in backup: {original}")
-        if zip_path is not None and (zip_path.is_symlink() or not zip_path.is_file()):
+        if zip_path is not None and (
+            zip_path.is_symlink() or not is_within(zip_path, folder, strict=True) or not zip_path.is_file()
+        ):
             raise LudusaviError(f"Missing in backup: {original}")
         target = mapper(drive, parts) if mapper is not None else _target_for(drive, parts, home)
         src = _Source(original, zip_path, member, file_path, digest, size)
@@ -637,12 +661,23 @@ def _snapshot_target(drive: str, parts: tuple[str, ...]) -> tuple[str, tuple[str
         if len(rest) >= 2 and rest[0].lower() == "programdata":
             return "prefix", ("ProgramData", *rest[1:])
         return None
-    if drive or len(parts) < 3 or parts[0] != "home":
+    if drive:
         return None
-    for i in range(len(parts) - 4):
-        if parts[i] == "userdata" and parts[i + 1].isdigit() and parts[i + 2].isdigit() and parts[i + 3] == "remote":
-            return "steamcloud", parts[i + 4:]
-    rest = parts[2:]
+    if len(parts) >= 4 and parts[0] == "var" and parts[1] == "home":
+        home_sub = parts[2:]
+    elif len(parts) >= 3 and parts[0] == "home":
+        home_sub = parts[1:]
+    else:
+        return None
+    for i in range(len(home_sub) - 3):
+        if (
+            home_sub[i] == "userdata"
+            and home_sub[i + 1].isdigit()
+            and home_sub[i + 2].isdigit()
+            and home_sub[i + 3] == "remote"
+        ):
+            return "steamcloud", home_sub[i + 4:]
+    rest = home_sub[1:]
     if any(p.lower() in _SNAPSHOT_SKIP_HOME_DIRS for p in rest[:-1]) or "drive_c" in [p.lower() for p in rest]:
         return None
     return ("home", rest) if save_sync.home_entry_allowed(rest) else None

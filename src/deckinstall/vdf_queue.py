@@ -33,6 +33,7 @@ VdfEditOp = Literal[
     "remove_shortcut",
     "add_or_update_shortcut",
     "update_shortcut_paths",
+    "add_installed_game",
 ]
 
 _COALESCIBLE_OPS = frozenset({"set_proton", "set_launch_options", "set_app_launch_options"})
@@ -140,11 +141,13 @@ class VdfEditQueue:
         errors: list[str] = []
         remaining: list[QueuedVdfEdit] = []
 
-        anchors = {paths.shortcuts_vdf}
+        anchors = {paths.shortcuts_vdf, paths.config_vdf}
+        if any(e.op == "set_app_launch_options" for e in self._queue):
+            anchors.add(paths.localconfig_vdf)
         for edit in self._queue:
-            if edit.op == "update_shortcut_paths":
+            if edit.op in ("update_shortcut_paths", "add_installed_game"):
                 try:
-                    anchors.add(self._repair_paths(paths, edit.payload).shortcuts_vdf)
+                    anchors.add(self._account_paths(paths, edit.payload).shortcuts_vdf)
                 except (KeyError, OSError, ValueError):
                     pass  # Dispatch reports invalid edits and keeps them in the queue.
         with ExitStack() as locks:
@@ -166,7 +169,7 @@ class VdfEditQueue:
         return BatchApplyResult(applied=applied, errors=errors)
 
     @staticmethod
-    def _repair_paths(paths: SteamPaths, payload: dict[str, Any]) -> SteamPaths:
+    def _account_paths(paths: SteamPaths, payload: dict[str, Any]) -> SteamPaths:
         account = str(payload["user_id"])
         if Path(payload["steam_root"]).resolve() != paths.steam_root.resolve():
             raise ValueError("The shortcut belongs to another Steam installation")
@@ -176,7 +179,7 @@ class VdfEditQueue:
             raise ValueError("The Steam account for this shortcut is unavailable")
         userdata = paths.steam_root / "userdata" / account
         return replace(paths, user_id=account, userdata_dir=userdata,
-                       shortcuts_vdf=userdata / "config" / "shortcuts.vdf")
+                       shortcuts_vdf=userdata / "config" / "shortcuts.vdf", grid_dir=userdata / "config" / "grid")
 
     @staticmethod
     def _dispatch_edit(paths: SteamPaths, edit: QueuedVdfEdit) -> None:
@@ -213,12 +216,17 @@ class VdfEditQueue:
             if not remove_shortcut(paths, edit.appid_u32):
                 raise RuntimeError(f"Atalho {edit.appid_u32} não encontrado em shortcuts.vdf")
         elif edit.op == "update_shortcut_paths":
-            paths = VdfEditQueue._repair_paths(paths, payload)
+            paths = VdfEditQueue._account_paths(paths, payload)
             if not update_shortcut_paths(
                 paths, edit.appid_u32, Path(payload["exe_path"]), Path(payload["start_dir"]),
                 expected_exe=payload["expected_exe"],
             ):
                 raise RuntimeError(f"Atalho {edit.appid_u32} não encontrado em shortcuts.vdf")
+        elif edit.op == "add_installed_game":
+            from .standalone import add_installed_game_to_steam
+
+            paths = VdfEditQueue._account_paths(paths, payload)
+            add_installed_game_to_steam(paths, Path(payload["game_dir"]), payload["uid"])
         elif edit.op == "add_or_update_shortcut":
             app_name = str(payload.get("app_name") or edit.label)
             exe_path = Path(payload["exe_path"])

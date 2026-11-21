@@ -116,7 +116,7 @@ def fs_type_of(path: Path, table: list[tuple[Path, str]] | None = None) -> str:
     for mount, fstype in entries:
         if target == mount or mount in target.parents:
             depth = len(mount.parts)
-            if depth > best[0]:
+            if depth >= best[0]:
                 best = (depth, fstype)
     return best[1]
 
@@ -127,8 +127,20 @@ def default_mount_search_roots() -> list[Path]:
         user = getpass.getuser()
     except Exception:
         user = os.environ.get("USER", "")
-    roots = [Path("/run/media") / user, Path("/media") / user, Path("/media"), Path("/mnt")]
-    return [r for r in roots if r.name]
+    roots = [
+        Path("/run/media") / user,
+        Path("/run/media"),
+        Path("/media") / user,
+        Path("/media"),
+        Path("/mnt"),
+    ]
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for r in roots:
+        if r.name and r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
 
 
 def _is_mount(path: Path) -> bool:

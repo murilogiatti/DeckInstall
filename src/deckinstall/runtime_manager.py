@@ -209,7 +209,7 @@ def detect_gpu_profile() -> GpuProfile:
                         continue
                     if "[10de:" in low or "nvidia" in low:
                         has_nvidia = True
-                    if "[1002:" in low or "amd" in low or "ati" in low or "radeon" in low:
+                    if "[1002:" in low or "amd" in low or "radeon" in low or re.search(r"\bati\b|\[amd/ati\]", low):
                         has_amd = True
                     if "[8086:" in low or "intel" in low:
                         has_intel = True
@@ -1864,14 +1864,26 @@ def check_runtime_updates(force: bool = False) -> dict[str, Any]:
     }
 
 
-def validate_steamrt4_integrity() -> bool:
-    """Remove broken/partial ~/.local/share/umu/steamrt4 directory if required files are missing."""
+def is_steamrt4_valid() -> bool:
+    """Read-only check whether ~/.local/share/umu/steamrt4 holds the expected runtime files."""
     steamrt4_dir = get_steamrt4_dir()
+    if steamrt4_dir.is_symlink():
+        return False
     if not steamrt4_dir.is_dir():
         return True
     manifest = steamrt4_dir / "toolmanifest.vdf"
     mtree = steamrt4_dir / "mtree.txt.gz"
-    if not manifest.is_file() or not mtree.is_file():
+    return manifest.is_file() and not manifest.is_symlink() and mtree.is_file() and not mtree.is_symlink()
+
+
+def validate_steamrt4_integrity() -> bool:
+    """Remove broken/partial ~/.local/share/umu/steamrt4 directory if required files are missing."""
+    steamrt4_dir = get_steamrt4_dir()
+    if steamrt4_dir.is_symlink():
+        return False
+    if not steamrt4_dir.is_dir():
+        return True
+    if not is_steamrt4_valid():
         shutil.rmtree(steamrt4_dir, ignore_errors=True)
         return False
     return True

@@ -175,7 +175,8 @@ def test_apply_all_uses_single_lock_and_mocked_writers(tmp_path: Path) -> None:
     assert result.applied == 5
     assert result.errors == []
     assert queue.pending_count() == 0
-    assert lock_entries == [paths.shortcuts_vdf]
+    assert set(lock_entries) == {paths.shortcuts_vdf, paths.config_vdf}
+    assert lock_entries == sorted({paths.shortcuts_vdf, paths.config_vdf})
     assert backups == [paths.shortcuts_vdf, paths.config_vdf]
 
     mock_set_proton.assert_called_once_with(paths.config_vdf, 2001, "GE-Proton9-5")

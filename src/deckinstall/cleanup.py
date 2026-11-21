@@ -82,6 +82,7 @@ _PREFIX_SAFE_CACHE_RELPATHS = (
     "AppData/Local/D3DSCache",
 )
 _APP_CACHE_MIN_BYTES = 5 * 1024 * 1024
+_CORE_RUNTIME_APPIDS = frozenset({0, 228980, 1070560, 1391110, 1493710, 1628350, 1887720})
 
 # A finder yields (candidate, min_size): min_size None = size already known,
 # otherwise the directory is sized later and dropped if smaller than min_size.
@@ -125,6 +126,9 @@ def collect_active_proton_tools(
     for game in list_standalone_games(games_dir):
         if game.proton_name:
             tools.add(game.proton_name)
+        prev = str(game.meta.get("proton_previous") or "").strip()
+        if prev:
+            tools.add(prev)
     return tools
 
 
@@ -288,6 +292,7 @@ class _ScanContext:
         self.games_dir = (home_dir / "Games") if home_dir is not None else get_legacy_games_dir()
         self.standalone_prefixes_dir = self.games_dir / ".prefixes"
         self.standalone_prefix_paths = self._protected_standalone_prefixes(list_standalone_games)
+        self.active_external_prefixes = self._active_external_prefixes()
         if extra_external_roots is not None:
             self.prefix_roots = list(extra_external_roots)
         else:
@@ -300,6 +305,33 @@ class _ScanContext:
         if paths is not None:
             for entry in self.current_entries:
                 self._target_save_index(paths.compatdata_dir / str(entry.appid_u32))
+
+    def _active_external_prefixes(self) -> set[Path]:
+        """Collect resolved Wine prefixes currently used by Heroic, Lutris, Bottles or Hydra."""
+        active: set[Path] = set()
+        try:
+            from .launcher_scan import scan_external_launcher_games
+
+            for ext in scan_external_launcher_games(self.home):
+                if ext.prefix_dir is not None:
+                    try:
+                        active.add(ext.prefix_dir.resolve())
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        try:
+            from .adopt import _scan_hydra
+
+            for cand in _scan_hydra(self.home):
+                if cand.prefix_dir is not None:
+                    try:
+                        active.add(cand.prefix_dir.resolve())
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        return active
 
     def _protected_standalone_prefixes(self, list_standalone_games: Callable) -> set[Path]:
         protected: set[Path] = set()
@@ -351,7 +383,11 @@ class _ScanContext:
 
     @cached_property
     def sniper_in_use(self) -> bool:
-        return any(_tool_uses_sniper_or_old_proton(t) for t in self.active_tools)
+        if any(_tool_uses_sniper_or_old_proton(t) for t in self.active_tools):
+            return True
+        if self.active_shortcuts:
+            return True
+        return bool(self.installed_steam - _CORE_RUNTIME_APPIDS)
 
     def _cached_sha256(self, file_path: Path) -> str:
         st = file_path.stat(follow_symlinks=False)
@@ -504,7 +540,7 @@ def _scan_prefix_roots(ctx: _ScanContext, standalone: bool) -> Iterator[_Found]:
             if resolved in ctx.seen_prefixes:
                 continue
             ctx.seen_prefixes.add(resolved)
-            if resolved in ctx.standalone_prefix_paths:
+            if resolved in ctx.standalone_prefix_paths or resolved in ctx.active_external_prefixes:
                 continue
             if is_standalone_prefixes_root and (
                 find_manifest(ctx.games_dir / child.name) is not None or (ctx.games_dir / child.name).is_dir()
@@ -794,7 +830,7 @@ def _find_old_compat_tools(ctx: _ScanContext) -> Iterator[_Found]:
 
     seen_compat_dirs: set[Path] = set()
     for compat_dir in compat_dirs:
-        if not compat_dir.is_dir():
+        if not compat_dir.is_dir() or not os.access(compat_dir, os.W_OK):
             continue
         try:
             resolved_compat = compat_dir.resolve()

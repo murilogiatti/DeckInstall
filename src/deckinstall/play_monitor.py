@@ -24,8 +24,51 @@ IDLE, LOADING, RUNNING, ERROR = "idle", "loading", "running", "error"
 _SYSTEM_ROOTS = ("/usr", "/bin", "/sbin", "/opt", "/etc", "/var", "/proc", "/sys", "/dev", "/tmp")
 
 
-def _is_system_path(path: str, home: str) -> bool:
-    if path == home or path.startswith(home + "/"):
+_NON_GAME_CWD_BINARIES = frozenset(
+    {
+        "bash",
+        "sh",
+        "dash",
+        "zsh",
+        "fish",
+        "dolphin",
+        "nautilus",
+        "thunar",
+        "nemo",
+        "pcmanfm",
+        "konsole",
+        "kitty",
+        "alacritty",
+        "wezterm",
+        "gnome-terminal",
+        "xfce4-terminal",
+        "kate",
+        "kwrite",
+        "gedit",
+        "code",
+        "codium",
+        "vim",
+        "nvim",
+        "nano",
+        "emacs",
+        "python",
+        "python3",
+    }
+)
+
+
+def _home_roots() -> tuple[str, ...]:
+    home = str(Path.home())
+    try:
+        resolved = str(Path.home().resolve())
+    except OSError:
+        resolved = home
+    return (home,) if resolved == home else (home, resolved)
+
+
+def _is_system_path(path: str, home: str | tuple[str, ...]) -> bool:
+    homes = (home,) if isinstance(home, str) else home
+    if any(path == h or path.startswith(h + "/") for h in homes):
         return False
     return any(path == root or path.startswith(root + "/") for root in _SYSTEM_ROOTS)
 _ENV_KEYS = (b"WINEPREFIX=", b"STEAM_COMPAT_DATA_PATH=")
@@ -37,7 +80,7 @@ _RELEASED: list[QProcess] = []
 
 def watch_paths(*candidates: object) -> tuple[str, ...]:
     """The folders that identify a game's processes (system folders and $HOME itself are left out)."""
-    home = str(Path.home())
+    homes = _home_roots()
     out: list[str] = []
     for cand in candidates:
         if not cand:
@@ -46,7 +89,7 @@ def watch_paths(*candidates: object) -> tuple[str, ...]:
         if not text.startswith("/"):
             continue
         path = os.path.normpath(text)
-        if path == home or len(Path(path).parts) < 3 or _is_system_path(path, home):
+        if path in homes or len(Path(path).parts) < 3 or _is_system_path(path, homes):
             continue
         if path not in out:
             out.append(path)
@@ -61,12 +104,53 @@ def _read(path: str) -> bytes:
         return b""
 
 
+def _cmd_has_path_prefix(raw_cmd: bytes, prefix: bytes) -> bool:
+    """Match prefix inside cmdline args on a path boundary (not '/Games/Portal' inside '/Games/Portal 2')."""
+    if not prefix:
+        return False
+    plen = len(prefix)
+    for arg in raw_cmd.split(b"\0"):
+        if not arg:
+            continue
+        alen = len(arg)
+        start = 0
+        while True:
+            idx = arg.find(prefix, start)
+            if idx < 0:
+                break
+            end = idx + plen
+            before_ok = idx == 0 or arg[idx - 1 : idx] in (b"=", b'"', b"'", b":", b" ")
+            after_ok = end == alen or arg[end : end + 1] in (b"/", b"\\", b'"', b"'")
+            if before_ok and after_ok:
+                return True
+            start = idx + 1
+    return False
+
+
+def _is_interactive_host_cwd_only(raw_cmd: bytes, unix: list[bytes]) -> bool:
+    first = raw_cmd.split(b"\0", 1)[0].strip(b'"').strip(b"'")
+    if not first:
+        return False
+    if any(first == u or first.startswith(u + b"/") for u in unix):
+        return False
+    low = raw_cmd.lower()
+    if any(tok in low for tok in (b"wine", b"proton", b"umu", b".exe", b"pressure-vessel", b"reaper")):
+        return False
+    base = os.path.basename(first.decode("utf-8", errors="ignore")).lower()
+    return base in _NON_GAME_CWD_BINARIES
+
+
 def find_game_pids(watch: tuple[str, ...], proc_root: str = "/proc") -> set[int]:
     """PIDs (other than this app) whose cmdline, cwd or Wine prefix points inside a watched folder."""
     if not watch:
         return set()
-    unix = [w.encode() for w in watch]
-    dos = [("z:" + w.replace("/", "\\")).lower().encode() for w in watch]
+    unix = [w.encode() for w in watch if w and w != "/"]
+    if not unix:
+        return set()
+    dos = [("z:" + w.replace("/", "\\")).lower().encode() for w in watch if w and w != "/"]
+    ignored_env_roots = {b"", b"/"}
+    for h in _home_roots():
+        ignored_env_roots.add(h.rstrip("/").encode())
     me = os.getpid()
     found: set[int] = set()
     try:
@@ -78,29 +162,44 @@ def find_game_pids(watch: tuple[str, ...], proc_root: str = "/proc") -> set[int]
         if pid == me:
             continue
         base = f"{proc_root}/{name}"
-        cmd = _read(f"{base}/cmdline").replace(b"\0", b" ")
-        if any(u in cmd for u in unix) or any(d in cmd.lower() for d in dos):
+        raw_cmd = _read(f"{base}/cmdline")
+        raw_cmd_low = raw_cmd.lower()
+        if any(_cmd_has_path_prefix(raw_cmd, u) for u in unix) or any(
+            _cmd_has_path_prefix(raw_cmd_low, d) for d in dos
+        ):
             found.add(pid)
             continue
         try:
             cwd = os.readlink(f"{base}/cwd").encode()
         except OSError:
             cwd = b""
-        if cwd and any(cwd == u or cwd.startswith(u + b"/") for u in unix):
+        if (
+            cwd
+            and any(cwd == u or cwd.startswith(u + b"/") for u in unix)
+            and not _is_interactive_host_cwd_only(raw_cmd, unix)
+        ):
             found.add(pid)
             continue
         for var in _read(f"{base}/environ").split(b"\0"):
             if var.startswith(_ENV_KEYS):  # WINEPREFIX and STEAM_COMPAT_DATA_PATH: both are checked
                 value = var.split(b"=", 1)[1].rstrip(b"/")
+                if not value or value in ignored_env_roots:
+                    continue
                 if any(value == u or value.startswith(u + b"/") or u.startswith(value + b"/") for u in unix):
                     found.add(pid)
                     break
     return found
 
 
+def _exe_comm_bytes(exe_name: str) -> bytes:
+    """Truncate exe_name to Linux TASK_COMM_LEN - 1 (15 bytes) on UTF-8 boundary."""
+    raw = exe_name.encode("utf-8", errors="ignore")[:15]
+    return raw
+
+
 def exe_process_state(exe_name: str, proc_root: str = "/proc") -> tuple[bool, bool]:
-    """(alive, zombie): processes named like the game's .exe (Wine sets comm to its first 15 chars)."""
-    comm = exe_name[:15].encode()
+    """(alive, zombie): processes named like the game's .exe (Wine sets comm to its first 15 bytes)."""
+    comm = _exe_comm_bytes(exe_name)
     alive = zombie = False
     try:
         entries = [e.name for e in os.scandir(proc_root) if e.name.isdigit()]
@@ -119,10 +218,10 @@ def exe_process_state(exe_name: str, proc_root: str = "/proc") -> tuple[bool, bo
 
 
 def exe_pids(exe_name: str, proc_root: str = "/proc") -> set[int]:
-    """Live (not zombie) processes named like the game's .exe (Wine sets comm to its first 15 chars)."""
+    """Live (not zombie) processes named like the game's .exe (Wine sets comm to its first 15 bytes)."""
     if not exe_name:
         return set()
-    comm = exe_name[:15].encode()
+    comm = _exe_comm_bytes(exe_name)
     found: set[int] = set()
     try:
         entries = [e.name for e in os.scandir(proc_root) if e.name.isdigit()]
@@ -327,7 +426,8 @@ class PlayMonitor(QObject):
                 pass
 
     def kill_pids(self, pids: set[int], grace_ms: int = 3000) -> None:
-        """SIGTERM now, SIGKILL to whatever is left after grace_ms (a hung game ignores SIGTERM)."""
+        """SIGTERM now, SIGKILL to whatever is left after grace_ms (guarding against PID reuse)."""
+        epochs = {pid: process_start_epoch(pid) for pid in pids}
         for pid in pids:
             try:
                 os.kill(pid, signal.SIGTERM)
@@ -335,7 +435,11 @@ class PlayMonitor(QObject):
                 pass
 
         def _kill() -> None:
-            for pid in pids:
+            for pid, orig_epoch in epochs.items():
+                if orig_epoch is not None:
+                    cur_epoch = process_start_epoch(pid)
+                    if cur_epoch is None or cur_epoch != orig_epoch:
+                        continue
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except OSError:
@@ -424,10 +528,26 @@ class PlayMonitor(QObject):
             return True
         return bool(self.exe_pids(run.exe_name) - run.old_exe_pids)
 
+    def _has_live_child_exe(self, run: _Run, proc_root: str = "/proc") -> bool:
+        """True if another live Windows .exe runs inside run.watch (bootstrapper handed off to real exe)."""
+        if not run.watch:
+            return False
+        for pid in self.scan(run.watch):
+            if pid in run.old_exe_pids:
+                continue
+            stat = _read(f"{proc_root}/{pid}/stat")
+            end = stat.rfind(b")")
+            if end < 0 or stat[end + 2 : end + 3] == b"Z":
+                continue
+            cmd_low = _read(f"{proc_root}/{pid}/cmdline").replace(b"\0", b" ").lower()
+            if b".exe" in cmd_low and b"proton" not in cmd_low and b"wineserver" not in cmd_low:
+                return True
+        return False
+
     def _check_hung(self, run: _Run, now: float) -> None:
         """The game .exe is a zombie and nothing alive has its name: Proton hung after the game died."""
         alive, zombie = self.exe_state(run.exe_name)
-        if not zombie or alive:
+        if not zombie or alive or self._has_live_child_exe(run):
             run.zombie_since = None
             return
         if run.zombie_since is None:

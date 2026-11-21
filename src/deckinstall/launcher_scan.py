@@ -27,11 +27,17 @@ class ExternalLauncherGame:
     game_id: str = ""  # launcher id: Heroic app name, Lutris database id
 
 
+def _can_open_quote(text: str, idx: int) -> bool:
+    """Return True if a quote at idx can open a YAML quoted scalar (not inside a word)."""
+    return idx == 0 or text[idx - 1].isspace() or text[idx - 1] in (":", "[", "{", ",")
+
+
 def _strip_yaml_comment(line: str) -> str:
     """Remove inline YAML comments outside single/double quotes."""
     in_single = False
     in_double = False
     escaped = False
+    n = len(line)
     for idx, ch in enumerate(line):
         if escaped:
             escaped = False
@@ -40,13 +46,91 @@ def _strip_yaml_comment(line: str) -> str:
             escaped = True
             continue
         if ch == "'" and not in_double:
-            in_single = not in_single
+            if in_single:
+                if idx + 1 < n and line[idx + 1] == "'":
+                    escaped = True
+                    continue
+                in_single = False
+            elif _can_open_quote(line, idx):
+                in_single = True
         elif ch == '"' and not in_single:
-            in_double = not in_double
+            if in_double:
+                in_double = False
+            elif _can_open_quote(line, idx):
+                in_double = True
         elif ch == "#" and not in_single and not in_double:
             if idx == 0 or line[idx - 1].isspace():
                 return line[:idx]
     return line
+
+
+_DOUBLE_YAML_ESCAPES = {
+    "0": "\0",
+    "a": "\a",
+    "b": "\b",
+    "t": "\t",
+    "n": "\n",
+    "v": "\v",
+    "f": "\f",
+    "r": "\r",
+    "e": "\x1b",
+    " ": " ",
+    '"': '"',
+    "/": "/",
+    "\\": "\\",
+    "N": "\u0085",
+    "_": "\u00a0",
+}
+
+
+def _decode_double_quoted_yaml(inner: str) -> str:
+    out: list[str] = []
+    i = 0
+    n = len(inner)
+    while i < n:
+        ch = inner[i]
+        if ch != "\\" or i + 1 >= n:
+            out.append(ch)
+            i += 1
+            continue
+        nxt = inner[i + 1]
+        if nxt in _DOUBLE_YAML_ESCAPES:
+            out.append(_DOUBLE_YAML_ESCAPES[nxt])
+            i += 2
+        elif nxt == "x" and i + 3 < n:
+            hex_part = inner[i + 2 : i + 4]
+            try:
+                out.append(chr(int(hex_part, 16)))
+                i += 4
+                continue
+            except ValueError:
+                pass
+            out.append("\\")
+            i += 1
+        elif nxt == "u" and i + 5 < n:
+            hex_part = inner[i + 2 : i + 6]
+            try:
+                out.append(chr(int(hex_part, 16)))
+                i += 6
+                continue
+            except ValueError:
+                pass
+            out.append("\\")
+            i += 1
+        elif nxt == "U" and i + 9 < n:
+            hex_part = inner[i + 2 : i + 10]
+            try:
+                out.append(chr(int(hex_part, 16)))
+                i += 10
+                continue
+            except ValueError:
+                pass
+            out.append("\\")
+            i += 1
+        else:
+            out.append(nxt)
+            i += 2
+    return "".join(out)
 
 
 def _unquote_yaml_scalar(value: str) -> str:
@@ -55,17 +139,7 @@ def _unquote_yaml_scalar(value: str) -> str:
     if len(val) >= 2 and val[0] == "'" and val[-1] == "'":
         return val[1:-1].replace("''", "'")
     if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
-        inner = val[1:-1]
-        out: list[str] = []
-        i = 0
-        while i < len(inner):
-            if inner[i] == "\\" and i + 1 < len(inner) and inner[i + 1] in ('"', "\\"):
-                out.append(inner[i + 1])
-                i += 2
-                continue
-            out.append(inner[i])
-            i += 1
-        return "".join(out)
+        return _decode_double_quoted_yaml(val[1:-1])
     if val.lower() in ("null", "~"):
         return ""
     return val
@@ -85,12 +159,18 @@ def _split_yaml_key_value(line: str) -> tuple[str, str] | None:
             escaped = True
             continue
         if ch == "'" and not in_double:
-            if in_single and idx + 1 < n and line[idx + 1] == "'":
-                escaped = True
-                continue
-            in_single = not in_single
+            if in_single:
+                if idx + 1 < n and line[idx + 1] == "'":
+                    escaped = True
+                    continue
+                in_single = False
+            elif _can_open_quote(line, idx):
+                in_single = True
         elif ch == '"' and not in_single:
-            in_double = not in_double
+            if in_double:
+                in_double = False
+            elif _can_open_quote(line, idx):
+                in_double = True
         elif ch == ":" and not in_single and not in_double:
             if idx + 1 == n or line[idx + 1].isspace():
                 return line[:idx], line[idx + 1 :]

@@ -13,8 +13,8 @@ from .runtime_manager import (
     get_compat_tools_dir,
     get_steamrt4_dir,
     get_umu_run_path,
+    is_steamrt4_valid,
     list_ge_proton11_dirs,
-    validate_steamrt4_integrity,
 )
 from .steam_paths import SteamPaths, dir_size_bytes_many, find_proton_binary, find_steam_root
 from .steam_vdf import (
@@ -77,9 +77,9 @@ class MaintHealthWorker(QThread):
         )
 
         steamrt4_dir = get_steamrt4_dir()
-        if not steamrt4_dir.is_dir():
+        if not steamrt4_dir.is_dir() and not steamrt4_dir.is_symlink():
             rt4_status = missing_status
-        elif validate_steamrt4_integrity():
+        elif is_steamrt4_valid():
             rt4_status = tr("maint.status_ok")
         else:
             rt4_status = tr("maint.status_corrupted")
