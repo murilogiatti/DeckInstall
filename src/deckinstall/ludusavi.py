@@ -38,6 +38,7 @@ import tempfile
 import time
 import zipfile
 from collections.abc import Callable, Iterator
+from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -674,19 +675,96 @@ def ludusavi_backup_path(home: Path | None = None) -> Path | None:
     return None
 
 
+_IMPORT_ZIP_RE = re.compile(r"^(\d{8}-\d{6})-ludusavi-import(?:-(\d+))?\.zip$")
+
+
+def _content_fingerprint(items: list[tuple[str, str, int]]) -> str:
+    """Stable hash of a snapshot's content: sorted (path in the zip, sha1, size) of every file."""
+    h = hashlib.sha1()  # noqa: S324 - content id, not security
+    for dest, digest, size in sorted(items):
+        h.update(f"{dest}\0{digest}\0{size}\n".encode())
+    return h.hexdigest()
+
+
+def _zip_fingerprint(zip_path: Path) -> str | None:
+    """The content fingerprint of an existing snapshot zip (None when unreadable or too large)."""
+    items: list[tuple[str, str, int]] = []
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            infos = [i for i in zf.infolist() if not i.is_dir()]
+            if len(infos) > _RESTORE_MAX_ENTRIES or sum(i.file_size for i in infos) > _RESTORE_MAX_TOTAL_BYTES:
+                return None
+            for info in infos:
+                with zf.open(info) as fh:
+                    digest, size = _sha1_stream(iter(partial(fh.read, 65536), b""))
+                items.append((info.filename, digest, size))
+    except (OSError, zipfile.BadZipFile, RuntimeError):
+        return None
+    return _content_fingerprint(items)
+
+
+def _import_zip_order(path: Path) -> tuple[str, int, str]:
+    """Creation order of import zips: name timestamp, then the -N counter."""
+    m = _IMPORT_ZIP_RE.match(path.name)
+    return (m.group(1), int(m.group(2) or 0), path.name) if m else ("", 0, path.name)
+
+
+def import_snapshot_fingerprints(snap_dir: Path) -> dict[Path, str]:
+    """{import zip: fingerprint} of a game's Ludusavi imports, oldest first.
+
+    Zips from older versions have no recorded fingerprint: it is computed once and saved.
+    """
+    known = save_sync.import_fingerprints(snap_dir)
+    try:
+        zips = sorted(
+            (p for p in snap_dir.glob("*-ludusavi-import*.zip") if not p.is_symlink() and p.is_file()),
+            key=_import_zip_order,
+        )
+    except OSError:
+        return {}
+    out: dict[Path, str] = {}
+    for zp in zips:
+        fp = known.get(zp.name)
+        if fp is None:
+            fp = _zip_fingerprint(zp)
+            if fp is None:
+                continue
+            save_sync.remember_import_fingerprint(snap_dir, zp.name, fp)
+        out[zp] = fp
+    return out
+
+
+def find_import_duplicates(dest_root: Path | None = None) -> list[Path]:
+    """Ludusavi import zips whose content equals an older import of the same game (the oldest is kept)."""
+    root = dest_root or save_sync.DEFAULT_SNAPSHOTS_DIR
+    try:
+        game_dirs = sorted(d for d in root.iterdir() if d.is_dir() and not d.is_symlink())
+    except OSError:
+        return []
+    dupes: list[Path] = []
+    for snap_dir in game_dirs:
+        seen: set[str] = set()
+        for zp, fp in import_snapshot_fingerprints(snap_dir).items():
+            if fp in seen:
+                dupes.append(zp)
+            seen.add(fp)
+    return dupes
+
+
 def import_ludusavi_to_snapshot(
     game_folder: Path,
     game_name: str = "",
     *,
     home: Path | None = None,
     dest_root: Path | None = None,
-) -> tuple[Path | None, int, int]:
+) -> tuple[Path | None, int, int, bool]:
     """Store the newest backup as a save snapshot of game_name, without touching any prefix.
 
     For games that are not installed yet: the snapshot is restored later with the normal
     "Restore" (which takes a safety snapshot first). Only Windows user/ProgramData files fit a
     snapshot; anything else is counted as skipped. Every file is checked against its sha1/size.
-    Returns (snapshot zip or None when nothing fit, files stored, files skipped).
+    An import with the same content as an earlier one creates nothing.
+    Returns (snapshot zip or None when nothing fit, files stored, files skipped, already imported).
     """
     home = (home or Path.home()).resolve()
     name = game_name or str(load_mapping(game_folder).get("name") or game_folder.name)
@@ -709,8 +787,13 @@ def import_ludusavi_to_snapshot(
         else:
             usable.append((src, (parts if kind == "prefix" else (kind, *parts))))
     if not usable:
-        return None, 0, skipped
+        return None, 0, skipped, False
     snap_dir = save_sync.snapshot_dir_for(name, dest_root)
+    fingerprint = _content_fingerprint([("snap/" + "/".join(p), src.digest, src.size) for src, p in usable])
+    if snap_dir.is_dir():
+        for existing, fp in import_snapshot_fingerprints(snap_dir).items():
+            if fp == fingerprint:
+                return existing, len(usable), skipped, True
     snap_dir.mkdir(parents=True, exist_ok=True)
     target = snap_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-ludusavi-import.zip"
     counter = 1
@@ -741,10 +824,11 @@ def import_ludusavi_to_snapshot(
         for zf in zips.values():
             zf.close()
     save_sync.remember_snapshot_name(snap_dir, name)
+    save_sync.remember_import_fingerprint(snap_dir, target.name, fingerprint)
     if appid:
         save_sync.remember_steamcloud_appid(snap_dir, target.name, appid)
     save_sync.remember_home_files(snap_dir, ["/".join(p[1:]) for _, p in usable if p[0] == "home"])
-    return target, len(usable), skipped
+    return target, len(usable), skipped, False
 
 
 def import_ludusavi(

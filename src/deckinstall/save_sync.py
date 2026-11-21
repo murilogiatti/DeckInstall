@@ -870,6 +870,23 @@ def remember_snapshot_name(snap_dir: Path, game_name: str) -> None:
         _write_snapshot_index(snap_dir, index)
 
 
+def import_fingerprints(snap_dir: Path) -> dict[str, str]:
+    """{zip name: content fingerprint} recorded for the Ludusavi imports still on disk."""
+    raw = _read_snapshot_index(snap_dir).get("import_fingerprints")
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(v, str) and (snap_dir / k).is_file()}
+
+
+def remember_import_fingerprint(snap_dir: Path, zip_name: str, fingerprint: str) -> None:
+    """Record the content fingerprint of one Ludusavi import zip (to skip importing it again)."""
+    index = _read_snapshot_index(snap_dir)
+    known = import_fingerprints(snap_dir)
+    known[zip_name] = fingerprint
+    index["import_fingerprints"] = known
+    _write_snapshot_index(snap_dir, index)
+
+
 def snapshot_home_files(snap_dir: Path) -> tuple[str, ...]:
     """The game's files under $HOME recorded in the index (allowed relative paths only)."""
     raw = _read_snapshot_index(snap_dir).get("home")

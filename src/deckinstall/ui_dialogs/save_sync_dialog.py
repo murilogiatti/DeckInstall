@@ -260,7 +260,10 @@ def build_saves_page(win: MainWindow) -> QWidget:
     win.btn_save_sync.clicked.connect(win._open_save_sync_dialog)
     win.btn_save_refresh = QPushButton(tr("save_sync.btn_refresh"))
     win.btn_save_refresh.clicked.connect(lambda: refresh_saves_page(win))
-    for b in (win.btn_save_backup, win.btn_save_restore, win.btn_save_sync):
+    win.btn_save_dedup = QPushButton(tr("saves.btn_dedup"))
+    win.btn_save_dedup.setToolTip(tr("saves.btn_dedup_tip"))
+    win.btn_save_dedup.clicked.connect(lambda: _remove_import_duplicates(win))
+    for b in (win.btn_save_backup, win.btn_save_restore, win.btn_save_sync, win.btn_save_dedup):
         buttons.addWidget(b)
     buttons.addStretch()
     buttons.addWidget(win.btn_save_refresh)
@@ -624,20 +627,102 @@ def _import_to_snapshots(win: MainWindow, root: Path, row: SaveRow | None) -> No
             games = [games[labels.index(picked) - 1]]
 
     def _job() -> object:
-        done: list[tuple[str, int, int]] = []
+        done: list[tuple[str, int, int, bool]] = []
         for name, folder in games:
-            _snap, stored, skipped = lds.import_ludusavi_to_snapshot(folder, name)
-            done.append((name, stored, skipped))
+            _snap, stored, skipped, already = lds.import_ludusavi_to_snapshot(folder, name)
+            done.append((name, stored, skipped, already))
         return done
 
     def _ok(res: object) -> None:
-        lines = [
-            tr("saves.import_snapshot_line", name=name, stored=stored, skipped=skipped)
-            for name, stored, skipped in (res if isinstance(res, list) else [])
-        ]
-        _info(win, tr("saves.import_snapshot_done") + "\n" + "\n".join(lines))
+        show_import_result(win, res if isinstance(res, list) else [])
 
     _run(win, tr("saves.import_running", name=root.name), _job, _ok)
+
+
+def import_result_text(results: list[tuple[str, int, int, bool]]) -> tuple[str, str]:
+    """(summary with the 3 counters, one line per game) of a Ludusavi import; summary only when all was there."""
+    new = sum(1 for _n, stored, _s, already in results if stored and not already)
+    old = sum(1 for *_x, already in results if already)
+    empty = sum(1 for _n, stored, _s, already in results if not stored and not already)
+    if results and old == len(results):
+        return tr("saves.import_all_already"), ""
+    lines = []
+    for name, stored, skipped, already in results:
+        if already:
+            lines.append(tr("saves.import_line_already", name=name))
+        elif stored:
+            lines.append(tr("saves.import_snapshot_line", name=name, stored=stored, skipped=skipped))
+        else:
+            lines.append(tr("saves.import_line_empty", name=name, skipped=skipped))
+    return tr("saves.import_summary", new=new, already=old, empty=empty), "\n".join(lines)
+
+
+def show_import_result(win: MainWindow, results: list[tuple[str, int, int, bool]]) -> None:
+    """Import result in a dialog sized to the screen: counters on top, scrollable per-game list."""
+    summary, details = import_result_text(results)
+    win.status_label.setText(summary.splitlines()[0])
+    parent = _dialog_parent(win)
+    if not details:
+        QMessageBox.information(parent, __app_name__, summary)
+        return
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(tr("saves.import_result_title"))
+    lay = QVBoxLayout(dlg)
+    head = QLabel(summary)
+    head.setObjectName("PageTitle")
+    head.setWordWrap(True)
+    lay.addWidget(head)
+    hint = QLabel(tr("saves.import_snapshot_done"))
+    hint.setObjectName("MutedText")
+    hint.setWordWrap(True)
+    lay.addWidget(hint)
+    txt = QPlainTextEdit(dlg)
+    txt.setReadOnly(True)
+    txt.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+    txt.setPlainText(details)
+    lay.addWidget(txt, 1)
+    btn = QPushButton(tr("proton_mgr.btn_close"), dlg)
+    btn.clicked.connect(dlg.accept)
+    lay.addWidget(btn)
+    screen = parent.screen() if parent is not None else None
+    if screen is not None:
+        avail = screen.availableGeometry()
+        dlg.setMaximumSize(int(avail.width() * 0.95), int(avail.height() * 0.9))
+        dlg.resize(min(680, int(avail.width() * 0.9)), min(480, int(avail.height() * 0.8)))
+    else:
+        dlg.resize(680, 480)
+    dlg.exec()
+    dlg.deleteLater()
+
+
+def _remove_import_duplicates(win: MainWindow) -> None:
+    """Delete Ludusavi imports identical to an older one of the same game, after a confirmation listing them."""
+    if win._steam_busy:
+        return
+    dupes = lds.find_import_duplicates()
+    parent = _dialog_parent(win)
+    if not dupes:
+        QMessageBox.information(parent, __app_name__, tr("saves.dedup_none"))
+        return
+    listing = "\n".join(f"• {snapshot_display_name(p.parent.name)}: {p.name}" for p in dupes)
+    box = QMessageBox(QMessageBox.Icon.Question, __app_name__, tr("saves.dedup_confirm", count=len(dupes)),
+                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, parent)
+    box.setDefaultButton(QMessageBox.StandardButton.No)
+    box.setDetailedText(listing)
+    box.setInformativeText(listing if len(dupes) <= 8 else tr("saves.dedup_see_details"))
+    answer = box.exec()
+    box.deleteLater()
+    if answer != QMessageBox.StandardButton.Yes:
+        return
+    removed = 0
+    for p in dupes:
+        try:
+            p.unlink()
+            removed += 1
+        except OSError as exc:
+            logging.getLogger(__name__).warning("Could not remove %s: %s", p, exc)
+    refresh_saves_page(win, after_play=False)
+    _info(win, tr("saves.dedup_done", count=removed))
 
 
 def _ludusavi_start_dir(win: MainWindow) -> Path:

@@ -89,7 +89,7 @@ def test_import_keeps_only_allowed_home_files(tmp_path: Path) -> None:
     files = {f"/home/deck/{rel}": rel.encode() for rel in (ALLOWED, *BLOCKED)}
     folder = _unix_backup(tmp_path, "Game", files)
     snaps = tmp_path / "snaps"
-    snap, stored, skipped = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "x", dest_root=snaps)
+    snap, stored, skipped, _ = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "x", dest_root=snaps)
     assert snap is not None and (stored, skipped) == (1, len(BLOCKED))
     with zipfile.ZipFile(snap) as zf:
         assert zf.namelist() == [f"snap/home/{ALLOWED}"]
@@ -134,7 +134,7 @@ def test_sync_zip_refuses_blocked_home_files(tmp_path: Path, home: Path) -> None
 def test_home_overwrite_is_covered_by_safety_snapshot_and_later_snapshots(tmp_path: Path, home: Path) -> None:
     snaps = tmp_path / "snaps"
     folder = _unix_backup(tmp_path, "Game", {f"/home/deck/{ALLOWED}": b"from-backup"})
-    snap, _, _ = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "x", dest_root=snaps)
+    snap, _, _, _ = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "x", dest_root=snaps)
     assert snap is not None
     (home / ALLOWED).parent.mkdir(parents=True)
     (home / ALLOWED).write_bytes(b"mine")
@@ -174,7 +174,7 @@ def test_home_file_not_in_safety_snapshot_is_skipped_and_reported(tmp_path: Path
 
 def _cloud_import(tmp_path: Path) -> tuple[Path, Path]:
     folder = _unix_backup(tmp_path, "Cloud", {"/home/deck/.local/share/Steam/userdata/1/311340/remote/slot": b"saved"})
-    snap, _, _ = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "x", dest_root=tmp_path / "snaps")
+    snap, _, _, _ = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "x", dest_root=tmp_path / "snaps")
     assert snap is not None
     assert save_sync.snapshot_steamcloud_appid(snap) == "311340"
     return snap, tmp_path / "userdata" / "999" / "remote"

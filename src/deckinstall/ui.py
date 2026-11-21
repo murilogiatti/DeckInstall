@@ -301,6 +301,7 @@ class MainWindow(QMainWindow):
     btn_save_backup: QPushButton
     btn_save_restore: QPushButton
     btn_save_sync: QPushButton
+    btn_save_dedup: QPushButton
     btn_save_refresh: QPushButton
     btn_save_snapshot_now: QPushButton
     btn_save_restore_selected: QPushButton
@@ -3249,6 +3250,7 @@ class MainWindow(QMainWindow):
             self.btn_save_backup,
             self.btn_save_restore,
             self.btn_save_sync,
+            self.btn_save_dedup,
             self.btn_save_refresh,
             self.btn_adopt_games,
             self.btn_manage_protons,

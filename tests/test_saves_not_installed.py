@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import zipfile
@@ -33,7 +34,7 @@ def _backup(tmp_path: Path, name: str = "My Game", data: bytes = b"progress-42")
 def test_import_without_game_makes_a_restorable_snapshot(tmp_path: Path) -> None:
     folder = _backup(tmp_path)
     snaps = tmp_path / "snaps"
-    snap, stored, skipped = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "home", dest_root=snaps)
+    snap, stored, skipped, _ = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "home", dest_root=snaps)
     assert snap is not None and (stored, skipped) == (1, 0)
     assert snap.parent == save_sync.snapshot_dir_for("My Game", snaps)
     assert save_sync.snapshot_display_name(snap.parent.name, snaps) == "My Game"
@@ -110,16 +111,21 @@ def test_page_imports_backup_of_games_not_installed(tmp_path: Path) -> None:
         win = ui.MainWindow(app)
         try:
             assert win.btn_save_import.isEnabled()  # no game selected: import goes to snapshots
-            with (
-                mock.patch.object(ssd.QInputDialog, "getItem", return_value=(tr("saves.import_all", count=2), True)),
-                mock.patch.object(ssd.QMessageBox, "information") as info,
-            ):
-                ssd._import_to_snapshots(win, tmp_path / "ludusavi", None)
-                deadline = time.monotonic() + 10
-                while not info.called and time.monotonic() < deadline:
-                    app.processEvents()
-                    time.sleep(0.01)
-            assert info.called
+            for already in (False, True):  # the second import creates nothing
+                with (
+                    mock.patch.object(
+                        ssd.QInputDialog, "getItem", return_value=(tr("saves.import_all", count=2), True)
+                    ),
+                    mock.patch.object(ssd, "show_import_result") as shown,
+                ):
+                    ssd._import_to_snapshots(win, tmp_path / "ludusavi", None)
+                    deadline = time.monotonic() + 10
+                    while not shown.called and time.monotonic() < deadline:
+                        app.processEvents()
+                        time.sleep(0.01)
+                assert shown.called
+                assert [r[3] for r in shown.call_args.args[1]] == [already, already]
+            assert len(list(snaps.rglob("*.zip"))) == 2
             names = {win.saves_list.item(r, 0).text() for r in range(win.saves_list.rowCount())}
             assert names == {tr("saves.orphan", name="Alpha"), tr("saves.orphan", name="Beta")}
             win.saves_list.setCurrentCell(0, 0)
@@ -160,7 +166,7 @@ def test_import_keeps_unix_paths_steam_cloud_heroic_and_home(tmp_path: Path) -> 
         f"{deck}/.local/share/Steam/steamapps/shadercache/1/x.bin": b"cache",
     })
     snaps = tmp_path / "snaps"
-    snap, stored, skipped = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "other-home", dest_root=snaps)
+    snap, stored, skipped, _ = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "other-home", dest_root=snaps)
     assert snap is not None and (stored, skipped) == (3, 3)
     with zipfile.ZipFile(snap) as zf:
         assert {n: zf.read(n) for n in zf.namelist()} == {
@@ -213,5 +219,56 @@ def test_import_falls_back_to_older_full_backup_when_newest_has_no_saves(tmp_pat
     bk.mkdir(parents=True)
     (bk / "system.reg").write_bytes(b"")
     (folder / "mapping.yaml").write_text(text, encoding="utf-8")
-    snap, stored, skipped = lds.import_ludusavi_to_snapshot(folder, home=Path("/home/deck"), dest_root=tmp_path / "s")
+    snap, stored, skipped, _ = lds.import_ludusavi_to_snapshot(folder, home=Path("/home/deck"), dest_root=tmp_path / "s")
     assert snap is not None and (stored, skipped) == (1, 0)
+
+
+def test_import_twice_makes_one_snapshot(tmp_path: Path) -> None:
+    folder = _backup(tmp_path)
+    snaps = tmp_path / "snaps"
+    first, stored, _, already = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "home", dest_root=snaps)
+    assert first is not None and stored == 1 and not already
+    again, stored2, _, already2 = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "home", dest_root=snaps)
+    assert again == first and stored2 == 1 and already2
+    assert len(list(first.parent.glob("*.zip"))) == 1
+
+
+def test_changed_content_makes_a_new_snapshot(tmp_path: Path) -> None:
+    snaps = tmp_path / "snaps"
+    first, *_ = lds.import_ludusavi_to_snapshot(_backup(tmp_path / "a"), home=tmp_path / "home", dest_root=snaps)
+    second, _, _, already = lds.import_ludusavi_to_snapshot(
+        _backup(tmp_path / "b", data=b"progress-43"), home=tmp_path / "home", dest_root=snaps
+    )
+    assert second is not None and second != first and not already
+    assert len(list(second.parent.glob("*.zip"))) == 2
+
+
+def test_old_snapshot_without_fingerprint_is_recognized(tmp_path: Path) -> None:
+    folder = _backup(tmp_path)
+    snaps = tmp_path / "snaps"
+    first, *_ = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "home", dest_root=snaps)
+    assert first is not None
+    index = first.parent / ".index.json"  # as written by versions before the fingerprint
+    data = json.loads(index.read_text())
+    data.pop("import_fingerprints")
+    index.write_text(json.dumps(data))
+    again, _, _, already = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "home", dest_root=snaps)
+    assert already and again == first
+    assert first.name in save_sync.import_fingerprints(first.parent)  # computed once and saved
+
+
+def test_find_import_duplicates_keeps_the_oldest(tmp_path: Path) -> None:
+    folder = _backup(tmp_path)
+    snaps = tmp_path / "snaps"
+    first, *_ = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "home", dest_root=snaps)
+    assert first is not None
+    older = first.parent / "20000101-000000-ludusavi-import.zip"  # an older version imported it before
+    older.write_bytes(first.read_bytes())
+    assert lds.find_import_duplicates(snaps) == [first]
+
+
+def test_import_result_text_counters() -> None:
+    summary, details = ssd.import_result_text([("A", 2, 0, False), ("B", 1, 0, True), ("C", 0, 3, False)])
+    assert "1" in summary and details.count("\n") == 2
+    summary, details = ssd.import_result_text([("A", 2, 0, True), ("B", 1, 0, True)])
+    assert details == "" and summary == ssd.tr("saves.import_all_already")

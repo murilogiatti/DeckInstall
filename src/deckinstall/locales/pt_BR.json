@@ -862,5 +862,16 @@
   "saves.home_skipped": "{count} arquivo(s) da pasta pessoal foram mantidos como estão: a cópia de segurança não conseguiu guardá-los.",
   "saves.steam_running": "Feche a Steam antes de restaurar saves da nuvem Steam. Com ela aberta, a sincronização pode sobrescrever os arquivos restaurados.",
   "saves.steamcloud_appid_mismatch": "Restauração recusada: este snapshot tem saves da nuvem Steam do app {snap}, mas o jogo selecionado é o app {target}.",
-  "cleanup.cat_game_cache": "Cache de jogo removido"
+  "cleanup.cat_game_cache": "Cache de jogo removido",
+  "saves.import_all_already": "Tudo já foi importado. Nenhum snapshot novo foi criado.",
+  "saves.import_summary": "Importados agora: {new}  •  Já importados: {already}  •  Sem save de usuário: {empty}",
+  "saves.import_line_already": "• {name}: já importado antes (nada criado)",
+  "saves.import_line_empty": "• {name}: nenhum save de usuário ({skipped} arquivo(s) ignorado(s))",
+  "saves.import_result_title": "Resultado da importação do Ludusavi",
+  "saves.btn_dedup": "Remover duplicados de importação",
+  "saves.btn_dedup_tip": "Apaga importações do Ludusavi com conteúdo idêntico, mantendo a cópia mais antiga de cada jogo. Pede confirmação antes.",
+  "saves.dedup_none": "Nenhuma importação duplicada encontrada.",
+  "saves.dedup_confirm": "Apagar {count} importação(ões) duplicada(s)? A cópia mais antiga de cada conteúdo é mantida. Isto não pode ser desfeito.",
+  "saves.dedup_see_details": "Veja a lista completa em \"Mostrar detalhes\".",
+  "saves.dedup_done": "{count} importação(ões) duplicada(s) removida(s)."
 }
