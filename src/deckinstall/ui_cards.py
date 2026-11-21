@@ -9,8 +9,6 @@ from pathlib import Path
 
 from PySide6.QtCore import (
     QPoint,
-    QProcess,
-    QProcessEnvironment,
     QRect,
     QSettings,
     QSize,
@@ -21,13 +19,17 @@ from PySide6.QtGui import (
     QDragEnterEvent,
     QDragLeaveEvent,
     QDropEvent,
+    QGuiApplication,
 )
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QFileDialog,
     QFrame,
+    QLabel,
     QLayout,
+    QPlainTextEdit,
+    QPushButton,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -90,34 +92,33 @@ def get_game_log_path(game_name: str) -> Path:
     return Path.home() / ".local" / "share" / "DeckInstall" / "logs" / f"{safe}.log"
 
 
-def _start_detached_process(
-    cmd: list[str],
-    cwd: Path | None = None,
-    env: dict[str, str] | None = None,
-    log_file: Path | None = None,
-) -> None:
-    """Spawn a fire-and-forget process via QProcess.startDetached without Popen leaks."""
-    if not cmd:
-        raise ValueError("Empty command")
-    proc = QProcess()
-    proc.setProgram(cmd[0])
-    proc.setArguments(cmd[1:])
-    if cwd is not None:
-        proc.setWorkingDirectory(str(cwd))
-    if env is not None:
-        qenv = QProcessEnvironment()
-        for k, v in env.items():
-            qenv.insert(k, v)
-        proc.setProcessEnvironment(qenv)
-    if log_file is not None:
-        try:
-            log_file.parent.mkdir(parents=True, exist_ok=True)
-            proc.setStandardOutputFile(str(log_file))
-            proc.setStandardErrorFile(str(log_file))
-        except OSError:
-            pass
-    if not proc.startDetached():
-        raise RuntimeError(f"Failed to launch: {cmd[0]}")
+def show_text_dialog(parent: QWidget | None, title: str, summary: str, details: str) -> QDialog:
+    """Non-blocking dialog sized to the screen: a summary on top and a scrollable, wrapped text below."""
+    parent = _dialog_parent(parent) if parent is not None else None
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(title)
+    dlg.setWindowModality(Qt.WindowModality.WindowModal)
+    lay = QVBoxLayout(dlg)
+    head = QLabel(summary, dlg)
+    head.setObjectName("SectionTitle")
+    head.setWordWrap(True)
+    lay.addWidget(head)
+    txt = QPlainTextEdit(dlg)
+    txt.setReadOnly(True)
+    txt.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+    txt.setPlainText(details)
+    lay.addWidget(txt, 1)
+    btn = QPushButton(tr("proton_mgr.btn_close"), dlg)
+    btn.clicked.connect(dlg.accept)
+    lay.addWidget(btn)
+    screen = parent.screen() if parent is not None else QGuiApplication.primaryScreen()
+    if screen is not None:
+        avail = screen.availableGeometry()
+        dlg.setMaximumSize(int(avail.width() * 0.95), int(avail.height() * 0.9))
+        dlg.resize(min(680, int(avail.width() * 0.9)), min(480, int(avail.height() * 0.8)))
+    dlg.finished.connect(dlg.deleteLater)
+    dlg.open()
+    return dlg
 
 
 def _resolve_asset_path(filename: str) -> Path | None:

@@ -845,5 +845,18 @@
   "saves.dedup_none": "No duplicate imports found.",
   "saves.dedup_confirm": "Delete {count} duplicate import(s)? The oldest copy of each content is kept. This cannot be undone.",
   "saves.dedup_see_details": "See the full list under \"Show Details\".",
-  "saves.dedup_done": "{count} duplicate import(s) removed."
+  "saves.dedup_done": "{count} duplicate import(s) removed.",
+  "play.btn_loading": "Loading",
+  "play.btn_stop": "Stop",
+  "play.btn_error": "Error",
+  "play.running_tip": "Running. Click to close the game.",
+  "play.confirm_stop": "Close '{name}' now? Unsaved progress will be lost.",
+  "play.failed": "'{name}' did not start.",
+  "play.failed_title": "Could not start the game",
+  "play.failed_to_start": "The launch command could not be started: {err}",
+  "play.exit_error": "The game closed right away with exit code {code}.",
+  "play.closed_at_once": "The game closed as soon as it opened (exit code 0) and none of its processes kept running.",
+  "play.log_tail": "Last lines of the log ({path}):",
+  "play.timeout": "'{name}' showed no sign of life in 60 s. Check the log under Configure game.",
+  "play.steam_timeout": "Could not confirm that Steam opened '{name}'."
 }

@@ -845,5 +845,18 @@
   "saves.dedup_none": "Nenhuma importação duplicada encontrada.",
   "saves.dedup_confirm": "Apagar {count} importação(ões) duplicada(s)? A cópia mais antiga de cada conteúdo é mantida. Isto não pode ser desfeito.",
   "saves.dedup_see_details": "Veja a lista completa em \"Mostrar detalhes\".",
-  "saves.dedup_done": "{count} importação(ões) duplicada(s) removida(s)."
+  "saves.dedup_done": "{count} importação(ões) duplicada(s) removida(s).",
+  "play.btn_loading": "Carregando",
+  "play.btn_stop": "Parar",
+  "play.btn_error": "Erro",
+  "play.running_tip": "Em execução. Clique para fechar o jogo.",
+  "play.confirm_stop": "Fechar '{name}' agora? O progresso não salvo será perdido.",
+  "play.failed": "'{name}' não abriu.",
+  "play.failed_title": "Erro ao abrir o jogo",
+  "play.failed_to_start": "O comando de abertura não pôde ser iniciado: {err}",
+  "play.exit_error": "O jogo fechou logo em seguida com código {code}.",
+  "play.closed_at_once": "O jogo fechou assim que abriu (código 0) e nenhum processo dele ficou rodando.",
+  "play.log_tail": "Últimas linhas do log ({path}):",
+  "play.timeout": "'{name}' não deu sinal de vida em 60 s. Confira o log em Configurar jogo.",
+  "play.steam_timeout": "Não deu para confirmar se a Steam abriu '{name}'."
 }

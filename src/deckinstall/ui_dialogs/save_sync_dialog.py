@@ -66,6 +66,7 @@ from ..ui_cards import (
     _setting_bool,
     _SortableTableItem,
     format_size_bytes,
+    show_text_dialog,
 )
 from ..ui_workers import SteamOpWorker
 
@@ -658,41 +659,13 @@ def import_result_text(results: list[tuple[str, int, int, bool]]) -> tuple[str, 
 
 
 def show_import_result(win: MainWindow, results: list[tuple[str, int, int, bool]]) -> None:
-    """Import result in a dialog sized to the screen: counters on top, scrollable per-game list."""
+    """Import result inside the window: counters on top, scrollable per-game list (sized to the screen)."""
     summary, details = import_result_text(results)
     win.status_label.setText(summary.splitlines()[0])
-    parent = _dialog_parent(win)
     if not details:
-        QMessageBox.information(parent, __app_name__, summary)
+        QMessageBox.information(_dialog_parent(win), __app_name__, summary)
         return
-    dlg = QDialog(parent)
-    dlg.setWindowTitle(tr("saves.import_result_title"))
-    lay = QVBoxLayout(dlg)
-    head = QLabel(summary)
-    head.setObjectName("PageTitle")
-    head.setWordWrap(True)
-    lay.addWidget(head)
-    hint = QLabel(tr("saves.import_snapshot_done"))
-    hint.setObjectName("MutedText")
-    hint.setWordWrap(True)
-    lay.addWidget(hint)
-    txt = QPlainTextEdit(dlg)
-    txt.setReadOnly(True)
-    txt.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
-    txt.setPlainText(details)
-    lay.addWidget(txt, 1)
-    btn = QPushButton(tr("proton_mgr.btn_close"), dlg)
-    btn.clicked.connect(dlg.accept)
-    lay.addWidget(btn)
-    screen = parent.screen() if parent is not None else None
-    if screen is not None:
-        avail = screen.availableGeometry()
-        dlg.setMaximumSize(int(avail.width() * 0.95), int(avail.height() * 0.9))
-        dlg.resize(min(680, int(avail.width() * 0.9)), min(480, int(avail.height() * 0.8)))
-    else:
-        dlg.resize(680, 480)
-    dlg.exec()
-    dlg.deleteLater()
+    show_text_dialog(win, tr("saves.import_result_title"), summary, tr("saves.import_snapshot_done") + "\n\n" + details)
 
 
 def _remove_import_duplicates(win: MainWindow) -> None:

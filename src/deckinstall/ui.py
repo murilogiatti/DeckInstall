@@ -90,6 +90,7 @@ from .migrate import (
     plan_migration,
     undo_migration,
 )
+from .play_monitor import ERROR, LOADING, RUNNING, PlayMonitor, watch_paths
 from .runtime_manager import (
     detect_gpu_profile,
     fix_bwrap_userns,
@@ -106,9 +107,11 @@ from .scanner import (
 )
 from .standalone import (
     StandaloneGame,
+    game_log_dir,
     get_games_dir,
     import_standalone_to_steam,
     list_standalone_games,
+    shortcut_game_dir,
     update_standalone_launch_options,
     uses_library_layout,
 )
@@ -142,9 +145,9 @@ from .ui_cards import (  # noqa: F401
     _pick_file_async,
     _resolve_asset_path,
     _setting_bool,
-    _start_detached_process,
     format_size_bytes,
     get_game_log_path,
+    show_text_dialog,
 )
 from .ui_cards import (
     _parse_launch_preset_state as _raw_parse_launch_preset_state,
@@ -347,6 +350,10 @@ class MainWindow(QMainWindow):
         self._extract_worker: ExtractWorker | None = None
         self._add_worker: AddToSteamWorker | None = None
         self._scan_worker: ScanWorker | None = None
+        self._play = PlayMonitor(self)
+        self._play.changed.connect(self._on_play_changed)
+        self._play.failed.connect(self._on_play_failed)
+        self._play.timed_out.connect(self._on_play_timed_out)
 
         self.setWindowTitle(f"{__app_name__} v{__version__}")
         self.resize(1080, 700)
@@ -416,6 +423,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         if self._force_closing:
+            self._play.release()
             super().closeEvent(event)
             return
         if (
@@ -491,6 +499,7 @@ class MainWindow(QMainWindow):
         if self._close_force_timer is not None:
             self._close_force_timer.stop()
         self._auto_art_timer.stop()
+        self._play.release()  # stop following running games; they keep running
         super().closeEvent(event)
 
     def _build_ui(self) -> None:
@@ -2706,7 +2715,7 @@ class MainWindow(QMainWindow):
         can_write_vdf = bool(self.paths) and not self._vdf_corrupt
 
         self.btn_configure_game.setEnabled(sel is not None)
-        self.btn_play_game.setEnabled(sel is not None)
+        self._update_play_button(sel)
         self.btn_move_game.setEnabled(is_standalone and not self._steam_busy)
 
         # Hide mutually exclusive per-game actions instead of merely disabling them
@@ -3141,19 +3150,90 @@ class MainWindow(QMainWindow):
     def _open_configure_game_dialog(self) -> None:
         open_configure_game_dialog(self)
 
+    @staticmethod
+    def _play_key(kind: str, obj: object) -> str:
+        """One Play state per game: Steam shortcuts by app id, the others by their folder."""
+        if isinstance(obj, ShortcutEntry):
+            return f"steam:{obj.appid_u32}"
+        return f"{kind}:{getattr(obj, 'game_dir', '') or getattr(obj, 'name', '')}"
+
+    def _update_play_button(
+        self, sel: tuple[str, ShortcutEntry | StandaloneGame | ExternalLauncherGame] | None = None
+    ) -> None:
+        """Play -> Loading... (disabled) -> Stop while running -> Play; Error while the diagnosis is open."""
+        btn = self.btn_play_game
+        state = self._play.state(self._play_key(*sel)) if sel is not None else ""
+        if state == LOADING:
+            btn.setText(tr("play.btn_loading") + "." * (self._play.frame % 3 + 1))
+            btn.setEnabled(False)
+        elif state == RUNNING:
+            btn.setText(tr("play.btn_stop"))
+            btn.setToolTip(tr("play.running_tip"))
+            btn.setEnabled(not self._steam_busy)
+        elif state == ERROR:
+            btn.setText(tr("play.btn_error"))
+            btn.setEnabled(False)
+        else:
+            btn.setText(tr("library.btn_play"))
+            btn.setToolTip("")
+            btn.setEnabled(sel is not None and not self._steam_busy)
+        name = "dangerBtn" if state == RUNNING else "primaryBtn"
+        if btn.objectName() != name:
+            btn.setObjectName(name)
+            btn.style().unpolish(btn)
+            btn.style().polish(btn)
+
+    def _on_play_changed(self, key: str) -> None:
+        sel = self._selected_library_item()
+        if sel is not None and self._play_key(*sel) == key and not self._closing_pending:
+            self._update_play_button(sel)
+
+    def _on_play_failed(self, key: str, name: str, diagnosis: str) -> None:
+        if self._closing_pending:
+            self._play.acknowledge(key)
+            return
+        self.status_label.setText(tr("play.failed", name=name))
+        dlg = show_text_dialog(self, tr("play.failed_title"), tr("play.failed", name=name), diagnosis)
+        dlg.finished.connect(lambda _r, k=key: self._play.acknowledge(k))
+
+    def _on_play_timed_out(self, _key: str, name: str, steam: bool) -> None:
+        if self._closing_pending:
+            return
+        msg = tr("play.steam_timeout", name=name) if steam else tr("play.timeout", name=name)
+        self.status_label.setText(msg)
+        if not steam:
+            QMessageBox.warning(_dialog_parent(self), __app_name__, msg)
+
     def _play_selected_game(self) -> None:
-        """Launch the selected Steam, Standalone, or External game."""
+        """Play the selected game, or stop it when it is already running."""
         sel = self._selected_library_item()
         if not sel:
             return
         kind, obj = sel
+        key = self._play_key(kind, obj)
+        state = self._play.state(key)
+        if state == RUNNING:
+            name = obj.app_name if isinstance(obj, ShortcutEntry) else obj.name
+            if QMessageBox.question(
+                _dialog_parent(self), __app_name__, tr("play.confirm_stop", name=name)
+            ) == QMessageBox.StandardButton.Yes:
+                self._play.stop(key)
+            return
+        if state != "idle":
+            return
         if isinstance(obj, ShortcutEntry):
             rungameid = (obj.appid_u32 << 32) | 0x02000000
+            try:
+                game_dir: Path | None = shortcut_game_dir(obj)
+            except ValueError:
+                game_dir = None
+            compat = self.paths.compatdata_dir / str(obj.appid_u32) if self.paths is not None else None
+            self._play.watch_only(key, obj.app_name, watch_paths(game_dir, compat))
             QDesktopServices.openUrl(QUrl(f"steam://rungameid/{rungameid}"))
             self.status_label.setText(tr("play.launched", name=obj.app_name))
             return
         title_name = obj.name
-
+        self._play.prepare(key, title_name)
         paths_snap = self.paths
 
         def _on_prep_ready(
@@ -3165,6 +3245,8 @@ class MainWindow(QMainWindow):
         ) -> None:
             if self._closing_pending:
                 return
+            if status != "ok":
+                self._play.cancel(key)
             if status == "win32":
                 assert isinstance(obj, StandaloneGame)
                 self._warn_if_win32_prefix(obj.prefix_dir)
@@ -3180,13 +3262,15 @@ class MainWindow(QMainWindow):
                 fb_msg = tr("play.proton_fallback", name=obj.name, proton=msg_or_fallback)
                 self.status_label.setText(fb_msg)
                 QMessageBox.information(_dialog_parent(self), __app_name__, fb_msg)
-            try:
-                # DeckInstall games log every run from their own launch.sh (any launcher).
-                log_file = None if isinstance(obj, StandaloneGame) else get_game_log_path(title_name)
-                _start_detached_process(cmd, cwd=cwd, env=env, log_file=log_file)
-                self.status_label.setText(tr("play.launched", name=title_name))
-            except Exception as exc:
-                QMessageBox.critical(_dialog_parent(self), __app_name__, tr("play.error", err=str(exc)))
+            # DeckInstall games log every run from their own launch.sh (any launcher).
+            standalone = isinstance(obj, StandaloneGame)
+            log_file = None if standalone else get_game_log_path(title_name)
+            log_path = game_log_dir(obj) / "run.log" if isinstance(obj, StandaloneGame) else log_file
+            self._play.launch(
+                key, title_name, cmd, cwd=cwd, env=env, log_file=log_file, log_path=log_path,
+                watch=watch_paths(obj.game_dir, obj.prefix_dir),
+            )
+            self.status_label.setText(tr("play.launched", name=title_name))
 
         worker = LaunchPrepWorker(kind, obj, paths_snap)
         self._track_worker(worker)
