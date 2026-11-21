@@ -217,3 +217,28 @@ def test_game_dead_but_proton_hung_is_an_error_and_cleaned_up(mon: pm.PlayMonito
     (_k, _n, diag), = mon.events["failed"]  # type: ignore[attr-defined]
     assert diag.startswith(pm.tr("play.hung"))
     assert not os.path.exists(f"/proc/{pid}") or open(f"/proc/{pid}/stat").read().split(") ")[1][0] == "Z"
+
+
+def test_watch_paths_keep_var_home(monkeypatch) -> None:
+    """Fedora Atomic / Bazzite keep home in /var/home: those games are followed too."""
+    monkeypatch.setenv("HOME", "/var/home/deck")
+    assert pm.watch_paths("/var/home/deck/Games/X", "/var/lib/foo", "/optical/G", "/usr/share/x") == (
+        "/var/home/deck/Games/X",
+        "/optical/G",
+    )
+
+
+def test_late_prepare_answer_is_not_a_launch(mon: pm.PlayMonitor) -> None:
+    first = mon.prepare("g", "Game")
+    assert mon.is_preparing("g", first)
+    mon.cancel("g")
+    second = mon.prepare("g", "Game")
+    assert not mon.is_preparing("g", first) and mon.is_preparing("g", second)
+
+
+def test_compat_data_path_after_another_wineprefix(tmp_path: Path) -> None:
+    proc = tmp_path / "proc" / "4242"
+    proc.mkdir(parents=True)
+    (proc / "cmdline").write_bytes(b"wine\0game.exe\0")
+    (proc / "environ").write_bytes(b"WINEPREFIX=/elsewhere/pfx\0STEAM_COMPAT_DATA_PATH=/data/compat/1\0")
+    assert pm.find_game_pids(("/data/compat/1",), str(tmp_path / "proc")) == {4242}

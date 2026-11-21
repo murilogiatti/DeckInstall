@@ -1274,10 +1274,12 @@ def _norm_key(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", clean_game_name(name).lower())
 
 
-def external_prefix_roots() -> list[Path]:
+def external_prefix_roots(include_configured: bool = True) -> list[Path]:
     """Return candidate directories where Hydra, Heroic, Lutris, Bottles, and UMU store prefixes.
 
-    The usual locations plus the ones each launcher's settings point to (custom prefix folders).
+    The usual locations plus, with include_configured, the ones each launcher's settings point to
+    (custom prefix folders). Those can be broad (the parent of a per-game prefix), so they are
+    only for finding a game's prefix by name, never for listing prefixes to delete.
     """
     from .launcher_scan import configured_prefix_roots
 
@@ -1299,6 +1301,8 @@ def external_prefix_roots() -> list[Path]:
         home / "Games" / "Prefixes",
         home / "Prefixes",
     ]
+    if not include_configured:
+        return roots
     try:
         extra = configured_prefix_roots(home)
     except Exception:  # a broken launcher config must never break the prefix search

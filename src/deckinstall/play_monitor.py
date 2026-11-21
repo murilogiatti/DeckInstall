@@ -20,7 +20,14 @@ from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signa
 from .i18n import tr
 
 IDLE, LOADING, RUNNING, ERROR = "idle", "loading", "running", "error"
+# System folders (whole path components): /var/home (Fedora Atomic, Bazzite) is a user folder.
 _SYSTEM_ROOTS = ("/usr", "/bin", "/sbin", "/opt", "/etc", "/var", "/proc", "/sys", "/dev", "/tmp")
+
+
+def _is_system_path(path: str, home: str) -> bool:
+    if path == home or path.startswith(home + "/"):
+        return False
+    return any(path == root or path.startswith(root + "/") for root in _SYSTEM_ROOTS)
 _ENV_KEYS = (b"WINEPREFIX=", b"STEAM_COMPAT_DATA_PATH=")
 _READ_MAX = 256 * 1024
 _LOG_TAIL_LINES = 20
@@ -39,7 +46,7 @@ def watch_paths(*candidates: object) -> tuple[str, ...]:
         if not text.startswith("/"):
             continue
         path = os.path.normpath(text)
-        if path == home or len(Path(path).parts) < 3 or path.startswith(_SYSTEM_ROOTS):
+        if path == home or len(Path(path).parts) < 3 or _is_system_path(path, home):
             continue
         if path not in out:
             out.append(path)
@@ -83,11 +90,11 @@ def find_game_pids(watch: tuple[str, ...], proc_root: str = "/proc") -> set[int]
             found.add(pid)
             continue
         for var in _read(f"{base}/environ").split(b"\0"):
-            if var.startswith(_ENV_KEYS):
+            if var.startswith(_ENV_KEYS):  # WINEPREFIX and STEAM_COMPAT_DATA_PATH: both are checked
                 value = var.split(b"=", 1)[1].rstrip(b"/")
                 if any(value == u or value.startswith(u + b"/") or u.startswith(value + b"/") for u in unix):
                     found.add(pid)
-                break
+                    break
     return found
 
 
@@ -143,6 +150,7 @@ class _Run:
     exe_name: str = ""
     zombie_since: float | None = None
     hung: bool = False
+    attempt: int = 0
 
 
 class PlayMonitor(QObject):
@@ -154,6 +162,7 @@ class PlayMonitor(QObject):
 
     FAST_FAIL_S = 20.0  # exiting with an error before this is a failed launch
     LOADING_TIMEOUT_S = 60.0  # Loading without any sign of life
+    PREPARE_TIMEOUT_S = 600.0  # launch command still being prepared (a late answer is then ignored)
     RUNNING_AFTER_S = 3.0  # our process alive this long: the game is running
     CHILD_GRACE_S = 15.0  # after a quick exit 0, how long to look for the real game process
     GONE_TICKS = 4  # consecutive empty /proc scans before a followed game counts as closed
@@ -167,6 +176,7 @@ class PlayMonitor(QObject):
         self._timer.setInterval(self.TICK_MS)
         self._timer.timeout.connect(self._tick)
         self.frame = 0
+        self._attempt = 0
         self.clock = time.monotonic
         self.scan = find_game_pids
         self.exe_state = exe_process_state
@@ -175,10 +185,17 @@ class PlayMonitor(QObject):
         run = self._runs.get(key)
         return run.state if run is not None else IDLE
 
-    def prepare(self, key: str, name: str) -> None:
-        """Show Loading while the launch command is being prepared."""
-        self._runs[key] = _Run(name, LOADING, self.clock(), preparing=True)
+    def prepare(self, key: str, name: str) -> int:
+        """Show Loading while the launch command is being prepared; returns this attempt's id."""
+        self._attempt += 1
+        self._runs[key] = _Run(name, LOADING, self.clock(), preparing=True, attempt=self._attempt)
         self._changed(key)
+        return self._attempt
+
+    def is_preparing(self, key: str, attempt: int) -> bool:
+        """True while this prepare() attempt is still the one shown (a late result must not launch)."""
+        run = self._runs.get(key)
+        return run is not None and run.preparing and run.attempt == attempt
 
     def cancel(self, key: str) -> None:
         """The launch did not happen (prepare failed or was refused): back to Play."""
@@ -353,7 +370,8 @@ class PlayMonitor(QObject):
         if run.state == ERROR:
             return
         if run.preparing:
-            if now - run.started >= self.LOADING_TIMEOUT_S:
+            # Preparing can download (the official MangoHud): only a worker that never answered times out.
+            if now - run.started >= self.PREPARE_TIMEOUT_S:
                 self._finish(key)
             else:
                 self.changed.emit(key)

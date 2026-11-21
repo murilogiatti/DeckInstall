@@ -1,8 +1,14 @@
 DeckInstall - Plano de acao v3 (2026-11-17, atualizado 2026-11-19)
 ==========================================================
 
-STATUS: Fases 0 a 12 concluidas. Versao 0.21.0 (Fase 12, 2026-11-21, sem tag nem release ainda).
-Ultima release: v0.20.1 (2026-11-20, crash ao fechar o app).
+STATUS: Fases 0 a 12 concluidas. Ultima release: v0.21.0 (2026-11-21).
+v0.21.0: Fase 12 + Biblioteca sem barra lateral, botao Jogar dinamico, MangoHud oficial por usuario (todas as GPUs
+com nome), oferta do save guardado ao instalar, tamanhos > 2 GiB nos sinais do Qt, colunas Graficos/Motor cobrindo
+muito mais formatos (Unreal WinGDK/Test/Linux/modular/UE1-3, backends em DLL propria, tabela de importacoes do PE,
+Wwise .pck nao e Godot, Agility SDK do OptiScaler nao conta como DX12), prefixos lidos das configs do
+Heroic/Lutris/Bottles (so para achar saves, nunca na limpeza), Jogar seguindo jogos em /var/home (Bazzite/Fedora
+Atomic) e sem lancar duas vezes, reimportar um estado antigo do Ludusavi volta a ser o mais novo.
+v0.20.1 (2026-11-20): crash ao fechar o app.
 v0.20.1: o app caia ao fechar (SIGBUS/SIGSEGV em QObject::~QObject na limpeza do PySide no fim do Python,
 visto no core do Deck: QPushButton ja liberado). Agora main() sincroniza o QSettings e sai com os._exit.
 v0.19.0: tag enviada mas o CI abortou na saida do Python 3.10 (thread da busca de saves ainda rodando ao destruir

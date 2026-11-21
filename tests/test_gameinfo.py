@@ -231,12 +231,15 @@ def test_breadth_first_walk_reaches_binaries(tmp_path: Path, monkeypatch) -> Non
 def test_container_folder_is_not_walked(tmp_path: Path) -> None:
     from deckinstall.gameinfo import safe_scan_root
 
-    games = tmp_path / "Games"
+    games = Path.home() / "Games"
     exe = games / "A" / "a.exe"
     exe.parent.mkdir(parents=True)
     exe.write_bytes(b"MZ")
     assert safe_scan_root(exe, games) == exe.parent
     assert safe_scan_root(exe, games / "A") == games / "A"
+    run = tmp_path / "lib" / "Run"  # a game called "Run" is still a game folder
+    (run / "bin").mkdir(parents=True)
+    assert safe_scan_root(run / "bin" / "g.exe", run) == run
 
 
 def test_optiscaler_agility_sdk_is_not_the_games_api(tmp_path: Path) -> None:

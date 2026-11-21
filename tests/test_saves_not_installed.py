@@ -258,14 +258,30 @@ def test_old_snapshot_without_fingerprint_is_recognized(tmp_path: Path) -> None:
     assert first.name in save_sync.import_fingerprints(first.parent)  # computed once and saved
 
 
-def test_find_import_duplicates_keeps_the_oldest(tmp_path: Path) -> None:
+def test_find_import_duplicates_keeps_the_newest(tmp_path: Path) -> None:
     folder = _backup(tmp_path)
     snaps = tmp_path / "snaps"
     first, *_ = lds.import_ludusavi_to_snapshot(folder, home=tmp_path / "home", dest_root=snaps)
     assert first is not None
     older = first.parent / "20000101-000000-ludusavi-import.zip"  # an older version imported it before
     older.write_bytes(first.read_bytes())
-    assert lds.find_import_duplicates(snaps) == [first]
+    assert lds.find_import_duplicates(snaps) == [older]
+
+
+def test_reimport_of_an_older_state_becomes_the_newest(tmp_path: Path) -> None:
+    """A, B, then A again: Restore must bring back A, so the third import is a new snapshot."""
+    import os
+
+    snaps = tmp_path / "snaps"
+    a = _backup(tmp_path / "a")
+    first, *_ = lds.import_ludusavi_to_snapshot(a, home=tmp_path / "home", dest_root=snaps)
+    second, *_ = lds.import_ludusavi_to_snapshot(_backup(tmp_path / "b", data=b"progress-43"),
+                                                home=tmp_path / "home", dest_root=snaps)
+    assert first is not None and second is not None
+    os.utime(first, (1, 1))  # first is clearly older
+    third, _, _, already = lds.import_ludusavi_to_snapshot(a, home=tmp_path / "home", dest_root=snaps)
+    assert third is not None and not already and third not in (first, second)
+    assert lds.find_import_duplicates(snaps) == [first]  # the old copy of A goes, the new one stays
 
 
 def test_import_result_text_counters() -> None:

@@ -212,6 +212,14 @@ def bottles_roots(home: Path) -> list[tuple[Path, bool]]:
     return roots
 
 
+def _expand_home(raw: str, home: Path) -> str:
+    """A leading "~" is the user's home (Heroic writes "~/Games/..."); a "~" elsewhere is a real name."""
+    text = raw.strip()
+    if text == "~" or text.startswith("~/"):
+        return str(home) + text[1:]
+    return text
+
+
 def configured_prefix_roots(home: Path, max_games: int = 2000) -> list[Path]:
     """Prefix-holding folders read from the launchers' own settings (custom locations included).
 
@@ -221,13 +229,13 @@ def configured_prefix_roots(home: Path, max_games: int = 2000) -> list[Path]:
     found: list[Path] = []
 
     def _add(raw: Any) -> None:
-        p = _resolve_existing_dir(str(raw).replace("~", str(home), 1) if isinstance(raw, str) and raw else None)
+        p = _resolve_existing_dir(_expand_home(raw, home) if isinstance(raw, str) and raw.strip() else None)
         if p is not None and p not in found and p != home and p != Path("/"):
             found.append(p)
 
     def _add_parent(raw: Any) -> None:
         if isinstance(raw, str) and raw.strip():
-            _add(str(Path(raw.strip().replace("~", str(home), 1)).parent))
+            _add(str(Path(_expand_home(raw, home)).parent))
 
     for rel in _HEROIC_CONFIGS:
         root = home / rel

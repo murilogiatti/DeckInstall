@@ -3205,7 +3205,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(tr("play.launched", name=obj.app_name))
             return
         title_name = obj.name
-        self._play.prepare(key, title_name)
+        attempt = self._play.prepare(key, title_name)
         paths_snap = self.paths
 
         def _on_prep_ready(
@@ -3215,8 +3215,8 @@ class MainWindow(QMainWindow):
             cwd: Path | None,
             env: dict[str, str] | None,
         ) -> None:
-            if self._closing_pending:
-                return
+            if self._closing_pending or not self._play.is_preparing(key, attempt):
+                return  # closing, or this attempt timed out / was replaced: never launch twice
             if status != "ok":
                 self._play.cancel(key)
             if status == "win32":

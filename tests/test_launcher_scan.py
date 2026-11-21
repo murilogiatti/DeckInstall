@@ -340,3 +340,32 @@ def test_configured_prefix_roots_reads_launcher_settings(tmp_path):
     assert lutris_pfx.parent in roots
     assert bottles_custom in roots
     assert (bottles_custom, False) in bottles_roots(home)
+
+
+def test_configured_prefix_roots_tilde_only_at_start(tmp_path):
+    import json
+
+    from deckinstall.launcher_scan import configured_prefix_roots
+
+    odd = tmp_path / "mnt" / "Foo~Bar"
+    (odd / "pfx").mkdir(parents=True)
+    heroic = tmp_path / ".config" / "heroic"
+    (heroic / "GamesConfig").mkdir(parents=True)
+    (heroic / "GamesConfig" / "x.json").write_text(json.dumps({"x": {"winePrefix": str(odd / "pfx")}}))
+    (tmp_path / "Games" / "Heroic" / "Prefixes").mkdir(parents=True)
+    (heroic / "config.json").write_text(json.dumps({"defaultSettings": {"defaultWinePrefixDir": "~/Games/Heroic/Prefixes"}}))
+    roots = configured_prefix_roots(tmp_path)
+    assert odd in roots and tmp_path / "Games" / "Heroic" / "Prefixes" in roots
+
+
+def test_cleanup_roots_leave_out_configured_ones(tmp_path, monkeypatch):
+    """Config-derived roots can be broad (~/Games): they find prefixes, never list them to delete."""
+    from pathlib import Path
+
+    from deckinstall import cleanup, launcher_scan, steam_vdf
+
+    extra = tmp_path / "Games"
+    monkeypatch.setattr(launcher_scan, "configured_prefix_roots", lambda home: [extra])
+    assert extra in steam_vdf.external_prefix_roots()
+    assert extra not in steam_vdf.external_prefix_roots(include_configured=False)
+    assert "external_prefix_roots(include_configured=False)" in Path(cleanup.__file__).read_text(encoding="utf-8")

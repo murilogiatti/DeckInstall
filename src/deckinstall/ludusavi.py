@@ -734,8 +734,21 @@ def import_snapshot_fingerprints(snap_dir: Path) -> dict[Path, str]:
     return out
 
 
+def _newest_snapshot(snap_dir: Path) -> Path | None:
+    """The game's newest snapshot zip (what Restore and the install offer pick)."""
+    try:
+        zips = [p for p in snap_dir.glob("*.zip") if not p.is_symlink() and p.is_file()]
+        return max(zips, key=lambda p: p.stat().st_mtime, default=None)
+    except OSError:
+        return None
+
+
 def find_import_duplicates(dest_root: Path | None = None) -> list[Path]:
-    """Ludusavi import zips whose content equals an older import of the same game (the oldest is kept)."""
+    """Ludusavi import zips whose content equals a newer import of the same game (the newest is kept).
+
+    Keeping the newest copy keeps the newest snapshot the same: after importing A, B and A again,
+    the save restored is still A.
+    """
     root = dest_root or save_sync.DEFAULT_SNAPSHOTS_DIR
     try:
         game_dirs = sorted(d for d in root.iterdir() if d.is_dir() and not d.is_symlink())
@@ -744,11 +757,11 @@ def find_import_duplicates(dest_root: Path | None = None) -> list[Path]:
     dupes: list[Path] = []
     for snap_dir in game_dirs:
         seen: set[str] = set()
-        for zp, fp in import_snapshot_fingerprints(snap_dir).items():
+        for zp, fp in reversed(list(import_snapshot_fingerprints(snap_dir).items())):  # newest first
             if fp in seen:
                 dupes.append(zp)
             seen.add(fp)
-    return dupes
+    return sorted(dupes)
 
 
 def import_ludusavi_to_snapshot(
@@ -763,7 +776,7 @@ def import_ludusavi_to_snapshot(
     For games that are not installed yet: the snapshot is restored later with the normal
     "Restore" (which takes a safety snapshot first). Only Windows user/ProgramData files fit a
     snapshot; anything else is counted as skipped. Every file is checked against its sha1/size.
-    An import with the same content as an earlier one creates nothing.
+    An import with the same content as the newest snapshot creates nothing.
     Returns (snapshot zip or None when nothing fit, files stored, files skipped, already imported).
     """
     home = (home or Path.home()).resolve()
@@ -791,9 +804,11 @@ def import_ludusavi_to_snapshot(
     snap_dir = save_sync.snapshot_dir_for(name, dest_root)
     fingerprint = _content_fingerprint([("snap/" + "/".join(p), src.digest, src.size) for src, p in usable])
     if snap_dir.is_dir():
-        for existing, fp in import_snapshot_fingerprints(snap_dir).items():
-            if fp == fingerprint:
-                return existing, len(usable), skipped, True
+        # Already there only when it is the newest snapshot: importing an older state again (A, B, A)
+        # must make it the newest, or Restore would bring back B.
+        newest = _newest_snapshot(snap_dir)
+        if newest is not None and import_snapshot_fingerprints(snap_dir).get(newest) == fingerprint:
+            return newest, len(usable), skipped, True
     snap_dir.mkdir(parents=True, exist_ok=True)
     target = snap_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-ludusavi-import.zip"
     counter = 1

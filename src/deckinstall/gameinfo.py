@@ -528,8 +528,16 @@ def _is_container(path: Path) -> bool:
         home = Path.home().resolve()
     except OSError:
         return True
-    # "/", "/home", the home folder itself and anything named like a library or user folder.
-    if home.is_relative_to(resolved) or resolved.name.lower() in _CONTAINER_NAMES:
+    # "/", "/home" and the home folder itself.
+    if home.is_relative_to(resolved):
+        return True
+    # A library or user folder (~/Games, steamapps/common, <disk>/DeckInstall/Games): the name only
+    # counts where such folders live, so a game called "Run" or "Games" is still walked.
+    name = resolved.name.lower()
+    if name in _CONTAINER_NAMES and (
+        resolved.parent == home or resolved.parent.name.lower() in ("steamapps", "deckinstall", "heroic")
+        or os.path.ismount(resolved.parent) or name in ("common", "steamapps")
+    ):
         return True
     try:
         return os.path.ismount(resolved)

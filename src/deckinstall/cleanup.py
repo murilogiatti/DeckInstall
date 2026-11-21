@@ -291,7 +291,7 @@ class _ScanContext:
         if extra_external_roots is not None:
             self.prefix_roots = list(extra_external_roots)
         else:
-            self.prefix_roots = list(external_prefix_roots()) + [self.standalone_prefixes_dir]
+            self.prefix_roots = list(external_prefix_roots(include_configured=False)) + [self.standalone_prefixes_dir]
         self.seen_prefixes: set[Path] = set()
 
         self._lock = threading.Lock()
