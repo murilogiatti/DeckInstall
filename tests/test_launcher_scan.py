@@ -307,3 +307,36 @@ class TestLutrisAndCombinedScan:
             "heroic": "Heroic Game",
             "bottles": "Bottles Game",
         }
+
+
+def test_configured_prefix_roots_reads_launcher_settings(tmp_path):
+    import json
+
+    from deckinstall.launcher_scan import bottles_roots, configured_prefix_roots
+
+    home = tmp_path
+    custom = tmp_path / "ssd" / "HeroicPrefixes"
+    custom.mkdir(parents=True)
+    game_pfx = tmp_path / "ssd" / "Other" / "My Game"
+    game_pfx.mkdir(parents=True)
+    heroic = home / ".config" / "heroic"
+    (heroic / "GamesConfig").mkdir(parents=True)
+    (heroic / "config.json").write_text(json.dumps({"defaultSettings": {"defaultWinePrefixDir": str(custom)}}))
+    (heroic / "GamesConfig" / "abc.json").write_text(json.dumps({"abc": {"winePrefix": str(game_pfx)}}))
+    lutris_pfx = tmp_path / "hdd" / "lutris" / "g1"
+    lutris_pfx.mkdir(parents=True)
+    games = home / ".local" / "share" / "lutris" / "games"  # no ~/.config/lutris: data dir
+    games.mkdir(parents=True)
+    (games / "g1-123.yml").write_text(f"game:\n  exe: /x/g.exe\n  prefix: {lutris_pfx}\n")
+    bottles_custom = tmp_path / "hdd" / "bottles"
+    bottles_custom.mkdir(parents=True)
+    base = home / ".local" / "share" / "bottles"
+    base.mkdir(parents=True)
+    (base / "data.yml").write_text(f"custom_bottles_path: {bottles_custom}\n")
+
+    roots = configured_prefix_roots(home)
+    assert custom in roots
+    assert game_pfx.parent in roots
+    assert lutris_pfx.parent in roots
+    assert bottles_custom in roots
+    assert (bottles_custom, False) in bottles_roots(home)

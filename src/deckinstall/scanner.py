@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
+from .gameinfo import is_unreal_binary_name
 from .library import _unescape_mount
 
 IGNORED_EXE_PATTERNS = (
@@ -340,7 +341,7 @@ def _scan_game_tree_scandir(
                             except OSError:
                                 size_neg = 0
                             is_utility = 1 if any(pat in low for pat in UTILITY_EXE_PATTERNS) else 0
-                            is_shipping = 0 if "win64-shipping.exe" in low else 1
+                            is_shipping = 0 if is_unreal_binary_name(low) else 1
                             is_root = 0 if rel_depth == 1 else 1
                             score = (is_utility, is_shipping, is_root, rel_depth, size_neg)
                             exe_scored.append((score, Path(entry.path)))

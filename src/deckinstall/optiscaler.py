@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .fsutil import atomic_copy_file, atomic_write_text, prune_empty_parents
+from .gameinfo import safe_scan_root
 from .runtime_manager import ProgressCb, _load_versions, ensure_optiscaler
 from .scanner import detect_exe_kind, detect_pe_arch
 
@@ -123,20 +124,7 @@ class OptiScalerCompatibility:
 
 def _resolve_upscaler_scan_root(exe_path: Path, game_dir: Path | None) -> Path:
     """Choose a safe directory root to scan for DLSS/FSR/XeSS upscaler DLLs."""
-    exe_dir = exe_path.parent
-    if game_dir is None or not game_dir.is_dir() or game_dir.is_symlink():
-        return exe_dir
-    try:
-        resolved_game = game_dir.resolve()
-        resolved_exe_dir = exe_dir.resolve()
-        home_resolved = Path.home().resolve()
-        if resolved_game in (Path("/"), home_resolved, home_resolved / "Games"):
-            return exe_dir
-        if resolved_exe_dir.is_relative_to(resolved_game):
-            return game_dir
-    except OSError:
-        return exe_dir
-    return exe_dir
+    return safe_scan_root(exe_path, game_dir)
 
 
 def check_optiscaler_compatibility(

@@ -182,6 +182,91 @@ def _resolve_existing_file(raw_path: str | Path | None, base_dir: Path | None = 
         return None
 
 
+def _lutris_games_dir(home: Path) -> Path:
+    """Lutris game configs: ~/.config/lutris/games, or its data dir when ~/.config/lutris is absent."""
+    config = home / ".config" / "lutris"
+    return (config if config.is_dir() else home / ".local" / "share" / "lutris") / "games"
+
+
+_BOTTLES_BASES = ((Path(".local") / "share" / "bottles", False),
+                  (Path(".var") / "app" / "com.usebottles.bottles" / "data" / "bottles", True))
+_HEROIC_CONFIGS = (
+    Path(".config") / "heroic",
+    Path(".var") / "app" / "com.heroicgameslauncher.hgl" / "config" / "heroic",
+)
+
+
+def bottles_roots(home: Path) -> list[tuple[Path, bool]]:
+    """Folders that hold bottles: the default ones and the "custom bottles path" of data.yml."""
+    roots: list[tuple[Path, bool]] = []
+    for rel, is_flatpak in _BOTTLES_BASES:
+        base = home / rel
+        roots.append((base / "bottles", is_flatpak))
+        try:
+            data = _parse_simple_yaml((base / "data.yml").read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        custom = _resolve_existing_dir(str(data.get("custom_bottles_path") or "").strip() or None)
+        if custom is not None and all(custom != r for r, _ in roots):
+            roots.append((custom, is_flatpak))
+    return roots
+
+
+def configured_prefix_roots(home: Path, max_games: int = 2000) -> list[Path]:
+    """Prefix-holding folders read from the launchers' own settings (custom locations included).
+
+    Heroic: defaultWinePrefixDir / defaultWinePrefix (games get <dir>/<title>) and the parent of
+    every per-game winePrefix; Lutris: the parent of every game's wine prefix; Bottles: its custom path.
+    """
+    found: list[Path] = []
+
+    def _add(raw: Any) -> None:
+        p = _resolve_existing_dir(str(raw).replace("~", str(home), 1) if isinstance(raw, str) and raw else None)
+        if p is not None and p not in found and p != home and p != Path("/"):
+            found.append(p)
+
+    def _add_parent(raw: Any) -> None:
+        if isinstance(raw, str) and raw.strip():
+            _add(str(Path(raw.strip().replace("~", str(home), 1)).parent))
+
+    for rel in _HEROIC_CONFIGS:
+        root = home / rel
+        cfg = _read_json_safe(root / "config.json")
+        defaults = cfg.get("defaultSettings") if isinstance(cfg, dict) else None
+        if isinstance(defaults, dict):
+            _add(defaults.get("defaultWinePrefixDir"))
+            _add(defaults.get("defaultWinePrefix"))
+            _add_parent(defaults.get("winePrefix"))
+        try:
+            game_cfgs = sorted((root / "GamesConfig").glob("*.json"))[:max_games]
+        except OSError:
+            game_cfgs = []
+        for path in game_cfgs:
+            raw = _read_json_safe(path)
+            if not isinstance(raw, dict):
+                continue
+            for entry in [raw, *(v for v in raw.values() if isinstance(v, dict))]:
+                _add_parent(entry.get("winePrefix"))
+    lutris_dirs = [_lutris_games_dir(home), home / ".var" / "app" / "net.lutris.Lutris" / "config" / "lutris" / "games",
+                   home / ".var" / "app" / "net.lutris.Lutris" / "data" / "lutris" / "games"]
+    for games_dir in lutris_dirs:
+        try:
+            ymls = sorted(games_dir.glob("*.yml"))[:max_games]
+        except OSError:
+            continue
+        for yml in ymls:
+            try:
+                data = _parse_simple_yaml(yml.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+            game = data.get("game")
+            if isinstance(game, dict):
+                _add_parent(game.get("prefix"))
+    for root, _ in bottles_roots(home):
+        _add(str(root))
+    return found
+
+
 _LUTRIS_TIMESTAMP_RE = re.compile(r"-\d{9,}$")
 
 
@@ -309,7 +394,7 @@ def _scan_lutris(home: Path) -> list[ExternalLauncherGame]:
         results.append(item)
 
     roots = [
-        (home / ".local" / "share" / "lutris" / "pga.db", home / ".config" / "lutris" / "games", False),
+        (home / ".local" / "share" / "lutris" / "pga.db", _lutris_games_dir(home), False),
         (
             home / ".var" / "app" / "net.lutris.Lutris" / "data" / "lutris" / "pga.db",
             home / ".var" / "app" / "net.lutris.Lutris" / "config" / "lutris" / "games",
@@ -573,10 +658,7 @@ def _scan_bottles(home: Path) -> list[ExternalLauncherGame]:
     results: list[ExternalLauncherGame] = []
     seen_exes: set[Path] = set()
 
-    roots = [
-        (home / ".local" / "share" / "bottles" / "bottles", False),
-        (home / ".var" / "app" / "com.usebottles.bottles" / "data" / "bottles" / "bottles", True),
-    ]
+    roots = [(root, is_flatpak) for root, is_flatpak in bottles_roots(home)]
     for bottles_root, is_flatpak in roots:
         if not bottles_root.is_dir():
             continue

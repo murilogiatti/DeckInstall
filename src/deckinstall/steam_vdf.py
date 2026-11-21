@@ -1275,12 +1275,19 @@ def _norm_key(name: str) -> str:
 
 
 def external_prefix_roots() -> list[Path]:
-    """Return candidate directories where Hydra, Heroic, Lutris, Bottles, and UMU store prefixes."""
+    """Return candidate directories where Hydra, Heroic, Lutris, Bottles, and UMU store prefixes.
+
+    The usual locations plus the ones each launcher's settings point to (custom prefix folders).
+    """
+    from .launcher_scan import configured_prefix_roots
+
     home = Path.home()
-    return [
+    roots = [
         home / ".config" / "hydralauncher" / "wine-prefixes",
         home / ".config" / "hydralauncher" / "umu",
         home / "Games" / "Heroic" / "Prefixes",
+        # Heroic before defaultWinePrefixDir: per-game prefixes went inside Prefixes/default/<title>.
+        home / "Games" / "Heroic" / "Prefixes" / "default",
         home / ".config" / "heroic" / "Prefixes",
         home / ".var" / "app" / "com.heroicgameslauncher.hgl" / "config" / "heroic" / "Prefixes",
         home / "Games" / "lutris",
@@ -1292,6 +1299,11 @@ def external_prefix_roots() -> list[Path]:
         home / "Games" / "Prefixes",
         home / "Prefixes",
     ]
+    try:
+        extra = configured_prefix_roots(home)
+    except Exception:  # a broken launcher config must never break the prefix search
+        extra = []
+    return list(dict.fromkeys([*roots, *extra]))
 
 
 def _prefix_users_dir(prefix_dir: Path) -> Path | None:
