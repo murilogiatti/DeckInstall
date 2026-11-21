@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import NoReturn, TypedDict, cast
@@ -90,7 +91,7 @@ from .migrate import (
     plan_migration,
     undo_migration,
 )
-from .play_monitor import ERROR, LOADING, RUNNING, PlayMonitor, watch_paths
+from .play_monitor import ERROR, LOADING, RUNNING, PlayMonitor, process_start_epoch, stale_instance_pids, watch_paths
 from .runtime_manager import (
     detect_gpu_profile,
     fix_bwrap_userns,
@@ -126,6 +127,7 @@ from .steam_vdf import (
     DEFAULT_SAVES_DIR,
     CleanupCandidate,
     ShortcutEntry,
+    _strip_vdf_quotes,
     infer_game_root_from_exe,
     load_shortcuts,
     set_shortcut_proton,
@@ -3176,6 +3178,39 @@ class MainWindow(QMainWindow):
         if not steam:
             QMessageBox.warning(_dialog_parent(self), __app_name__, msg)
 
+    def _close_stale_instance(self, obj: ShortcutEntry | StandaloneGame | ExternalLauncherGame) -> bool:
+        """An old instance of the game still running (often hung without a window) blocks a new launch:
+        Proton waits for it before opening another. Offer to close it; False when the user cancels."""
+        if isinstance(obj, ShortcutEntry):
+            exe = Path(_strip_vdf_quotes(obj.exe))
+            try:
+                game_dir: Path | None = shortcut_game_dir(obj)
+            except ValueError:
+                game_dir = exe.parent
+            compat = self.paths.compatdata_dir / str(obj.appid_u32) if self.paths is not None else None
+            name, watch = obj.app_name, watch_paths(game_dir, compat)
+        else:
+            exe = Path(obj.exe_path)
+            name, watch = obj.name, watch_paths(obj.game_dir, obj.prefix_dir)
+        pids = stale_instance_pids(exe.name, watch)
+        if not pids:
+            return True
+        starts = [t for p in pids if (t := process_start_epoch(p)) is not None]
+        since = time.strftime("%H:%M", time.localtime(min(starts))) if starts else "?"
+        box = QMessageBox(
+            QMessageBox.Icon.Warning, __app_name__, tr("play.stale_instance", name=name, since=since),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, _dialog_parent(self),
+        )
+        box.button(QMessageBox.StandardButton.Yes).setText(tr("play.stale_close_and_play"))
+        box.setDefaultButton(QMessageBox.StandardButton.Yes)
+        answer = box.exec()
+        box.deleteLater()
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        logging.info("Closing old instance of %s: %s", name, sorted(pids))
+        self._play.kill_pids(pids)  # the new launch then starts once Proton sees the old one gone
+        return True
+
     def _play_selected_game(self) -> None:
         """Play the selected game, or stop it when it is already running."""
         sel = self._selected_library_item()
@@ -3192,6 +3227,8 @@ class MainWindow(QMainWindow):
                 self._play.stop(key)
             return
         if state != "idle":
+            return
+        if not self._close_stale_instance(obj):
             return
         if isinstance(obj, ShortcutEntry):
             rungameid = (obj.appid_u32 << 32) | 0x02000000

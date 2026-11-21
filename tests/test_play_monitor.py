@@ -242,3 +242,52 @@ def test_compat_data_path_after_another_wineprefix(tmp_path: Path) -> None:
     (proc / "cmdline").write_bytes(b"wine\0game.exe\0")
     (proc / "environ").write_bytes(b"WINEPREFIX=/elsewhere/pfx\0STEAM_COMPAT_DATA_PATH=/data/compat/1\0")
     assert pm.find_game_pids(("/data/compat/1",), str(tmp_path / "proc")) == {4242}
+
+
+def test_stale_instance_needs_the_exe_alive_in_the_game_folders(tmp_path: Path) -> None:
+    root = tmp_path / "proc"
+    game = "/home/deck/Games/Returnal"
+    procs = {
+        "30": ("30 (Returnal-Win64-) S 1 1", "X:\\Games\\Returnal-Win64-Shipping.exe", f"WINEPREFIX={game}/pfx\0".encode()),
+        "31": ("31 (wineserver) S 1 1", "wineserver", f"WINEPREFIX={game}/pfx\0".encode()),
+        "32": ("32 (Returnal-Win64-) Z 1 1", "", b""),
+    }
+    for pid, (stat, cmd, env) in procs.items():
+        (root / pid).mkdir(parents=True)
+        (root / pid / "stat").write_text(stat)
+        (root / pid / "cmdline").write_text(cmd)
+        (root / pid / "environ").write_bytes(env)
+    assert pm.exe_pids("Returnal-Win64-Shipping.exe", str(root)) == {30}  # the zombie does not count
+    assert pm.stale_instance_pids("Returnal-Win64-Shipping.exe", (game,), str(root)) == {30, 31}
+    (root / "30" / "stat").write_text("30 (Returnal-Win64-) Z 1 1")
+    # Only a leftover wineserver (it lingers a few seconds after a normal exit): no stale instance.
+    assert pm.stale_instance_pids("Returnal-Win64-Shipping.exe", (game,), str(root)) == set()
+
+
+def test_process_start_epoch_of_this_process() -> None:
+    started = pm.process_start_epoch(os.getpid())
+    assert started is not None and started <= time.time() + 1
+
+
+def test_running_only_when_a_new_exe_process_appears(mon: pm.PlayMonitor) -> None:
+    pids = {"set": {50}}
+    mon.exe_pids = lambda name: set(pids["set"])
+    mon.scan = lambda watch: set()
+    mon.LOADING_TIMEOUT_S = 30.0
+    mon.launch("g", "Game", ["sleep", "30"], exe_name="Game.exe")
+    time.sleep(0.6)
+    mon.app.processEvents()  # type: ignore[attr-defined]
+    assert mon.state("g") == pm.LOADING  # launcher alive, but only the old .exe exists
+    pids["set"] = {50, 51}
+    _wait(mon, lambda: mon.state("g") == pm.RUNNING)
+    mon.stop("g")
+
+
+def test_launch_blocked_by_old_instance_is_an_error(mon: pm.PlayMonitor) -> None:
+    mon.exe_pids = lambda name: {50}  # the old instance never goes away; no new .exe appears
+    mon.scan = lambda watch: set()
+    mon.LOADING_TIMEOUT_S = 0.5
+    mon.launch("g", "Game", ["sleep", "30"], exe_name="Game.exe")
+    _wait(mon, lambda: mon.state("g") == pm.ERROR)
+    (_k, _n, diag), = mon.events["failed"]  # type: ignore[attr-defined]
+    assert diag.startswith(pm.tr("play.blocked_by_old", pids="50"))

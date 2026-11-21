@@ -118,6 +118,50 @@ def exe_process_state(exe_name: str, proc_root: str = "/proc") -> tuple[bool, bo
     return alive, zombie
 
 
+def exe_pids(exe_name: str, proc_root: str = "/proc") -> set[int]:
+    """Live (not zombie) processes named like the game's .exe (Wine sets comm to its first 15 chars)."""
+    if not exe_name:
+        return set()
+    comm = exe_name[:15].encode()
+    found: set[int] = set()
+    try:
+        entries = [e.name for e in os.scandir(proc_root) if e.name.isdigit()]
+    except OSError:
+        return found
+    for name in entries:
+        stat = _read(f"{proc_root}/{name}/stat")
+        start, end = stat.find(b"("), stat.rfind(b")")
+        if start >= 0 and end >= 0 and stat[start + 1:end] == comm and stat[end + 2:end + 3] != b"Z":
+            found.add(int(name))
+    return found
+
+
+def process_start_epoch(pid: int, proc_root: str = "/proc") -> float | None:
+    """When a process started (seconds since the epoch), from /proc/<pid>/stat and the boot time."""
+    stat = _read(f"{proc_root}/{pid}/stat")
+    end = stat.rfind(b")")
+    try:
+        ticks = int(stat[end + 2:].split()[19])
+        btime = next(int(line.split()[1]) for line in _read(f"{proc_root}/stat").splitlines()
+                     if line.startswith(b"btime "))
+        return btime + ticks / os.sysconf("SC_CLK_TCK")
+    except (ValueError, IndexError, StopIteration, OSError):
+        return None
+
+
+def stale_instance_pids(exe_name: str, watch: tuple[str, ...], proc_root: str = "/proc") -> set[int]:
+    """Processes of a game instance already running (its .exe alive inside the watched folders).
+
+    Proton launches with "waitforexitandrun": a new launch waits, without any window, until the
+    old instance of the same prefix exits. Empty when the game's .exe is not running.
+    """
+    alive = exe_pids(exe_name, proc_root)
+    if not alive:
+        return set()
+    game = find_game_pids(watch, proc_root)
+    return game if alive & game else set()
+
+
 def log_tail(path: Path | None, lines: int = _LOG_TAIL_LINES) -> str:
     """The last lines of a run log ("" when there is none)."""
     if path is None:
@@ -151,6 +195,7 @@ class _Run:
     zombie_since: float | None = None
     hung: bool = False
     attempt: int = 0
+    old_exe_pids: set[int] = field(default_factory=set)  # the .exe already running before this launch
 
 
 class PlayMonitor(QObject):
@@ -180,6 +225,7 @@ class PlayMonitor(QObject):
         self.clock = time.monotonic
         self.scan = find_game_pids
         self.exe_state = exe_process_state
+        self.exe_pids = exe_pids
 
     def state(self, key: str) -> str:
         run = self._runs.get(key)
@@ -242,7 +288,10 @@ class PlayMonitor(QObject):
         proc.setStandardOutputFile(out, QProcess.OpenModeFlag.Append)
         proc.setStandardErrorFile(out, QProcess.OpenModeFlag.Append)
         proc.setUnixProcessParameters(QProcess.UnixProcessFlag.CreateNewSession)
-        self._runs[key] = _Run(name, LOADING, self.clock(), watch, log_path or log_file, proc, exe_name=exe_name)
+        self._runs[key] = _Run(
+            name, LOADING, self.clock(), watch, log_path or log_file, proc, exe_name=exe_name,
+            old_exe_pids=self.exe_pids(exe_name),
+        )
         proc.errorOccurred.connect(lambda err, k=key, p=proc: self._on_error(k, p, err))
         proc.finished.connect(lambda code, status, k=key, p=proc: self._on_finished(k, p, code, status))
         proc.started.connect(lambda k=key: self._changed(k))
@@ -276,6 +325,23 @@ class PlayMonitor(QObject):
                 os.kill(pid, signal.SIGTERM)
             except OSError:
                 pass
+
+    def kill_pids(self, pids: set[int], grace_ms: int = 3000) -> None:
+        """SIGTERM now, SIGKILL to whatever is left after grace_ms (a hung game ignores SIGTERM)."""
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+        def _kill() -> None:
+            for pid in pids:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+        QTimer.singleShot(grace_ms, self, _kill)
 
     def acknowledge(self, key: str) -> None:
         """The error was shown: back to Play."""
@@ -332,6 +398,8 @@ class PlayMonitor(QObject):
         run.proc = None
         proc.deleteLater()
         now = self.clock()
+        if run.state == ERROR:  # already diagnosed (blocked by an old instance): nothing more to say
+            return
         if run.hung:
             self._fail(key, tr("play.hung"))
             return
@@ -347,6 +415,14 @@ class PlayMonitor(QObject):
         else:
             run.exited_at = now  # quick exit 0: look for the real game process
             self._tick_run(key, run, now)
+
+    def _started(self, run: _Run, now: float) -> bool:
+        """Running: without a known .exe, our process alive RUNNING_AFTER_S; with one, a new .exe process."""
+        if now - run.started < self.RUNNING_AFTER_S:
+            return False
+        if not run.exe_name:
+            return True
+        return bool(self.exe_pids(run.exe_name) - run.old_exe_pids)
 
     def _check_hung(self, run: _Run, now: float) -> None:
         """The game .exe is a zombie and nothing alive has its name: Proton hung after the game died."""
@@ -377,9 +453,21 @@ class PlayMonitor(QObject):
                 self.changed.emit(key)
             return
         if run.proc is not None:  # our process is alive
-            if run.state == LOADING and now - run.started >= self.RUNNING_AFTER_S:
+            if run.state == LOADING and self._started(run, now):
                 run.state = RUNNING
                 self._changed(key)
+            elif run.state == LOADING and run.exe_name and now - run.started >= self.LOADING_TIMEOUT_S:
+                old = run.old_exe_pids & self.exe_pids(run.exe_name)
+                if old:  # Proton is waiting for the old instance: this launch never shows anything
+                    self._fail(key, tr("play.blocked_by_old", pids=", ".join(map(str, sorted(old)))))
+                    if run.proc is not None and run.proc.state() != QProcess.ProcessState.NotRunning:
+                        try:
+                            os.killpg(int(run.proc.processId()), signal.SIGTERM)
+                        except OSError:
+                            run.proc.terminate()
+                else:  # the .exe never showed under its name (a launcher exe): trust our process
+                    run.state = RUNNING
+                    self._changed(key)
             elif run.state == LOADING:
                 self.changed.emit(key)
             elif run.exe_name and not run.hung and not run.stopping:
