@@ -40,7 +40,7 @@ logging.info(
     os.environ.get("DISPLAY", ""),
 )
 
-from deckinstall.ui import exit_now, main  # noqa: E402
+from deckinstall.ui import run  # noqa: E402
 
 
 def _excepthook(exc_type, exc_value, exc_tb) -> None:
@@ -51,11 +51,4 @@ def _excepthook(exc_type, exc_value, exc_tb) -> None:
 sys.excepthook = _excepthook
 
 if __name__ == "__main__":
-    try:
-        _code = main()
-    except SystemExit as exc:
-        _code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
-    except BaseException:
-        logging.exception("Uncaught exception")
-        _code = 1
-    exit_now(_code)
+    run()

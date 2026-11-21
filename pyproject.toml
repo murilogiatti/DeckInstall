@@ -30,7 +30,7 @@ Repository = "https://github.com/murilogiatti/DeckInstall"
 Issues = "https://github.com/murilogiatti/DeckInstall/issues"
 
 [project.scripts]
-deckinstall = "deckinstall.ui:main"
+deckinstall = "deckinstall.ui:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]

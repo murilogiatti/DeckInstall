@@ -4073,3 +4073,19 @@ def exit_now(code: int) -> NoReturn:
         except (OSError, ValueError):
             pass
     os._exit(code)
+
+
+def run() -> NoReturn:
+    """Entry point (main.py and the "deckinstall" command): main(), then exit_now with its code.
+
+    Exiting through os._exit also keeps running games alive: PySide's teardown would destroy
+    their QProcess objects, which kills the process.
+    """
+    try:
+        code = main()
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+    except BaseException:
+        logging.exception("Uncaught exception")
+        code = 1
+    exit_now(code)

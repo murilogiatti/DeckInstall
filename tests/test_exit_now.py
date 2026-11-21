@@ -34,3 +34,22 @@ def test_entry_point_exit_codes(tmp_path: Path) -> None:
     )
     assert out.returncode == 0
     assert ui.__version__ in out.stdout
+
+
+
+def test_run_exits_through_exit_now_with_main_code() -> None:
+    """The "deckinstall" command (ui:run) also skips Python's shutdown, so running games survive."""
+    for main_mock, expected in (
+        (mock.Mock(return_value=4), 4),
+        (mock.Mock(side_effect=SystemExit(None)), 0),
+        (mock.Mock(side_effect=RuntimeError("boom")), 1),
+    ):
+        with (
+            mock.patch.object(ui, "main", main_mock),
+            mock.patch.object(ui, "exit_now", side_effect=SystemExit("stop")) as fake_exit,
+        ):
+            try:
+                ui.run()
+            except SystemExit:
+                pass
+        fake_exit.assert_called_once_with(expected)
