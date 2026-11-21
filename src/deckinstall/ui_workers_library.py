@@ -479,7 +479,7 @@ class RemoveShortcutWorker(QThread):
 class DirStatsWorker(QThread):
     """Compute item count and byte size for a game directory."""
 
-    ready = Signal(int, int)
+    ready = Signal(int, object)  # byte size as object: a Qt int is 32-bit and games pass 2 GiB
 
     def __init__(
         self,

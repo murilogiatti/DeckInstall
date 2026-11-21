@@ -44,3 +44,23 @@ def test_run_catches_exceptions(label: str, run: ast.FunctionDef) -> None:
             fn = call.func
             name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
             assert name in ("emit", "isinstance"), f"{label}.run calls {name}() outside its try (line {call.lineno})"
+
+
+def test_byte_size_signals_carry_more_than_2_gib(tmp_path) -> None:
+    """A 57 GB game made DirStatsWorker.ready (int, int) raise OverflowError and never fire."""
+    from PySide6.QtWidgets import QApplication
+
+    from deckinstall.ui_workers_library import DirStatsWorker
+    from deckinstall.ui_workers_maint import MaintDeleteWorker
+
+    app = QApplication.instance() or QApplication([])
+    big = 57_388_175_265
+    got: list = []
+    worker = DirStatsWorker(tmp_path, tmp_path / "x.exe", False)
+    worker.ready.connect(lambda count, size: got.append(size))
+    worker.ready.emit(1, big)
+    maint = MaintDeleteWorker(None, [], False, False)
+    maint.done.connect(lambda deleted, freed, *_: got.append(freed))
+    maint.done.emit(1, big, [], [], "")
+    app.processEvents()
+    assert got == [big, big]

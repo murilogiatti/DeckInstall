@@ -180,7 +180,7 @@ class MaintRevalWorker(QThread):
 class MaintDeleteWorker(QThread):
     """Delete selected cleanup candidates with optional unverified save backup."""
 
-    done = Signal(int, int, list, list, str)
+    done = Signal(int, object, list, list, str)  # freed bytes as object (can pass 2 GiB)
     failed = Signal(str)
 
     def __init__(
