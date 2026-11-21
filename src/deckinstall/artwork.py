@@ -60,7 +60,6 @@ class SteamMatch:
 
     appid: int
     name: str
-    tiny_image: str
 
 
 @dataclass(frozen=True)
@@ -92,13 +91,7 @@ def search_steam_games(query: str, limit: int = 8) -> list[SteamMatch]:
         appid = item.get("id")
         name = item.get("name")
         if isinstance(appid, int) and name:
-            matches.append(
-                SteamMatch(
-                    appid=appid,
-                    name=str(name),
-                    tiny_image=str(item.get("tiny_image", "")),
-                )
-            )
+            matches.append(SteamMatch(appid=appid, name=str(name)))
     return matches
 
 

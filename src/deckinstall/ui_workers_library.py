@@ -75,11 +75,16 @@ def compute_library_runner_labels(
             pass
         return ""
 
-    default_lbl = tr("proton.default_label")
+    from .proton_policy import newest_ge_proton
+
+    newest = newest_ge_proton()
+    # "Default" means two things: Steam's own default tool, or DeckInstall's newest GE-Proton.
+    steam_default_lbl = tr("proton.steam_default_label")
+    default_lbl = tr("proton.default_is", name=newest.name) if newest is not None else tr("proton.default_label")
     native_lbl = tr("library.tag_native_linux")
 
     for entry in entries:
-        runner = compat_map.get(entry.appid_u32, "") or default_lbl
+        runner = compat_map.get(entry.appid_u32, "") or steam_default_lbl
         exe_clean = _strip_vdf_quotes(entry.exe)
         if exe_clean:
             runner += _opti_tag(Path(exe_clean))

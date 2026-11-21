@@ -84,3 +84,27 @@ def test_layer_pointing_elsewhere_is_not_official(release: Path) -> None:
 
 def test_never_from_the_distro_package_manager() -> None:
     assert rm.get_system_package_install_cmd("mangohud") is None
+
+
+def test_versions_and_uninstall_keep_a_foreign_layer(release: Path) -> None:
+    assert rm.mangohud_versions() == ("", "v0.8.4")
+    rm.ensure_mangohud()
+    assert rm.mangohud_versions() == ("v0.8.4", "v0.8.4")
+    layer_dir = Path.home() / ".local/share/vulkan/implicit_layer.d"
+    foreign = json.loads((layer_dir / "MangoHud.x86.json").read_text())
+    foreign["layer"]["library_path"] = "/usr/lib/mangohud/lib32/libMangoHud.so"  # someone else's layer
+    (layer_dir / "MangoHud.x86.json").write_text(json.dumps(foreign))
+    assert rm.uninstall_mangohud()
+    assert not rm.get_mangohud_dir().exists()
+    assert not (layer_dir / "MangoHud.x86_64.json").exists()
+    assert (layer_dir / "MangoHud.x86.json").exists()
+    assert "mangohud_installed_version" not in rm._load_versions()
+
+
+def test_update_runtimes_installs_mangohud_when_missing(release: Path) -> None:
+    from deckinstall.ui_workers import RuntimeUpdateWorker
+
+    worker = RuntimeUpdateWorker()
+    assert worker._update_mangohud() == "+MangoHud v0.8.4"
+    assert rm.official_mangohud_installed()
+    assert worker._update_mangohud() == "MangoHud v0.8.4"  # up to date: nothing downloaded

@@ -34,9 +34,7 @@ def test_bulk_buttons_in_library_not_in_maintenance() -> None:
         for key in (
             "library.btn_bulk_optiscaler",
             "library.btn_bulk_proton",
-            "library.btn_manage_protons",
             "maint.btn_migrate_legacy",
-            "maint.btn_undo_migration",
         ):
             assert lib_labels.count(tr(key)) == 1, key
             assert tr(key) not in maint_labels, key

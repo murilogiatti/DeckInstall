@@ -250,7 +250,7 @@ def build_saves_page(win: MainWindow) -> QWidget:
     keep_row.addWidget(spin_keep)
     keep_row.addStretch()
     card_layout.addLayout(keep_row)
-    win.chk_save_auto, win.chk_save_after_play, win.spin_save_keep = chk_auto, chk_play, spin_keep
+    win.spin_save_keep = spin_keep
 
     buttons = QHBoxLayout()
     win.btn_save_backup = QPushButton(tr("library.btn_backup_saves"))

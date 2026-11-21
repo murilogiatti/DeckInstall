@@ -4,22 +4,24 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass
+from contextlib import ExitStack
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, cast, get_args
 
 from .fsutil import atomic_write_text
-from .steam_paths import SteamPaths
+from .steam_paths import SteamPaths, list_steam_users
 from .steam_vdf import (
     _backup_file,
     _steam_transaction_lock,
     add_or_update_shortcut,
     bulk_migrate_compat_tool,
-    remove_compat_tools,
+    remove_orphan_shortcut_mappings,
     remove_shortcut,
     set_shortcut_proton,
     set_steam_app_launch_options,
     update_shortcut_launch_options,
+    update_shortcut_paths,
 )
 
 VdfEditOp = Literal[
@@ -30,6 +32,7 @@ VdfEditOp = Literal[
     "remove_compat",
     "remove_shortcut",
     "add_or_update_shortcut",
+    "update_shortcut_paths",
 ]
 
 _COALESCIBLE_OPS = frozenset({"set_proton", "set_launch_options", "set_app_launch_options"})
@@ -137,7 +140,16 @@ class VdfEditQueue:
         errors: list[str] = []
         remaining: list[QueuedVdfEdit] = []
 
-        with _steam_transaction_lock(paths.shortcuts_vdf):
+        anchors = {paths.shortcuts_vdf}
+        for edit in self._queue:
+            if edit.op == "update_shortcut_paths":
+                try:
+                    anchors.add(self._repair_paths(paths, edit.payload).shortcuts_vdf)
+                except (KeyError, OSError, ValueError):
+                    pass  # Dispatch reports invalid edits and keeps them in the queue.
+        with ExitStack() as locks:
+            for anchor in sorted(anchors):
+                locks.enter_context(_steam_transaction_lock(anchor))
             _backup_file(paths.shortcuts_vdf)
             _backup_file(paths.config_vdf)
 
@@ -152,6 +164,19 @@ class VdfEditQueue:
         self._queue = remaining
         self._save()
         return BatchApplyResult(applied=applied, errors=errors)
+
+    @staticmethod
+    def _repair_paths(paths: SteamPaths, payload: dict[str, Any]) -> SteamPaths:
+        account = str(payload["user_id"])
+        if Path(payload["steam_root"]).resolve() != paths.steam_root.resolve():
+            raise ValueError("The shortcut belongs to another Steam installation")
+        if account == paths.user_id:
+            return paths
+        if account not in list_steam_users(paths.steam_root):
+            raise ValueError("The Steam account for this shortcut is unavailable")
+        userdata = paths.steam_root / "userdata" / account
+        return replace(paths, user_id=account, userdata_dir=userdata,
+                       shortcuts_vdf=userdata / "config" / "shortcuts.vdf")
 
     @staticmethod
     def _dispatch_edit(paths: SteamPaths, edit: QueuedVdfEdit) -> None:
@@ -183,9 +208,16 @@ class VdfEditQueue:
                 if raw_appids is not None
                 else ([edit.appid_u32] if edit.appid_u32 else [])
             )
-            remove_compat_tools(paths.config_vdf, appids)
+            remove_orphan_shortcut_mappings(paths, appids)
         elif edit.op == "remove_shortcut":
             if not remove_shortcut(paths, edit.appid_u32):
+                raise RuntimeError(f"Atalho {edit.appid_u32} não encontrado em shortcuts.vdf")
+        elif edit.op == "update_shortcut_paths":
+            paths = VdfEditQueue._repair_paths(paths, payload)
+            if not update_shortcut_paths(
+                paths, edit.appid_u32, Path(payload["exe_path"]), Path(payload["start_dir"]),
+                expected_exe=payload["expected_exe"],
+            ):
                 raise RuntimeError(f"Atalho {edit.appid_u32} não encontrado em shortcuts.vdf")
         elif edit.op == "add_or_update_shortcut":
             app_name = str(payload.get("app_name") or edit.label)

@@ -86,10 +86,8 @@ from .library import (
 )
 from .migrate import (
     MigrationResult,
-    latest_undoable_journal,
     migrate_legacy_games,
     plan_migration,
-    undo_migration,
 )
 from .play_monitor import ERROR, LOADING, RUNNING, PlayMonitor, process_start_epoch, stale_instance_pids, watch_paths
 from .runtime_manager import (
@@ -112,7 +110,10 @@ from .standalone import (
     get_games_dir,
     import_standalone_to_steam,
     list_standalone_games,
+    match_owned_shortcuts,
+    repaired_shortcut_start_dir,
     shortcut_game_dir,
+    shortcut_path_repairs,
     update_standalone_launch_options,
     uses_library_layout,
 )
@@ -155,12 +156,11 @@ from .ui_cards import (
     _parse_launch_preset_state as _raw_parse_launch_preset_state,
 )
 from .ui_dialogs import (
-    bulk_migrate_proton_dialog,
+    bulk_proton_dialog,
     edit_launch_options_presets,
     open_configure_game_dialog,
     open_launch_presets_dialog,
     open_optiscaler_dialog,
-    open_proton_manager_dialog,
     open_save_sync_dialog,
     open_scan_folders_dialog,
     open_winetricks_dialog,
@@ -250,6 +250,11 @@ def _parse_launch_preset_state(opts: str) -> LaunchPresetState:
     return cast(LaunchPresetState, _raw_parse_launch_preset_state(opts))
 
 
+def _inside_any(path: Path, dirs: list[str]) -> bool:
+    p = os.path.normpath(str(path))
+    return any(p == d or p.startswith(d + os.sep) for d in dirs)
+
+
 def _setting_int(settings: QSettings, key: str, default: int = 0) -> int:
     val = settings.value(key, default)
     if isinstance(val, bool):
@@ -276,9 +281,7 @@ class MainWindow(QMainWindow):
     _maint_scanned: bool
     _maint_filter_group: QButtonGroup
     maint_list: QTableWidget
-    btn_manage_protons: QPushButton
     btn_migrate_legacy: QPushButton
-    btn_undo_migration: QPushButton
     btn_maint_refresh_health: QPushButton
     btn_maint_scan: QPushButton
     btn_maint_revalidate: QPushButton
@@ -289,15 +292,15 @@ class MainWindow(QMainWindow):
     lbl_maint_umu: QLabel
     lbl_maint_proton: QLabel
     lbl_maint_steamrt4: QLabel
+    lbl_maint_mangohud: QLabel
     lbl_maint_disk: QLabel
     lbl_maint_summary: QLabel
     btn_update_runtimes: QPushButton
+    btn_uninstall_runtimes: QPushButton
     btn_app_update: QPushButton
     # Backup/Sync page (ui_dialogs/save_sync_dialog.py)
     saves_list: QTableWidget
     lbl_saves_empty: QLabel
-    chk_save_auto: QCheckBox
-    chk_save_after_play: QCheckBox
     spin_save_keep: QSpinBox
     btn_save_backup: QPushButton
     btn_save_restore: QPushButton
@@ -1274,14 +1277,11 @@ class MainWindow(QMainWindow):
         self.btn_remove_game.clicked.connect(self._remove_selected_shortcut)
 
         self.btn_bulk_proton = QPushButton(tr("library.btn_bulk_proton"))
-        self.btn_bulk_proton.clicked.connect(self._bulk_migrate_proton_dialog)
-        self.btn_manage_protons = QPushButton(tr("library.btn_manage_protons"))
-        self.btn_manage_protons.clicked.connect(self._open_proton_manager_dialog)
+        self.btn_bulk_proton.setToolTip(tr("library.btn_bulk_proton_tip"))
+        self.btn_bulk_proton.clicked.connect(lambda: bulk_proton_dialog(self))
         self.btn_migrate_legacy = QPushButton(tr("maint.btn_migrate_legacy"))
         self.btn_migrate_legacy.setToolTip(tr("maint.migrate_legacy_tooltip"))
         self.btn_migrate_legacy.clicked.connect(lambda: self._start_legacy_migration())
-        self.btn_undo_migration = QPushButton(tr("maint.btn_undo_migration"))
-        self.btn_undo_migration.clicked.connect(lambda: self._undo_last_migration())
         footer = QHBoxLayout()
         footer.setSpacing(24)
         for group_text, group_btns in (
@@ -1309,9 +1309,7 @@ class MainWindow(QMainWindow):
         for batch_btn in (
             self.btn_bulk_optiscaler,
             self.btn_bulk_proton,
-            self.btn_manage_protons,
             self.btn_migrate_legacy,
-            self.btn_undo_migration,
         ):
             batch_flow.addWidget(batch_btn)
         lib_layout.addLayout(batch_flow)
@@ -2422,6 +2420,11 @@ class MainWindow(QMainWindow):
             )
         )
         default_runner = tr("proton.default_label")
+        # A DeckInstall game that is also in Steam is one row (the Steam shortcut runs the same prefix).
+        owned = match_owned_shortcuts(entries, standalone_games, paths_snapshot.user_id if paths_snapshot else None)
+        in_steam = {str(g.game_dir) for g in owned.values()}
+        standalone_dirs = [os.path.normpath(str(g.game_dir)) for g in standalone_games]
+        self._queue_shortcut_repairs(entries, standalone_games)
         rows: list[tuple[str, str, str, str, tuple[str, object], str]] = [
             (
                 entry.app_name,
@@ -2432,11 +2435,12 @@ class MainWindow(QMainWindow):
                 f"steam:{entry.appid_u32}",
             )
             for entry in entries
+            if entry.appid_u32 not in owned
         ]
         rows.extend(
             (
                 game.name,
-                tr("library.tag_standalone"),
+                tr("library.tag_standalone_steam") if str(game.game_dir) in in_steam else tr("library.tag_standalone"),
                 labels.get(("standalone", str(game.game_dir)), default_runner),
                 str(game.exe_path),
                 ("standalone", game),
@@ -2454,6 +2458,7 @@ class MainWindow(QMainWindow):
                 f"external:{ext.source}:{ext.name}:{ext.exe_path}",
             )
             for ext in external_games
+            if not _inside_any(ext.exe_path, standalone_dirs)  # adopted: the DeckInstall row is the game
         )
         for row, (name, source, runner, executable, data, key) in enumerate(rows):
             self.shortcuts_list.insertRow(row)
@@ -2563,46 +2568,6 @@ class MainWindow(QMainWindow):
         worker.failed.connect(_err)
         worker.start()
 
-    def _undo_last_migration(self) -> None:
-        """Put the games of the latest migration back in ~/Games."""
-        if _is_wine_game_running():
-            QMessageBox.warning(_dialog_parent(self), __app_name__, tr("migrate.game_running"))
-            return
-        journal = latest_undoable_journal()
-        if journal is None:
-            QMessageBox.information(_dialog_parent(self), __app_name__, tr("migrate.nothing_to_undo"))
-            return
-        ans = QMessageBox.question(
-            _dialog_parent(self), __app_name__, tr("migrate.undo_confirm", name=journal.stem)
-        )
-        if ans != QMessageBox.StandardButton.Yes:
-            return
-        self._begin_busy()
-        worker = SteamOpWorker(lambda: undo_migration(journal))
-        self._track_worker(worker)
-
-        def _ok(res: object) -> None:
-            self._end_busy()
-            self._refresh_shortcuts()
-            if self._closing_pending or not isinstance(res, tuple):
-                return
-            restored, problems = res
-            text = tr("migrate.undo_done", count=len(restored))
-            if problems:
-                text += "\n\n" + tr("migrate.undo_problems", items="\n".join(f"• {p}" for p in problems))
-                QMessageBox.warning(_dialog_parent(self), __app_name__, text)
-            else:
-                QMessageBox.information(_dialog_parent(self), __app_name__, text)
-
-        def _err(err: str) -> None:
-            self._end_busy()
-            if not self._closing_pending:
-                QMessageBox.critical(_dialog_parent(self), __app_name__, tr("migrate.failed", err=err))
-
-        worker.finished_ok.connect(_ok)
-        worker.failed.connect(_err)
-        worker.start()
-
     def _refresh_shortcuts(self) -> None:
         self._refresh_libraries()
         self._shortcuts_req_id += 1
@@ -2639,6 +2604,26 @@ class MainWindow(QMainWindow):
         worker.ready.connect(_on_loaded)
         worker.failed.connect(self._on_background_failed)
         worker.start()
+
+    def _queue_shortcut_repairs(self, entries: list[ShortcutEntry], games: list[StandaloneGame]) -> None:
+        """Steam shortcuts of adopted/moved games still pointing at the old folder (Steam was open):
+        queue the fix, applied as soon as Steam is closed (AppID, artwork and playtime are kept)."""
+        if self.paths is None or self._vdf_corrupt:
+            return
+        pending = {e.edit_id for e in self._vdf_queue.list_pending()}
+        for entry, game in shortcut_path_repairs(entries, games, self.paths.user_id):
+            edit_id = f"update_shortcut_paths:{self.paths.user_id}:{entry.appid_u32}"
+            if edit_id in pending:
+                continue
+            logging.info("Steam shortcut %s points at a missing exe; queueing %s", entry.appid_u32, game.exe_path)
+            self.enqueue_vdf_edit(
+                QueuedVdfEdit(
+                    edit_id, "update_shortcut_paths", entry.appid_u32, entry.app_name,
+                    {"exe_path": str(game.exe_path), "start_dir": str(repaired_shortcut_start_dir(entry, game)),
+                     "expected_exe": entry.exe, "user_id": self.paths.user_id,
+                     "steam_root": str(self.paths.steam_root)},
+                )
+            )
 
     def _filter_library_list(self) -> None:
         """Filter Steam, Standalone, and External library items live and update the count label."""
@@ -3337,7 +3322,6 @@ class MainWindow(QMainWindow):
             self.btn_save_dedup,
             self.btn_save_refresh,
             self.btn_adopt_games,
-            self.btn_manage_protons,
             self.btn_bulk_optiscaler,
             self.btn_maint_scan,
             self.btn_maint_clean_safe,
@@ -3570,12 +3554,6 @@ class MainWindow(QMainWindow):
         steam_prep.ready.connect(_on_steam_prep)
         steam_prep.failed.connect(self._on_background_failed)
         steam_prep.start()
-
-    def _bulk_migrate_proton_dialog(self) -> None:
-        bulk_migrate_proton_dialog(self)
-
-    def _open_proton_manager_dialog(self) -> None:
-        open_proton_manager_dialog(self)
 
     def _open_save_sync_dialog(self) -> None:
         open_save_sync_dialog(self)
@@ -4013,7 +3991,7 @@ def _install_qt_translator(app: QApplication, lang: str) -> bool:
     return False
 
 
-def _qt_message_handler(mode, context, message: str) -> None:
+def _qt_message_handler(mode, _context, message: str) -> None:
     logging.warning("Qt[%s]: %s", mode, message)
 
 

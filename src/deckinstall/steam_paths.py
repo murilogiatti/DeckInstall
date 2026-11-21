@@ -291,11 +291,6 @@ def _proton_version_key(entry: Path) -> tuple[tuple[int, ...], str]:
     return (nums, entry.name.lower())
 
 
-def proton_name_sort_key(name: str) -> tuple[tuple[int, ...], str]:
-    """Sort key for tool names by version numbers (GE-Proton11-12 > GE-Proton11-9); use reverse=True."""
-    return (tuple(int(n) for n in re.findall(r"\d+", name)), name.lower())
-
-
 def find_default_proton_name(steam_root: Path) -> str:
     """Return the Steam CompatToolMapping name for the newest stable Proton."""
     libs = _list_steam_library_roots(steam_root)

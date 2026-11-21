@@ -271,6 +271,7 @@ def get_user_vulkan_layer_dir() -> Path:
 
 
 _MANGOHUD_LAYERS = (("MangoHud.x86_64.json", "lib64"), ("MangoHud.x86.json", "lib32"))
+_GE_MANAGED_MARKER = ".deckinstall-managed"
 
 
 def official_mangohud_installed() -> bool:
@@ -285,6 +286,25 @@ def official_mangohud_installed() -> bool:
         if path != expected or not expected.is_file():
             return False
     return True
+
+
+def system_mangohud_installed() -> bool:
+    """Recognize a native installation from its Vulkan manifests and libraries."""
+    data_dirs = os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share"
+    for base in map(Path, data_dirs.split(os.pathsep)):
+        if not base.is_absolute() or base.is_relative_to(Path.home()):
+            continue
+        layers = base / "vulkan" / "implicit_layer.d"
+        try:
+            libraries = [
+                Path(json.loads((layers / name).read_text(encoding="utf-8"))["layer"]["library_path"])
+                for name, _ in _MANGOHUD_LAYERS
+            ]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if all(lib.is_absolute() and lib.is_file() for lib in libraries):
+            return True
+    return False
 
 
 def _write_mangohud_layers(mh_dir: Path) -> None:
@@ -360,6 +380,70 @@ def ensure_mangohud(force_update: bool = False, progress_cb: ProgressCb | None =
         _update_versions(_record)
         _emit_progress(progress_cb, f"MangoHud {tag} installed.", 100)
         return mh_dir
+
+
+def mangohud_versions() -> tuple[str, str]:
+    """(installed tag or "", latest tag on GitHub or "") of the official MangoHud."""
+    installed = str(_load_versions().get("mangohud_installed_version") or "") if official_mangohud_installed() else ""
+    release = _fetch_json(MANGOHUD_RELEASES_API)
+    latest = str(release.get("tag_name", "")).strip() if isinstance(release, dict) else ""
+    return installed, latest
+
+
+def uninstall_mangohud() -> bool:
+    """Remove DeckInstall's official MangoHud and its user layers (a layer pointing elsewhere is kept)."""
+    mh_dir = get_mangohud_dir()
+    removed = False
+    with _MANGOHUD_LOCK:
+        for json_name, _lib in _MANGOHUD_LAYERS:
+            layer = get_user_vulkan_layer_dir() / json_name
+            try:
+                data = json.loads(layer.read_text(encoding="utf-8"))
+                ours = Path(str(data["layer"]["library_path"])).is_relative_to(mh_dir)
+            except (OSError, ValueError, KeyError, TypeError):
+                ours = False
+            if ours:
+                layer.unlink(missing_ok=True)
+                removed = True
+        if mh_dir.is_dir() and not mh_dir.is_symlink():
+            shutil.rmtree(mh_dir)
+            removed = True
+
+    def _forget(versions: dict[str, Any]) -> None:
+        versions.pop("mangohud_installed_version", None)
+
+    _update_versions(_forget)
+    return removed
+
+
+def _remove_runtime_dir(path: Path, version_keys: tuple[str, ...] = ()) -> bool:
+    """Remove a runtime folder that DeckInstall downloaded (never a symlink)."""
+    if not path.is_dir() or path.is_symlink():
+        return False
+    shutil.rmtree(path)
+
+    def _forget(versions: dict[str, Any]) -> None:
+        for key in version_keys:
+            versions.pop(key, None)
+
+    if version_keys:
+        _update_versions(_forget)
+    return True
+
+
+def uninstall_umu_run() -> bool:
+    """Remove the portable umu-run (installed again by "Update runtimes" or the next launch)."""
+    return _remove_runtime_dir(get_umu_dir(), ("umu_installed_version",))
+
+
+def uninstall_steamrt4() -> bool:
+    """Remove umu's Steam Runtime 4 (umu downloads it again on the next launch)."""
+    return _remove_runtime_dir(get_steamrt4_dir())
+
+
+def uninstall_optiscaler_package() -> bool:
+    """Remove the downloaded OptiScaler package (games keep the copy installed in their folder)."""
+    return _remove_runtime_dir(get_optiscaler_dir().parent, ("optiscaler_installed_version",))
 
 
 def get_umu_database_path() -> Path:
@@ -503,6 +587,18 @@ def list_ge_proton_dirs(
 
     found.sort(key=lambda item: item[0], reverse=True)
     return [entry for _, entry in found]
+
+
+def is_managed_ge_proton(path: Path) -> bool:
+    """True for a GE-Proton directory recorded as installed by this app."""
+    marker = path / _GE_MANAGED_MARKER
+    return (
+        path.parent.resolve() == get_compat_tools_dir().resolve()
+        and not path.is_symlink()
+        and _parse_ge_proton_version(path.name, min_major=1) is not None
+        and not marker.is_symlink()
+        and marker.is_file()
+    )
 
 
 def list_ge_proton11_dirs() -> list[Path]:
@@ -1376,6 +1472,7 @@ def ensure_ge_proton11(
             subdirs = [p for p in extract_dir.iterdir() if p.is_dir()]
             extracted_root = subdirs[0] if len(subdirs) == 1 else extract_dir
 
+        atomic_write_text(extracted_root / _GE_MANAGED_MARKER, f"{tag}\n")
         backup_dir: Path | None = None
         try:
             if target_dir.exists() or target_dir.is_symlink():
@@ -1660,6 +1757,8 @@ def install_compat_tool(
         target_dir = compat_dir / folder_name
         if ".." in folder_name or target_dir.resolve().parent != compat_dir.resolve():
             raise RuntimeError(f"Unsafe compatibility tool target directory: {target_dir}")
+        if _parse_ge_proton_version(folder_name, min_major=1) is not None:
+            atomic_write_text(extracted_root / _GE_MANAGED_MARKER, f"{folder_name}\n")
         backup_dir: Path | None = None
         try:
             if target_dir.exists() or target_dir.is_symlink():

@@ -1,4 +1,4 @@
-"""Fase 3.1: the "Proton per game" dialog lists games and pins them in batch."""
+"""Proton in batch: one list (DeckInstall games + Steam shortcuts), always the newest GE-Proton."""
 
 from __future__ import annotations
 
@@ -13,82 +13,94 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtWidgets import QApplication, QDialog, QTableWidget  # noqa: E402
-
-from deckinstall import runtime_manager, standalone  # noqa: E402
-from deckinstall.i18n import tr  # noqa: E402
-from deckinstall.ui_dialogs import proton_dialogs  # noqa: E402
+from deckinstall import proton_policy, runtime_manager, standalone  # noqa: E402
+from deckinstall.steam_vdf import ShortcutEntry  # noqa: E402
+from deckinstall.ui_dialogs import proton_bulk_dialog as pbd  # noqa: E402
 
 PE = b"MZ" + b"\x00" * 58 + (64).to_bytes(4, "little") + b"PE\x00\x00"
 
 
-def test_dialog_lists_games_with_mode_and_versions(tmp_path: Path) -> None:
-    app = QApplication.instance() or QApplication([])
-    tool = runtime_manager.get_compat_tools_dir() / "GE-Proton11-2"
+def _tool(name: str) -> None:
+    tool = runtime_manager.get_compat_tools_dir() / name
     tool.mkdir(parents=True)
     (tool / "proton").write_text("#!/bin/sh\n", encoding="utf-8")
-    src = tmp_path / "Alpha"
+
+
+def _install(tmp_path: Path, name: str) -> standalone.StandaloneGame:
+    src = tmp_path / name
     src.mkdir()
     (src / "Game.exe").write_bytes(PE)
     with mock.patch.object(standalone, "resolve_game_icon", return_value=None):
-        standalone.install_standalone_game("Alpha", src / "Game.exe", src)
-
-    dlg = QDialog()
-    page = proton_dialogs._build_game_proton_widget(mock.Mock(), dlg, True)
-    tbl = page.findChild(QTableWidget)
-    assert tbl is not None
-    rows = [tuple(tbl.item(r, c).text() for c in range(4)) for r in range(tbl.rowCount())]  # type: ignore[union-attr]
-    assert rows == [("Alpha", tr("proton_games.mode_default"), "GE-Proton11-2", "-")]
-    assert app is not None
-    page.deleteLater()
-    dlg.deleteLater()
+        return standalone.install_standalone_game(name, src / "Game.exe", src)
 
 
-def test_pin_action_calls_set_games_proton(tmp_path: Path) -> None:
-    from PySide6.QtWidgets import QPushButton
+def _shortcut(appid: int, name: str, exe: str) -> ShortcutEntry:
+    return ShortcutEntry("0", appid, name, f'"{exe}"', '"/x"', "", "")
 
-    app = QApplication.instance() or QApplication([])
-    tool = runtime_manager.get_compat_tools_dir() / "GE-Proton11-2"
-    tool.mkdir(parents=True)
-    (tool / "proton").write_text("#!/bin/sh\n", encoding="utf-8")
-    src = tmp_path / "Beta"
-    src.mkdir()
-    (src / "Game.exe").write_bytes(PE)
-    with mock.patch.object(standalone, "resolve_game_icon", return_value=None):
-        standalone.install_standalone_game("Beta", src / "Game.exe", src)
-    dlg = QDialog()
-    win = mock.Mock()
-    worker_cls = mock.Mock()
+
+def test_rows_mark_default_games_newest_and_pinned_ones_outdated(tmp_path: Path) -> None:
+    _tool("GE-Proton11-1")
+    _tool("GE-Proton11-2")
+    alpha = _install(tmp_path, "Alpha")
+    beta = _install(tmp_path, "Beta")
+    proton_policy.set_game_proton(beta.game_dir, "GE-Proton11-1")
+    rows, orphans, newest = pbd.collect_rows(None)
+    assert newest == "GE-Proton11-2" and orphans == []
+    by_name = {r.name: r for r in rows}
+    assert by_name["Alpha"].newest and by_name["Alpha"].current == "GE-Proton11-2"
+    assert not by_name["Beta"].newest and by_name["Beta"].current == "GE-Proton11-1"
+    assert by_name["Alpha"].game_dir == alpha.game_dir
+
+
+def test_steam_shortcuts_owned_by_a_game_are_not_listed_twice(tmp_path: Path) -> None:
+    _tool("GE-Proton11-2")
+    game = _install(tmp_path, "Alpha")
+    paths = mock.Mock()
+    shortcuts = [
+        _shortcut(0x80000001, "Alpha", str(game.exe_path)),  # the DeckInstall game itself
+        _shortcut(0x80000002, "Other", "/games/other/Other.exe"),
+        _shortcut(0x80000003, "Native", "/games/native/run.sh"),  # no Proton
+    ]
+    compat = {0x80000001: "proton_11", 0x80000002: "proton_9", 0x80000099: "GE-Proton9-1"}
     with (
-        mock.patch("deckinstall.proton_policy.set_games_proton", return_value=(1, [])) as sgp,
-        mock.patch.object(proton_dialogs, "SteamOpWorker", worker_cls),
+        mock.patch.object(pbd, "load_shortcuts", return_value=shortcuts),
+        mock.patch.object(pbd, "get_compat_tool_map", return_value=compat),
+        mock.patch.object(pbd, "orphan_shortcut_mappings", return_value=[0x80000099]),
     ):
-        page = proton_dialogs._build_game_proton_widget(win, dlg, True)
-        tbl = page.findChild(QTableWidget)
-        assert tbl is not None
-        tbl.item(0, 0).setCheckState(Qt.CheckState.Checked)  # type: ignore[union-attr]
-        btn = next(b for b in page.findChildren(QPushButton) if b.text() == tr("proton_games.btn_apply"))
-        btn.click()
-        job = worker_cls.call_args.args[0]
-        job()
-    assert sgp.called
-    assert app is not None
-    page.deleteLater()
-    dlg.deleteLater()
+        rows, orphans, _ = pbd.collect_rows(paths)
+    assert [(r.name, r.source, r.current) for r in rows] == [
+        ("Alpha", "deckinstall", "GE-Proton11-2"),
+        ("Other", "shortcut", "proton_9"),
+    ]
+    assert rows[0].steam_tools == ((0x80000001, "proton_11"),) and not rows[0].newest
+    assert orphans == [0x80000099]
 
 
-def test_bulk_dialog_games_tab_visibility(tmp_path: Path) -> None:
-    from PySide6.QtWidgets import QTabWidget
+def test_update_downloads_a_newer_ge_proton_and_moves_default_games(tmp_path: Path) -> None:
+    _tool("GE-Proton11-1")
+    _install(tmp_path, "Alpha")
 
-    app = QApplication.instance() or QApplication([])
-    assert app is not None
-    src = tmp_path / "Gamma"
-    src.mkdir()
-    (src / "Game.exe").write_bytes(PE)
-    assert proton_dialogs._deckinstall_proton_games() == []
-    with mock.patch.object(standalone, "resolve_game_icon", return_value=None):
-        standalone.install_standalone_game("Gamma", src / "Game.exe", src)
-    assert [g.name for g in proton_dialogs._deckinstall_proton_games()] == ["Gamma"]
-    assert tr("proton_bulk.tab_games")
-    assert QTabWidget is not None
+    def _download(force_update: bool = False, progress_cb=None) -> Path:  # noqa: ANN001
+        _tool("GE-Proton11-2")
+        return runtime_manager.get_compat_tools_dir() / "GE-Proton11-2"
+
+    info = {"ge_proton": {"installed": "GE-Proton11-1", "latest": "GE-Proton11-2", "update_available": True}}
+    with (
+        mock.patch.object(pbd, "check_runtime_updates", return_value=info),
+        mock.patch.object(pbd, "ensure_ge_proton11", side_effect=_download) as dl,
+        mock.patch.object(pbd, "retarget_default_games", return_value=1) as retarget,
+    ):
+        assert pbd.ensure_newest_ge_proton() == "GE-Proton11-2"
+    assert dl.call_args.kwargs["force_update"] is True
+    retarget.assert_called_once_with("GE-Proton11-1")
+
+
+def test_up_to_date_ge_proton_is_not_downloaded(tmp_path: Path) -> None:
+    _tool("GE-Proton11-2")
+    info = {"ge_proton": {"installed": "GE-Proton11-2", "latest": "GE-Proton11-2", "update_available": False}}
+    with (
+        mock.patch.object(pbd, "check_runtime_updates", return_value=info),
+        mock.patch.object(pbd, "ensure_ge_proton11") as dl,
+    ):
+        assert pbd.ensure_newest_ge_proton() == "GE-Proton11-2"
+    dl.assert_not_called()

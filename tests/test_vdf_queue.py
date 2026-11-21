@@ -167,7 +167,7 @@ def test_apply_all_uses_single_lock_and_mocked_writers(tmp_path: Path) -> None:
             "deckinstall.vdf_queue.update_shortcut_launch_options", return_value=True
         ) as mock_update_launch,
         patch("deckinstall.vdf_queue.bulk_migrate_compat_tool") as mock_bulk_migrate,
-        patch("deckinstall.vdf_queue.remove_compat_tools") as mock_remove_compat,
+        patch("deckinstall.vdf_queue.remove_orphan_shortcut_mappings") as mock_remove_compat,
         patch("deckinstall.vdf_queue.remove_shortcut", return_value=True) as mock_remove_shortcut,
     ):
         result = queue.apply_all(paths)
@@ -181,7 +181,7 @@ def test_apply_all_uses_single_lock_and_mocked_writers(tmp_path: Path) -> None:
     mock_set_proton.assert_called_once_with(paths.config_vdf, 2001, "GE-Proton9-5")
     mock_update_launch.assert_called_once_with(paths, 2001, "ENABLE_LSFG=1 %command%")
     mock_bulk_migrate.assert_called_once_with(paths.config_vdf, [2001, 2002], "GE-Proton9-5")
-    mock_remove_compat.assert_called_once_with(paths.config_vdf, [2003])
+    mock_remove_compat.assert_called_once_with(paths, [2003])
     mock_remove_shortcut.assert_called_once_with(paths, 2004)
 
 

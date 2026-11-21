@@ -9,6 +9,7 @@ from PySide6.QtCore import QPoint, Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QButtonGroup,
+    QDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -85,12 +86,14 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     win.lbl_maint_umu = QLabel()
     win.lbl_maint_proton = QLabel()
     win.lbl_maint_steamrt4 = QLabel()
+    win.lbl_maint_mangohud = QLabel()
     win.lbl_maint_disk = QLabel()
     for lbl in (
         win.lbl_maint_app,
         win.lbl_maint_umu,
         win.lbl_maint_proton,
         win.lbl_maint_steamrt4,
+        win.lbl_maint_mangohud,
         win.lbl_maint_disk,
     ):
         lbl.setWordWrap(True)
@@ -99,9 +102,13 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     win.btn_update_runtimes = QPushButton(tr("runtime.btn_update"))
     win.btn_update_runtimes.setToolTip(tr("runtime.tooltip"))
     win.btn_update_runtimes.clicked.connect(win._update_runtimes)
+    win.btn_uninstall_runtimes = QPushButton(tr("runtime.btn_uninstall"))
+    win.btn_uninstall_runtimes.setToolTip(tr("runtime.uninstall_tip"))
+    win.btn_uninstall_runtimes.clicked.connect(lambda: open_uninstall_runtimes_dialog(win))
     win.btn_app_update = QPushButton(tr("app_update.btn"))
     win.btn_app_update.clicked.connect(win._check_and_update_app)
     health_actions.addWidget(win.btn_update_runtimes)
+    health_actions.addWidget(win.btn_uninstall_runtimes)
     health_actions.addWidget(win.btn_app_update)
     health_layout.addLayout(health_actions)
     layout.addWidget(health_card)
@@ -218,6 +225,7 @@ def refresh_maintenance_health(win: MainWindow) -> None:
         win.lbl_maint_steamrt4.setText(
             tr("maint.health_steamrt4", status=data["rt4_status"])
         )
+        win.lbl_maint_mangohud.setText(tr("maint.health_mangohud", status=data.get("mangohud_status", "-")))
         win.lbl_maint_disk.setText(
             tr(
                 "maint.health_disk",
@@ -614,3 +622,134 @@ def show_maint_context_menu(win: MainWindow, pos: QPoint) -> None:
         worker.done.connect(_on_backup_done)
         worker.failed.connect(_on_backup_failed)
         worker.start()
+
+
+def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
+    """Check the runtimes to remove (one, some or all); sizes and GE-Proton users are shown."""
+    from .runtime_uninstall import GE, RuntimeItem, list_runtimes, uninstall
+    from .ui_workers import SteamOpWorker
+
+    win.btn_uninstall_runtimes.setEnabled(False)
+    win.status_label.setText(tr("runtime.uninstall_loading"))
+    loader = SteamOpWorker(lambda: list_runtimes(win.paths))
+    win._track_worker(loader)
+
+    def _show(res: object) -> None:
+        win.btn_uninstall_runtimes.setEnabled(True)
+        win.status_label.setText(tr("status.ready"))
+        items = [i for i in res if isinstance(i, RuntimeItem)] if isinstance(res, list) else []
+        if win._closing_pending:
+            return
+        if not items:
+            QMessageBox.information(_dialog_parent(win), __app_name__, tr("runtime.uninstall_none"))
+            return
+        dlg = QDialog(_dialog_parent(win))
+        dlg.setWindowTitle(tr("runtime.uninstall_title"))
+        dlg.resize(760, 420)
+        lay = QVBoxLayout(dlg)
+        hint = QLabel(tr("runtime.uninstall_hint"))
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        tbl = QTableWidget(0, 3)
+        tbl.setHorizontalHeaderLabels([tr("table.name"), tr("table.size"), tr("runtime.uninstall_col_users")])
+        tbl.verticalHeader().setVisible(False)
+        tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        for item in items:
+            row = tbl.rowCount()
+            tbl.insertRow(row)
+            it = QTableWidgetItem(item.name)
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Unchecked)
+            tbl.setItem(row, 0, it)
+            tbl.setItem(row, 1, QTableWidgetItem(format_size_bytes(item.size_bytes)))
+            users = ", ".join(item.users) if item.users else ("-" if item.kind == GE else "")
+            tbl.setItem(row, 2, QTableWidgetItem(users))
+        lay.addWidget(tbl, 1)
+        buttons = QHBoxLayout()
+        btn_all = QPushButton(tr("optiscaler_bulk.btn_select_all"))
+        btn_none = QPushButton(tr("optiscaler_bulk.btn_select_none"))
+        btn_remove = QPushButton(tr("runtime.uninstall_btn_selected"))
+        btn_remove.setObjectName("dangerBtn")
+        btn_close = QPushButton(tr("proton_bulk.btn_close"))
+        for b in (btn_all, btn_none, btn_remove):
+            buttons.addWidget(b)
+        buttons.addStretch()
+        buttons.addWidget(btn_close)
+        lay.addLayout(buttons)
+
+        def _set_all(state: Qt.CheckState) -> None:
+            for r in range(tbl.rowCount()):
+                cell = tbl.item(r, 0)
+                if cell is not None:
+                    cell.setCheckState(state)
+
+        def _remove() -> None:
+            chosen = [
+                items[r] for r in range(tbl.rowCount())
+                if (cell := tbl.item(r, 0)) is not None and cell.checkState() == Qt.CheckState.Checked
+            ]
+            if not chosen:
+                QMessageBox.information(dlg, __app_name__, tr("proton_bulk.none_selected"))
+                return
+            if _is_wine_game_running():
+                QMessageBox.warning(dlg, __app_name__, tr("runtime.uninstall_game_running"))
+                return
+            listing = "\n".join(
+                f"• {i.name} ({format_size_bytes(i.size_bytes)})"
+                + (f" - {tr('runtime.uninstall_used_by', games=', '.join(i.users))}" if i.users else "")
+                for i in chosen
+            )
+            if QMessageBox.question(
+                dlg, __app_name__, tr("runtime.uninstall_confirm", count=len(chosen), items=listing)
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            btn_remove.setEnabled(False)
+            btn_close.setEnabled(False)
+
+            def _uninstall() -> tuple[list[str], list[str]]:
+                if _is_wine_game_running():
+                    raise RuntimeError(tr("runtime.uninstall_game_running"))
+                return uninstall(chosen)
+
+            worker = SteamOpWorker(_uninstall)
+            win._track_worker(worker)
+
+            def _done(result: object) -> None:
+                removed, errors = result if isinstance(result, tuple) else ([], [])
+                msg = tr("runtime.uninstall_done", count=len(removed))
+                if errors:
+                    msg += "\n\n" + "\n".join(errors)
+                win.status_label.setText(tr("runtime.uninstall_done", count=len(removed)))
+                refresh_maintenance_health(win)
+                win._refresh_shortcuts()
+                QMessageBox.information(dlg, __app_name__, msg)
+                dlg.accept()
+
+            def _fail(err: str) -> None:
+                btn_remove.setEnabled(True)
+                btn_close.setEnabled(True)
+                QMessageBox.critical(dlg, __app_name__, tr("runtime.error", err=err))
+
+            worker.finished_ok.connect(_done)
+            worker.failed.connect(_fail)
+            worker.start()
+
+        btn_all.clicked.connect(lambda: _set_all(Qt.CheckState.Checked))
+        btn_none.clicked.connect(lambda: _set_all(Qt.CheckState.Unchecked))
+        btn_remove.clicked.connect(_remove)
+        btn_close.clicked.connect(dlg.reject)
+        dlg.exec()
+        dlg.deleteLater()
+
+    def _err(err: str) -> None:
+        win.btn_uninstall_runtimes.setEnabled(True)
+        win.status_label.setText(tr("status.ready"))
+        if not win._closing_pending:
+            QMessageBox.critical(_dialog_parent(win), __app_name__, tr("runtime.error", err=err))
+
+    loader.finished_ok.connect(_show)
+    loader.failed.connect(_err)
+    loader.start()

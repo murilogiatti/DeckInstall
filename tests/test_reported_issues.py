@@ -468,6 +468,30 @@ class LibraryColumnsFilterAndLogsTests(unittest.TestCase):
                     ]
                     self.assertEqual(visible_names, ["Lutris Game"])
 
+                    # The Steam shortcut of the DeckInstall game and a Lutris entry adopted into it:
+                    # still one row each (the game, marked as also in Steam).
+                    win._on_library_source_filter_changed("all")
+                    owned_sc = ShortcutEntry(
+                        index="1", appid_u32=3000000002, app_name="Standalone Game",
+                        exe=f'"{sa.exe_path}"', start_dir=f'"{sa.game_dir}"', icon="", launch_options="",
+                    )
+                    adopted_ext = ExternalLauncherGame(
+                        source="lutris", name="Standalone Game", exe_path=sa.game_dir / "bin" / "sa.exe",
+                        game_dir=sa.game_dir, prefix_dir=None, runner="wine",
+                    )
+                    win._apply_shortcuts_data(
+                        None, [sc, owned_sc], [sa], [ext, adopted_ext], "", runner_labels=runner_labels
+                    )
+                    win.shortcuts_list.setSortingEnabled(False)
+                    rows = {
+                        win.shortcuts_list.item(r, 0).text(): win.shortcuts_list.item(r, 1).text()
+                        for r in range(win.shortcuts_list.rowCount())
+                    }
+                    self.assertEqual(win.shortcuts_list.rowCount(), 3)
+                    from deckinstall.i18n import tr
+
+                    self.assertEqual(rows["Standalone Game"], tr("library.tag_standalone_steam"))
+
                     win._on_library_source_filter_changed("all")
                     self.assertEqual(
                         sum(

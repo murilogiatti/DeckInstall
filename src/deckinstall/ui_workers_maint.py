@@ -84,6 +84,16 @@ class MaintHealthWorker(QThread):
         else:
             rt4_status = tr("maint.status_corrupted")
 
+        from .runtime_manager import _load_versions, official_mangohud_installed, system_mangohud_installed
+
+        if official_mangohud_installed():
+            mh_ver = str(_load_versions().get("mangohud_installed_version") or "")
+            mangohud_status = f"{tr('maint.status_ok')} ({mh_ver})" if mh_ver else tr("maint.status_ok")
+        elif system_mangohud_installed():
+            mangohud_status = tr("maint.mangohud_system")
+        else:
+            mangohud_status = tr("maint.status_missing")
+
         prefix_dirs: list[Path] = []
         if self._paths is not None and self._paths.compatdata_dir.is_dir():
             prefix_dirs.append(self._paths.compatdata_dir)
@@ -117,6 +127,7 @@ class MaintHealthWorker(QThread):
                 "umu_status": umu_status,
                 "proton_status": proton_status,
                 "rt4_status": rt4_status,
+                "mangohud_status": mangohud_status,
                 "prefixes_bytes": prefixes_bytes,
                 "runtimes_bytes": runtimes_bytes,
                 "caches_bytes": self._cached_bytes,

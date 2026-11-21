@@ -40,9 +40,11 @@ from .runtime_manager import (
     check_runtime_updates,
     check_ubuntu_bwrap_userns,
     ensure_ge_proton11,
+    ensure_mangohud,
     ensure_optiscaler,
     ensure_umu_run,
     get_optiscaler_dir,
+    mangohud_versions,
     run_exe_in_prefix,
     run_winetricks_verbs,
 )
@@ -408,7 +410,7 @@ class AddToSteamWorker(QThread):
 
 
 class RuntimeUpdateWorker(QThread):
-    """Background worker to check and update umu-run and GE-Proton11+ runtimes."""
+    """Background worker to check and update umu-run, GE-Proton11+, OptiScaler and the official MangoHud."""
 
     status = Signal(str)
     finished_ok = Signal(str, str)
@@ -439,6 +441,21 @@ class RuntimeUpdateWorker(QThread):
         if removed:
             msg = f"{msg} | {tr('runtime.ge_pruned', names=', '.join(p.name for p in removed))}"
         return msg
+
+    def _update_mangohud(self) -> str:
+        """Official MangoHud: installed when missing (as on SteamOS, it is always there), updated when
+        GitHub has a newer one. "+" in front when something changed; a failure never stops the rest."""
+        try:
+            if not _rm.official_mangohud_installed() and _rm.system_mangohud_installed():
+                return tr("maint.mangohud_system")
+            installed, latest = mangohud_versions()
+            if installed and (not latest or installed == latest):
+                return f"MangoHud {installed}"
+            ensure_mangohud(force_update=bool(installed), progress_cb=lambda msg, _pct: self.status.emit(msg))
+            return "+MangoHud " + (str(_load_versions().get("mangohud_installed_version") or latest or ""))
+        except Exception as exc:
+            logging.warning("MangoHud update failed: %s", exc)
+            return tr("runtime.mangohud_failed", err=str(exc))
 
     def run(self) -> None:
         try:
@@ -489,6 +506,11 @@ class RuntimeUpdateWorker(QThread):
                 if opti_ver and opti_ver != old_opti_ver:
                     any_updated = True
 
+            mh_msg = self._update_mangohud()
+            if mh_msg.startswith("+"):
+                any_updated = True
+                mh_msg = mh_msg[1:]
+
             self.status.emit(tr("runtime.umu_db_updating"))
             if _rm.ensure_umu_database(force_update=True) is None:
                 logging.warning("umu-database.csv could not be downloaded")
@@ -500,6 +522,8 @@ class RuntimeUpdateWorker(QThread):
             )
             if opti_ver:
                 msg = f"{msg} | OptiScaler {opti_ver}"
+            if mh_msg:
+                msg = f"{msg} | {mh_msg}"
             if policy_msg:
                 msg = f"{msg} | {policy_msg}"
             self.finished_ok.emit(msg, bwrap_warn)

@@ -1,4 +1,4 @@
-"""Migrate schema-v1 games (~/Games layout) into the internal library, with a journal to undo it.
+"""Migrate schema-v1 games (~/Games layout) into the internal library, with a journal for rollback.
 
 For each v1 game the migration:
   1. snapshots the prefix saves (ZIP, see save_sync.auto_snapshot);
@@ -6,9 +6,8 @@ For each v1 game the migration:
      into ~/DeckInstall/{Games,Prefixes/<id>,Caches/<id>};
   3. rewrites launch.sh and the .desktop launchers, writes the v2 manifest and registers the game.
 
-Every step is written to a journal before it runs. A failure undoes that game at once, and
-undo_migration() puts every migrated game back as it was (files moved back, original
-launch.sh/.desktop/manifest restored). Games referenced by a Steam shortcut are skipped,
+Every step is written to a journal before it runs. A failure undoes that game at once (files
+moved back, original launch.sh/.desktop/manifest restored). Games referenced by a Steam shortcut are skipped,
 because moving them would break the shortcut.
 """
 
@@ -399,48 +398,3 @@ def migrate_legacy_games(
             result.failed.append((item.game.name, msg))
     journal.save()
     return result
-
-
-def list_journals() -> list[Path]:
-    """Return migration journals, newest first."""
-    folder = journal_dir()
-    if not folder.is_dir():
-        return []
-    return sorted(folder.glob("*.json"), reverse=True)
-
-
-def latest_undoable_journal() -> Path | None:
-    """Return the newest journal that still has migrated games to undo."""
-    for path in list_journals():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not data.get("undone") and any(g.get("status") == "done" for g in data.get("games") or []):
-            return path
-    return None
-
-
-def undo_migration(journal_path: Path) -> tuple[list[str], list[str]]:
-    """Put back every game migrated by journal_path. Returns (restored names, problems)."""
-    data = json.loads(journal_path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or data.get("schema") != JOURNAL_SCHEMA:
-        raise ValueError(f"Unsupported migration journal: {journal_path}")
-    journal = _Journal(journal_path, data)
-    restored: list[str] = []
-    problems: list[str] = []
-    for entry in reversed(data.get("games") or []):
-        if entry.get("status") != "done":
-            continue
-        issues = _undo_entry(entry)
-        entry["status"] = "undone" if not issues else "undo_incomplete"
-        entry["problems"] = issues
-        if issues:
-            problems.extend(f"{entry.get('name')}: {p}" for p in issues)
-        else:
-            restored.append(str(entry.get("name")))
-        journal.save()
-    data["undone"] = True
-    data["undone_at"] = now_iso()
-    journal.save()
-    return restored, problems

@@ -209,26 +209,27 @@ def _backup_file(path: Path, keep: int = 5, backup_dir: Path | None = None) -> P
     return backup
 
 
-def load_shortcuts(shortcuts_vdf: Path) -> list[ShortcutEntry]:
+def load_shortcuts(shortcuts_vdf: Path, *, strict: bool = False) -> list[ShortcutEntry]:
     """Read all Non-Steam shortcuts from shortcuts.vdf."""
-    if not shortcuts_vdf.is_file():
-        return []
     try:
         raw = shortcuts_vdf.read_bytes()
-        if not raw:
+        if not raw and not strict:
             return []
         data = vdf.binary_loads(raw)
+        if not isinstance(data.get("shortcuts"), dict):
+            raise ValueError("Invalid shortcuts.vdf structure")
+    except FileNotFoundError:
+        return []
     except Exception as exc:
+        if strict:
+            raise ValueError(f"Could not read {shortcuts_vdf}: {exc}") from exc
         logging.warning("Failed to parse %s: %s", shortcuts_vdf, exc)
         return []
-    if not isinstance(data, dict):
-        return []
-    shortcuts = data.get("shortcuts", {})
-    if not isinstance(shortcuts, dict):
-        return []
     entries: list[ShortcutEntry] = []
-    for idx, item in shortcuts.items():
+    for idx, item in data["shortcuts"].items():
         if not isinstance(item, dict):
+            if strict:
+                raise ValueError("Invalid shortcut record")
             continue
         app_name = str(item.get("AppName") or item.get("appname") or "")
         exe = str(item.get("Exe") or item.get("exe") or "")
@@ -626,6 +627,38 @@ def update_shortcut_launch_options(
         return True
 
 
+def update_shortcut_paths(
+    paths: SteamPaths, appid_u32: int, exe_path: Path, start_dir: Path, *, expected_exe: str,
+) -> bool:
+    """Point an existing shortcut at a new exe/StartDir keeping its AppID (artwork, compatdata, playtime)."""
+    with _steam_transaction_lock(paths.shortcuts_vdf):
+        if paths.shortcuts_vdf.is_symlink() or not paths.shortcuts_vdf.is_file():
+            return False
+        if not exe_path.is_absolute() or not exe_path.is_file() or not start_dir.is_dir():
+            raise ValueError(f"Shortcut destination unavailable: {exe_path}")
+        data = vdf.binary_loads(paths.shortcuts_vdf.read_bytes())
+        matches = [
+            item for item in data.get("shortcuts", {}).values()
+            if isinstance(item, dict) and _parse_appid_u32(item.get("appid", 0)) == appid_u32
+        ]
+        if len(matches) != 1:
+            return False
+        item = matches[0]
+        exe_key = "Exe" if "Exe" in item else "exe"
+        current = _strip_vdf_quotes(str(item.get(exe_key) or ""))
+        if current == str(exe_path):
+            return True
+        old = Path(current)
+        if current != _strip_vdf_quotes(expected_exe) or not old.is_absolute() or old.exists() or old.is_symlink():
+            raise ValueError(f"Shortcut target changed or is available again: {current}")
+        start_key = "startdir" if "startdir" in item and "StartDir" not in item else "StartDir"
+        item[exe_key] = _quote_path(str(exe_path))
+        item[start_key] = _quote_path(str(start_dir))
+        _backup_file(paths.shortcuts_vdf)
+        _atomic_write_bytes(paths.shortcuts_vdf, vdf.binary_dumps(data))
+        return True
+
+
 def remove_shortcut(paths: SteamPaths, appid_u32: int) -> bool:
     """Remove a Non-Steam shortcut by its unsigned 32-bit AppID."""
     with _steam_transaction_lock(paths.shortcuts_vdf):
@@ -984,6 +1017,25 @@ def remove_compat_tools(config_vdf: Path, appids: list[int]) -> int:
         if removed:
             _dump_vdf_mapping(config_vdf, data)
         return removed
+
+
+def orphan_shortcut_mappings(paths: SteamPaths) -> list[int]:
+    """Find Non-Steam mappings absent from every readable Steam shortcut file."""
+    known: set[int] = set()
+    userdata = paths.steam_root / "userdata"
+    for account in userdata.iterdir():
+        if account.name.isascii() and account.name.isdigit():
+            sv = account / "config" / "shortcuts.vdf"
+            known.update(entry.appid_u32 for entry in load_shortcuts(sv, strict=True))
+    mapping = get_compat_tool_map(paths.config_vdf)
+    return sorted(appid for appid in mapping if appid >= 0x80000000 and appid not in known)
+
+
+def remove_orphan_shortcut_mappings(paths: SteamPaths, appids: list[int]) -> int:
+    """Recheck the list before a confirmed cleanup, including edits queued with Steam open."""
+    with _steam_transaction_lock(paths.config_vdf):
+        still_orphaned = set(orphan_shortcut_mappings(paths))
+        return remove_compat_tools(paths.config_vdf, [appid for appid in appids if appid in still_orphaned])
 
 
 _SUBDIR_NAMES = {

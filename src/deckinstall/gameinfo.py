@@ -309,12 +309,6 @@ class _Tree:
                 continue
         return n
 
-    def first_suffix(self, suffix: str) -> Path | None:
-        for name, p in self.files.items():
-            if name.endswith(suffix):
-                return p
-        return None
-
     def any_suffix(self, *suffixes: str) -> bool:
         return any(name.endswith(suffixes) for name in self.files)
 

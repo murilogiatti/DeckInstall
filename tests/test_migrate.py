@@ -1,4 +1,4 @@
-"""Migration of v1 (~/Games) games into the internal library, and undoing it."""
+"""Migration of v1 (~/Games) games into the internal library (and its rollback on failure)."""
 
 from __future__ import annotations
 
@@ -97,29 +97,6 @@ def test_migrate_moves_everything_and_keeps_saves(tmp_path: Path) -> None:
     assert migrate.plan_migration() == []  # nothing left to migrate
 
 
-def test_undo_restores_the_original_layout(tmp_path: Path) -> None:
-    old = _make_v1_game("Hollow")
-    before = _snapshot(old)
-    result = migrate.migrate_legacy_games()
-    assert result.journal is not None
-    migrated = standalone.list_standalone_games()[0]
-    (migrated.prefix_dir / "drive_c" / "new-after-migration.txt").write_text("played", encoding="utf-8")
-
-    assert migrate.latest_undoable_journal() == result.journal
-    restored, problems = migrate.undo_migration(result.journal)
-
-    assert restored == ["Hollow"] and problems == []
-    assert _snapshot(old) == before
-    assert (old["prefix"] / "drive_c" / "new-after-migration.txt").read_text(encoding="utf-8") == "played"
-    assert (old["cache"] / "dxvk").is_dir()
-    assert not migrated.game_dir.exists() and not migrated.prefix_dir.exists()
-    games = standalone.list_standalone_games()
-    assert [(g.name, g.schema) for g in games] == [("Hollow", 1)]
-    lib_file = library.read_library_file(library.internal_library_root())
-    assert lib_file is not None and lib_file["games"] == []
-    assert migrate.latest_undoable_journal() is None
-
-
 def test_failure_rolls_the_game_back(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     old = _make_v1_game("Hollow")
     before = _snapshot(old)
@@ -143,7 +120,7 @@ def test_kept_in_place_and_nested_games(tmp_path: Path) -> None:
         standalone._load_manifest(outside["game_dir"] / MANIFEST_V1),  # type: ignore[arg-type]
         outside["game_dir"] / MANIFEST_V1,
     )
-    nested = _make_v1_game("Kiborg", game_dir=_legacy() / "KIBORG" / "Kiborg")
+    _make_v1_game("Kiborg", game_dir=_legacy() / "KIBORG" / "Kiborg")
 
     result = migrate.migrate_legacy_games()
 
@@ -156,13 +133,6 @@ def test_kept_in_place_and_nested_games(tmp_path: Path) -> None:
     assert by_name["Kiborg"].game_dir == (library.internal_library_root() / "Games" / "KIBORG" / "Kiborg").resolve()
     assert not (_legacy() / "KIBORG").exists()
 
-    assert result.journal is not None
-    _, problems = migrate.undo_migration(result.journal)
-    assert problems == []
-    assert (nested["game_dir"] / MANIFEST_V1).is_file()
-    assert (outside["game_dir"] / MANIFEST_V1).is_file()
-    assert not (outside["game_dir"] / MANIFEST_V2).exists()
-    assert outside["prefix"].is_dir()
 
 
 def test_games_used_by_steam_shortcuts_are_skipped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -237,11 +207,6 @@ def test_ui_migrate_and_undo_buttons(tmp_path: Path, monkeypatch: pytest.MonkeyP
         _drain()
         assert not old["game_dir"].exists()
         assert [g.schema for g in standalone.list_standalone_games()] == [2]
-
-        win._undo_last_migration()
-        _drain()
-        assert (old["game_dir"] / MANIFEST_V1).is_file()
-        assert [g.schema for g in standalone.list_standalone_games()] == [1]
 
         win._active_workers.clear()
         win.close()

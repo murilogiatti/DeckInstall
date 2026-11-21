@@ -752,7 +752,7 @@ def _rva_to_offset(rva: int, sections: list[tuple[int, int, int, int]]) -> int |
     return None
 
 
-def _parse_rsrc_entries(data: bytes, rsrc_off: int, dir_off: int) -> list[tuple[int, int]]:
+def _parse_rsrc_entries(data: bytes, dir_off: int) -> list[tuple[int, int]]:
     """Return (id_or_name, offset_to_data_or_subdir) entries from a PE resource directory."""
     if dir_off < 0 or dir_off + 16 > len(data):
         return []
@@ -838,16 +838,16 @@ def extract_pe_icon(exe_path: Path, out_ico: Path) -> Path | None:
         rt_icons: dict[int, bytes] = {}
         group_blob: bytes | None = None
 
-        for type_id, type_sub in _parse_rsrc_entries(rsrc_data, rsrc_local_off, rsrc_local_off):
+        for type_id, type_sub in _parse_rsrc_entries(rsrc_data, rsrc_local_off):
             if not (type_sub & 0x80000000):
                 continue
             l2_off = rsrc_local_off + (type_sub & 0x7FFFFFFF)
             if type_id == 3:  # RT_ICON
-                for icon_id, icon_sub in _parse_rsrc_entries(rsrc_data, rsrc_local_off, l2_off):
+                for icon_id, icon_sub in _parse_rsrc_entries(rsrc_data, l2_off):
                     if not (icon_sub & 0x80000000):
                         continue
                     l3_off = rsrc_local_off + (icon_sub & 0x7FFFFFFF)
-                    for _lang, data_entry_rel in _parse_rsrc_entries(rsrc_data, rsrc_local_off, l3_off):
+                    for _lang, data_entry_rel in _parse_rsrc_entries(rsrc_data, l3_off):
                         if data_entry_rel & 0x80000000:
                             continue
                         de_off = rsrc_local_off + data_entry_rel
@@ -860,11 +860,11 @@ def extract_pe_icon(exe_path: Path, out_ico: Path) -> Path | None:
                                     rt_icons[icon_id] = rsrc_data[local_blob_off : local_blob_off + blob_size]
                                     break
             elif type_id == 14 and group_blob is None:  # RT_GROUP_ICON
-                for _grp_id, grp_sub in _parse_rsrc_entries(rsrc_data, rsrc_local_off, l2_off):
+                for _grp_id, grp_sub in _parse_rsrc_entries(rsrc_data, l2_off):
                     if not (grp_sub & 0x80000000):
                         continue
                     l3_off = rsrc_local_off + (grp_sub & 0x7FFFFFFF)
-                    for _lang, data_entry_rel in _parse_rsrc_entries(rsrc_data, rsrc_local_off, l3_off):
+                    for _lang, data_entry_rel in _parse_rsrc_entries(rsrc_data, l3_off):
                         if data_entry_rel & 0x80000000:
                             continue
                         de_off = rsrc_local_off + data_entry_rel
@@ -1581,6 +1581,91 @@ def _load_manifest(manifest_path: Path) -> StandaloneGame | None:
     except Exception as exc:
         logging.warning("Failed to load standalone manifest %s: %s", manifest_path, exc)
         return None
+
+
+def owned_shortcut_appids(game: StandaloneGame) -> set[int]:
+    """Steam shortcut AppIDs that belong to this game: added to Steam by DeckInstall, or the
+    shortcut it was adopted from (kept in Steam, now running the same prefix)."""
+    out: set[int] = set()
+    source = game.meta.get("source") or {}
+    candidates = [(game.meta.get("steam") or {}).get("shortcut_appid")]
+    if source.get("origin") == "steam":
+        candidates.append(source.get("shortcut_appid"))
+    for raw in candidates:
+        try:
+            if raw is not None and int(raw) > 0:
+                out.add(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def match_owned_shortcuts(
+    entries: list[ShortcutEntry], games: list[StandaloneGame], user_id: str | None = None,
+) -> dict[int, StandaloneGame]:
+    """Associate shortcuts with a unique game using current paths, AppIDs or adoption paths."""
+    by_path: dict[Path, list[StandaloneGame]] = {}
+    by_appid: dict[int, list[StandaloneGame]] = {}
+    for g in games:
+        paths = {g.exe_path, g.launch_script}
+        source = g.meta.get("source") or {}
+        original = source.get("original_game_dir")
+        if source.get("kind") == "adopted" and isinstance(original, str):
+            try:
+                paths.add(decode_path(original, None) / g.exe_path.relative_to(g.game_dir))
+            except ValueError:
+                pass
+        for path in paths:
+            if path:
+                by_path.setdefault(Path(os.path.normpath(path)), []).append(g)
+        account = (g.meta.get("steam") or {}).get("user_id")
+        if not account or user_id is None or str(account) == user_id:
+            for appid in owned_shortcut_appids(g):
+                by_appid.setdefault(appid, []).append(g)
+    owned: dict[int, StandaloneGame] = {}
+    for entry in entries:
+        exe = Path(os.path.normpath(_strip_vdf_quotes(entry.exe)))
+        if not exe.is_absolute():
+            continue
+        candidates = {
+            g.game_dir: g for g in [*by_path.get(exe, ()), *by_appid.get(entry.appid_u32, ())]
+        }
+        if len(candidates) == 1:
+            owned[entry.appid_u32] = next(iter(candidates.values()))
+    return owned
+
+
+def shortcut_path_repairs(
+    entries: list[ShortcutEntry], games: list[StandaloneGame], user_id: str | None = None,
+) -> list[tuple[ShortcutEntry, StandaloneGame]]:
+    """Owned shortcuts whose exe no longer exists (the game was adopted/moved with Steam open):
+    they should run the game's exe from its new folder, keeping their AppID."""
+    owned = match_owned_shortcuts(entries, games, user_id)
+    out: list[tuple[ShortcutEntry, StandaloneGame]] = []
+    for entry in entries:
+        game = owned.get(entry.appid_u32)
+        if game is None or not game.exe_path.is_file():
+            continue
+        exe = Path(_strip_vdf_quotes(entry.exe))
+        if not exe.exists() and not exe.is_symlink():
+            out.append((entry, game))
+    return out
+
+
+def repaired_shortcut_start_dir(entry: ShortcutEntry, game: StandaloneGame) -> Path:
+    """Keep the original working directory's relative location when the game moved."""
+    original = (game.meta.get("source") or {}).get("original_game_dir")
+    if isinstance(original, str):
+        try:
+            root = decode_path(original, None)
+            start = Path(_strip_vdf_quotes(entry.start_dir))
+            relative = Path(os.path.normpath(start)).relative_to(root)
+            mapped = game.game_dir / relative
+            if mapped.is_dir() and is_within(mapped, game.game_dir):
+                return mapped
+        except ValueError:
+            pass
+    return game.exe_path.parent
 
 
 def list_standalone_games(games_dir: Path | None = None) -> list[StandaloneGame]:
