@@ -804,7 +804,10 @@ def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
                                 QMessageBox.information(
                                     _dialog_parent(win),
                                     __app_name__,
-                                    tr("runtime.uninstall_steam_cleaned", count=int(cnt or 0)),
+                                    tr(
+                                        "runtime.uninstall_steam_cleaned",
+                                        count=cnt if isinstance(cnt, int) else 0,
+                                    ),
                                 )
 
                         def _clean_err(cerr: str) -> None:

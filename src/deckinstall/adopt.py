@@ -704,15 +704,14 @@ def _merge_steam_into_candidate(primary: AdoptionCandidate, steam_cand: Adoption
     if steam_pfx is None or primary.native_linux:
         return
     prim_pfx = primary.prefix_dir
-    prim_valid = _is_real_dir(prim_pfx) and _has_drive_c(prim_pfx)
+    prim_valid = prim_pfx is not None and _is_real_dir(prim_pfx) and _has_drive_c(prim_pfx)
     steam_valid = _is_real_dir(steam_pfx) and _has_drive_c(steam_pfx)
-    if not prim_valid:
-        if _is_real_dir(prim_pfx) and _resolved(prim_pfx) != _resolved(steam_pfx):
+    if prim_pfx is None or not prim_valid:
+        if prim_pfx is not None and _is_real_dir(prim_pfx) and _resolved(prim_pfx) != _resolved(steam_pfx):
             primary.extra_save_prefixes = (*primary.extra_save_prefixes, prim_pfx)
         primary.prefix_dir = steam_pfx
     elif steam_valid and _resolved(steam_pfx) != _resolved(prim_pfx):
         if _prefix_save_score(steam_pfx) > _prefix_save_score(prim_pfx):
-            assert prim_pfx is not None
             primary.extra_save_prefixes = (*primary.extra_save_prefixes, prim_pfx)
             primary.prefix_dir = steam_pfx
         else:
