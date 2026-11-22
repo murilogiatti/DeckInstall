@@ -25,9 +25,9 @@ from typing import Any
 from . import library as _lib
 from . import standalone as _sa
 from .adopt import SnapshotFn, _default_snapshot, _move_back, _move_tree
-from .fsutil import atomic_write_text, is_within
+from .fsutil import atomic_write_text, is_within, symlink_points_to
 from .library import Library, find_library_root
-from .manifest import decode_path, find_manifest
+from .manifest import decode_path, encode_path, find_manifest
 from .migrate import _unique_dir
 from .standalone import StandaloneGame
 from .steam_paths import dir_size_bytes
@@ -212,15 +212,7 @@ def _restore_files(saved: dict[Path, str | None]) -> Callable[[], None]:
 
 def _repoint_compat_link(link: Path, old_prefix: Path, new_prefix: Path) -> bool:
     """Retarget Steam's compatdata symlink from old_prefix to new_prefix. False if it is not ours."""
-    if not link.is_symlink():
-        return False
-    try:
-        current = Path(os.readlink(link))
-        if not current.is_absolute():
-            current = link.parent / current
-    except OSError:
-        return False
-    if os.path.abspath(current) != os.path.abspath(old_prefix):
+    if not symlink_points_to(link, old_prefix):
         return False
     tmp = link.with_name(f".{link.name}.deckinstall.tmp")
     tmp.unlink(missing_ok=True)
@@ -312,6 +304,18 @@ def relocate_game(
             return new_dir / p.relative_to(old_dir) if is_within(p, old_dir) else p
 
         meta: dict[str, Any] = dict(game.meta)
+        source_meta = dict(meta.get("source") or {}) if isinstance(meta.get("source"), dict) else {}
+        prev_raw = source_meta.get("previous_game_dirs")
+        prev_dirs = [str(p) for p in prev_raw] if isinstance(prev_raw, list) else []
+        encoded_old = encode_path(old_dir, None)
+        if encoded_old not in prev_dirs:
+            prev_dirs.append(encoded_old)
+        source_meta["previous_game_dirs"] = prev_dirs
+        meta["source"] = source_meta
+        if plan.new_prefix_dir is not None:
+            meta["prefix_location"] = "library"
+        elif W_PREFIX_STAYS in plan.warnings:
+            meta["prefix_location"] = "internal"
         if meta.get("icons"):
             meta["icons"] = [rebase(Path(p)) for p in meta["icons"]]
         if meta.get("launch_script_backup"):

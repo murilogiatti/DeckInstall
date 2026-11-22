@@ -14,8 +14,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import library as _lib
+from . import save_sync
 from . import standalone as _sa
-from .fsutil import is_within, prune_empty_parents, remove_path_or_tree
+from .fsutil import is_within, prune_empty_parents, remove_path_or_tree, symlink_points_to
 from .library import find_library_root
 from .manifest import decode_path
 from .standalone import (
@@ -129,15 +130,7 @@ def _decoded(raw: object) -> Path | None:
 def _steam_link(game: StandaloneGame) -> Path | None:
     """The recorded compatdata link, only while it still points at this game's prefix."""
     link = _decoded((game.meta.get("steam") or {}).get("compatdata_link"))
-    if link is None or not link.is_symlink():
-        return None
-    try:
-        target = Path(os.readlink(link))
-        if not target.is_absolute():
-            target = link.parent / target
-        if os.path.abspath(target) != os.path.abspath(game.prefix_dir):
-            return None
-    except OSError:
+    if link is None or not symlink_points_to(link, game.prefix_dir):
         return None
     return link
 
@@ -273,9 +266,10 @@ def execute_uninstall(
             result.skipped.append(item.id)
 
     prefix_item = plan.item(PREFIX)
-    if prefix_item is not None and PREFIX in chosen and SAVES in chosen and snapshot_fn is not None:
+    if prefix_item is not None and PREFIX in chosen and SAVES in chosen:
+        snap = snapshot_fn or save_sync.auto_snapshot
         try:
-            result.snapshot = snapshot_fn(game.prefix_dir, game.name, "remove-game", "remove")
+            result.snapshot = snap(game.prefix_dir, game.name, "remove-game", "remove")
             result.removed.append(SAVES)
         except Exception as exc:
             # No snapshot, no prefix deletion: the saves live there.
@@ -328,7 +322,7 @@ def execute_uninstall(
             done(prefix_item, False)
         else:
             _unlink_steam_compatdata(game)
-            _safe_remove_prefix_dir(game.prefix_dir)
+            _safe_remove_prefix_dir(game.prefix_dir, game.game_dir)
             prefix_removed = _gone([game.prefix_dir])
             done(prefix_item, prefix_removed)
 
@@ -348,7 +342,7 @@ def execute_uninstall(
 
     cache_item = plan.item(CACHE)
     if cache_item is not None and CACHE in chosen:
-        _safe_remove_cache_dir(game.cache_dir)
+        _safe_remove_cache_dir(game.cache_dir, game.game_dir)
         done(cache_item, _gone(cache_item.paths))
 
     logs_item = plan.item(LOGS)

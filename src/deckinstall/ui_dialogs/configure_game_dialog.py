@@ -354,6 +354,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                             "expected_exe": obj.exe,
                             "user_id": win.paths.user_id,
                             "steam_root": str(win.paths.steam_root),
+                            "allow_existing_old": True,
                         },
                     )
                 )

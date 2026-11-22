@@ -653,6 +653,8 @@
   "adopt.prefix_none": "Jogo nativo de Linux: sem prefixo.",
   "adopt.plan_prefix_at": "Novo prefixo: {path}",
   "adopt.plan_proton": "Proton: {name}",
+  "adopt.plan_steam_add": "Atalho na Steam: será adicionado após adotar",
+  "adopt.plan_steam_update": "Atalho na Steam: mantém o AppID atual e aponta para a nova pasta",
   "adopt.plan_copy": "A copiar entre discos: {size}",
   "adopt.plan_free": "Espaço livre em {path}: {size}",
   "adopt.mark_planning": "planejando",

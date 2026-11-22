@@ -12,7 +12,7 @@ from .. import relocate as rl
 from ..i18n import tr
 from ..library import Library
 from ..standalone import StandaloneGame
-from ..ui_cards import _dialog_parent, format_size_bytes
+from ..ui_cards import _dialog_parent, _is_wine_game_running, format_size_bytes
 from ..ui_workers import SteamOpWorker
 
 if TYPE_CHECKING:
@@ -63,6 +63,9 @@ def plan_summary(plan: rl.RelocatePlan) -> str:
 def move_game_to_disk(win: MainWindow, sa: StandaloneGame) -> None:
     """Choose a target library, plan in the background, confirm, then move in the background."""
     if win._steam_busy:
+        return
+    if _is_wine_game_running():
+        QMessageBox.warning(_dialog_parent(win), __app_name__, tr("cleanup.wine_running"))
         return
 
     def _fail(err: str) -> None:
@@ -116,6 +119,9 @@ def move_game_to_disk(win: MainWindow, sa: StandaloneGame) -> None:
         planner.start()
 
     def _run(plan: rl.RelocatePlan) -> None:
+        if _is_wine_game_running():
+            QMessageBox.warning(_dialog_parent(win), __app_name__, tr("cleanup.wine_running"))
+            return
         win._begin_busy()
         win.status_label.setText(tr("relocate.running", name=sa.name))
         snap = win._make_pre_snapshot_fn(force=True)

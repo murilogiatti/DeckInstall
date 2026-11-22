@@ -57,7 +57,7 @@ from .standalone import (
     shortcut_game_dir,
     shortcut_launch_options,
 )
-from .steam_paths import SteamPaths, dir_size_bytes
+from .steam_paths import SteamPaths, dir_size_bytes, is_gamescope_session, is_steam_running
 from .steam_vdf import (
     _PREFIX_REL_DIRS,
     _strip_vdf_quotes,
@@ -153,6 +153,8 @@ class AdoptionCandidate:
     prefix_shared: bool = False
     saves_hints: list[Path] = field(default_factory=list)  # folders in the prefix holding saves
     warnings: list[str] = field(default_factory=list)
+    extra_save_prefixes: tuple[Path, ...] = ()
+    steam_compat_dir: Path | None = None
 
     @property
     def key(self) -> str:
@@ -222,6 +224,9 @@ class AdoptionResult:
     removed_from_steam: bool = False
     warnings: list[str] = field(default_factory=list)
     add_to_steam: bool = False
+    shortcut_needs_repoint: bool = False
+    shortcut_appid: int | None = None
+    remove_shortcut_deferred: bool = False
 
 
 class AdoptionError(RuntimeError):
@@ -444,7 +449,16 @@ def _scan_hydra(home: Path) -> list[AdoptionCandidate]:
             if prefix is None:
                 prefix = next((p for p in prefixes if is_within(exe, p, strict=True)), None)
             if prefix is None and object_id:
-                prefix = next((p for p in prefixes if object_id in p.name), None)
+                prefix = next(
+                    (
+                        p
+                        for p in prefixes
+                        if p.name == object_id
+                        or p.name.endswith(f"-{object_id}")
+                        or p.name.startswith(f"{object_id}-")
+                    ),
+                    None,
+                )
             if prefix is not None:
                 used_prefixes.add(_resolved(prefix))
             appid = int(object_id) if shop == "steam" and object_id.isdigit() else None
@@ -621,6 +635,8 @@ def _finish(c: AdoptionCandidate, prefix_users: dict[Path, int], managed_prefixe
     if c.exe is not None and not c.native_linux and c.runner == "linux":
         c.native_linux = True
     if c.prefix_dir is not None and not c.native_linux:
+        if W_STEAM_OTHER_USERS in c.warnings:
+            c.prefix_shared = True
         key = _resolved(c.prefix_dir)
         if (
             prefix_users.get(key, 0) > 1
@@ -642,6 +658,80 @@ def _finish(c: AdoptionCandidate, prefix_users: dict[Path, int], managed_prefixe
         c.game_id = str(c.steam_appid)
 
 
+def _prefix_save_score(prefix: Path | None) -> tuple[int, float, int]:
+    """Return (has_hints, newest_mtime, save_file_count) for saves inside a Wine prefix."""
+    hints = _saves_hints(prefix)
+    if not hints:
+        return (0, 0.0, 0)
+    count = 0
+    newest_mtime = 0.0
+    for hint in hints:
+        try:
+            for root_s, _dirs, files_s in os.walk(hint, followlinks=False):
+                for fname in files_s:
+                    fp = Path(root_s) / fname
+                    if fp.is_symlink():
+                        continue
+                    try:
+                        st = fp.stat()
+                    except OSError:
+                        continue
+                    count += 1
+                    if st.st_mtime > newest_mtime:
+                        newest_mtime = st.st_mtime
+        except OSError:
+            continue
+    return (1, newest_mtime, count)
+
+
+def _merge_steam_into_candidate(primary: AdoptionCandidate, steam_cand: AdoptionCandidate) -> None:
+    """Attach a matching Steam shortcut onto a Heroic/Lutris/Bottles/Hydra candidate."""
+    if primary.shortcut_appid is None and steam_cand.shortcut_appid is not None:
+        primary.shortcut_appid = steam_cand.shortcut_appid
+        primary.steam_compat_dir = steam_cand.prefix_dir
+    if not primary.launch_options and steam_cand.launch_options:
+        primary.launch_options = steam_cand.launch_options
+    if not primary.winedlloverrides and steam_cand.winedlloverrides:
+        primary.winedlloverrides = steam_cand.winedlloverrides
+    if primary.icon is None and steam_cand.icon is not None:
+        primary.icon = steam_cand.icon
+    if not primary.runtime and steam_cand.runtime:
+        primary.runtime = steam_cand.runtime
+    if W_STEAM_OTHER_USERS in steam_cand.warnings:
+        _add(primary.warnings, W_STEAM_OTHER_USERS)
+
+    steam_pfx = steam_cand.prefix_dir
+    if steam_pfx is None or primary.native_linux:
+        return
+    prim_pfx = primary.prefix_dir
+    prim_valid = _is_real_dir(prim_pfx) and _has_drive_c(prim_pfx)
+    steam_valid = _is_real_dir(steam_pfx) and _has_drive_c(steam_pfx)
+    if not prim_valid:
+        if _is_real_dir(prim_pfx) and _resolved(prim_pfx) != _resolved(steam_pfx):
+            primary.extra_save_prefixes = (*primary.extra_save_prefixes, prim_pfx)
+        primary.prefix_dir = steam_pfx
+    elif steam_valid and _resolved(steam_pfx) != _resolved(prim_pfx):
+        if _prefix_save_score(steam_pfx) > _prefix_save_score(prim_pfx):
+            assert prim_pfx is not None
+            primary.extra_save_prefixes = (*primary.extra_save_prefixes, prim_pfx)
+            primary.prefix_dir = steam_pfx
+        else:
+            primary.extra_save_prefixes = (*primary.extra_save_prefixes, steam_pfx)
+
+
+def _candidate_game_dir(c: AdoptionCandidate) -> Path | None:
+    if c.game_dir is not None:
+        return c.game_dir
+    if c.exe is None:
+        return None
+    from .steam_vdf import infer_game_root_from_exe
+
+    try:
+        return infer_game_root_from_exe(c.exe)
+    except ValueError:
+        return c.exe.parent
+
+
 def find_adoption_candidates(
     *,
     home: Path | None = None,
@@ -650,8 +740,8 @@ def find_adoption_candidates(
 ) -> list[AdoptionCandidate]:
     """Read-only scan of every supported source. Steam shortcuts need paths (current user).
 
-    Games DeckInstall already manages are left out; the same exe found by two sources is
-    listed once (Heroic, Lutris, Bottles, Hydra, Steam, umu, in that order of preference).
+    Games DeckInstall already manages are left out; the same exe/folder found by another
+    source and Steam merges the Steam shortcut into the primary candidate without duplicating it.
     """
     home_dir = home or Path.home()
     wanted = set(kinds or ALL_KINDS)
@@ -681,16 +771,26 @@ def find_adoption_candidates(
         found = [c for c in found if c.kind != UMU] + steam + umu
 
     out: list[AdoptionCandidate] = []
-    seen_exes: set[Path] = set()
+    by_exe: dict[Path, AdoptionCandidate] = {}
+    by_game_dir: dict[Path, AdoptionCandidate] = {}
     seen_prefixes: set[Path] = set()
     for c in found:
+        gdir = _candidate_game_dir(c)
+        existing: AdoptionCandidate | None = None
         if c.exe is not None:
-            key = _resolved(c.exe)
-            if key in seen_exes:
-                continue
-            seen_exes.add(key)
-            if c.prefix_dir is not None:
-                seen_prefixes.add(_resolved(c.prefix_dir))
+            existing = by_exe.get(_resolved(c.exe))
+        if existing is None and gdir is not None and not c.in_drive_c:
+            existing = by_game_dir.get(_resolved(gdir))
+        if existing is not None:
+            if c.kind == STEAM and existing.kind != STEAM:
+                _merge_steam_into_candidate(existing, c)
+            continue
+        if c.exe is not None:
+            by_exe[_resolved(c.exe)] = c
+        if gdir is not None and not c.in_drive_c:
+            by_game_dir[_resolved(gdir)] = c
+        if (c.kind != UMU or c.exe is not None) and c.prefix_dir is not None:
+            seen_prefixes.add(_resolved(c.prefix_dir))
         out.append(c)
     # A umu prefix without a recognized game is dropped when another source owns it.
     out = [c for c in out if c.exe is not None or c.prefix_dir is None or _resolved(c.prefix_dir) not in seen_prefixes]
@@ -816,7 +916,11 @@ def plan_adoption(
     try:
         exe_dst = game_dst / exe.relative_to(game_src) if move_game else exe
     except ValueError:
-        exe_dst = exe
+        try:
+            exe_dst = game_dst / _resolved(exe).relative_to(_resolved(game_src)) if move_game else exe
+        except ValueError:
+            exe_dst = exe
+            _add(blockers, B_EXE_OUTSIDE_GAME_DIR)
 
     src_prefix = c.prefix_dir
     prefix_layout = ""
@@ -865,10 +969,9 @@ def plan_adoption(
         if free[probe] < int(bytes_needed * 1.05):
             _add(blockers, B_NO_SPACE)
 
-    if c.kind == STEAM:
-        if move_game and not opts.remove_from_steam:
-            _add(warnings, W_STEAM_SHORTCUT_BREAKS)
-    elif c.kind != FOLDER and (move_game or prefix_action == "move"):
+    if c.shortcut_appid is not None and move_game and not opts.remove_from_steam:
+        _add(warnings, W_STEAM_SHORTCUT_BREAKS)
+    if c.kind not in (STEAM, FOLDER) and (move_game or prefix_action == "move"):
         _add(warnings, W_LAUNCHER_ENTRY_BREAKS)
 
     if opts.proton_name is not None:
@@ -1087,6 +1190,7 @@ def adopt(
         launch_sh = plan.game_dir / "launch.sh"
         original_launch = _read_bytes(launch_sh)
         prefix_existed = plan.prefix_dir is not None and plan.prefix_dir.exists()
+        cache_existed = (lib.caches_dir / plan.uid).exists()
         game = install_standalone_game(
             game_name=plan.name,
             exe_path=plan.exe,
@@ -1106,7 +1210,7 @@ def adopt(
         )
 
         def undo_install(g: StandaloneGame = game) -> None:
-            remove_standalone_game(g, delete_files=False, delete_prefix=False, delete_cache=False)
+            remove_standalone_game(g, delete_files=False, delete_prefix=False, delete_cache=not cache_existed)
             for icon in g.meta.get("icons") or []:
                 p = Path(icon)
                 if is_within(p, g.game_dir, strict=True):
@@ -1126,53 +1230,84 @@ def adopt(
         if plan.prefix_dir is not None and game.prefix_dir != plan.prefix_dir:
             raise RuntimeError(f"Unexpected prefix {game.prefix_dir} (planned {plan.prefix_dir})")
 
-        # 5. Saves from a prefix that stays where it is.
+        # 5. Saves from prefixes that stay where they are (including secondary merged prefixes).
         saves_copied = 0
+        seen_save_srcs: set[Path] = set()
         if plan.prefix_action == "copy_saves" and src_prefix is not None:
             progress(STEP_SAVES)
-            saves_copied = import_prefix_saves(src_prefix, game.prefix_dir, game.name)
+            seen_save_srcs.add(_resolved(src_prefix))
+            saves_copied += import_prefix_saves(src_prefix, game.prefix_dir, game.name)
+        if not plan.native_linux and game.prefix_dir is not None:
+            for extra_pfx in c.extra_save_prefixes:
+                if not _is_real_dir(extra_pfx) or not _has_drive_c(extra_pfx):
+                    continue
+                res_extra = _resolved(extra_pfx)
+                if res_extra in seen_save_srcs or res_extra == _resolved(game.prefix_dir):
+                    continue
+                seen_save_srcs.add(res_extra)
+                progress(STEP_SAVES)
+                saves_copied += import_prefix_saves(extra_pfx, game.prefix_dir, game.name)
 
         # 6. Steam: keep the shortcut on the same prefix, or remove it (last step, never undone).
         steam_link: Path | None = None
         removed = False
-        if c.kind == STEAM and c.shortcut_appid is not None and paths is not None:
+        remove_deferred = False
+        shortcut_needs_repoint = (
+            c.shortcut_appid is not None
+            and not opts.remove_from_steam
+            and (game_move is not None or plan.exe != c.exe)
+        )
+        if c.shortcut_appid is not None and paths is not None:
             progress(STEP_STEAM)
-            if (
-                not opts.remove_from_steam
-                and opts.link_steam_compatdata
-                and plan.prefix_action == "move"
-                and not plan.native_linux
-            ):
-                compat = paths.compatdata_dir / str(c.shortcut_appid)
-                pfx_link = game.prefix_dir / "pfx"
-                had_pfx = pfx_link.exists() or pfx_link.is_symlink()
-                backup = link_compatdata_to_prefix(compat, game.prefix_dir)
+            if not opts.remove_from_steam:
+                if (
+                    opts.link_steam_compatdata
+                    and plan.prefix_action in ("move", "copy_saves", "new")
+                    and not c.prefix_shared
+                    and not plan.native_linux
+                ):
+                    compat = paths.compatdata_dir / str(c.shortcut_appid)
+                    pfx_link = game.prefix_dir / "pfx"
+                    had_pfx = pfx_link.exists() or pfx_link.is_symlink()
+                    backup = link_compatdata_to_prefix(compat, game.prefix_dir)
 
-                def undo_link() -> None:
-                    if compat.is_symlink():
-                        compat.unlink()
-                    if not had_pfx and pfx_link.is_symlink():
-                        pfx_link.unlink()
-                    if backup is not None and not compat.exists() and backup.is_dir():
-                        os.replace(backup, compat)
+                    def undo_link() -> None:
+                        if compat.is_symlink():
+                            compat.unlink()
+                        if not had_pfx and pfx_link.is_symlink():
+                            pfx_link.unlink()
+                        if backup is not None and not compat.exists() and backup.is_dir():
+                            os.replace(backup, compat)
 
-                undo.push(f"unlink {compat}", undo_link)
-                steam_meta: dict[str, Any] = {
-                    "user_id": paths.user_id,
-                    "shortcut_appid": c.shortcut_appid,
-                    "compatdata_link": encode_path(compat, None),
-                }
-                if plan.proton_name:
-                    steam_meta["compat_tool"] = plan.proton_name
-                if backup is not None:
-                    steam_meta["compatdata_backup"] = encode_path(backup, None)
-                game.meta["steam"] = steam_meta
-                _write_manifest(game)
-                steam_link = compat
+                    undo.push(f"unlink {compat}", undo_link)
+                    steam_meta: dict[str, Any] = {
+                        "user_id": paths.user_id,
+                        "shortcut_appid": c.shortcut_appid,
+                        "compatdata_link": encode_path(compat, None),
+                    }
+                    if plan.proton_name:
+                        steam_meta["compat_tool"] = plan.proton_name
+                    if backup is not None:
+                        steam_meta["compatdata_backup"] = encode_path(backup, None)
+                    game.meta["steam"] = steam_meta
+                    _write_manifest(game)
+                    steam_link = compat
+                elif not game.meta.get("steam"):
+                    steam_meta = {
+                        "user_id": paths.user_id,
+                        "shortcut_appid": c.shortcut_appid,
+                    }
+                    if plan.proton_name:
+                        steam_meta["compat_tool"] = plan.proton_name
+                    game.meta["steam"] = steam_meta
+                    _write_manifest(game)
             if opts.remove_from_steam:
-                if not remove_shortcut(paths, c.shortcut_appid):
-                    raise RuntimeError(f"Shortcut {c.shortcut_appid} could not be removed from Steam.")
-                removed = True
+                if is_steam_running() or is_gamescope_session():
+                    remove_deferred = True
+                else:
+                    if not remove_shortcut(paths, c.shortcut_appid):
+                        raise RuntimeError(f"Shortcut {c.shortcut_appid} could not be removed from Steam.")
+                    removed = True
     except Exception as exc:
         logging.exception("Adoption of %s failed; undoing it", plan.name)
         problems = undo.run()
@@ -1188,4 +1323,7 @@ def adopt(
         removed_from_steam=removed,
         warnings=result_warnings,
         add_to_steam=opts.add_to_steam,
+        shortcut_needs_repoint=shortcut_needs_repoint,
+        shortcut_appid=c.shortcut_appid,
+        remove_shortcut_deferred=remove_deferred,
     )

@@ -645,7 +645,13 @@ def update_shortcut_launch_options(
 
 
 def update_shortcut_paths(
-    paths: SteamPaths, appid_u32: int, exe_path: Path, start_dir: Path, *, expected_exe: str,
+    paths: SteamPaths,
+    appid_u32: int,
+    exe_path: Path,
+    start_dir: Path,
+    *,
+    expected_exe: str,
+    allow_existing_old: bool = False,
 ) -> bool:
     """Point an existing shortcut at a new exe/StartDir keeping its AppID (artwork, compatdata, playtime)."""
     with _steam_transaction_lock(paths.shortcuts_vdf):
@@ -666,7 +672,9 @@ def update_shortcut_paths(
         if current == str(exe_path):
             return True
         old = Path(current)
-        if current != _strip_vdf_quotes(expected_exe) or not old.is_absolute() or old.exists() or old.is_symlink():
+        if current != _strip_vdf_quotes(expected_exe) or not old.is_absolute():
+            raise ValueError(f"Shortcut target changed or is available again: {current}")
+        if not allow_existing_old and (old.exists() or old.is_symlink()):
             raise ValueError(f"Shortcut target changed or is available again: {current}")
         start_key = "startdir" if "startdir" in item and "StartDir" not in item else "StartDir"
         raw_id = _parse_appid_u32(item.get("appid", 0))

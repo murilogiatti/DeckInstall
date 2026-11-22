@@ -9,7 +9,7 @@ ready games one after the other and ends with a summary. Blocked games are skipp
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread
@@ -399,7 +399,7 @@ class AdoptWizard(QDialog):
         self.btn_shortcut_desktop = shortcut_target_button(tr("add.shortcut_desktop"))
         self.btn_shortcut_steam = shortcut_target_button(tr("add.shortcut_steam"))
         for button in (self.btn_shortcut_menu, self.btn_shortcut_desktop, self.btn_shortcut_steam):
-            button.toggled.connect(self._on_options_changed)
+            button.toggled.connect(self._on_shortcut_targets_changed)
             targets.addWidget(button)
         self.btn_shortcut_steam.setVisible(self._paths is not None)
         form.addRow(tr("add.shortcuts_label"), targets)
@@ -587,18 +587,16 @@ class AdoptWizard(QDialog):
         self.cmb_proton.setEnabled(not native)
         self.btn_shortcut_menu.setChecked(it.opts.create_menu_shortcut)
         self.btn_shortcut_desktop.setChecked(it.opts.create_desktop_shortcut)
-        is_steam = c.kind == ad.STEAM
-        self.btn_shortcut_steam.setEnabled(self._steam_add_allowed and not is_steam)
-        self.btn_shortcut_steam.setText(tr("add.shortcut_steam_linked") if is_steam else tr("add.shortcut_steam"))
-        self.btn_shortcut_steam.setChecked(it.opts.add_to_steam and not is_steam)
-        self.steam_box.setVisible(is_steam)
+        has_steam = c.shortcut_appid is not None
+        remove_steam = has_steam and it.opts.remove_from_steam and self._steam_writable
+        self.steam_box.setVisible(has_steam)
         steam_label = self._plan_form.labelForField(self.steam_box)
         if steam_label is not None:
-            steam_label.setVisible(is_steam)
-        if is_steam:
-            remove = it.opts.remove_from_steam and self._steam_writable
-            self.rb_steam_remove.setChecked(remove)
-            self.rb_steam_link.setChecked(not remove)
+            steam_label.setVisible(has_steam)
+        if has_steam:
+            self.rb_steam_remove.setChecked(remove_steam)
+            self.rb_steam_link.setChecked(not remove_steam)
+        self._sync_steam_shortcut_pill(has_steam, remove_steam)
         guessed = ad.W_GAME_ROOT_GUESSED in c.warnings
         needs = ad.W_NEEDS_GAME_FOLDER in c.warnings or c.game_dir is None
         self.btn_pick_game_folder.setVisible(guessed or needs)
@@ -631,6 +629,10 @@ class AdoptWizard(QDialog):
         if plan.prefix_dir is not None:
             lines.append(tr("adopt.plan_prefix_at", path=str(plan.prefix_dir)))
         lines.append(tr("adopt.plan_proton", name=plan.proton_name or tr("adopt.proton_default")))
+        if plan.candidate.shortcut_appid is not None and not it.opts.remove_from_steam:
+            lines.append(tr("adopt.plan_steam_update"))
+        elif it.opts.add_to_steam and self._paths is not None:
+            lines.append(tr("adopt.plan_steam_add"))
         if plan.bytes_to_copy:
             lines.append(tr("adopt.plan_copy", size=format_size_bytes(plan.bytes_to_copy)))
         for where, free in plan.free_bytes.items():
@@ -643,6 +645,41 @@ class AdoptWizard(QDialog):
             blocks.append(tr("adopt.confirm_needed"))
         self.lbl_blockers.setText("\n".join(f"✖ {b}" for b in blocks))
 
+    def _sync_steam_shortcut_pill(self, has_steam: bool, removing_steam: bool) -> None:
+        linked = has_steam and not removing_steam
+        self.btn_shortcut_steam.blockSignals(True)
+        self.btn_shortcut_steam.setEnabled(self._steam_add_allowed and not linked)
+        self.btn_shortcut_steam.setText(
+            tr("add.shortcut_steam_linked") if linked else tr("add.shortcut_steam")
+        )
+        idx = self._current
+        add_checked = (
+            bool(self.items[idx].opts.add_to_steam) if 0 <= idx < len(self.items) else False
+        )
+        self.btn_shortcut_steam.setChecked(not linked and self._steam_add_allowed and add_checked)
+        self.btn_shortcut_steam.blockSignals(False)
+
+    def _on_shortcut_targets_changed(self, *_args: object) -> None:
+        idx = self._current
+        if idx < 0 or idx >= len(self.items):
+            return
+        it = self.items[idx]
+        add_steam = (
+            self._paths is not None
+            and self.btn_shortcut_steam.isEnabled()
+            and self.btn_shortcut_steam.isChecked()
+        )
+        it.opts = replace(
+            it.opts,
+            create_menu_shortcut=self.btn_shortcut_menu.isChecked(),
+            create_desktop_shortcut=self.btn_shortcut_desktop.isChecked(),
+            add_to_steam=add_steam,
+        )
+        if it.plan is not None:
+            it.plan = replace(it.plan, options=it.opts)
+        self._render_plan(it)
+        self._update_nav()
+
     def _on_options_changed(self, *_args: object) -> None:
         idx = self._current
         if idx < 0 or idx >= len(self.items):
@@ -650,6 +687,9 @@ class AdoptWizard(QDialog):
         it = self.items[idx]
         it.library_root = Path(str(self.cmb_library.currentData())) if self.cmb_library.count() else None
         proton_data = self.cmb_proton.currentData()
+        has_steam = it.cand.shortcut_appid is not None
+        remove_steam = has_steam and self.rb_steam_remove.isChecked() and self._steam_writable
+        self._sync_steam_shortcut_pill(has_steam, remove_steam)
         it.opts = ad.AdoptOptions(
             move_game=self.chk_move_game.isChecked(),
             move_prefix=self.chk_move_prefix.isChecked(),
@@ -658,8 +698,8 @@ class AdoptWizard(QDialog):
             proton_name=None if proton_data == "source" else "",
             create_menu_shortcut=self.btn_shortcut_menu.isChecked(),
             create_desktop_shortcut=self.btn_shortcut_desktop.isChecked(),
-            remove_from_steam=it.cand.kind == ad.STEAM and self.rb_steam_remove.isChecked() and self._steam_writable,
-            link_steam_compatdata=not self.rb_steam_remove.isChecked(),
+            remove_from_steam=remove_steam,
+            link_steam_compatdata=not remove_steam,
             add_to_steam=self._paths is not None and self.btn_shortcut_steam.isEnabled()
             and self.btn_shortcut_steam.isChecked(),
         )

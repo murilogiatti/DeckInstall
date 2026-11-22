@@ -25,6 +25,7 @@ from .fsutil import (
     remove_path_or_tree,
     sanitize_dir_name,
     slugify,
+    symlink_points_to,
 )
 from .library import (
     Library,
@@ -1603,21 +1604,41 @@ def owned_shortcut_appids(game: StandaloneGame) -> set[int]:
     return out
 
 
+def _prior_game_dirs(game: StandaloneGame) -> list[Path]:
+    """Return decoded original or previously relocated game directories for a game."""
+    source = game.meta.get("source") or {}
+    raw_dirs: list[object] = [source.get("original_game_dir")]
+    previous = source.get("previous_game_dirs")
+    if isinstance(previous, list):
+        raw_dirs.extend(previous)
+    out: list[Path] = []
+    for raw in raw_dirs:
+        if not isinstance(raw, str):
+            continue
+        try:
+            decoded = decode_path(raw, None)
+        except ValueError:
+            continue
+        if decoded not in out:
+            out.append(decoded)
+    return out
+
+
 def match_owned_shortcuts(
     entries: list[ShortcutEntry], games: list[StandaloneGame], user_id: str | None = None,
 ) -> dict[int, StandaloneGame]:
-    """Associate shortcuts with a unique game using current paths, AppIDs or adoption paths."""
+    """Associate shortcuts with a unique game using current paths, AppIDs or prior paths."""
     by_path: dict[Path, list[StandaloneGame]] = {}
     by_appid: dict[int, list[StandaloneGame]] = {}
     for g in games:
         paths = {g.exe_path, g.launch_script}
-        source = g.meta.get("source") or {}
-        original = source.get("original_game_dir")
-        if source.get("kind") == "adopted" and isinstance(original, str):
-            try:
-                paths.add(decode_path(original, None) / g.exe_path.relative_to(g.game_dir))
-            except ValueError:
-                pass
+        try:
+            rel_exe = g.exe_path.relative_to(g.game_dir)
+        except ValueError:
+            rel_exe = None
+        if rel_exe is not None:
+            for prior in _prior_game_dirs(g):
+                paths.add(prior / rel_exe)
         for path in paths:
             if path:
                 by_path.setdefault(Path(os.path.normpath(path)), []).append(g)
@@ -1674,17 +1695,16 @@ def shortcut_path_repairs(
 
 def repaired_shortcut_start_dir(entry: ShortcutEntry, game: StandaloneGame) -> Path:
     """Keep the original working directory's relative location when the game moved."""
-    original = (game.meta.get("source") or {}).get("original_game_dir")
-    if isinstance(original, str):
+    start = Path(_strip_vdf_quotes(entry.start_dir))
+    norm_start = Path(os.path.normpath(start))
+    for root in _prior_game_dirs(game):
         try:
-            root = decode_path(original, None)
-            start = Path(_strip_vdf_quotes(entry.start_dir))
-            relative = Path(os.path.normpath(start)).relative_to(root)
+            relative = norm_start.relative_to(root)
             mapped = game.game_dir / relative
             if mapped.is_dir() and is_within(mapped, game.game_dir):
                 return mapped
         except ValueError:
-            pass
+            continue
     return game.exe_path.parent
 
 
@@ -1787,9 +1807,9 @@ def update_standalone_launch_options(
     return game
 
 
-def _safe_remove_prefix_dir(prefix_dir: Path) -> None:
+def _safe_remove_prefix_dir(prefix_dir: Path, game_dir: Path | None = None) -> None:
     """Remove prefix_dir only if it is a non-symlink strictly inside a managed prefixes folder."""
-    if not any(is_within(prefix_dir, r, strict=True) for r in _managed_roots(_lib.PREFIXES)):
+    if not any(is_within(prefix_dir, r, strict=True) for r in _managed_roots(_lib.PREFIXES, game_dir)):
         logging.warning(
             "Refusing to remove prefix_dir outside prefixes directory: %s",
             prefix_dir,
@@ -1798,11 +1818,11 @@ def _safe_remove_prefix_dir(prefix_dir: Path) -> None:
     remove_path_or_tree(prefix_dir)
 
 
-def _safe_remove_cache_dir(cache_dir: Path | None) -> None:
+def _safe_remove_cache_dir(cache_dir: Path | None, game_dir: Path | None = None) -> None:
     """Remove cache_dir only if it is a non-symlink strictly inside get_shader_caches_dir()."""
     if cache_dir is None:
         return
-    if not any(is_within(cache_dir, r, strict=True) for r in _managed_roots(_lib.CACHES)):
+    if not any(is_within(cache_dir, r, strict=True) for r in _managed_roots(_lib.CACHES, game_dir)):
         logging.warning(
             "Refusing to remove cache_dir outside shader caches directory: %s",
             cache_dir,
@@ -1933,12 +1953,12 @@ def remove_standalone_game(
             prune_empty_parents(game.game_dir, _games_roots_for(game.game_dir))
     if (delete_files or delete_prefix) and not _prefix_used_by_other_game(game.prefix_dir, game.game_dir):
         _unlink_steam_compatdata(game)
-        _safe_remove_prefix_dir(game.prefix_dir)
+        _safe_remove_prefix_dir(game.prefix_dir, game.game_dir)
     elif delete_files or delete_prefix:
         logging.warning("Keeping prefix %s: it is shared with another standalone game", game.prefix_dir)
 
     if delete_cache:
-        _safe_remove_cache_dir(game.cache_dir)
+        _safe_remove_cache_dir(game.cache_dir, game.game_dir)
 
 
 def _is_shortcut_shared_across_users(paths: SteamPaths, appid_u32: int) -> bool:
@@ -2072,15 +2092,7 @@ def _unlink_steam_compatdata(game: StandaloneGame) -> None:
         link = decode_path(raw, None)
     except ValueError:
         return
-    if not link.is_symlink():
-        return
-    try:
-        target = Path(os.readlink(link))
-        if not target.is_absolute():
-            target = link.parent / target
-        if os.path.abspath(target) != os.path.abspath(game.prefix_dir):
-            return
-    except OSError:
+    if not symlink_points_to(link, game.prefix_dir):
         return
     try:
         link.unlink()
@@ -2163,12 +2175,23 @@ def import_standalone_to_steam(
             target_compat.unlink()
         copy_or_move_dir_contents(game.prefix_dir, target_pfx, move=remove_standalone_files)
         if remove_standalone_files:
-            _safe_remove_prefix_dir(game.prefix_dir)
+            _safe_remove_prefix_dir(game.prefix_dir, game.game_dir)
 
     if remove_standalone_files:
         remove_standalone_game(game, delete_files=False, delete_cache=True)
 
     sync_prefix_symlinks(paths)
+    if game.steam_appid and paths.grid_dir:
+        try:
+            from .artwork import download_steam_artwork
+
+            download_steam_artwork(
+                steam_appid=game.steam_appid,
+                shortcut_appid_u32=appid_u32,
+                grid_dir=paths.grid_dir,
+            )
+        except Exception as exc:
+            logging.debug("Skipping Steam artwork download for %s: %s", game.name, exc)
     return appid_u32
 
 
@@ -2198,18 +2221,47 @@ def add_installed_game_to_steam(paths: SteamPaths, game_dir: Path, uid: str) -> 
                     expected_exe=entry.exe,
                 ):
                     raise RuntimeError(f"Could not update existing Steam shortcut {entry.appid_u32}")
-            return next(iter(existing))
+            appid = next(iter(existing))
+            if (
+                not game.native_linux
+                and not game.prefix_dir.is_symlink()
+                and not is_win32_prefix(game.prefix_dir)
+            ):
+                compat = paths.compatdata_dir / str(appid)
+                compat_missing = not compat.exists() and not compat.is_symlink()
+                compat_empty = compat.is_dir() and not compat.is_symlink() and not any(compat.iterdir())
+                if compat_missing or compat_empty or symlink_points_to(compat, game.prefix_dir):
+                    if compat_empty:
+                        compat.rmdir()
+                    backup = link_compatdata_to_prefix(compat, game.prefix_dir)
+                    if game.schema >= 2:
+                        steam_meta: dict[str, Any] = dict(game.meta.get("steam") or {})
+                        steam_meta.update({
+                            "user_id": paths.user_id,
+                            "shortcut_appid": appid,
+                            "compatdata_link": encode_path(compat, None),
+                        })
+                        if game.proton_name.strip():
+                            steam_meta.setdefault("compat_tool", game.proton_name.strip())
+                        if backup is not None:
+                            steam_meta["compatdata_backup"] = encode_path(backup, None)
+                        if game.meta.get("steam") != steam_meta:
+                            game.meta["steam"] = steam_meta
+                            _write_manifest(game)
+            return appid
         appid, _ = compute_shortcut_appid(f'"{game.exe_path}"', game.name)
         if any(entry.appid_u32 == appid for entry in entries):
             raise ValueError(f"Steam AppID {appid} already belongs to another shortcut")
 
         compat = paths.compatdata_dir / str(appid)
         had_link = compat.is_symlink()
+        pfx_link = game.prefix_dir / "pfx"
+        had_pfx = pfx_link.exists() or pfx_link.is_symlink()
         if not game.native_linux:
             if game.prefix_dir.is_symlink() or is_win32_prefix(game.prefix_dir):
                 raise ValueError(f"Unsupported game prefix: {game.prefix_dir}")
             if (compat.exists() or had_link) and not (
-                had_link and compat.resolve() == game.prefix_dir.resolve()
+                had_link and symlink_points_to(compat, game.prefix_dir)
             ):
                 raise ValueError(f"Steam compatdata {appid} already contains a different prefix")
 
@@ -2222,6 +2274,8 @@ def add_installed_game_to_steam(paths: SteamPaths, game_dir: Path, uid: str) -> 
                     path.unlink(missing_ok=True)
                 elif not path.is_file() or path.read_bytes() != original:
                     atomic_write_bytes(path, original)
-            if not had_link and compat.is_symlink() and compat.resolve() == game.prefix_dir.resolve():
+            if not had_link and symlink_points_to(compat, game.prefix_dir):
                 compat.unlink()
+            if not had_pfx and symlink_points_to(pfx_link, game.prefix_dir):
+                pfx_link.unlink()
             raise

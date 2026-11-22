@@ -218,8 +218,12 @@ class VdfEditQueue:
         elif edit.op == "update_shortcut_paths":
             paths = VdfEditQueue._account_paths(paths, payload)
             if not update_shortcut_paths(
-                paths, edit.appid_u32, Path(payload["exe_path"]), Path(payload["start_dir"]),
+                paths,
+                edit.appid_u32,
+                Path(payload["exe_path"]),
+                Path(payload["start_dir"]),
                 expected_exe=payload["expected_exe"],
+                allow_existing_old=bool(payload.get("allow_existing_old", False)),
             ):
                 raise RuntimeError(f"Atalho {edit.appid_u32} não encontrado em shortcuts.vdf")
         elif edit.op == "add_installed_game":

@@ -653,6 +653,8 @@
   "adopt.prefix_none": "Native Linux game: no prefix.",
   "adopt.plan_prefix_at": "New prefix: {path}",
   "adopt.plan_proton": "Proton: {name}",
+  "adopt.plan_steam_add": "Steam shortcut: will be added after adoption",
+  "adopt.plan_steam_update": "Steam shortcut: keeps existing AppID and points to the new path",
   "adopt.plan_copy": "To copy across disks: {size}",
   "adopt.plan_free": "Free space in {path}: {size}",
   "adopt.mark_planning": "planning",

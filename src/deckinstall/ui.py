@@ -2652,16 +2652,24 @@ class MainWindow(QMainWindow):
         queue the fix, applied as soon as Steam is closed (AppID, artwork and playtime are kept)."""
         if self.paths is None or self._vdf_corrupt:
             return
-        pending = {e.edit_id for e in self._vdf_queue.list_pending()}
+        pending = {e.edit_id: e for e in self._vdf_queue.list_pending()}
         for entry, game in shortcut_path_repairs(entries, games, self.paths.user_id):
             edit_id = f"update_shortcut_paths:{self.paths.user_id}:{entry.appid_u32}"
-            if edit_id in pending:
+            exe_str = str(game.exe_path)
+            start_str = str(repaired_shortcut_start_dir(entry, game))
+            existing_edit = pending.get(edit_id)
+            if (
+                existing_edit is not None
+                and str(existing_edit.payload.get("exe_path") or "") == exe_str
+                and str(existing_edit.payload.get("start_dir") or "") == start_str
+                and str(existing_edit.payload.get("expected_exe") or "") == entry.exe
+            ):
                 continue
             logging.info("Steam shortcut %s points at a missing exe; queueing %s", entry.appid_u32, game.exe_path)
             self.enqueue_vdf_edit(
                 QueuedVdfEdit(
                     edit_id, "update_shortcut_paths", entry.appid_u32, entry.app_name,
-                    {"exe_path": str(game.exe_path), "start_dir": str(repaired_shortcut_start_dir(entry, game)),
+                    {"exe_path": exe_str, "start_dir": start_str,
                      "expected_exe": entry.exe, "user_id": self.paths.user_id,
                      "steam_root": str(self.paths.steam_root)},
                 )
@@ -3841,9 +3849,48 @@ class MainWindow(QMainWindow):
                 self.status_label.setText(tr("adopt.status_done", count=len(results)))
                 self._refresh_libraries()
                 self._refresh_shortcuts()
-                selected = [result.game for result in results if result.add_to_steam]
-                if paths is not None and selected:
-                    self._add_installed_shortcuts_to_steam(paths, selected)
+                if paths is not None and not self._vdf_corrupt:
+                    for r in results:
+                        if r.remove_shortcut_deferred and r.shortcut_appid is not None:
+                            self.enqueue_vdf_edit(
+                                QueuedVdfEdit(
+                                    f"remove_shortcut:{r.shortcut_appid}",
+                                    "remove_shortcut",
+                                    r.shortcut_appid,
+                                    r.game.name,
+                                    {},
+                                )
+                            )
+                        elif (
+                            r.shortcut_needs_repoint
+                            and r.shortcut_appid is not None
+                            and not r.removed_from_steam
+                        ):
+                            matched_sc = next(
+                                (e for e in self._steam_shortcuts if e.appid_u32 == r.shortcut_appid),
+                                None,
+                            )
+                            if matched_sc is not None:
+                                self.enqueue_vdf_edit(
+                                    QueuedVdfEdit(
+                                        f"update_shortcut_paths:{paths.user_id}:{matched_sc.appid_u32}",
+                                        "update_shortcut_paths",
+                                        matched_sc.appid_u32,
+                                        matched_sc.app_name,
+                                        {
+                                            "exe_path": str(r.game.exe_path),
+                                            "start_dir": str(repaired_shortcut_start_dir(matched_sc, r.game)),
+                                            "expected_exe": matched_sc.exe,
+                                            "user_id": paths.user_id,
+                                            "steam_root": str(paths.steam_root),
+                                        },
+                                    )
+                                )
+                    selected = [result.game for result in results if result.add_to_steam]
+                    if selected:
+                        self._add_installed_shortcuts_to_steam(paths, selected)
+                    elif self._vdf_queue.pending_count() > 0 and not self.should_queue_vdf_edits():
+                        self._confirm_close_steam_async(lambda: self._apply_vdf_queue())
 
         self._check_steam_running_async(_open)
 
@@ -3900,6 +3947,9 @@ class MainWindow(QMainWindow):
                 self._refresh_shortcuts()
                 if self._closing_pending or not isinstance(result, BatchApplyResult):
                     return
+                if result.errors:
+                    for pending_edit in batch.list_pending():
+                        self.enqueue_vdf_edit(pending_edit)
                 msg = tr("add.steam_shortcuts_done", count=result.applied)
                 self.status_label.setText(msg)
                 if result.errors:
