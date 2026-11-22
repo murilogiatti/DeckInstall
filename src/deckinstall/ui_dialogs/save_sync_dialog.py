@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
 from PySide6.QtCore import QSettings, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -40,7 +40,9 @@ from ..save_sync import (
     SaveArchiveEntry,
     SteamCloudAppMismatch,
     SyncDryRunPreview,
+    SyncGameTarget,
     SyncPlanItem,
+    _resolve_wine_root,
     _slugify,
     archive_has_steamcloud,
     auto_snapshot,
@@ -53,13 +55,15 @@ from ..save_sync import (
     snapshot_after_play,
     snapshot_dir_for,
     snapshot_display_name,
+    snapshot_home_files,
 )
 from ..standalone import StandaloneGame, game_log_dir
-from ..steam_paths import SteamPaths, is_steam_running
+from ..steam_paths import SteamPaths, invalidate_process_cache, is_steam_running
 from ..steam_vdf import DEFAULT_SAVES_DIR
 from ..ui_cards import (
     _dialog_parent,
     _format_worker_error,
+    _is_wine_game_running,
     _make_card,
     _pick_dir_async,
     _setting_bool,
@@ -154,8 +158,22 @@ def snapshot_keep(settings: QSettings) -> int:
     return max(1, min(50, value))
 
 
+def _target_size_key(target: SaveTarget) -> str:
+    """Unique lookup key per game target so same-name games keep independent sizes."""
+    return f"{_slugify(target.name)}|{target.prefix_dir}"
+
+
+def _resolved_prefix_key(prefix_dir: Path) -> Path | None:
+    if not prefix_dir.exists():
+        return None
+    try:
+        return _resolve_wine_root(prefix_dir).resolve()
+    except OSError:
+        return None
+
+
 def collect_save_targets(win: MainWindow) -> list[SaveTarget]:
-    """Library, Steam shortcut and other-launcher games with a Wine prefix (first name wins)."""
+    """Library, Steam shortcut and other-launcher games with a Wine prefix (first matching target wins)."""
     targets: list[SaveTarget] = []
     for sg in win._standalone_games:
         if not sg.native_linux:
@@ -174,13 +192,22 @@ def collect_save_targets(win: MainWindow) -> list[SaveTarget]:
         if ext.prefix_dir is not None and ext.runner != "linux":
             targets.append(SaveTarget(ext.name, ext.prefix_dir, ext.game_dir, None, None, ext.source))
     targets.extend(win._external_save_targets)
-    seen: set[str] = set()
+    seen_by_slug: dict[str, list[tuple[Path | None, int | None]]] = {}
     unique: list[SaveTarget] = []
     for t in targets:
         slug = _slugify(t.name)
-        if slug not in seen:
-            seen.add(slug)
-            unique.append(t)
+        pfx_key = _resolved_prefix_key(t.prefix_dir)
+        prior = seen_by_slug.get(slug, [])
+        is_dup = any(
+            (pfx_key is None or prev_pfx is None)
+            or pfx_key == prev_pfx
+            or (t.steam_appid is not None and t.steam_appid == prev_appid)
+            for prev_pfx, prev_appid in prior
+        )
+        if is_dup:
+            continue
+        seen_by_slug.setdefault(slug, []).append((pfx_key, t.steam_appid))
+        unique.append(t)
     return unique
 
 
@@ -383,14 +410,25 @@ def refresh_saves_page(win: MainWindow, after_play: bool = True, scan_sources: b
         table.setItem(r, 0, name_item)
         source = source_label(row.target.source) if row.target is not None else "-"
         table.setItem(r, 1, QTableWidgetItem(source))
-        now = sizes.get(row.slug) if row.target is not None else None
+        now = (
+            sizes.get(_target_size_key(row.target), sizes.get(row.slug))
+            if row.target is not None
+            else None
+        )
         now_text = format_size_bytes(now) if now is not None else ("…" if row.target is not None else "-")
         table.setItem(r, 2, _SortableTableItem(now_text, sort_key=now or 0))
         table.setItem(r, 3, _SortableTableItem(last, sort_key=row.last_mtime))
         table.setItem(r, 4, _SortableTableItem(str(row.snapshots), sort_key=row.snapshots))
         table.setItem(r, 5, _SortableTableItem(format_size_bytes(row.size_bytes), sort_key=row.size_bytes))
-        if selected is not None and row.slug == selected.slug:
-            table.setCurrentCell(r, 0)
+        if selected is not None:
+            same_row = (
+                row.target is not None
+                and selected.target is not None
+                and row.target.prefix_dir == selected.target.prefix_dir
+                and row.slug == selected.slug
+            ) or (row.target is None and selected.target is None and row.slug == selected.slug)
+            if same_row:
+                table.setCurrentCell(r, 0)
     table.setSortingEnabled(True)
     win.lbl_saves_empty.setVisible(not rows)
     update_saves_action_states(win)
@@ -400,7 +438,10 @@ def refresh_saves_page(win: MainWindow, after_play: bool = True, scan_sources: b
 
 def _start_sources_scan(win: MainWindow) -> None:
     """Find Steam/Hydra/UMU/Nexus games and measure every game's saves, off the UI thread."""
-    if win._save_sources_running or win._closing_pending:
+    if win._closing_pending:
+        return
+    if win._save_sources_running:
+        win._save_sources_pending = True
         return
     paths = win.paths
     base = collect_save_targets(win)
@@ -409,23 +450,40 @@ def _start_sources_scan(win: MainWindow) -> None:
         extra = scan_external_save_targets(paths)
         sizes: dict[str, int] = {}
         for t in [*base, *extra]:
-            slug = _slugify(t.name)
-            if slug not in sizes:
-                sizes[slug] = saves_size(t.prefix_dir, t.extra_dirs)[0]
+            skey = _target_size_key(t)
+            if skey not in sizes:
+                home_files = snapshot_home_files(snapshot_dir_for(t.name))
+                sz = saves_size(
+                    t.prefix_dir,
+                    t.extra_dirs,
+                    game_name=t.name,
+                    game_dir=t.game_dir,
+                    steam_appid=t.steam_appid,
+                    home_files=home_files,
+                )[0]
+                sizes[skey] = sz
+                sizes.setdefault(_slugify(t.name), sz)
         return extra, sizes
 
     worker = SteamOpWorker(_job)
     win._track_worker(worker)
     win._save_sources_running = True
 
+    def _maybe_rerun_pending() -> None:
+        if getattr(win, "_save_sources_pending", False) and not win._closing_pending:
+            win._save_sources_pending = False
+            _start_sources_scan(win)
+
     def _done(res: object) -> None:
         win._save_sources_running = False
         if isinstance(res, tuple) and not win._closing_pending:
             win._external_save_targets, win._save_sizes = res
             refresh_saves_page(win, after_play=False, scan_sources=False)
+        _maybe_rerun_pending()
 
     def _err(_e: str) -> None:
         win._save_sources_running = False
+        _maybe_rerun_pending()
 
     worker.finished_ok.connect(_done)
     worker.failed.connect(_err)
@@ -433,7 +491,7 @@ def _start_sources_scan(win: MainWindow) -> None:
 
 
 def _start_after_play(win: MainWindow, targets: list[SaveTarget]) -> None:
-    if not targets or win._after_play_running or win._closing_pending:
+    if not targets or win._after_play_running or win._steam_busy or win._closing_pending:
         return
     keep = snapshot_keep(win.settings)
 
@@ -486,6 +544,7 @@ def _run(
     def _err(err: str) -> None:
         win._end_busy()
         win.status_label.setText(tr("status.ready"))
+        refresh_saves_page(win, after_play=False)
         if not win._closing_pending:
             QMessageBox.critical(_dialog_parent(win), __app_name__, tr("saves.error", err=err))
 
@@ -549,8 +608,13 @@ def _restore_selected(win: MainWindow) -> None:
             QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.nexus_running"))
             return
         question += "\n\n" + tr("saves.nexus_cloud_warning")
-    if _restores_steam_cloud(t, entry) and is_steam_running():
-        QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.steam_running"))
+    if _restores_steam_cloud(t, entry):
+        invalidate_process_cache()
+        if is_steam_running():
+            QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.steam_running"))
+            return
+    if _is_wine_game_running():
+        QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.game_running"))
         return
     if QMessageBox.question(_dialog_parent(win), __app_name__, question) != QMessageBox.StandardButton.Yes:
         return
@@ -583,8 +647,12 @@ def _restores_steam_cloud(t: SaveTarget, entry: SaveArchiveEntry) -> bool:
 def _restore_job(t: SaveTarget, entry: SaveArchiveEntry) -> object:
     if t.source == "nexus" and is_nexus_running():  # checked again right before writing
         raise RuntimeError(tr("saves.nexus_running"))
-    if _restores_steam_cloud(t, entry) and is_steam_running():  # Steam would sync over the restored files
-        raise RuntimeError(tr("saves.steam_running"))
+    if _restores_steam_cloud(t, entry):
+        invalidate_process_cache()
+        if is_steam_running():  # Steam would sync over the restored files
+            raise RuntimeError(tr("saves.steam_running"))
+    if _is_wine_game_running():
+        raise RuntimeError(tr("saves.game_running"))
     skipped: list[str] = []
     try:
         count, safety = restore_snapshot_safely(
@@ -609,34 +677,60 @@ def _open_folder(win: MainWindow) -> None:
 
 def _import_to_snapshots(win: MainWindow, root: Path, row: SaveRow | None) -> None:
     """Ludusavi backup of games that are not installed: keep it as snapshots to restore later."""
-    games = lds.list_backup_games(root)
-    if row is not None:
-        folder = lds.find_game_folder(root, row.name)
-        games = [(row.name, folder)] if folder is not None else []
-    if not games:
-        QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.import_none_found", path=root))
+    if win._steam_busy or win._closing_pending:
         return
-    if len(games) > 1:
-        labels = [tr("saves.import_all", count=len(games))] + [name for name, _ in games]
-        picked, ok = QInputDialog.getItem(
-            _dialog_parent(win), __app_name__, tr("saves.import_pick_game"), labels, 0, False
-        )
-        if not ok or picked not in labels:
+
+    def _scan_job() -> object:
+        if row is not None:
+            folder = lds.find_game_folder(root, row.name)
+            return [(row.name, folder)] if folder is not None else []
+        return lds.list_backup_games(root)
+
+    win._begin_busy()
+    win.status_label.setText(tr("saves.import_scanning"))
+    scan_worker = SteamOpWorker(_scan_job)
+    win._track_worker(scan_worker)
+
+    def _on_scanned(res: object) -> None:
+        win._end_busy()
+        win.status_label.setText(tr("status.ready"))
+        if win._closing_pending or win._steam_busy:
             return
-        if picked != labels[0]:
-            games = [games[labels.index(picked) - 1]]
+        games: list[tuple[str, Path]] = res if isinstance(res, list) else []
+        if not games:
+            QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.import_none_found", path=root))
+            return
+        if len(games) > 1:
+            labels = [tr("saves.import_all", count=len(games))] + [name for name, _ in games]
+            picked, ok = QInputDialog.getItem(
+                _dialog_parent(win), __app_name__, tr("saves.import_pick_game"), labels, 0, False
+            )
+            if not ok or picked not in labels:
+                return
+            if picked != labels[0]:
+                games = [games[labels.index(picked) - 1]]
 
-    def _job() -> object:
-        done: list[tuple[str, int, int, bool]] = []
-        for name, folder in games:
-            _snap, stored, skipped, already = lds.import_ludusavi_to_snapshot(folder, name)
-            done.append((name, stored, skipped, already))
-        return done
+        def _job() -> object:
+            done: list[tuple[str, int, int, bool]] = []
+            for name, folder in games:
+                _snap, stored, skipped, already = lds.import_ludusavi_to_snapshot(folder, name)
+                done.append((name, stored, skipped, already))
+            return done
 
-    def _ok(res: object) -> None:
-        show_import_result(win, res if isinstance(res, list) else [])
+        def _ok(import_res: object) -> None:
+            show_import_result(win, import_res if isinstance(import_res, list) else [])
 
-    _run(win, tr("saves.import_running", name=root.name), _job, _ok)
+        _run(win, tr("saves.import_running", name=root.name), _job, _ok)
+
+    def _on_scan_err(err: str) -> None:
+        win._end_busy()
+        win.status_label.setText(tr("status.ready"))
+        if not win._closing_pending:
+            QMessageBox.critical(_dialog_parent(win), __app_name__, tr("saves.error", err=err))
+
+    scan_worker.finished_ok.connect(_on_scanned)
+    scan_worker.failed.connect(_on_scan_err)
+    scan_worker.start()
 
 
 def import_result_text(results: list[tuple[str, int, int, bool]]) -> tuple[str, str]:
@@ -668,33 +762,64 @@ def show_import_result(win: MainWindow, results: list[tuple[str, int, int, bool]
 
 
 def _remove_import_duplicates(win: MainWindow) -> None:
-    """Delete Ludusavi imports identical to an older one of the same game, after a confirmation listing them."""
-    if win._steam_busy:
+    """Delete Ludusavi imports identical to a newer one of the same game, after a confirmation listing them."""
+    if win._steam_busy or win._closing_pending:
         return
-    dupes = lds.find_import_duplicates()
-    parent = _dialog_parent(win)
-    if not dupes:
-        QMessageBox.information(parent, __app_name__, tr("saves.dedup_none"))
-        return
-    listing = "\n".join(f"• {snapshot_display_name(p.parent.name)}: {p.name}" for p in dupes)
-    box = QMessageBox(QMessageBox.Icon.Question, __app_name__, tr("saves.dedup_confirm", count=len(dupes)),
-                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, parent)
-    box.setDefaultButton(QMessageBox.StandardButton.No)
-    box.setDetailedText(listing)
-    box.setInformativeText(listing if len(dupes) <= 8 else tr("saves.dedup_see_details"))
-    answer = box.exec()
-    box.deleteLater()
-    if answer != QMessageBox.StandardButton.Yes:
-        return
-    removed = 0
-    for p in dupes:
-        try:
-            p.unlink()
-            removed += 1
-        except OSError as exc:
-            logging.getLogger(__name__).warning("Could not remove %s: %s", p, exc)
-    refresh_saves_page(win, after_play=False)
-    _info(win, tr("saves.dedup_done", count=removed))
+    win._begin_busy()
+    win.status_label.setText(tr("saves.dedup_scanning"))
+    scan_worker = SteamOpWorker(lds.find_import_duplicates)
+    win._track_worker(scan_worker)
+
+    def _on_scanned(res: object) -> None:
+        win._end_busy()
+        win.status_label.setText(tr("status.ready"))
+        if win._closing_pending or win._steam_busy:
+            return
+        dupes: list[Path] = res if isinstance(res, list) else []
+        parent = _dialog_parent(win)
+        if not dupes:
+            QMessageBox.information(parent, __app_name__, tr("saves.dedup_none"))
+            return
+        listing = "\n".join(f"• {snapshot_display_name(p.parent.name)}: {p.name}" for p in dupes)
+        box = QMessageBox(
+            QMessageBox.Icon.Question,
+            __app_name__,
+            tr("saves.dedup_confirm", count=len(dupes)),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            parent,
+        )
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        box.setDetailedText(listing)
+        box.setInformativeText(listing if len(dupes) <= 8 else tr("saves.dedup_see_details"))
+        answer = box.exec()
+        box.deleteLater()
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        def _delete_job() -> object:
+            removed = 0
+            for p in dupes:
+                try:
+                    p.unlink()
+                    removed += 1
+                except OSError as exc:
+                    logging.getLogger(__name__).warning("Could not remove %s: %s", p, exc)
+            return removed
+
+        def _on_deleted(removed: object) -> None:
+            _info(win, tr("saves.dedup_done", count=int(removed) if isinstance(removed, int) else 0))
+
+        _run(win, tr("saves.dedup_scanning"), _delete_job, _on_deleted)
+
+    def _on_scan_err(err: str) -> None:
+        win._end_busy()
+        win.status_label.setText(tr("status.ready"))
+        if not win._closing_pending:
+            QMessageBox.critical(_dialog_parent(win), __app_name__, tr("saves.error", err=err))
+
+    scan_worker.finished_ok.connect(_on_scanned)
+    scan_worker.failed.connect(_on_scan_err)
+    scan_worker.start()
 
 
 def existing_snapshots_for(name: str, archives: list[SaveArchiveEntry]) -> list[SaveArchiveEntry]:
@@ -711,22 +836,43 @@ def existing_snapshots_for(name: str, archives: list[SaveArchiveEntry]) -> list[
     )
 
 
-def ludusavi_backup_for(win: MainWindow, name: str) -> Path | None:
-    """The game's folder in the Ludusavi backup last used (or set in Ludusavi), when there is one."""
-    saved = str(win.settings.value(LUDUSAVI_DIR_KEY, "") or "")
+def _find_ludusavi_backup(saved: str, name: str) -> Path | None:
+    """Locate the game's backup folder inside saved or Ludusavi's configured backup root."""
     for root in (Path(saved) if saved else None, lds.ludusavi_backup_path()):
         if root is None or not root.is_dir():
             continue
         folder = lds.find_game_folder(root, name)
         if folder is None:
             continue
-        try:
-            found = str(lds.load_mapping(folder).get("name") or folder.name)
-        except (lds.LudusaviError, OSError):
-            continue
+        found = lds.read_mapping_name(folder)
+        if found is None:
+            try:
+                found = str(lds.load_mapping(folder).get("name") or folder.name)
+            except (lds.LudusaviError, OSError):
+                continue
         if lds._norm_key(found) == lds._norm_key(name):  # root may itself be another game's backup
             return folder
     return None
+
+
+def ludusavi_backup_for(win: MainWindow, name: str) -> Path | None:
+    """The game's folder in the Ludusavi backup last used (or set in Ludusavi), when there is one."""
+    saved = str(win.settings.value(LUDUSAVI_DIR_KEY, "") or "")
+    return _find_ludusavi_backup(saved, name)
+
+
+def _import_ludusavi_checked(target: SaveTarget, folder: Path) -> lds.ImportResult:
+    if target.source == "nexus" and is_nexus_running():
+        raise RuntimeError(tr("saves.nexus_running"))
+    if _is_wine_game_running():
+        raise RuntimeError(tr("saves.game_running"))
+    return lds.import_ludusavi(
+        folder,
+        target.prefix_dir,
+        target.name,
+        game_dir=target.game_dir,
+        steam_appid=target.steam_appid,
+    )
 
 
 def offer_existing_saves(win: MainWindow, game: StandaloneGame) -> None:
@@ -753,29 +899,41 @@ def offer_existing_saves(win: MainWindow, game: StandaloneGame) -> None:
 
         _run(win, tr("saves.restore_running", name=game.name), lambda: _restore_job(target, newest), _restored)
         return
-    folder = ludusavi_backup_for(win, game.name)
-    if folder is None:
-        return
-    if QMessageBox.question(
-        parent, __app_name__, tr("saves.offer_ludusavi", name=game.name, path=folder)
-    ) != QMessageBox.StandardButton.Yes:
-        return
 
-    def _imported(res: object) -> None:
-        if isinstance(res, lds.ImportResult):
-            _info(win, tr(
-                "saves.import_done", name=game.name, restored=res.restored, unchanged=res.unchanged,
-                kept=res.kept, skipped=res.skipped, safety=res.snapshot or "-",
-            ))
+    saved = str(win.settings.value(LUDUSAVI_DIR_KEY, "") or "")
+    lookup_worker = SteamOpWorker(lambda: _find_ludusavi_backup(saved, game.name))
+    if hasattr(win, "_track_worker"):
+        win._track_worker(lookup_worker)
 
-    _run(
-        win,
-        tr("saves.import_running", name=game.name),
-        lambda: lds.import_ludusavi(
-            folder, game.prefix_dir, game.name, game_dir=game.game_dir, steam_appid=game.steam_appid
-        ),
-        _imported,
-    )
+    def _on_found(res: object) -> None:
+        if not isinstance(res, Path) or win._closing_pending or win._steam_busy:
+            return
+        folder = res
+        if QMessageBox.question(
+            _dialog_parent(win), __app_name__, tr("saves.offer_ludusavi", name=game.name, path=folder)
+        ) != QMessageBox.StandardButton.Yes:
+            return
+
+        def _imported(imp_res: object) -> None:
+            if isinstance(imp_res, lds.ImportResult):
+                _info(win, tr(
+                    "saves.import_done", name=game.name, restored=imp_res.restored, unchanged=imp_res.unchanged,
+                    kept=imp_res.kept, skipped=imp_res.skipped, safety=imp_res.snapshot or "-",
+                ))
+
+        _run(
+            win,
+            tr("saves.import_running", name=game.name),
+            lambda: _import_ludusavi_checked(target, folder),
+            _imported,
+        )
+
+    def _on_lookup_err(err: str) -> None:
+        logging.getLogger(__name__).debug("Ludusavi backup lookup skipped for %s: %s", game.name, err)
+
+    lookup_worker.finished_ok.connect(_on_found)
+    lookup_worker.failed.connect(_on_lookup_err)
+    lookup_worker.start()
 
 
 def _ludusavi_start_dir(win: MainWindow) -> Path:
@@ -787,19 +945,26 @@ def _ludusavi_start_dir(win: MainWindow) -> Path:
     return Path.home()
 
 
+def _ludusavi_import_setting_dir(root: Path) -> str:
+    """Store the Ludusavi backup root (root.parent when user picked a single game subfolder)."""
+    return str(root.parent if (root / lds.MAPPING_FILE).is_file() else root)
+
+
 def _ludusavi_pick(win: MainWindow, *, export: bool, one: bool = False) -> None:
     """Export/import-one work on the selected game; plain import takes every game of a backup folder."""
     row = _selected_row(win)
-    if win._steam_busy or ((export or one) and (row is None or row.target is None)):
+    if win._steam_busy or win._closing_pending or ((export or one) and (row is None or row.target is None)):
         return
     if not export and not one:
         row = None
         start_dir = _ludusavi_start_dir(win)
 
         def _picked_root(chosen: str) -> None:
-            if chosen:
-                win.settings.setValue(LUDUSAVI_DIR_KEY, str(Path(chosen)))
-                _import_to_snapshots(win, Path(chosen), row)
+            if not chosen or win._closing_pending or win._steam_busy:
+                return
+            root = Path(chosen)
+            win.settings.setValue(LUDUSAVI_DIR_KEY, _ludusavi_import_setting_dir(root))
+            _import_to_snapshots(win, root, row)
 
         _pick_dir_async(_dialog_parent(win), tr("saves.pick_import"), start_dir, _picked_root)
         return
@@ -809,11 +974,28 @@ def _ludusavi_pick(win: MainWindow, *, export: bool, one: bool = False) -> None:
     title = tr("saves.pick_export") if export else tr("saves.pick_import")
 
     def _picked(chosen: str) -> None:
-        if not chosen:
+        if not chosen or win._closing_pending or win._steam_busy:
             return
         root = Path(chosen)
-        win.settings.setValue(LUDUSAVI_DIR_KEY, str(root if export else root.parent))
+        win.settings.setValue(
+            LUDUSAVI_DIR_KEY,
+            str(root) if export else _ludusavi_import_setting_dir(root),
+        )
         if export:
+            target_dir = root / lds.escape_folder_name(t.name)
+            if (target_dir / lds.MAPPING_FILE).is_file():
+                box = QMessageBox(
+                    QMessageBox.Icon.Question,
+                    __app_name__,
+                    tr("saves.confirm_export_overwrite", name=t.name, path=target_dir),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    _dialog_parent(win),
+                )
+                box.setDefaultButton(QMessageBox.StandardButton.No)
+                answer = box.exec()
+                box.deleteLater()
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
 
             def _exported(res: object) -> None:
                 if isinstance(res, tuple):
@@ -827,39 +1009,82 @@ def _ludusavi_pick(win: MainWindow, *, export: bool, one: bool = False) -> None:
                 _exported,
             )
             return
-        folder = lds.find_game_folder(root, t.name)
-        if folder is None:
-            QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.import_not_found", name=t.name, path=root))
-            return
-        if QMessageBox.question(
-            _dialog_parent(win), __app_name__, tr("saves.confirm_import", name=t.name, path=folder)
-        ) != QMessageBox.StandardButton.Yes:
-            return
 
-        def _ok(res: object) -> None:
-            if isinstance(res, lds.ImportResult):
-                _info(win, tr(
-                    "saves.import_done", name=t.name, restored=res.restored, unchanged=res.unchanged,
-                    kept=res.kept, skipped=res.skipped, safety=res.snapshot or "-",
-                ))
+        win._begin_busy()
+        win.status_label.setText(tr("saves.import_scanning"))
+        scan_worker = SteamOpWorker(lambda: lds.find_game_folder(root, t.name))
+        win._track_worker(scan_worker)
 
-        _run(
-            win,
-            tr("saves.import_running", name=t.name),
-            lambda: lds.import_ludusavi(folder, t.prefix_dir, t.name, game_dir=t.game_dir, steam_appid=t.steam_appid),
-            _ok,
-        )
+        def _on_found_one(res: object) -> None:
+            win._end_busy()
+            win.status_label.setText(tr("status.ready"))
+            if win._closing_pending or win._steam_busy:
+                return
+            folder = res if isinstance(res, Path) else None
+            if folder is None:
+                QMessageBox.warning(
+                    _dialog_parent(win), __app_name__, tr("saves.import_not_found", name=t.name, path=root)
+                )
+                return
+            if t.source == "nexus" and is_nexus_running():
+                QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.nexus_running"))
+                return
+            if _is_wine_game_running():
+                QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.game_running"))
+                return
+            if QMessageBox.question(
+                _dialog_parent(win), __app_name__, tr("saves.confirm_import", name=t.name, path=folder)
+            ) != QMessageBox.StandardButton.Yes:
+                return
+
+            def _ok(imp_res: object) -> None:
+                if isinstance(imp_res, lds.ImportResult):
+                    _info(win, tr(
+                        "saves.import_done", name=t.name, restored=imp_res.restored, unchanged=imp_res.unchanged,
+                        kept=imp_res.kept, skipped=imp_res.skipped, safety=imp_res.snapshot or "-",
+                    ))
+
+            _run(
+                win,
+                tr("saves.import_running", name=t.name),
+                lambda: _import_ludusavi_checked(t, folder),
+                _ok,
+            )
+
+        def _on_find_err(err: str) -> None:
+            win._end_busy()
+            win.status_label.setText(tr("status.ready"))
+            if not win._closing_pending:
+                QMessageBox.critical(_dialog_parent(win), __app_name__, tr("saves.error", err=err))
+
+        scan_worker.finished_ok.connect(_on_found_one)
+        scan_worker.failed.connect(_on_find_err)
+        scan_worker.start()
 
     _pick_dir_async(_dialog_parent(win), title, start, _picked)
 
 
 def open_save_sync_dialog(win: MainWindow) -> None:
     """Open the folder-based Save Sync dialog."""
-    dlg = QDialog(_dialog_parent(win))
+    dlg_alive = {"open": True}
+    syncing = {"active": False}
+
+    class _BusySyncDialog(QDialog):
+        def reject(self) -> None:
+            if syncing["active"]:
+                return
+            super().reject()
+
+        def closeEvent(self, event: QCloseEvent) -> None:
+            if syncing["active"]:
+                event.ignore()
+                return
+            super().closeEvent(event)
+
+    dlg = _BusySyncDialog(_dialog_parent(win))
     dlg.setWindowTitle(tr("save_sync.title"))
     dlg.resize(640, 520)
     lay = QVBoxLayout(dlg)
-    dlg_alive = {"open": True}
 
     def _on_finished(_r: int) -> None:
         dlg_alive["open"] = False
@@ -925,8 +1150,18 @@ def open_save_sync_dialog(win: MainWindow) -> None:
 
     current_plan: list[SyncPlanItem] = []
 
-    def _collect_games_for_sync() -> list[tuple[str, Path]]:
-        return [(t.name, t.prefix_dir) for t in collect_save_targets(win)]
+    def _collect_games_for_sync() -> list[SyncGameTarget]:
+        return [
+            SyncGameTarget(
+                game_name=t.name,
+                prefix_dir=t.prefix_dir,
+                game_dir=t.game_dir,
+                steam_appid=t.steam_appid,
+                extra_dirs=t.extra_dirs,
+                source=t.source,
+            )
+            for t in collect_save_targets(win)
+        ]
 
     def _current_sync_root() -> Path:
         raw = sync_dir_edit.text().strip() or str(DEFAULT_SYNC_DIR)
@@ -940,7 +1175,7 @@ def open_save_sync_dialog(win: MainWindow) -> None:
         failed = Signal(int, str)
 
         def __init__(
-            self, req_id: int, games: list[tuple[str, Path]], sync_root: Path
+            self, req_id: int, games: list[SyncGameTarget], sync_root: Path
         ) -> None:
             super().__init__()
             self._req_id = req_id
@@ -949,7 +1184,11 @@ def open_save_sync_dialog(win: MainWindow) -> None:
 
         def run(self) -> None:
             try:
+                if self.isInterruptionRequested():
+                    return
                 items = plan_sync_all(self._games, self._sync_root)
+                if self.isInterruptionRequested():
+                    return
                 self.ready.emit(self._req_id, items)
             except Exception as exc:
                 self.failed.emit(self._req_id, _format_worker_error(exc))
@@ -984,6 +1223,8 @@ def open_save_sync_dialog(win: MainWindow) -> None:
         btn_preview.setEnabled(bool(items))
 
     def _refresh_plan() -> None:
+        if not dlg_alive["open"] or win._closing_pending or syncing["active"]:
+            return
         plan_req["id"] += 1
         req_id = plan_req["id"]
         sync_root = _current_sync_root()
@@ -996,14 +1237,14 @@ def open_save_sync_dialog(win: MainWindow) -> None:
         win._track_worker(worker)
 
         def _on_plan_ready(r_id: int, items: list[SyncPlanItem]) -> None:
-            if not dlg_alive["open"] or win._closing_pending or r_id != plan_req["id"]:
+            if not dlg_alive["open"] or win._closing_pending or syncing["active"] or r_id != plan_req["id"]:
                 return
             btn_refresh.setEnabled(True)
             lbl_status.setText(tr("status.ready"))
             _apply_plan_items(items)
 
         def _on_plan_err(r_id: int, err: str) -> None:
-            if not dlg_alive["open"] or win._closing_pending or r_id != plan_req["id"]:
+            if not dlg_alive["open"] or win._closing_pending or syncing["active"] or r_id != plan_req["id"]:
                 return
             btn_refresh.setEnabled(True)
             lbl_status.setText(tr("save_sync.error", err=err))
@@ -1014,7 +1255,7 @@ def open_save_sync_dialog(win: MainWindow) -> None:
 
     def _on_browse() -> None:
         def _picked(picked: str) -> None:
-            if picked and dlg_alive["open"] and not win._closing_pending:
+            if picked and dlg_alive["open"] and not win._closing_pending and not syncing["active"]:
                 sync_dir_edit.setText(picked)
                 _refresh_plan()
 
@@ -1029,42 +1270,73 @@ def open_save_sync_dialog(win: MainWindow) -> None:
             self,
             ops: list[tuple[SyncPlanItem, str]],
             sync_root: Path,
+            max_keep: int,
         ) -> None:
             super().__init__()
             self._ops = ops
             self._sync_root = sync_root
+            self._max_keep = max_keep
 
         def run(self) -> None:
-            pushed = 0
-            pulled = 0
-            errors: list[str] = []
-            for item, action in self._ops:
-                self.status.emit(
-                    tr("save_sync.syncing_game", name=item.game_name, action=action)
-                )
-                try:
-                    if action == "PUSH":
-                        if (
-                            push_game_saves(
-                                item.game_name, item.prefix_dir, self._sync_root
+            try:
+                pushed = 0
+                pulled = 0
+                errors: list[str] = []
+                for item, action in self._ops:
+                    if self.isInterruptionRequested():
+                        break
+                    self.status.emit(
+                        tr("save_sync.syncing_game", name=item.game_name, action=action)
+                    )
+                    try:
+                        if action == "PUSH":
+                            if (
+                                push_game_saves(
+                                    item.game_name,
+                                    item.prefix_dir,
+                                    self._sync_root,
+                                    game_dir=item.game_dir,
+                                    steam_appid=item.steam_appid,
+                                    extra_dirs=item.extra_dirs,
+                                )
+                                is not None
+                            ):
+                                pushed += 1
+                        elif action == "PULL":
+                            if item.source == "nexus" and is_nexus_running():
+                                raise RuntimeError(tr("saves.nexus_running"))
+                            if any(name == "steamcloud" for name, _ in item.extra_dirs):
+                                invalidate_process_cache()
+                                if is_steam_running():
+                                    raise RuntimeError(tr("saves.steam_running"))
+                            if _is_wine_game_running():
+                                raise RuntimeError(tr("saves.game_running"))
+                            restored, _ = pull_game_saves(
+                                item.game_name,
+                                item.prefix_dir,
+                                self._sync_root,
+                                game_dir=item.game_dir,
+                                steam_appid=item.steam_appid,
+                                max_keep=self._max_keep,
+                                extra_dirs=item.extra_dirs,
                             )
-                            is not None
-                        ):
-                            pushed += 1
-                    elif action == "PULL":
-                        restored, _ = pull_game_saves(
-                            item.game_name, item.prefix_dir, self._sync_root
-                        )
-                        if restored > 0:
-                            pulled += 1
-                except Exception as exc:
-                    errors.append(f"{item.game_name}: {_format_worker_error(exc)}")
-            self.finished_ok.emit(pushed, pulled, errors)
+                            if restored > 0:
+                                pulled += 1
+                    except Exception as exc:
+                        errors.append(f"{item.game_name}: {_format_worker_error(exc)}")
+                self.finished_ok.emit(pushed, pulled, errors)
+            except Exception as exc:
+                self.failed.emit(_format_worker_error(exc))
 
     def _on_sync_now() -> None:
+        if syncing["active"] or win._steam_busy or win._closing_pending:
+            return
         sync_root = _current_sync_root()
+        plan_snapshot = list(current_plan)
         ops: list[tuple[SyncPlanItem, str]] = []
-        for item in current_plan:
+        for item in plan_snapshot:
+            if not dlg_alive["open"] or win._closing_pending:
+                return
             if item.action in ("PUSH", "PULL"):
                 ops.append((item, item.action))
             elif item.action == "CONFLICT":
@@ -1084,26 +1356,40 @@ def open_save_sync_dialog(win: MainWindow) -> None:
                 box.setDefaultButton(btn_skip)
                 box.exec()
                 clicked = box.clickedButton()
+                box.deleteLater()
                 if clicked == btn_push:
                     ops.append((item, "PUSH"))
                 elif clicked == btn_pull:
                     ops.append((item, "PULL"))
 
+        if not dlg_alive["open"] or win._closing_pending:
+            return
         if not ops:
             QMessageBox.information(dlg, __app_name__, tr("save_sync.nothing_to_sync"))
             return
 
-        for w in (btn_sync, btn_refresh, btn_browse, sync_dir_edit):
+        keep = snapshot_keep(win.settings)
+        syncing["active"] = True
+        win._begin_busy()
+        for w in (btn_sync, btn_preview, btn_refresh, btn_browse, btn_close, sync_dir_edit):
             w.setEnabled(False)
         lbl_status.setText(tr("save_sync.syncing"))
-        worker = _FolderSaveSyncWorker(ops, sync_root)
+        worker = _FolderSaveSyncWorker(ops, sync_root, keep)
         win._track_worker(worker)
 
+        def _finish_sync_state() -> None:
+            syncing["active"] = False
+            win._end_busy()
+            if not win._closing_pending:
+                refresh_saves_page(win, after_play=False)
+
         def _ok(pushed: int, pulled: int, errors: list[str]) -> None:
+            _finish_sync_state()
             if not dlg_alive["open"] or win._closing_pending:
                 return
-            for w in (btn_refresh, btn_browse, sync_dir_edit):
+            for w in (btn_refresh, btn_browse, btn_close, sync_dir_edit):
                 w.setEnabled(True)
+            btn_preview.setEnabled(bool(current_plan))
             msg = tr("save_sync.done", pushed=pushed, pulled=pulled)
             if errors:
                 msg += tr("save_sync.partial_errors", errs="\n".join(errors))
@@ -1115,10 +1401,12 @@ def open_save_sync_dialog(win: MainWindow) -> None:
                 QMessageBox.information(dlg, __app_name__, msg)
 
         def _err(err: str) -> None:
+            _finish_sync_state()
             if not dlg_alive["open"] or win._closing_pending:
                 return
-            for w in (btn_sync, btn_refresh, btn_browse, sync_dir_edit):
+            for w in (btn_sync, btn_refresh, btn_browse, btn_close, sync_dir_edit):
                 w.setEnabled(True)
+            btn_preview.setEnabled(bool(current_plan))
             lbl_status.setText(tr("save_sync.error", err=err))
             QMessageBox.critical(dlg, __app_name__, tr("save_sync.error", err=err))
 
@@ -1132,6 +1420,8 @@ def open_save_sync_dialog(win: MainWindow) -> None:
         worker.start()
 
     def _on_preview() -> None:
+        if syncing["active"]:
+            return
         sync_root = _current_sync_root()
         cur_item = plan_list.item(plan_list.currentRow(), 0)
         selected_plan = cur_item.data(Qt.ItemDataRole.UserRole) if cur_item is not None else None
@@ -1156,6 +1446,8 @@ def open_save_sync_dialog(win: MainWindow) -> None:
                 try:
                     previews: list[SyncDryRunPreview] = []
                     for item in targets:
+                        if self.isInterruptionRequested():
+                            return
                         action_arg = item.action if item.action in ("PUSH", "PULL") else None
                         previews.append(
                             preview_sync_operation(
@@ -1163,8 +1455,13 @@ def open_save_sync_dialog(win: MainWindow) -> None:
                                 item.prefix_dir,
                                 sync_root,
                                 action=action_arg,
+                                game_dir=item.game_dir,
+                                steam_appid=item.steam_appid,
+                                extra_dirs=item.extra_dirs,
                             )
                         )
+                    if self.isInterruptionRequested():
+                        return
                     self.ready.emit(previews)
                 except Exception as exc:
                     self.failed.emit(_format_worker_error(exc))
@@ -1175,7 +1472,7 @@ def open_save_sync_dialog(win: MainWindow) -> None:
         def _on_prev_ok(previews: list[SyncDryRunPreview]) -> None:
             if not dlg_alive["open"] or win._closing_pending:
                 return
-            btn_preview.setEnabled(bool(current_plan))
+            btn_preview.setEnabled(bool(current_plan) and not syncing["active"])
             lbl_status.setText(tr("status.ready"))
             lines: list[str] = []
             for pv in previews:
@@ -1208,11 +1505,12 @@ def open_save_sync_dialog(win: MainWindow) -> None:
             btn_ok.clicked.connect(pv_dlg.accept)
             pv_lay.addWidget(btn_ok)
             pv_dlg.exec()
+            pv_dlg.deleteLater()
 
         def _on_prev_err(err: str) -> None:
             if not dlg_alive["open"] or win._closing_pending:
                 return
-            btn_preview.setEnabled(bool(current_plan))
+            btn_preview.setEnabled(bool(current_plan) and not syncing["active"])
             lbl_status.setText(tr("save_sync.error", err=err))
             QMessageBox.critical(dlg, __app_name__, tr("save_sync.error", err=err))
 
@@ -1227,3 +1525,4 @@ def open_save_sync_dialog(win: MainWindow) -> None:
     sync_dir_edit.editingFinished.connect(_refresh_plan)
     _refresh_plan()
     dlg.exec()
+    dlg.deleteLater()

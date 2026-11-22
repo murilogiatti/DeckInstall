@@ -126,7 +126,13 @@ def test_sync_zip_refuses_blocked_home_files(tmp_path: Path, home: Path) -> None
         executable=("home/.config/Game/run",),
     )
     (sync_root / "game" / "meta.json").write_text(json.dumps({"sha256": save_sync.file_sha256(latest)}))
-    count, _ = save_sync.pull_game_saves("Game", tmp_path / "pfx", sync_root, snapshots_root=tmp_path / "snaps")
+    count_default, _ = save_sync.pull_game_saves("Game", tmp_path / "pfx", sync_root, snapshots_root=tmp_path / "snaps")
+    assert count_default == 0
+    assert sorted(p.relative_to(home).as_posix() for p in home.rglob("*") if p.is_file()) == []
+
+    count, _ = save_sync.pull_game_saves(
+        "Game", tmp_path / "pfx", sync_root, snapshots_root=tmp_path / "snaps", allow_home=True
+    )
     assert count == 1
     assert sorted(p.relative_to(home).as_posix() for p in home.rglob("*") if p.is_file()) == [ALLOWED]
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -12,8 +13,11 @@ import tempfile
 import threading
 import time
 import zipfile
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import IO
 
 from .fsutil import atomic_write_bytes, file_sha256, is_within
 from .steam_vdf import (
@@ -57,6 +61,18 @@ class SaveFingerprint:
 
 
 @dataclass(frozen=True)
+class SyncGameTarget:
+    """Game metadata passed to folder save synchronization."""
+
+    game_name: str
+    prefix_dir: Path
+    game_dir: Path | None = None
+    steam_appid: int | None = None
+    extra_dirs: ExtraDirs = ()
+    source: str = "deckinstall"
+
+
+@dataclass(frozen=True)
 class SyncPlanItem:
     """Planned synchronization action for a single game prefix."""
 
@@ -65,6 +81,10 @@ class SyncPlanItem:
     prefix_dir: Path
     action: str  # "PUSH", "PULL", "IN_SYNC", "CONFLICT", "NO_SAVES"
     reason: str
+    game_dir: Path | None = None
+    steam_appid: int | None = None
+    extra_dirs: ExtraDirs = ()
+    source: str = "deckinstall"
 
 
 @dataclass(frozen=True)
@@ -144,6 +164,76 @@ def _resolve_wine_root(prefix_dir: Path) -> Path:
     if pfx_dir.is_dir() and not pfx_dir.is_symlink():
         return pfx_dir
     return root
+
+
+def _require_safe_prefix_root(prefix_dir: Path) -> Path:
+    """Unwrap prefix_dir and reject any symlink that failed prefix validation."""
+    root = _unwrap_prefix_root(prefix_dir)
+    if root.is_symlink():
+        raise OSError(f"Unsafe target prefix root: {prefix_dir}")
+    return root
+
+
+def _require_safe_wine_root(prefix_dir: Path) -> tuple[Path, Path]:
+    """Return validated (root, wine_root) for writing .reg files, rejecting unsafe symlinks."""
+    root = _require_safe_prefix_root(prefix_dir)
+    pfx_dir = root / "pfx"
+    if pfx_dir.is_symlink():
+        try:
+            if pfx_dir.resolve() == root.resolve():
+                return root, root
+        except OSError as exc:
+            raise OSError(f"Unsafe target wine root: {pfx_dir}") from exc
+        raise OSError(f"Unsafe target wine root: {pfx_dir}")
+    if pfx_dir.exists():
+        if not pfx_dir.is_dir():
+            raise OSError(f"Unsafe target wine root: {pfx_dir}")
+        try:
+            root_resolved = root.resolve()
+        except OSError as exc:
+            raise OSError(f"Unsafe target wine root: {pfx_dir}") from exc
+        if not _safe_parents_within(root, root_resolved, ("pfx",)):
+            raise OSError(f"Unsafe target wine root: {pfx_dir}")
+        return root, pfx_dir
+    return root, root
+
+
+def _require_safe_drive_c(prefix_dir: Path) -> tuple[Path, Path]:
+    """Return validated (root, drive_c) for writing prefix files, rejecting unsafe symlinks."""
+    root = _require_safe_prefix_root(prefix_dir)
+    drive_c = _resolve_drive_c_target(root)
+    try:
+        root_resolved = root.resolve()
+        rel_parts = drive_c.relative_to(root).parts
+    except (OSError, ValueError) as exc:
+        raise OSError(f"Unsafe target drive_c path: {drive_c}") from exc
+    if not _safe_parents_within(root, root_resolved, rel_parts):
+        raise OSError(f"Unsafe target drive_c path: {drive_c}")
+    return root, drive_c
+
+
+_SYSTEM_WINE_USERS = frozenset({"public", "default", "default user", "all users"})
+
+
+def _detect_prefix_user(drive_c: Path) -> str:
+    """Return the existing non-Public Wine user directory name under drive_c/users, or 'steamuser'."""
+    users_dir = _find_child_ci(drive_c, "users")
+    if users_dir is None:
+        return "steamuser"
+    candidates: list[str] = []
+    try:
+        for child in users_dir.iterdir():
+            if child.is_symlink() or not child.is_dir():
+                continue
+            if child.name.lower() in _SYSTEM_WINE_USERS:
+                continue
+            candidates.append(child.name)
+    except OSError:
+        return "steamuser"
+    for name in candidates:
+        if name.lower() == "steamuser":
+            return name
+    return min(candidates) if candidates else "steamuser"
 
 
 def _find_child_ci(parent: Path, name_lower: str) -> Path | None:
@@ -540,7 +630,7 @@ def _parse_wine_reg_sections(reg_text: str) -> list[tuple[str, str, list[str]]]:
         if stripped.startswith("[") and "]" in stripped:
             if cur_subkey is not None:
                 sections.append((cur_subkey, cur_header, cur_lines))
-            rbracket = stripped.index("]")
+            rbracket = stripped.rindex("]")
             raw_key = stripped[1:rbracket]
             cur_subkey = raw_key.replace("\\\\", "\\")
             cur_header = line
@@ -566,9 +656,10 @@ def _parse_wine_reg_sections(reg_text: str) -> list[tuple[str, str, list[str]]]:
 
 def _extract_registry_saves(prefix_dir: Path, reg_paths: list[str]) -> bytes | None:
     """Extract matching Wine registry keys from prefix_dir as UTF-8 JSON bytes."""
-    if not reg_paths or not prefix_dir.is_dir():
+    root = _unwrap_prefix_root(prefix_dir)
+    if not reg_paths or root.is_symlink() or not root.is_dir():
         return None
-    wine_root = _resolve_wine_root(prefix_dir)
+    wine_root = _resolve_wine_root(root)
     targets_by_file: dict[str, list[tuple[str, str]]] = {}
     for raw_path in reg_paths:
         parsed = _split_reg_hive(raw_path)
@@ -627,7 +718,7 @@ def _restore_registry_saves(prefix_dir: Path, reg_json_bytes: bytes) -> int:
     if not isinstance(payload, dict) or not isinstance(payload.get("entries"), list):
         return 0
 
-    wine_root = _resolve_wine_root(prefix_dir)
+    _, wine_root = _require_safe_wine_root(prefix_dir)
     wine_root.mkdir(parents=True, exist_ok=True)
     by_file: dict[str, list[tuple[str, list[str]]]] = {}
 
@@ -645,11 +736,18 @@ def _restore_registry_saves(prefix_dir: Path, reg_json_bytes: bytes) -> int:
         if hive_info is None:
             continue
         _, reg_filename = hive_info
-        lines = [
-            ln
-            for ln in raw_lines
-            if isinstance(ln, str) and "\n" not in ln and "\r" not in ln and "\0" not in ln
-        ]
+        lines: list[str] = []
+        prev_continued = False
+        for ln in raw_lines:
+            if not isinstance(ln, str) or "\n" in ln or "\r" in ln or "\0" in ln:
+                continue
+            ls = ln.lstrip()
+            if not ls or ls.startswith("["):
+                continue
+            if not prev_continued and not (ls.startswith('"') or ls.startswith("@=")):
+                continue
+            lines.append(ln)
+            prev_continued = ln.endswith("\\")
         if lines:
             by_file.setdefault(reg_filename, []).append((subkey, lines))
 
@@ -659,12 +757,10 @@ def _restore_registry_saves(prefix_dir: Path, reg_json_bytes: bytes) -> int:
         reg_file = wine_root / reg_filename
         if reg_file.is_symlink():
             continue
-        existing_text = ""
-        if reg_file.is_file():
-            try:
-                existing_text = reg_file.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                existing_text = ""
+        try:
+            existing_text = reg_file.read_text(encoding="utf-8", errors="replace")
+        except FileNotFoundError:
+            existing_text = ""
 
         if not existing_text.strip():
             existing_text = "WINE REGISTRY Version 2\n"
@@ -743,6 +839,12 @@ _HOME_BLOCKED_ROOTS = (
     (".local", "share", "kio"), (".local", "share", "plasma"), (".local", "share", "dolphin"),
     (".local", "share", "kwin"), (".local", "share", "trash"),
     (".local", "share", "vulkan"), (".local", "share", "deckinstall"), (".config", "deckinstall"),
+    (".local", "share", "bash-completion"), (".local", "share", "konsole"),
+    (".local", "share", "nautilus"), (".local", "share", "nemo"),
+    (".config", "autostart-scripts"), (".config", "gdb"), (".config", "tmux"),
+    (".config", "direnv"), (".config", "wezterm"), (".config", "hypr"),
+    (".config", "sway"), (".config", "i3"), (".config", "cargo"),
+    (".config", "nix"), (".config", "npm"), (".config", "zsh"), (".config", "bash"),
 )
 _HOME_BLOCKED_NAMES = frozenset({
     ".bashrc", ".profile", ".bash_profile", ".bash_login", ".bash_logout", ".zshrc", ".zprofile",
@@ -826,29 +928,27 @@ def _collect_prefix_save_entries(
 
     home_files: paths under $HOME (recorded in the snapshot index) added as the "home" section.
     """
-    extras = _extra_save_entries(extra_dirs) + _home_save_entries(home_files)
-    if not prefix_dir.is_dir():
-        return sorted(extras, key=lambda item: (item[0], item[2].as_posix()))
-    entries: list[tuple[str, Path, Path]] = list(extras)
-    seen: set[tuple[str, str]] = set()
-    src_users = _prefix_users_dir(prefix_dir)
-    if src_users is not None:
-        dummy_users = prefix_dir / "__fp_users__"
-        for src_file, dst_rel in _iter_prefix_save_pairs(
-            src_users, dummy_users, preserve_user_dirs=True, raise_on_error=False
-        ):
-            rel = dst_rel.relative_to(dummy_users)
-            seen.add(("users", rel.as_posix()))
-            entries.append(("users", src_file, rel))
-    src_progdata = _prefix_programdata_dir(prefix_dir)
-    if src_progdata is not None:
-        dummy_pd = prefix_dir / "__fp_pd__"
-        for src_file, dst_rel in _iter_programdata_save_pairs(
-            src_progdata, dummy_pd, raise_on_error=False
-        ):
-            rel = dst_rel.relative_to(dummy_pd)
-            seen.add(("ProgramData", rel.as_posix()))
-            entries.append(("ProgramData", src_file, rel))
+    entries: list[tuple[str, Path, Path]] = _extra_save_entries(extra_dirs) + _home_save_entries(home_files)
+    seen: set[tuple[str, str]] = {(sec, rel.as_posix()) for sec, _src, rel in entries}
+    if prefix_dir.is_dir():
+        src_users = _prefix_users_dir(prefix_dir)
+        if src_users is not None:
+            dummy_users = prefix_dir / "__fp_users__"
+            for src_file, dst_rel in _iter_prefix_save_pairs(
+                src_users, dummy_users, preserve_user_dirs=True, raise_on_error=False
+            ):
+                rel = dst_rel.relative_to(dummy_users)
+                seen.add(("users", rel.as_posix()))
+                entries.append(("users", src_file, rel))
+        src_progdata = _prefix_programdata_dir(prefix_dir)
+        if src_progdata is not None:
+            dummy_pd = prefix_dir / "__fp_pd__"
+            for src_file, dst_rel in _iter_programdata_save_pairs(
+                src_progdata, dummy_pd, raise_on_error=False
+            ):
+                rel = dst_rel.relative_to(dummy_pd)
+                seen.add(("ProgramData", rel.as_posix()))
+                entries.append(("ProgramData", src_file, rel))
 
     if game_name or steam_appid is not None:
         manifest_entry = find_manifest_game_entry(game_name, steam_appid=steam_appid)
@@ -864,13 +964,16 @@ def _collect_prefix_save_entries(
     return entries
 
 
+_PROTECTED_SNAPSHOT_RE = re.compile(r"-(?:pre-restore|pre-import|ludusavi-import)(?:-\d+)?\.zip$")
+
+
 def _rotate_snapshots(snap_dir: Path, max_keep: int) -> None:
-    """Keep at most max_keep newest .zip snapshots in snap_dir."""
+    """Keep at most max_keep newest normal .zip snapshots in snap_dir (safety/imports preserved)."""
     if max_keep <= 0 or not snap_dir.is_dir():
         return
     zips: list[tuple[float, str, Path]] = []
     for p in snap_dir.glob("*.zip"):
-        if p.is_symlink() or not p.is_file():
+        if p.is_symlink() or not p.is_file() or _PROTECTED_SNAPSHOT_RE.search(p.name):
             continue
         try:
             st = p.stat()
@@ -953,6 +1056,70 @@ def _write_saves_zip_atomic(
         raise
 
 
+@dataclass
+class _DirLockEntry:
+    lock: threading.RLock
+    depth: int = 0
+    fh: IO[str] | None = None
+
+
+_SNAP_LOCKS_GUARD = threading.Lock()
+_SNAP_THREAD_LOCKS: dict[str, _DirLockEntry] = {}
+
+
+@contextmanager
+def _snapshot_dir_lock(snap_dir: Path) -> Iterator[None]:
+    """Serialize snapshot creation, rotation, and .index.json updates per snapshot folder."""
+    snap_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        key = str(snap_dir.resolve())
+    except OSError:
+        key = str(snap_dir)
+    with _SNAP_LOCKS_GUARD:
+        entry = _SNAP_THREAD_LOCKS.get(key)
+        if entry is None:
+            entry = _DirLockEntry(lock=threading.RLock())
+            _SNAP_THREAD_LOCKS[key] = entry
+    lock_path = snap_dir.parent / f".{snap_dir.name}.lock"
+    with entry.lock:
+        if entry.depth == 0:
+            fh = open(lock_path, "a+", encoding="utf-8")
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            except Exception:
+                fh.close()
+                raise
+            entry.fh = fh
+        entry.depth += 1
+        try:
+            yield
+        finally:
+            entry.depth -= 1
+            if entry.depth == 0 and entry.fh is not None:
+                lock_fh = entry.fh
+                entry.fh = None
+                try:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                finally:
+                    lock_fh.close()
+
+
+def _reserve_snapshot_zip(snap_dir: Path, stem_prefix: str) -> Path:
+    """Atomically reserve a unique .zip filename in snap_dir via O_CREAT | O_EXCL."""
+    snap_dir.mkdir(parents=True, exist_ok=True)
+    counter = 0
+    while True:
+        suffix = "" if counter == 0 else f"-{counter}"
+        cand = snap_dir / f"{stem_prefix}{suffix}.zip"
+        try:
+            fd = os.open(str(cand), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            counter += 1
+            continue
+        os.close(fd)
+        return cand
+
+
 def snapshot_dir_for(game_name: str, dest_root: Path | None = None) -> Path:
     """The folder holding a game's save snapshots."""
     return (dest_root or DEFAULT_SNAPSHOTS_DIR) / _slugify(game_name)
@@ -974,10 +1141,11 @@ def remember_snapshot_name(snap_dir: Path, game_name: str) -> None:
     """Keep the game's real name next to its snapshots (shown once the game is uninstalled)."""
     if not game_name or not snap_dir.is_dir():
         return
-    index = _read_snapshot_index(snap_dir)
-    if index.get("name") != game_name:
-        index["name"] = game_name
-        _write_snapshot_index(snap_dir, index)
+    with _snapshot_dir_lock(snap_dir):
+        index = _read_snapshot_index(snap_dir)
+        if index.get("name") != game_name:
+            index["name"] = game_name
+            _write_snapshot_index(snap_dir, index)
 
 
 def import_fingerprints(snap_dir: Path) -> dict[str, str]:
@@ -990,11 +1158,12 @@ def import_fingerprints(snap_dir: Path) -> dict[str, str]:
 
 def remember_import_fingerprint(snap_dir: Path, zip_name: str, fingerprint: str) -> None:
     """Record the content fingerprint of one Ludusavi import zip (to skip importing it again)."""
-    index = _read_snapshot_index(snap_dir)
-    known = import_fingerprints(snap_dir)
-    known[zip_name] = fingerprint
-    index["import_fingerprints"] = known
-    _write_snapshot_index(snap_dir, index)
+    with _snapshot_dir_lock(snap_dir):
+        index = _read_snapshot_index(snap_dir)
+        known = import_fingerprints(snap_dir)
+        known[zip_name] = fingerprint
+        index["import_fingerprints"] = known
+        _write_snapshot_index(snap_dir, index)
 
 
 def snapshot_home_files(snap_dir: Path) -> tuple[str, ...]:
@@ -1007,24 +1176,29 @@ def snapshot_home_files(snap_dir: Path) -> tuple[str, ...]:
 
 def remember_home_files(snap_dir: Path, rels: list[str] | tuple[str, ...]) -> None:
     """Add home save paths to the index, so every later snapshot (and its fingerprint) holds them."""
-    merged = set(snapshot_home_files(snap_dir)) | {r for r in rels if home_entry_allowed(tuple(r.split("/")))}
-    if not merged:
+    incoming = {r for r in rels if home_entry_allowed(tuple(r.split("/")))}
+    if not incoming:
         return
-    snap_dir.mkdir(parents=True, exist_ok=True)
-    index = _read_snapshot_index(snap_dir)
-    if index.get("home") != sorted(merged):
-        index["home"] = sorted(merged)
-        _write_snapshot_index(snap_dir, index)
+    with _snapshot_dir_lock(snap_dir):
+        merged = set(snapshot_home_files(snap_dir)) | incoming
+        if not merged:
+            return
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        index = _read_snapshot_index(snap_dir)
+        if index.get("home") != sorted(merged):
+            index["home"] = sorted(merged)
+            _write_snapshot_index(snap_dir, index)
 
 
 def remember_steamcloud_appid(snap_dir: Path, zip_name: str, appid: str) -> None:
     """Record which Steam app the "steamcloud" files of one snapshot zip belong to."""
-    index = _read_snapshot_index(snap_dir)
-    raw = index.get("steamcloud_appids")
-    known = {k: v for k, v in raw.items() if (snap_dir / k).is_file()} if isinstance(raw, dict) else {}
-    known[zip_name] = appid
-    index["steamcloud_appids"] = known
-    _write_snapshot_index(snap_dir, index)
+    with _snapshot_dir_lock(snap_dir):
+        index = _read_snapshot_index(snap_dir)
+        raw = index.get("steamcloud_appids")
+        known = {k: v for k, v in raw.items() if (snap_dir / k).is_file()} if isinstance(raw, dict) else {}
+        known[zip_name] = appid
+        index["steamcloud_appids"] = known
+        _write_snapshot_index(snap_dir, index)
 
 
 def snapshot_steamcloud_appid(snapshot_zip: Path) -> str | None:
@@ -1088,50 +1262,50 @@ def snapshot_prefix_saves(
     instead of writing an identical ZIP.
     """
     snap_dir = snapshot_dir_for(game_name, dest_root)
-    home_files = snapshot_home_files(snap_dir)
-    if not prefix_dir.is_dir() and not extra_dirs and not home_files:
-        return None
-    digest = ""
-    if dedup:
-        digest = compute_prefix_saves_fingerprint(
-            prefix_dir, game_name=game_name, game_dir=game_dir, steam_appid=steam_appid,
-            extra_dirs=extra_dirs, home_files=home_files,
-        ).digest
-        if not digest:
+    with _snapshot_dir_lock(snap_dir):
+        home_files = snapshot_home_files(snap_dir)
+        if not prefix_dir.is_dir() and not extra_dirs and not home_files:
             return None
+        digest = ""
+        if dedup:
+            digest = compute_prefix_saves_fingerprint(
+                prefix_dir, game_name=game_name, game_dir=game_dir, steam_appid=steam_appid,
+                extra_dirs=extra_dirs, home_files=home_files,
+            ).digest
+            if not digest:
+                return None
+            index = _read_snapshot_index(snap_dir)
+            last_zip = snap_dir / str(index.get("zip") or "")
+            if (
+                index.get("digest") == digest
+                and last_zip.suffix == ".zip"
+                and last_zip.is_file()
+                and not last_zip.is_symlink()
+            ):
+                return last_zip
+        safe_reason = _slugify(reason, fallback="op")
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target_zip = _reserve_snapshot_zip(snap_dir, f"{stamp}-{safe_reason}")
+        try:
+            written = _write_saves_zip_atomic(
+                prefix_dir, target_zip, key_prefix, game_name=game_name,
+                game_dir=game_dir, steam_appid=steam_appid, extra_dirs=extra_dirs, home_files=home_files,
+            )
+            if written == 0:
+                target_zip.unlink(missing_ok=True)
+                return None
+        except BaseException:
+            target_zip.unlink(missing_ok=True)
+            raise
+        if steam_appid is not None and any(name == "steamcloud" for name, _ in extra_dirs or ()):
+            remember_steamcloud_appid(snap_dir, target_zip.name, str(steam_appid))
         index = _read_snapshot_index(snap_dir)
-        last_zip = snap_dir / str(index.get("zip") or "")
-        if (
-            index.get("digest") == digest
-            and last_zip.suffix == ".zip"
-            and last_zip.is_file()
-            and not last_zip.is_symlink()
-        ):
-            return last_zip
-    safe_reason = _slugify(reason, fallback="op")
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    target_zip = snap_dir / f"{stamp}-{safe_reason}.zip"
-    if target_zip.exists():
-        counter = 1
-        while (snap_dir / f"{stamp}-{safe_reason}-{counter}.zip").exists():
-            counter += 1
-        target_zip = snap_dir / f"{stamp}-{safe_reason}-{counter}.zip"
-
-    written = _write_saves_zip_atomic(
-        prefix_dir, target_zip, key_prefix, game_name=game_name,
-        game_dir=game_dir, steam_appid=steam_appid, extra_dirs=extra_dirs, home_files=home_files,
-    )
-    if written == 0:
-        return None
-    if steam_appid is not None and any(name == "steamcloud" for name, _ in extra_dirs or ()):
-        remember_steamcloud_appid(snap_dir, target_zip.name, str(steam_appid))
-    index = _read_snapshot_index(snap_dir)
-    if digest:
-        index.update(digest=digest, zip=target_zip.name)
-    index["name"] = game_name
-    _write_snapshot_index(snap_dir, index)
-    _rotate_snapshots(snap_dir, max_keep)
-    return target_zip
+        if digest:
+            index.update(digest=digest, zip=target_zip.name)
+        index["name"] = game_name
+        _write_snapshot_index(snap_dir, index)
+        _rotate_snapshots(snap_dir, max_keep)
+        return target_zip
 
 
 def auto_snapshot(
@@ -1190,20 +1364,34 @@ def snapshot_after_play(
     except OSError:
         return None
     snap_dir = snapshot_dir_for(game_name, dest_root)
-    seen = _read_snapshot_index(snap_dir).get("played")
-    if isinstance(seen, (int, float)) and played <= float(seen):
-        return None
-    if not _run_finished(run_log):
-        return None
-    snap = auto_snapshot(
-        prefix_dir, game_name, "after-play", keep=keep,
-        game_dir=game_dir, steam_appid=steam_appid, dest_root=dest_root,
-    )
-    snap_dir.mkdir(parents=True, exist_ok=True)
-    index = _read_snapshot_index(snap_dir)
-    index["played"] = played
-    _write_snapshot_index(snap_dir, index)
-    return snap
+    with _snapshot_dir_lock(snap_dir):
+        seen = _read_snapshot_index(snap_dir).get("played")
+        if isinstance(seen, (int, float)) and played <= float(seen):
+            return None
+        if not _run_finished(run_log):
+            return None
+        snap = auto_snapshot(
+            prefix_dir, game_name, "after-play", keep=keep,
+            game_dir=game_dir, steam_appid=steam_appid, dest_root=dest_root,
+        )
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        index = _read_snapshot_index(snap_dir)
+        index["played"] = played
+        _write_snapshot_index(snap_dir, index)
+        return snap
+
+
+def _wrap_restore_error(exc: Exception, safety: Path | None) -> Exception:
+    """Attach the created safety snapshot path to a restore failure while preserving OSError."""
+    if safety is None or str(safety) in str(exc):
+        return exc
+    msg = f"{exc} (safety snapshot: {safety})"
+    if isinstance(exc, OSError):
+        try:
+            return type(exc)(msg)
+        except TypeError:
+            return OSError(msg)
+    return RuntimeError(msg)
 
 
 def restore_snapshot_safely(
@@ -1243,7 +1431,10 @@ def restore_snapshot_safely(
             prefix_dir, game_name, "pre-restore", dest_root=dest_root,
         )
         safety = state_snap.snapshot_zip if state_snap is not None else None
-        files, regs = restore_prefix_state_snapshot(snapshot_zip, prefix_dir)
+        try:
+            files, regs = restore_prefix_state_snapshot(snapshot_zip, prefix_dir)
+        except Exception as exc:
+            raise _wrap_restore_error(exc, safety) from exc
         return files + regs, safety
     safety = auto_snapshot(
         prefix_dir, game_name, "pre-restore", keep=0,
@@ -1253,9 +1444,18 @@ def restore_snapshot_safely(
     if safety is not None and home_rels:
         with zipfile.ZipFile(safety) as zf:
             covered = {n.split("/", 2)[2] for n in zf.namelist() if n.count("/") >= 2 and n.split("/", 2)[1] == "home"}
-    count = _restore_saves_archive(
-        snapshot_zip, prefix_dir, game_dir, extra_dirs=extra_dirs, home_overwrite=covered, skipped=skipped
-    )
+    try:
+        count = _restore_saves_archive(
+            snapshot_zip,
+            prefix_dir,
+            game_dir,
+            extra_dirs=extra_dirs,
+            home_overwrite=covered,
+            skipped=skipped,
+            allow_home=True,
+        )
+    except Exception as exc:
+        raise _wrap_restore_error(exc, safety) from exc
     return count, safety
 
 
@@ -1276,82 +1476,136 @@ def snapshot_prefix_state(
     if not entries:
         return None
 
-    root = dest_root or DEFAULT_SNAPSHOTS_DIR
+    dest = dest_root or DEFAULT_SNAPSHOTS_DIR
     safe_slug = _slugify(game_name)
     safe_reason = _slugify(reason, fallback="state")
-    snap_dir = root / safe_slug / "state"
+    snap_dir = dest / safe_slug / "state"
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    target_zip = snap_dir / f"{stamp}-{safe_reason}.zip"
-    if target_zip.exists():
-        counter = 1
-        while (snap_dir / f"{stamp}-{safe_reason}-{counter}.zip").exists():
-            counter += 1
-        target_zip = snap_dir / f"{stamp}-{safe_reason}-{counter}.zip"
 
-    snap_dir.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{target_zip.stem}-", suffix=".zip.tmp", dir=str(snap_dir)
-    )
-    os.close(fd)
-    tmp_zip = Path(tmp_name)
+    with _snapshot_dir_lock(snap_dir):
+        target_zip = _reserve_snapshot_zip(snap_dir, f"{stamp}-{safe_reason}")
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{target_zip.stem}-", suffix=".zip.tmp", dir=str(snap_dir)
+        )
+        os.close(fd)
+        tmp_zip = Path(tmp_name)
 
-    reg_count = 0
-    dll_count = 0
-    total_uncompressed = 0
-    try:
-        with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for kind, src_file, rel_path in entries:
-                try:
-                    st = src_file.stat()
-                except OSError:
-                    continue
-                fsize = st.st_size
-                if reg_count + dll_count + 1 > _RESTORE_MAX_ENTRIES:
-                    raise RuntimeError(
-                        f"Prefix state snapshot exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})"
-                    )
-                if fsize > _RESTORE_MAX_FILE_BYTES or total_uncompressed + fsize > max_total_bytes:
-                    raise RuntimeError(
-                        f"Prefix state snapshot size limit exceeded on {src_file.name}"
-                    )
-                try:
-                    sfd = os.open(str(src_file), os.O_RDONLY | os.O_NOFOLLOW)
-                except OSError:
-                    continue
-                arcname = f"{kind}/{rel_path.as_posix()}"
-                file_bytes = 0
-                with os.fdopen(sfd, "rb") as fh, zf.open(arcname, "w") as zout:
-                    while chunk := fh.read(65536):
-                        file_bytes += len(chunk)
-                        if (
-                            file_bytes > _RESTORE_MAX_FILE_BYTES
-                            or total_uncompressed + file_bytes > max_total_bytes
-                        ):
-                            raise RuntimeError(
-                                f"Prefix state snapshot size limit exceeded on {src_file.name}"
-                            )
-                        zout.write(chunk)
-                total_uncompressed += file_bytes
-                if kind == "reg":
-                    reg_count += 1
-                else:
-                    dll_count += 1
-        if reg_count + dll_count == 0:
+        reg_count = 0
+        dll_count = 0
+        total_uncompressed = 0
+        try:
+            with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for kind, src_file, rel_path in entries:
+                    try:
+                        st = src_file.stat()
+                    except OSError:
+                        continue
+                    fsize = st.st_size
+                    if reg_count + dll_count + 1 > _RESTORE_MAX_ENTRIES:
+                        raise RuntimeError(
+                            f"Prefix state snapshot exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})"
+                        )
+                    if fsize > _RESTORE_MAX_FILE_BYTES or total_uncompressed + fsize > max_total_bytes:
+                        raise RuntimeError(
+                            f"Prefix state snapshot size limit exceeded on {src_file.name}"
+                        )
+                    try:
+                        sfd = os.open(str(src_file), os.O_RDONLY | os.O_NOFOLLOW)
+                    except OSError:
+                        continue
+                    arcname = f"{kind}/{rel_path.as_posix()}"
+                    file_bytes = 0
+                    with os.fdopen(sfd, "rb") as fh, zf.open(arcname, "w") as zout:
+                        while chunk := fh.read(65536):
+                            file_bytes += len(chunk)
+                            if (
+                                file_bytes > _RESTORE_MAX_FILE_BYTES
+                                or total_uncompressed + file_bytes > max_total_bytes
+                            ):
+                                raise RuntimeError(
+                                    f"Prefix state snapshot size limit exceeded on {src_file.name}"
+                                )
+                            zout.write(chunk)
+                    total_uncompressed += file_bytes
+                    if kind == "reg":
+                        reg_count += 1
+                    else:
+                        dll_count += 1
+            if reg_count + dll_count == 0:
+                tmp_zip.unlink(missing_ok=True)
+                target_zip.unlink(missing_ok=True)
+                return None
+            os.replace(tmp_zip, target_zip)
+        except BaseException:
             tmp_zip.unlink(missing_ok=True)
-            return None
-        os.replace(tmp_zip, target_zip)
-    except Exception:
-        tmp_zip.unlink(missing_ok=True)
+            target_zip.unlink(missing_ok=True)
+            raise
+
+        _rotate_snapshots(snap_dir, max_keep)
+        return PrefixStateSnapshot(
+            snapshot_zip=target_zip,
+            prefix_dir=prefix_dir,
+            reason=reason,
+            reg_count=reg_count,
+            dll_count=dll_count,
+        )
+
+
+def _commit_staged_files(
+    staged: list[tuple[Path, Path]],
+    *,
+    mtime: float | None = None,
+    post_commit: Callable[[], None] | None = None,
+) -> None:
+    """Validate every target and atomically replace them all, rolling back on any failure."""
+    if not staged and post_commit is None:
+        return
+    for _tmp_path, target in staged:
+        if target.is_symlink():
+            raise OSError(f"Refusing to overwrite symlink target: {target}")
+        if target.exists() and target.is_dir():
+            raise IsADirectoryError(f"Target path is a directory: {target}")
+
+    committed: list[tuple[Path, Path | None]] = []
+    remaining_idx = 0
+    try:
+        for idx, (tmp_path, target) in enumerate(staged):
+            remaining_idx = idx
+            bak_path: Path | None = None
+            if target.exists():
+                fd, bak_name = tempfile.mkstemp(
+                    prefix=f".{target.name}.", suffix=".bak.tmp", dir=str(target.parent)
+                )
+                os.close(fd)
+                bak_path = Path(bak_name)
+                os.replace(target, bak_path)
+            committed.append((target, bak_path))
+            os.replace(tmp_path, target)
+            remaining_idx = idx + 1
+        if post_commit is not None:
+            post_commit()
+    except BaseException:
+        for target, bak_path in reversed(committed):
+            try:
+                if bak_path is not None and bak_path.exists():
+                    os.replace(bak_path, target)
+                else:
+                    target.unlink(missing_ok=True)
+            except OSError:
+                pass
+        for tmp_path, _target in staged[remaining_idx:]:
+            tmp_path.unlink(missing_ok=True)
         raise
 
-    _rotate_snapshots(snap_dir, max_keep)
-    return PrefixStateSnapshot(
-        snapshot_zip=target_zip,
-        prefix_dir=prefix_dir,
-        reason=reason,
-        reg_count=reg_count,
-        dll_count=dll_count,
-    )
+    for _target, bak_path in committed:
+        if bak_path is not None:
+            bak_path.unlink(missing_ok=True)
+    if mtime is not None:
+        for _tmp_path, target in staged:
+            try:
+                os.utime(target, (mtime, mtime))
+            except OSError:
+                pass
 
 
 def restore_prefix_state_snapshot(snapshot_zip: Path, prefix_dir: Path) -> tuple[int, int]:
@@ -1359,87 +1613,96 @@ def restore_prefix_state_snapshot(snapshot_zip: Path, prefix_dir: Path) -> tuple
     if not snapshot_zip.is_file() or snapshot_zip.is_symlink():
         raise FileNotFoundError(f"Prefix state snapshot not found: {snapshot_zip}")
 
-    root = _unwrap_prefix_root(prefix_dir)
-    wine_root = _resolve_wine_root(root)
-    drive_c = _resolve_drive_c_target(root)
+    root, wine_root = _require_safe_wine_root(prefix_dir)
+    _, drive_c = _require_safe_drive_c(root)
     wine_root.mkdir(parents=True, exist_ok=True)
     drive_c.mkdir(parents=True, exist_ok=True)
     wine_root_resolved = wine_root.resolve()
     drive_c_resolved = drive_c.resolve()
 
-    reg_count = 0
-    dll_count = 0
+    staged_by_target: dict[Path, tuple[Path, str]] = {}
     total_bytes = 0
-    with zipfile.ZipFile(snapshot_zip, "r") as zf:
-        infolist = zf.infolist()
-        if len(infolist) > _RESTORE_MAX_ENTRIES:
-            raise RuntimeError(
-                f"Prefix state snapshot exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})"
-            )
-        for info in infolist:
-            if info.is_dir():
-                continue
-            if stat.S_ISLNK((info.external_attr >> 16) & 0o170000):
-                continue
-            filename = info.filename
-            if not filename or filename.startswith("/") or "\\" in filename:
-                continue
-            parts = Path(filename).parts
-            if any(p in ("..", "", ".") for p in parts):
-                continue
-            rel_parts: tuple[str, ...]
-            if parts[0] == "reg" and len(parts) == 2 and parts[1].lower().endswith(".reg"):
-                base_dir = wine_root
-                base_resolved = wine_root_resolved
-                rel_parts = (parts[1],)
-                kind = "reg"
-            elif parts[0] == "dll" and len(parts) >= 2:
-                base_dir = drive_c
-                base_resolved = drive_c_resolved
-                rel_parts = parts[1:]
-                kind = "dll"
-            else:
-                continue
+    try:
+        with zipfile.ZipFile(snapshot_zip, "r") as zf:
+            infolist = zf.infolist()
+            if len(infolist) > _RESTORE_MAX_ENTRIES:
+                raise RuntimeError(
+                    f"Prefix state snapshot exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})"
+                )
+            for info in infolist:
+                if info.is_dir():
+                    continue
+                if stat.S_ISLNK((info.external_attr >> 16) & 0o170000):
+                    continue
+                filename = info.filename
+                if not filename or filename.startswith("/") or "\\" in filename:
+                    continue
+                parts = Path(filename).parts
+                if any(p in ("..", "", ".") for p in parts):
+                    continue
+                rel_parts: tuple[str, ...]
+                if parts[0] == "reg" and len(parts) == 2 and parts[1].lower().endswith(".reg"):
+                    base_dir = wine_root
+                    base_resolved = wine_root_resolved
+                    rel_parts = (parts[1],)
+                    kind = "reg"
+                elif parts[0] == "dll" and len(parts) >= 2:
+                    base_dir = drive_c
+                    base_resolved = drive_c_resolved
+                    rel_parts = parts[1:]
+                    kind = "dll"
+                else:
+                    continue
 
-            if info.file_size > _RESTORE_MAX_FILE_BYTES:
-                raise RuntimeError(f"Snapshot file too large: {info.filename}")
-            if not _safe_parents_within(base_dir, base_resolved, rel_parts[:-1]):
-                continue
+                if info.file_size > _RESTORE_MAX_FILE_BYTES:
+                    raise RuntimeError(f"Snapshot file too large: {info.filename}")
+                if not _safe_parents_within(base_dir, base_resolved, rel_parts[:-1]):
+                    continue
 
-            target = base_dir.joinpath(*rel_parts)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if not is_within(target.parent, base_resolved) or target.is_symlink():
-                continue
+                target = base_dir.joinpath(*rel_parts)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not is_within(target.parent, base_resolved) or target.is_symlink():
+                    continue
+                if target.exists() and target.is_dir():
+                    raise IsADirectoryError(f"Target path is a directory: {target}")
 
-            fd, tmp_name = tempfile.mkstemp(
-                prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
-            )
-            os.close(fd)
-            tmp_path = Path(tmp_name)
-            try:
-                copied = 0
-                with zf.open(info, "r") as src_fh, tmp_path.open("wb") as dst_fh:
-                    while chunk := src_fh.read(65536):
-                        copied += len(chunk)
-                        total_bytes += len(chunk)
-                        if (
-                            copied > _RESTORE_MAX_FILE_BYTES
-                            or total_bytes > _RESTORE_MAX_TOTAL_BYTES
-                        ):
-                            raise RuntimeError(
-                                f"Decompression limit exceeded on {info.filename}"
-                            )
-                        dst_fh.write(chunk)
-                os.replace(tmp_path, target)
-            except Exception:
-                tmp_path.unlink(missing_ok=True)
-                raise
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+                )
+                os.close(fd)
+                tmp_path = Path(tmp_name)
+                try:
+                    copied = 0
+                    with zf.open(info, "r") as src_fh, tmp_path.open("wb") as dst_fh:
+                        while chunk := src_fh.read(65536):
+                            copied += len(chunk)
+                            total_bytes += len(chunk)
+                            if (
+                                copied > _RESTORE_MAX_FILE_BYTES
+                                or total_bytes > _RESTORE_MAX_TOTAL_BYTES
+                            ):
+                                raise RuntimeError(
+                                    f"Decompression limit exceeded on {info.filename}"
+                                )
+                            dst_fh.write(chunk)
+                except BaseException:
+                    tmp_path.unlink(missing_ok=True)
+                    raise
 
-            if kind == "reg":
-                reg_count += 1
-            else:
-                dll_count += 1
+                prev = staged_by_target.get(target)
+                if prev is not None:
+                    prev[0].unlink(missing_ok=True)
+                staged_by_target[target] = (tmp_path, kind)
 
+        staged = [(tmp_path, target) for target, (tmp_path, _kind) in staged_by_target.items()]
+        _commit_staged_files(staged)
+    except BaseException:
+        for tmp_path, _kind in staged_by_target.values():
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+    reg_count = sum(1 for _tmp_path, kind in staged_by_target.values() if kind == "reg")
+    dll_count = sum(1 for _tmp_path, kind in staged_by_target.values() if kind == "dll")
     return reg_count, dll_count
 
 
@@ -1535,20 +1798,37 @@ def _sync_base_key(sync_root: Path, slug: str) -> str:
     return f"{root}|{slug}"
 
 
-def _read_sync_base(prefix_dir: Path, sync_root: Path, slug: str) -> str:
-    """Return the save digest last pushed/pulled by this device for (sync_root, slug)."""
+def _read_sync_base_pair(prefix_dir: Path, sync_root: Path, slug: str) -> tuple[str, str]:
+    """Return (remote_digest, local_digest) last agreed upon by this device."""
     state_path = prefix_dir / _SYNC_BASE_FILE
     try:
         if state_path.is_symlink() or not state_path.is_file() or state_path.stat().st_size > 1_048_576:
-            return ""
+            return "", ""
         data = json.loads(state_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return ""
+        return "", ""
     value = data.get(_sync_base_key(sync_root, slug)) if isinstance(data, dict) else None
-    return value if isinstance(value, str) else ""
+    if isinstance(value, str):
+        return value, value
+    if isinstance(value, dict):
+        rem = value.get("remote")
+        loc = value.get("local")
+        return (rem if isinstance(rem, str) else ""), (loc if isinstance(loc, str) else "")
+    return "", ""
 
 
-def _record_sync_base(prefix_dir: Path, sync_root: Path, slug: str, digest: str) -> None:
+def _read_sync_base(prefix_dir: Path, sync_root: Path, slug: str) -> str:
+    """Return the save digest last pushed/pulled by this device for (sync_root, slug)."""
+    return _read_sync_base_pair(prefix_dir, sync_root, slug)[0]
+
+
+def _record_sync_base(
+    prefix_dir: Path,
+    sync_root: Path,
+    slug: str,
+    digest: str,
+    local_digest: str | None = None,
+) -> None:
     """Remember the digest both sides agreed on; stored locally in the prefix (never synced)."""
     state_path = prefix_dir / _SYNC_BASE_FILE
     try:
@@ -1562,7 +1842,11 @@ def _record_sync_base(prefix_dir: Path, sync_root: Path, slug: str, digest: str)
                     data = loaded
             except ValueError:
                 data = {}
-        data[_sync_base_key(sync_root, slug)] = digest
+        key = _sync_base_key(sync_root, slug)
+        if local_digest is None or local_digest == digest:
+            data[key] = digest
+        else:
+            data[key] = {"remote": digest, "local": local_digest}
         atomic_write_bytes(state_path, json.dumps(data, indent=2).encode("utf-8"))
     except OSError:
         logging.warning("Could not record sync base for %s in %s", slug, prefix_dir, exc_info=True)
@@ -1574,15 +1858,17 @@ def push_game_saves(
     sync_root: Path,
     game_dir: Path | None = None,
     steam_appid: int | None = None,
+    extra_dirs: ExtraDirs | None = None,
 ) -> Path | None:
     """Package prefix saves into <sync_root>/<slug>/latest.zip with atomic meta.json."""
-    if not prefix_dir.is_dir():
+    if not prefix_dir.is_dir() and not extra_dirs:
         return None
     entries = _collect_prefix_save_entries(
         prefix_dir,
         game_name=game_name,
         game_dir=game_dir,
         steam_appid=steam_appid,
+        extra_dirs=extra_dirs,
     )
     reg_bytes = _extract_manifest_reg_bytes(prefix_dir, game_name, steam_appid)
     if not entries and not reg_bytes:
@@ -1680,7 +1966,8 @@ def push_game_saves(
     }
     meta_bytes = json.dumps(meta, indent=2, ensure_ascii=False).encode("utf-8")
     atomic_write_bytes(game_sync_dir / "meta.json", meta_bytes)
-    _record_sync_base(prefix_dir, sync_root, slug, str(meta["fingerprint_digest"]))
+    if prefix_dir.is_dir():
+        _record_sync_base(prefix_dir, sync_root, slug, str(meta["fingerprint_digest"]))
     return latest_zip
 
 
@@ -1734,11 +2021,15 @@ def pull_game_saves(
     allow_unverified: bool = False,
     game_dir: Path | None = None,
     steam_appid: int | None = None,
+    *,
+    max_keep: int = SNAPSHOT_KEEP_DEFAULT,
+    allow_home: bool = False,
+    extra_dirs: ExtraDirs | None = None,
 ) -> tuple[int, Path | None]:
     """Snapshot local saves, then safely extract synced saves into prefix drive_c."""
     slug = _slugify(game_name)
     latest_zip = sync_root / slug / "latest.zip"
-    if not latest_zip.is_file():
+    if latest_zip.is_symlink() or not latest_zip.is_file():
         return 0, None
 
     meta = _read_sync_meta(sync_root / slug / "meta.json")
@@ -1765,17 +2056,80 @@ def pull_game_saves(
         game_name,
         "pre-sync-pull",
         dest_root=snapshots_root,
+        max_keep=max_keep,
         game_dir=game_dir,
         steam_appid=steam_appid,
+        extra_dirs=extra_dirs,
     )
 
-    restored_files = _restore_saves_archive(latest_zip, prefix_dir, game_dir, remote_updated_at)
+    try:
+        restored_files = _restore_saves_archive(
+            latest_zip,
+            prefix_dir,
+            game_dir,
+            remote_updated_at,
+            extra_dirs=extra_dirs,
+            allow_home=allow_home,
+        )
+    except Exception as exc:
+        raise _wrap_restore_error(exc, snap_path) from exc
+
     remote_digest = meta.get("fingerprint_digest") if meta is not None else None
-    if isinstance(remote_digest, str) and remote_digest:
-        _record_sync_base(prefix_dir, sync_root, slug, remote_digest)
+    if isinstance(remote_digest, str) and remote_digest and prefix_dir.is_dir():
+        post_fp = compute_prefix_saves_fingerprint(
+            prefix_dir,
+            game_name=game_name,
+            game_dir=game_dir,
+            steam_appid=steam_appid,
+            extra_dirs=extra_dirs,
+        )
+        _record_sync_base(
+            prefix_dir,
+            sync_root,
+            slug,
+            remote_digest,
+            local_digest=post_fp.digest or remote_digest,
+        )
     return restored_files, snap_path
 
 
+def _resolve_existing_rel_parts(
+    drive_c: Path,
+    section: str,
+    rel_parts: tuple[str, ...],
+    target_user: str,
+) -> tuple[str, ...]:
+    """Remap non-Public users onto target_user if absent and reuse existing Wine path case."""
+    adj_rel = rel_parts
+    if section == "users" and len(rel_parts) >= 2 and rel_parts[0].lower() != "public":
+        users_dir = _find_child_ci(drive_c, "users")
+        if users_dir is None or _find_child_ci(users_dir, rel_parts[0].lower()) is None:
+            adj_rel = (target_user, *rel_parts[1:])
+    raw_parts = (section, *adj_rel)
+    cur = drive_c
+    out: list[str] = []
+    for part in raw_parts[:-1]:
+        exact = cur / part
+        if exact.is_dir() and not exact.is_symlink():
+            chosen = part
+        else:
+            found = _find_child_ci(cur, part.lower())
+            chosen = found.name if found is not None else part
+        out.append(chosen)
+        cur = cur / chosen
+    leaf = raw_parts[-1]
+    exact_leaf = cur / leaf
+    if not (exact_leaf.exists() or exact_leaf.is_symlink()) and cur.is_dir() and not cur.is_symlink():
+        leaf_low = leaf.lower()
+        try:
+            for child in sorted(cur.iterdir()):
+                if not child.is_symlink() and child.is_file() and child.name.lower() == leaf_low:
+                    leaf = child.name
+                    break
+        except OSError:
+            pass
+    out.append(leaf)
+    return tuple(out)
 
 
 def _restore_saves_archive(
@@ -1786,11 +2140,13 @@ def _restore_saves_archive(
     extra_dirs: ExtraDirs | None = None,
     home_overwrite: set[str] | None = None,
     skipped: list[str] | None = None,
+    *,
+    allow_home: bool = False,
 ) -> int:
     """Extract bounded save entries into explicitly selected prefix, game and extra roots.
 
-    Existing files under $HOME are replaced only when listed in home_overwrite (held by a safety
-    snapshot); the others are kept and appended to skipped.
+    Existing files under $HOME are replaced only when allow_home is True and the file is listed
+    in home_overwrite (held by a safety snapshot); the others are kept and appended to skipped.
     """
     root_prefix = _unwrap_prefix_root(prefix_dir)
     extras = {name: root for name, root in (extra_dirs or ()) if name in EXTRA_SECTIONS}
@@ -1799,145 +2155,204 @@ def _restore_saves_archive(
         with zipfile.ZipFile(archive_path, "r") as zf_scan:
             sections = {p[0] for n in zf_scan.namelist()[:_RESTORE_MAX_ENTRIES] if (p := _parse_sync_zip_entry(n))}
         has_prefix = not sections or bool(sections - {"home"})
-    drive_c = _resolve_drive_c_target(root_prefix)
+
     if has_prefix:
-        if not _safe_parents_within(
-            root_prefix, root_prefix.resolve(), drive_c.relative_to(root_prefix).parts
-        ):
+        if root_prefix.is_symlink():
+            raise OSError(f"Unsafe target drive_c path: {prefix_dir}")
+        drive_c = _resolve_drive_c_target(root_prefix)
+        try:
+            root_resolved = root_prefix.resolve()
+            drive_c_rel = drive_c.relative_to(root_prefix).parts
+        except (OSError, ValueError) as exc:
+            raise OSError(f"Unsafe target drive_c path: {drive_c}") from exc
+        if not _safe_parents_within(root_prefix, root_resolved, drive_c_rel):
             raise OSError(f"Unsafe target drive_c path: {drive_c}")
         drive_c.mkdir(parents=True, exist_ok=True)
-    drive_c_resolved = drive_c.resolve()
-    game_dir_resolved = game_dir.resolve() if game_dir is not None and game_dir.is_dir() else None
+        drive_c_resolved = drive_c.resolve()
+        target_user = _detect_prefix_user(drive_c)
+    else:
+        drive_c = _resolve_drive_c_target(root_prefix)
+        drive_c_resolved = drive_c.resolve() if drive_c.exists() else drive_c
+        target_user = "steamuser"
 
-    restored_files = 0
+    if game_dir is not None and not game_dir.is_symlink() and game_dir.is_dir():
+        game_dir_resolved = game_dir.resolve()
+    else:
+        game_dir_resolved = None
+
+    staged_by_target: dict[Path, Path] = {}
+    reg_payloads: list[bytes] = []
+    reg_restored = 0
     total_bytes = 0
-    with zipfile.ZipFile(archive_path, "r") as zf:
-        infolist = zf.infolist()
-        if len(infolist) > _RESTORE_MAX_ENTRIES:
-            raise RuntimeError(
-                f"Sync archive exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})"
-            )
-        if sum(max(0, info.file_size) for info in infolist) > _RESTORE_MAX_TOTAL_BYTES:
-            raise RuntimeError(
-                f"Sync archive exceeds maximum uncompressed size ({_RESTORE_MAX_TOTAL_BYTES})"
-            )
-        for info in infolist:
-            if info.is_dir():
-                continue
-            # Block symlink entries stored in POSIX zip attributes.
-            if stat.S_ISLNK((info.external_attr >> 16) & 0o170000):
-                continue
-            parsed = _parse_sync_zip_entry(info.filename, game_dir=game_dir)
-            if parsed is None:
-                continue
-            section, rel_parts = parsed
-            if info.file_size > _RESTORE_MAX_FILE_BYTES:
-                raise RuntimeError(f"Sync file too large: {info.filename}")
 
-            if section == "registry":
-                if rel_parts != ("registry.json",):
+    try:
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            infolist = zf.infolist()
+            if len(infolist) > _RESTORE_MAX_ENTRIES:
+                raise RuntimeError(
+                    f"Sync archive exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})"
+                )
+            if sum(max(0, info.file_size) for info in infolist) > _RESTORE_MAX_TOTAL_BYTES:
+                raise RuntimeError(
+                    f"Sync archive exceeds maximum uncompressed size ({_RESTORE_MAX_TOTAL_BYTES})"
+                )
+            for info in infolist:
+                if info.is_dir():
                     continue
-                chunks: list[bytes] = []
-                copied = 0
-                with zf.open(info, "r") as src_fh:
-                    while chunk := src_fh.read(65536):
-                        copied += len(chunk)
-                        total_bytes += len(chunk)
-                        if (
-                            copied > _RESTORE_MAX_FILE_BYTES
-                            or total_bytes > _RESTORE_MAX_TOTAL_BYTES
-                        ):
-                            raise RuntimeError(
-                                f"Decompression limit exceeded on {info.filename}"
-                            )
-                        chunks.append(chunk)
-                if _restore_registry_saves(root_prefix, b"".join(chunks)) > 0:
-                    restored_files += 1
-                continue
+                # Block symlink entries stored in POSIX zip attributes.
+                if stat.S_ISLNK((info.external_attr >> 16) & 0o170000):
+                    continue
+                parsed = _parse_sync_zip_entry(info.filename, game_dir=game_dir)
+                if parsed is None:
+                    continue
+                section, rel_parts = parsed
+                if info.file_size > _RESTORE_MAX_FILE_BYTES:
+                    raise RuntimeError(f"Sync file too large: {info.filename}")
 
-            if section == "game":
-                if game_dir is None or game_dir_resolved is None:
-                    continue
-                base_dir = game_dir
-                base_resolved = game_dir_resolved
-                check_parts = rel_parts[:-1]
-                target = game_dir.joinpath(*rel_parts)
-            elif section == "home":
-                # Native games' files under $HOME (from Ludusavi): allowed save folders only, and an
-                # existing file is replaced only when the safety snapshot holds it.
-                if not home_entry_allowed(rel_parts, info.external_attr >> 16):
-                    continue
-                home_root = _home_root()
-                base_dir = home_root
-                base_resolved = home_root.resolve()
-                check_parts = rel_parts[:-1]
-                target = home_root.joinpath(*rel_parts)
-                rel = "/".join(rel_parts)
-                covered = target.is_file() and rel in (home_overwrite or ())
-                if target.is_symlink() or (target.exists() and not covered):
-                    if skipped is not None:
-                        skipped.append(rel)
-                    continue
-            elif section in EXTRA_SECTIONS:
-                extra_root = extras.get(section)
-                if extra_root is None or extra_root.is_symlink():
-                    continue
-                extra_root.mkdir(parents=True, exist_ok=True)
-                base_dir = extra_root
-                base_resolved = extra_root.resolve()
-                check_parts = rel_parts[:-1]
-                target = extra_root.joinpath(*rel_parts)
-            elif not has_prefix:
-                continue
-            else:
-                base_dir = drive_c
-                base_resolved = drive_c_resolved
-                check_parts = (section, *rel_parts[:-1])
-                target = drive_c.joinpath(section, *rel_parts)
-
-            if not _safe_parents_within(base_dir, base_resolved, check_parts):
-                continue
-
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if not is_within(target.parent, base_resolved):
-                continue
-            if target.is_symlink():
-                continue
-
-            fd, tmp_name = tempfile.mkstemp(
-                prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
-            )
-            os.close(fd)
-            tmp_path = Path(tmp_name)
-            try:
-                copied = 0
-                with zf.open(info, "r") as src_fh, tmp_path.open("wb") as dst_fh:
-                    while chunk := src_fh.read(65536):
-                        copied += len(chunk)
-                        total_bytes += len(chunk)
-                        if (
-                            copied > _RESTORE_MAX_FILE_BYTES
-                            or total_bytes > _RESTORE_MAX_TOTAL_BYTES
-                        ):
-                            raise RuntimeError(
-                                f"Decompression limit exceeded on {info.filename}"
-                            )
-                        dst_fh.write(chunk)
-                os.replace(tmp_path, target)
-                if remote_updated_at is not None:
+                if section == "registry":
+                    if rel_parts != ("registry.json",):
+                        continue
+                    if root_prefix.is_symlink():
+                        raise OSError(f"Unsafe target wine root: {prefix_dir}")
+                    chunks: list[bytes] = []
+                    copied = 0
+                    with zf.open(info, "r") as src_fh:
+                        while chunk := src_fh.read(65536):
+                            copied += len(chunk)
+                            total_bytes += len(chunk)
+                            if (
+                                copied > _RESTORE_MAX_FILE_BYTES
+                                or total_bytes > _RESTORE_MAX_TOTAL_BYTES
+                            ):
+                                raise RuntimeError(
+                                    f"Decompression limit exceeded on {info.filename}"
+                                )
+                            chunks.append(chunk)
+                    raw_reg = b"".join(chunks)
                     try:
-                        os.utime(target, (remote_updated_at, remote_updated_at))
+                        json.loads(raw_reg.decode("utf-8", errors="replace"))
+                    except json.JSONDecodeError as exc:
+                        raise RuntimeError(f"Invalid registry save JSON: {exc}") from exc
+                    reg_payloads.append(raw_reg)
+                    continue
+
+                if section == "game":
+                    if game_dir is None or game_dir_resolved is None:
+                        continue
+                    base_dir = game_dir
+                    base_resolved = game_dir_resolved
+                    check_parts = rel_parts[:-1]
+                    target = game_dir.joinpath(*rel_parts)
+                elif section == "home":
+                    if not allow_home:
+                        continue
+                    # Native games' files under $HOME (from Ludusavi): allowed save folders only, and an
+                    # existing file is replaced only when the safety snapshot holds it.
+                    if not home_entry_allowed(rel_parts, info.external_attr >> 16):
+                        continue
+                    home_root = _home_root()
+                    base_dir = home_root
+                    base_resolved = home_root.resolve()
+                    check_parts = rel_parts[:-1]
+                    target = home_root.joinpath(*rel_parts)
+                    rel = "/".join(rel_parts)
+                    covered = target.is_file() and rel in (home_overwrite or ())
+                    if target.is_symlink() or (target.exists() and not covered):
+                        if skipped is not None:
+                            skipped.append(rel)
+                        continue
+                elif section in EXTRA_SECTIONS:
+                    extra_root = extras.get(section)
+                    if extra_root is None or extra_root.is_symlink():
+                        continue
+                    extra_root.mkdir(parents=True, exist_ok=True)
+                    base_dir = extra_root
+                    base_resolved = extra_root.resolve()
+                    check_parts = rel_parts[:-1]
+                    target = extra_root.joinpath(*rel_parts)
+                elif not has_prefix:
+                    continue
+                else:
+                    base_dir = drive_c
+                    base_resolved = drive_c_resolved
+                    resolved_parts = _resolve_existing_rel_parts(drive_c, section, rel_parts, target_user)
+                    check_parts = resolved_parts[:-1]
+                    target = drive_c.joinpath(*resolved_parts)
+
+                if not _safe_parents_within(base_dir, base_resolved, check_parts):
+                    continue
+
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not is_within(target.parent, base_resolved) or target.is_symlink():
+                    continue
+                if target.exists() and target.is_dir():
+                    raise IsADirectoryError(f"Target path is a directory: {target}")
+
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+                )
+                os.close(fd)
+                tmp_path = Path(tmp_name)
+                try:
+                    copied = 0
+                    with zf.open(info, "r") as src_fh, tmp_path.open("wb") as dst_fh:
+                        while chunk := src_fh.read(65536):
+                            copied += len(chunk)
+                            total_bytes += len(chunk)
+                            if (
+                                copied > _RESTORE_MAX_FILE_BYTES
+                                or total_bytes > _RESTORE_MAX_TOTAL_BYTES
+                            ):
+                                raise RuntimeError(
+                                    f"Decompression limit exceeded on {info.filename}"
+                                )
+                            dst_fh.write(chunk)
+                except BaseException:
+                    tmp_path.unlink(missing_ok=True)
+                    raise
+
+                prev_tmp = staged_by_target.get(target)
+                if prev_tmp is not None:
+                    prev_tmp.unlink(missing_ok=True)
+                staged_by_target[target] = tmp_path
+
+        def _apply_regs() -> None:
+            nonlocal reg_restored
+            if not reg_payloads:
+                return
+            _, wine_root = _require_safe_wine_root(root_prefix)
+            reg_backups: dict[Path, bytes | None] = {}
+            for reg_name in ("user.reg", "system.reg", "userdef.reg"):
+                rp = wine_root / reg_name
+                if not rp.is_symlink():
+                    reg_backups[rp] = rp.read_bytes() if rp.is_file() else None
+            try:
+                for raw_reg in reg_payloads:
+                    if _restore_registry_saves(root_prefix, raw_reg) > 0:
+                        reg_restored += 1
+            except BaseException:
+                for rp, orig_bytes in reg_backups.items():
+                    try:
+                        if orig_bytes is None:
+                            rp.unlink(missing_ok=True)
+                        else:
+                            atomic_write_bytes(rp, orig_bytes)
                     except OSError:
                         pass
-            except Exception:
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
                 raise
-            restored_files += 1
 
-    return restored_files
+        staged = [(tmp_path, target) for target, tmp_path in staged_by_target.items()]
+        _commit_staged_files(
+            staged,
+            mtime=remote_updated_at,
+            post_commit=_apply_regs if reg_payloads else None,
+        )
+    except BaseException:
+        for tmp_path in staged_by_target.values():
+            tmp_path.unlink(missing_ok=True)
+        raise
+
+    return len(staged_by_target) + reg_restored
 
 
 def _read_sync_meta(meta_path: Path) -> dict[str, object] | None:
@@ -1954,71 +2369,66 @@ def _read_sync_meta(meta_path: Path) -> dict[str, object] | None:
 
 
 def plan_sync_all(
-    games: list[tuple[str, Path]],
+    games: Sequence[tuple[str, Path] | SyncGameTarget],
     sync_root: Path,
     game_dir: Path | None = None,
     steam_appid: int | None = None,
+    extra_dirs: ExtraDirs | None = None,
 ) -> list[SyncPlanItem]:
     """Compare local prefix save fingerprints against sync_root metadata."""
     plan: list[SyncPlanItem] = []
-    for game_name, prefix_dir in games:
+    for item in games:
+        if isinstance(item, SyncGameTarget):
+            game_name = item.game_name
+            prefix_dir = item.prefix_dir
+            item_game_dir = item.game_dir if item.game_dir is not None else game_dir
+            item_appid = item.steam_appid if item.steam_appid is not None else steam_appid
+            item_extra = item.extra_dirs or extra_dirs
+            item_source = item.source
+        else:
+            game_name, prefix_dir = item
+            item_game_dir = game_dir
+            item_appid = steam_appid
+            item_extra = extra_dirs
+            item_source = "deckinstall"
+
         slug = _slugify(game_name)
         local_fp = compute_prefix_saves_fingerprint(
             prefix_dir,
             game_name=game_name,
-            game_dir=game_dir,
-            steam_appid=steam_appid,
+            game_dir=item_game_dir,
+            steam_appid=item_appid,
+            extra_dirs=item_extra,
         )
         has_local = local_fp.file_count > 0
 
         game_sync_dir = sync_root / slug
-        has_remote = (game_sync_dir / "latest.zip").is_file()
+        latest_zip = game_sync_dir / "latest.zip"
+        has_remote = not latest_zip.is_symlink() and latest_zip.is_file()
+
+        common = {
+            "game_name": game_name,
+            "slug": slug,
+            "prefix_dir": prefix_dir,
+            "game_dir": item_game_dir,
+            "steam_appid": item_appid,
+            "extra_dirs": tuple(item_extra or ()),
+            "source": item_source,
+        }
 
         if not has_local and not has_remote:
-            plan.append(
-                SyncPlanItem(
-                    game_name=game_name,
-                    slug=slug,
-                    prefix_dir=prefix_dir,
-                    action="NO_SAVES",
-                    reason="No local or remote saves found",
-                )
-            )
+            plan.append(SyncPlanItem(action="NO_SAVES", reason="No local or remote saves found", **common))  # type: ignore[arg-type]
             continue
         if has_local and not has_remote:
-            plan.append(
-                SyncPlanItem(
-                    game_name=game_name,
-                    slug=slug,
-                    prefix_dir=prefix_dir,
-                    action="PUSH",
-                    reason="Local saves present; no remote sync archive yet",
-                )
-            )
+            plan.append(SyncPlanItem(action="PUSH", reason="Local saves present; no remote sync archive yet", **common))  # type: ignore[arg-type]
             continue
         if not has_local and has_remote:
-            plan.append(
-                SyncPlanItem(
-                    game_name=game_name,
-                    slug=slug,
-                    prefix_dir=prefix_dir,
-                    action="PULL",
-                    reason="Remote sync archive available; no local saves",
-                )
-            )
+            plan.append(SyncPlanItem(action="PULL", reason="Remote sync archive available; no local saves", **common))  # type: ignore[arg-type]
             continue
 
         meta = _read_sync_meta(game_sync_dir / "meta.json")
         if meta is None:
-            plan.append(
-                SyncPlanItem(
-                    game_name=game_name,
-                    slug=slug,
-                    prefix_dir=prefix_dir,
-                    action="CONFLICT",
-                    reason="Remote metadata missing or unreadable",
-                )
-            )
+            plan.append(SyncPlanItem(action="CONFLICT", reason="Remote metadata missing or unreadable", **common))  # type: ignore[arg-type]
             continue
 
         remote_digest = str(meta.get("fingerprint_digest") or "")
@@ -2031,37 +2441,32 @@ def plan_sync_all(
         else:
             remote_updated_at = 0.0
 
-        # Three-way decision against the last digest this machine synced (the "base").
+        # Three-way decision against the last digests this machine synced (the "base").
         # Timestamps alone cannot tell "only one side changed" from "both sides changed".
-        base_digest = _read_sync_base(prefix_dir, sync_root, slug)
-        if remote_digest and local_fp.digest == remote_digest:
+        base_remote, base_local = _read_sync_base_pair(prefix_dir, sync_root, slug)
+        if remote_digest and (
+            local_fp.digest == remote_digest
+            or (base_remote and remote_digest == base_remote and local_fp.digest == base_local)
+        ):
             action = "IN_SYNC"
             reason = "Local and remote save digests match"
         elif not remote_digest or remote_updated_at <= 0.0:
             action = "CONFLICT"
             reason = "Incomplete remote metadata; manual resolution required"
-        elif not base_digest:
+        elif not base_remote and not base_local:
             action = "CONFLICT"
             reason = "No previous sync recorded on this device; choose which saves to keep"
-        elif remote_digest == base_digest:
+        elif base_remote and remote_digest == base_remote:
             action = "PUSH"
             reason = "Only local saves changed since last sync"
-        elif local_fp.digest == base_digest:
+        elif base_local and local_fp.digest == base_local:
             action = "PULL"
             reason = "Only remote saves changed since last sync"
         else:
             action = "CONFLICT"
             reason = "Both local and remote saves changed since last sync"
 
-        plan.append(
-            SyncPlanItem(
-                game_name=game_name,
-                slug=slug,
-                prefix_dir=prefix_dir,
-                action=action,
-                reason=reason,
-            )
-        )
+        plan.append(SyncPlanItem(action=action, reason=reason, **common))  # type: ignore[arg-type]
     return plan
 
 
@@ -2072,15 +2477,18 @@ def preview_sync_operation(
     action: str | None = None,
     game_dir: Path | None = None,
     steam_appid: int | None = None,
+    extra_dirs: ExtraDirs | None = None,
 ) -> SyncDryRunPreview:
     """Build a dry-run preview of files and registry entries for a sync operation."""
     slug = _slugify(game_name)
-    planned = plan_sync_all(
-        [(game_name, prefix_dir)],
-        sync_root,
+    target = SyncGameTarget(
+        game_name,
+        prefix_dir,
         game_dir=game_dir,
         steam_appid=steam_appid,
-    )[0]
+        extra_dirs=tuple(extra_dirs or ()),
+    )
+    planned = plan_sync_all([target], sync_root)[0]
     effective_action = action.strip().upper() if action else planned.action
     reason = planned.reason if action is None else f"Requested {effective_action}"
 
@@ -2094,6 +2502,7 @@ def preview_sync_operation(
             game_name=game_name,
             game_dir=game_dir,
             steam_appid=steam_appid,
+            extra_dirs=extra_dirs,
         )
         for section, src_file, rel_path in entries:
             try:

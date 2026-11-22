@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
@@ -491,6 +492,7 @@ def configure_qt_environment(env: dict[str, str] | os._Environ[str]) -> None:
 
 _PROC_ROOT = Path("/proc")
 _PROCESS_CACHE_SECONDS = 2.0
+_PROCESS_CACHE_LOCK = threading.Lock()
 _process_cache: dict[str, tuple[float, bool]] = {}
 # /proc/<pid>/comm keeps only 15 characters: "gamescope-session" and "gamescope-session-plus"
 # (SteamOS, Bazzite) both show up as "gamescope-sessi".
@@ -548,17 +550,20 @@ def _gamescope_from_processes(procs: dict[int, tuple[str, int]]) -> bool:
 
 def _cached(key: str, compute: Callable[[], bool]) -> bool:
     now = time.monotonic()
-    hit = _process_cache.get(key)
-    if hit is not None and now - hit[0] < _PROCESS_CACHE_SECONDS:
-        return hit[1]
+    with _PROCESS_CACHE_LOCK:
+        hit = _process_cache.get(key)
+        if hit is not None and now - hit[0] < _PROCESS_CACHE_SECONDS:
+            return hit[1]
     value = compute()
-    _process_cache[key] = (now, value)
+    with _PROCESS_CACHE_LOCK:
+        _process_cache[key] = (time.monotonic(), value)
     return value
 
 
 def invalidate_process_cache() -> None:
     """Forget the cached Steam/Gaming Mode checks (call around anything that closes or opens Steam)."""
-    _process_cache.clear()
+    with _PROCESS_CACHE_LOCK:
+        _process_cache.clear()
 
 
 def is_gamescope_session() -> bool:

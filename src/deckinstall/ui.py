@@ -321,6 +321,7 @@ class MainWindow(QMainWindow):
     btn_save_import_one: QPushButton
     _after_play_running: bool = False
     _save_sources_running: bool = False
+    _save_sources_pending: bool = False
     _external_save_targets: list = []  # Steam/Hydra/UMU/Nexus games for Backup/Sync (filled by a worker)
     _save_sizes: dict = {}  # slug -> bytes of saves right now
 

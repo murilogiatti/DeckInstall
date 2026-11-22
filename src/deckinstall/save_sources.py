@@ -188,10 +188,25 @@ def is_nexus_running() -> bool:
     return False
 
 
-def saves_size(prefix_dir: Path, extra_dirs: ExtraDirs = ()) -> tuple[int, int]:
+def saves_size(
+    prefix_dir: Path,
+    extra_dirs: ExtraDirs = (),
+    *,
+    game_name: str = "",
+    game_dir: Path | None = None,
+    steam_appid: int | None = None,
+    home_files: tuple[str, ...] = (),
+) -> tuple[int, int]:
     """(bytes, files) a snapshot would hold right now (caches and logs left out)."""
     total = files = 0
-    for _section, src, _rel in _collect_prefix_save_entries(prefix_dir, extra_dirs=extra_dirs):
+    for _section, src, _rel in _collect_prefix_save_entries(
+        prefix_dir,
+        game_name=game_name,
+        game_dir=game_dir,
+        steam_appid=steam_appid,
+        extra_dirs=extra_dirs,
+        home_files=home_files,
+    ):
         try:
             total += src.stat().st_size
             files += 1

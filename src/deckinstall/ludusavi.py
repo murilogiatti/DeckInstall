@@ -34,6 +34,7 @@ import hashlib
 import os
 import re
 import shutil
+import stat
 import tempfile
 import time
 import zipfile
@@ -113,6 +114,16 @@ def _yaml_value_after(lines: list[tuple[int, str]], i: int, indent: int, rest: s
     return None, i
 
 
+def _has_trailing_unescaped_backslash(text: str) -> bool:
+    """True when text ends with an odd number of backslashes."""
+    count = 0
+    for ch in reversed(text):
+        if ch != "\\":
+            break
+        count += 1
+    return count % 2 == 1
+
+
 def _yaml_map(lines: list[tuple[int, str]], i: int, indent: int) -> tuple[dict[str, Any], int]:
     out: dict[str, Any] = {}
     while i < len(lines):
@@ -125,9 +136,16 @@ def _yaml_map(lines: list[tuple[int, str]], i: int, indent: int) -> tuple[dict[s
             # Explicit key, which serde_yaml writes for long keys: "? <key>" then ": <value>".
             raw_key = text[1:].strip()
             i += 1
-            # A long plain key wraps onto more-indented lines, folded back with single spaces.
+            # A long key wraps onto more-indented lines: folded plain lines join with spaces,
+            # while double-quoted lines ending with an odd '\' continue directly without a space.
             while i < len(lines) and lines[i][0] > indent:
-                raw_key += " " + lines[i][1]
+                part = lines[i][1]
+                if not raw_key:
+                    raw_key = part
+                elif raw_key.startswith('"') and _has_trailing_unescaped_backslash(raw_key):
+                    raw_key = raw_key[:-1] + part
+                else:
+                    raw_key += " " + part
                 i += 1
             key = str(_yaml_scalar(raw_key) or "")
             if i >= len(lines) or lines[i][0] != indent or not (lines[i][1] == ":" or lines[i][1].startswith(": ")):
@@ -392,9 +410,38 @@ def export_ludusavi(
 # --- import ------------------------------------------------------------------------------------
 
 
-def load_mapping(game_folder: Path) -> dict[str, Any]:
+def read_mapping_name(game_folder: Path) -> str | None:
+    """Read only the top-level `name:` header from mapping.yaml without full YAML parsing."""
+    if game_folder.is_symlink():
+        return None
     path = game_folder / MAPPING_FILE
     if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        if path.stat().st_size > _MAPPING_MAX_BYTES:
+            return None
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for idx, raw in enumerate(fh):
+                if idx >= 64:
+                    break
+                if raw[:1].isspace():
+                    continue
+                cleaned = _strip_yaml_comment(raw).strip()
+                if not cleaned or cleaned in ("---", "..."):
+                    continue
+                if cleaned.startswith("name:"):
+                    val = _yaml_scalar(cleaned[5:].strip())
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+                    return None
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def load_mapping(game_folder: Path) -> dict[str, Any]:
+    path = game_folder / MAPPING_FILE
+    if game_folder.is_symlink() or path.is_symlink() or not path.is_file():
         raise LudusaviError(f"{MAPPING_FILE} not found in {game_folder}")
     if path.stat().st_size > _MAPPING_MAX_BYTES:
         raise LudusaviError(f"{MAPPING_FILE} is too large")
@@ -406,10 +453,10 @@ def load_mapping(game_folder: Path) -> dict[str, Any]:
 
 def find_game_folder(root: Path, game_name: str) -> Path | None:
     """root itself when it holds mapping.yaml, else the child backup whose name matches the game."""
-    if (root / MAPPING_FILE).is_file():
+    if not root.is_symlink() and not (root / MAPPING_FILE).is_symlink() and (root / MAPPING_FILE).is_file():
         return root
     direct = root / escape_folder_name(game_name)
-    if (direct / MAPPING_FILE).is_file():
+    if not direct.is_symlink() and not (direct / MAPPING_FILE).is_symlink() and (direct / MAPPING_FILE).is_file():
         return direct
     want = _norm_key(game_name)
     try:
@@ -417,12 +464,14 @@ def find_game_folder(root: Path, game_name: str) -> Path | None:
     except OSError:
         return None
     for child in children:
-        if child.is_symlink() or not (child / MAPPING_FILE).is_file():
+        if child.is_symlink() or (child / MAPPING_FILE).is_symlink() or not (child / MAPPING_FILE).is_file():
             continue
-        try:
-            name = load_mapping(child).get("name")
-        except (LudusaviError, OSError):
-            continue
+        name: object = read_mapping_name(child)
+        if name is None:
+            try:
+                name = load_mapping(child).get("name")
+            except (LudusaviError, OSError):
+                continue
         if isinstance(name, str) and want and _norm_key(name) == want:
             return child
     return None
@@ -480,18 +529,25 @@ def _drive_folders(mapping: dict[str, Any]) -> dict[str, str]:
     return out
 
 
-def _target_for(drive: str, parts: tuple[str, ...], home: Path) -> tuple[str, tuple[str, ...]] | None:
+def _target_for(
+    drive: str,
+    parts: tuple[str, ...],
+    home: Path,
+    *,
+    prefix_user: str = "steamuser",
+) -> tuple[str, tuple[str, ...]] | None:
     """('prefix', parts under drive_c) or ('home', parts under home); None when it does not map."""
 
     def windows(rest: tuple[str, ...]) -> tuple[str, tuple[str, ...]] | None:
         if not rest:
             return None
-        if rest[0].lower() == "users" and len(rest) >= 3:
-            user = "Public" if rest[1].lower() == "public" else "steamuser"
+        first = rest[0].lower()
+        if first == "users" and len(rest) >= 3:
+            user = "Public" if rest[1].lower() == "public" else prefix_user
             return "prefix", ("users", user, *rest[2:])
-        if rest[0].lower() == "users":
-            return None
-        return "prefix", rest
+        if first == "programdata" and len(rest) >= 2:
+            return "prefix", ("ProgramData", *rest[1:])
+        return None
 
     if drive == "C:":
         return windows(parts)
@@ -503,19 +559,42 @@ def _target_for(drive: str, parts: tuple[str, ...], home: Path) -> tuple[str, tu
     home_parts = home.parts[1:]
     if len(parts) > len(home_parts) and parts[: len(home_parts)] == home_parts:
         rest = parts[len(home_parts):]
-        return ("home", rest) if save_sync.home_entry_allowed(rest) else None
-    return None
+    elif len(parts) >= 4 and parts[0] == "var" and parts[1] == "home":
+        rest = parts[3:]
+    elif len(parts) >= 3 and parts[0] == "home":
+        rest = parts[2:]
+    else:
+        return None
+    if any(p.lower() in _SNAPSHOT_SKIP_HOME_DIRS for p in rest[:-1]) or "drive_c" in [p.lower() for p in rest]:
+        return None
+    return ("home", rest) if save_sync.home_entry_allowed(rest) else None
 
 
-def _ci_path(base: Path, parts: tuple[str, ...]) -> tuple[str, ...]:
-    """Reuse existing directory names that differ only in case (Wine paths are case-insensitive)."""
+def _ci_path(base: Path, parts: tuple[str, ...], *, match_file: bool = False) -> tuple[str, ...]:
+    """Reuse existing directory (and optionally file) names that differ only in case."""
     cur, out = base, []
     for part in parts[:-1]:
-        found = save_sync._find_child_ci(cur, part.lower()) if not (cur / part).exists() else None
+        exact = cur / part
+        found = (
+            save_sync._find_child_ci(cur, part.lower())
+            if not (exact.is_dir() and not exact.is_symlink())
+            else None
+        )
         name = found.name if found is not None else part
         out.append(name)
         cur = cur / name
-    return (*out, parts[-1])
+    leaf = parts[-1]
+    exact_leaf = cur / leaf
+    if match_file and not (exact_leaf.exists() or exact_leaf.is_symlink()) and cur.is_dir() and not cur.is_symlink():
+        leaf_low = leaf.lower()
+        try:
+            for child in sorted(cur.iterdir()):
+                if not child.is_symlink() and child.is_file() and child.name.lower() == leaf_low:
+                    leaf = child.name
+                    break
+        except OSError:
+            pass
+    return (*out, leaf)
 
 
 class _Source(NamedTuple):
@@ -557,16 +636,19 @@ def _plan_sources(
     home: Path,
     mapper: Callable[[str, tuple[str, ...]], tuple[str, tuple[str, ...]] | None] | None = None,
     older: int = 0,
+    *,
+    mapping: dict[str, Any] | None = None,
 ) -> tuple[str, list[tuple[_Source, str, tuple[str, ...]]], int]:
     """(backup label, [(source, kind, target parts)], files that map nowhere) for the newest backup.
 
     mapper(drive, parts) -> (kind, parts) | None; the default maps into a prefix or under home.
     """
-    mapping = load_mapping(game_folder)
-    label, files = _newest_files(mapping, older)
-    drives = _drive_folders(mapping)
+    loaded_mapping = mapping if mapping is not None else load_mapping(game_folder)
+    label, files = _newest_files(loaded_mapping, older)
+    drives = _drive_folders(loaded_mapping)
     folder = game_folder.resolve()
     plan: list[tuple[_Source, str, tuple[str, ...]]] = []
+    seen_targets: dict[tuple[str, tuple[str, ...]], int] = {}
     skipped = 0
     for original, (backup, digest, size) in sorted(files.items()):
         drive, parts = _split_drive(original)
@@ -595,7 +677,14 @@ def _plan_sources(
         if target is None or (target[0] == "home" and not save_sync.home_entry_allowed(target[1], _source_mode(src))):
             skipped += 1
             continue
-        plan.append((src, *target))
+        kind, norm_parts = target
+        tkey = (kind, tuple(p.lower() for p in norm_parts) if kind == "prefix" else norm_parts)
+        if tkey in seen_targets:
+            plan[seen_targets[tkey]] = (src, kind, norm_parts)
+            skipped += 1
+            continue
+        seen_targets[tkey] = len(plan)
+        plan.append((src, kind, norm_parts))
 
     return label, plan, skipped
 
@@ -625,19 +714,25 @@ def _verified_chunks(src: _Source, zips: dict[Path, zipfile.ZipFile]) -> Iterato
 
 def list_backup_games(root: Path) -> list[tuple[str, Path]]:
     """(game name, folder) for every game in a Ludusavi backup root (or root itself)."""
-    if (root / MAPPING_FILE).is_file():
+    if not root.is_symlink() and not (root / MAPPING_FILE).is_symlink() and (root / MAPPING_FILE).is_file():
         candidates = [root]
     else:
         try:
-            candidates = sorted(c for c in root.iterdir() if not c.is_symlink() and (c / MAPPING_FILE).is_file())
+            candidates = sorted(
+                c
+                for c in root.iterdir()
+                if not c.is_symlink() and not (c / MAPPING_FILE).is_symlink() and (c / MAPPING_FILE).is_file()
+            )
         except OSError:
             return []
     out: list[tuple[str, Path]] = []
     for folder in candidates:
-        try:
-            name = load_mapping(folder).get("name")
-        except (LudusaviError, OSError):
-            continue
+        name: object = read_mapping_name(folder)
+        if name is None:
+            try:
+                name = load_mapping(folder).get("name")
+            except (LudusaviError, OSError):
+                continue
         out.append((str(name) if isinstance(name, str) and name.strip() else folder.name, folder))
     return out
 
@@ -653,6 +748,14 @@ def _snapshot_target(drive: str, parts: tuple[str, ...]) -> tuple[str, tuple[str
     (a Unix path under /home/<user>/, the user name is dropped).
     """
     lowered = [p.lower() for p in parts]
+    for i in range(len(parts) - 4):
+        if (
+            lowered[i] == "userdata"
+            and parts[i + 1].isdigit()
+            and parts[i + 2].isdigit()
+            and lowered[i + 3] == "remote"
+        ):
+            return "steamcloud", parts[i + 4:]
     if drive == "C:" or (drive == "" and "drive_c" in lowered):
         rest = parts if drive == "C:" else parts[lowered.index("drive_c") + 1:]
         if len(rest) >= 3 and rest[0].lower() == "users":
@@ -669,14 +772,6 @@ def _snapshot_target(drive: str, parts: tuple[str, ...]) -> tuple[str, tuple[str
         home_sub = parts[1:]
     else:
         return None
-    for i in range(len(home_sub) - 3):
-        if (
-            home_sub[i] == "userdata"
-            and home_sub[i + 1].isdigit()
-            and home_sub[i + 2].isdigit()
-            and home_sub[i + 3] == "remote"
-        ):
-            return "steamcloud", home_sub[i + 4:]
     rest = home_sub[1:]
     if any(p.lower() in _SNAPSHOT_SKIP_HOME_DIRS for p in rest[:-1]) or "drive_c" in [p.lower() for p in rest]:
         return None
@@ -815,18 +910,21 @@ def import_ludusavi_to_snapshot(
     Returns (snapshot zip or None when nothing fit, files stored, files skipped, already imported).
     """
     home = (home or Path.home()).resolve()
-    name = game_name or str(load_mapping(game_folder).get("name") or game_folder.name)
+    mapping = load_mapping(game_folder)
+    name = game_name or str(mapping.get("name") or game_folder.name)
     # The newest full backup can hold only registry/config files; fall back to an older full one.
-    n_full = len([b for b in load_mapping(game_folder)["backups"] if isinstance(b, dict)])
+    n_full = len([b for b in mapping["backups"] if isinstance(b, dict)])
+    plan: list[tuple[_Source, str, tuple[str, ...]]] = []
+    skipped = 0
     for older in range(max(1, n_full)):
-        _, plan, skipped = _plan_sources(game_folder, home, _snapshot_target, older)
+        _, plan, skipped = _plan_sources(game_folder, home, _snapshot_target, older, mapping=mapping)
         if plan:
             break
     usable: list[tuple[_Source, tuple[str, ...]]] = []
     appid = ""
     for src, kind, parts in plan:
         if kind == "steamcloud":
-            m = re.search(r"/userdata/\d+/(\d+)/remote/", src.original)
+            m = re.search(r"/userdata/\d+/(\d+)/remote/", src.original, re.IGNORECASE)
             if m is not None and appid in ("", m.group(1)):  # one Steam app per snapshot
                 appid = m.group(1)
                 usable.append((src, (kind, *parts)))
@@ -838,47 +936,45 @@ def import_ludusavi_to_snapshot(
         return None, 0, skipped, False
     snap_dir = save_sync.snapshot_dir_for(name, dest_root)
     fingerprint = _content_fingerprint([("snap/" + "/".join(p), src.digest, src.size) for src, p in usable])
-    if snap_dir.is_dir():
-        # Already there only when it is the newest snapshot: importing an older state again (A, B, A)
-        # must make it the newest, or Restore would bring back B.
-        newest = _newest_snapshot(snap_dir)
-        if newest is not None and import_snapshot_fingerprints(snap_dir).get(newest) == fingerprint:
-            return newest, len(usable), skipped, True
-    snap_dir.mkdir(parents=True, exist_ok=True)
-    target = snap_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-ludusavi-import.zip"
-    counter = 1
-    while target.exists():
-        target = snap_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-ludusavi-import-{counter}.zip"
-        counter += 1
-    fd, tmp_name = tempfile.mkstemp(prefix=".ludusavi-", suffix=".zip.tmp", dir=str(snap_dir))
-    os.close(fd)
-    tmp = Path(tmp_name)
-    zips: dict[Path, zipfile.ZipFile] = {}
-    total = 0
-    try:
-        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as out:
-            for src, parts in usable:
-                total += src.size
-                if src.size > _RESTORE_MAX_FILE_BYTES or total > _RESTORE_MAX_TOTAL_BYTES:
-                    raise LudusaviError(f"Backup too large: {src.original}")
-                if src.zip_path is not None and src.zip_path not in zips:
-                    zips[src.zip_path] = zipfile.ZipFile(src.zip_path)
-                with out.open("snap/" + "/".join(parts), "w") as dst:
-                    for chunk in _verified_chunks(src, zips):
-                        dst.write(chunk)
-        os.replace(tmp, target)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-    finally:
-        for zf in zips.values():
-            zf.close()
-    save_sync.remember_snapshot_name(snap_dir, name)
-    save_sync.remember_import_fingerprint(snap_dir, target.name, fingerprint)
-    if appid:
-        save_sync.remember_steamcloud_appid(snap_dir, target.name, appid)
-    save_sync.remember_home_files(snap_dir, ["/".join(p[1:]) for _, p in usable if p[0] == "home"])
-    return target, len(usable), skipped, False
+    with save_sync._snapshot_dir_lock(snap_dir):
+        if snap_dir.is_dir():
+            # Already there only when it is the newest snapshot: importing an older state again (A, B, A)
+            # must make it the newest, or Restore would bring back B.
+            newest = _newest_snapshot(snap_dir)
+            if newest is not None and import_snapshot_fingerprints(snap_dir).get(newest) == fingerprint:
+                return newest, len(usable), skipped, True
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        target = save_sync._reserve_snapshot_zip(snap_dir, f"{time.strftime('%Y%m%d-%H%M%S')}-ludusavi-import")
+        fd, tmp_name = tempfile.mkstemp(prefix=".ludusavi-", suffix=".zip.tmp", dir=str(snap_dir))
+        os.close(fd)
+        tmp = Path(tmp_name)
+        zips: dict[Path, zipfile.ZipFile] = {}
+        total = 0
+        try:
+            with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as out:
+                for src, parts in usable:
+                    total += src.size
+                    if src.size > _RESTORE_MAX_FILE_BYTES or total > _RESTORE_MAX_TOTAL_BYTES:
+                        raise LudusaviError(f"Backup too large: {src.original}")
+                    if src.zip_path is not None and src.zip_path not in zips:
+                        zips[src.zip_path] = zipfile.ZipFile(src.zip_path)
+                    with out.open("snap/" + "/".join(parts), "w") as dst:
+                        for chunk in _verified_chunks(src, zips):
+                            dst.write(chunk)
+            os.replace(tmp, target)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            target.unlink(missing_ok=True)
+            raise
+        finally:
+            for zf in zips.values():
+                zf.close()
+        save_sync.remember_snapshot_name(snap_dir, name)
+        save_sync.remember_import_fingerprint(snap_dir, target.name, fingerprint)
+        if appid:
+            save_sync.remember_steamcloud_appid(snap_dir, target.name, appid)
+        save_sync.remember_home_files(snap_dir, ["/".join(p[1:]) for _, p in usable if p[0] == "home"])
+        return target, len(usable), skipped, False
 
 
 def import_ludusavi(
@@ -893,10 +989,17 @@ def import_ludusavi(
 ) -> ImportResult:
     """Restore the newest backup in game_folder into prefix_dir (see the module docstring)."""
     home = (home or Path.home()).resolve()
-    drive_c = save_sync._resolve_drive_c_target(prefix_dir)
+    _root_prefix, drive_c = save_sync._require_safe_drive_c(prefix_dir)
+    prefix_user = save_sync._detect_prefix_user(drive_c)
     # 1. Map and validate every path before touching anything.
-    label, plan, skipped = _plan_sources(game_folder, home)
+    label, plan, skipped = _plan_sources(
+        game_folder,
+        home,
+        partial(_target_for, home=home, prefix_user=prefix_user),
+    )
     zips: dict[Path, zipfile.ZipFile] = {}
+    staged_temps: list[Path] = []
+    snapshot: Path | None = None
     try:
         for src, _, _ in plan:
             if src.zip_path is not None and src.zip_path not in zips:
@@ -918,13 +1021,18 @@ def import_ludusavi(
         unchanged = kept = 0
         for src, kind, parts in plan:
             base = drive_c if kind == "prefix" else home
-            parts = _ci_path(base, parts)
-            dst = base.joinpath(*parts)
-            if dst.is_symlink() or (dst.exists() and not dst.is_file()):
+            parts = _ci_path(base, parts, match_file=(kind == "prefix"))
+            if not _safe_parents_within(base, base.resolve(), parts[:-1]):
                 kept += 1
                 continue
-            if not dst.exists():
+            dst = base.joinpath(*parts)
+            try:
+                st = dst.lstat()
+            except FileNotFoundError:
                 writes.append((src, base, dst, parts))
+                continue
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                kept += 1
                 continue
             if _sha1_stream(_file_chunks(dst))[0] == src.digest:
                 unchanged += 1
@@ -934,7 +1042,6 @@ def import_ludusavi(
                 kept += 1
 
         # 4. Overwrite only what the safety snapshot holds.
-        snapshot: Path | None = None
         if overwrites:
             snapshot = save_sync.auto_snapshot(
                 prefix_dir, game_name, "pre-import", keep=0,
@@ -950,28 +1057,44 @@ def import_ludusavi(
                 else:
                     kept += 1
 
-        # 5. Write atomically, checking the hash again while copying.
-        restored = 0
-        for src, base, dst, parts in writes:
-            if not _safe_parents_within(base, base.resolve(), parts[:-1]):
-                kept += 1
-                continue
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=str(dst.parent))
-            tmp = Path(tmp_name)
-            try:
-                h = hashlib.sha1()  # noqa: S324 - format-defined hash
-                with os.fdopen(fd, "wb") as out:
-                    for chunk in _bounded(_source_chunks(src, zips), src.size, src.original):
-                        h.update(chunk)
-                        out.write(chunk)
-                if h.hexdigest() != src.digest:
-                    raise LudusaviError(f"Hash mismatch for {src.original}")
-                os.replace(tmp, dst)
-            except BaseException:
+        # 5. Stage all temp files and verify hashes BEFORE replacing any live target.
+        staged_by_target: dict[Path, Path] = {}
+        try:
+            for src, base, dst, parts in writes:
+                if not _safe_parents_within(base, base.resolve(), parts[:-1]):
+                    kept += 1
+                    continue
+                if dst.exists() and dst.is_dir():
+                    raise IsADirectoryError(f"Target path is a directory: {dst}")
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=str(dst.parent))
+                tmp = Path(tmp_name)
+                staged_temps.append(tmp)
+                try:
+                    h = hashlib.sha1()  # noqa: S324 - format-defined hash
+                    with os.fdopen(fd, "wb") as out:
+                        for chunk in _bounded(_source_chunks(src, zips), src.size, src.original):
+                            h.update(chunk)
+                            out.write(chunk)
+                    if h.hexdigest() != src.digest:
+                        raise LudusaviError(f"Hash mismatch for {src.original}")
+                except BaseException:
+                    tmp.unlink(missing_ok=True)
+                    raise
+                prev_tmp = staged_by_target.get(dst)
+                if prev_tmp is not None:
+                    prev_tmp.unlink(missing_ok=True)
+                staged_by_target[dst] = tmp
+
+            staged = [(tmp_path, target) for target, tmp_path in staged_by_target.items()]
+            save_sync._commit_staged_files(staged)
+            restored = len(staged)
+        except BaseException as exc:
+            for tmp in staged_temps:
                 tmp.unlink(missing_ok=True)
-                raise
-            restored += 1
+            if isinstance(exc, Exception) and snapshot is not None:
+                raise save_sync._wrap_restore_error(exc, snapshot) from exc
+            raise
     finally:
         for zf in zips.values():
             zf.close()
