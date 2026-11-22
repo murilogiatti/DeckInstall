@@ -68,20 +68,7 @@ from .steam_vdf import (
     start_steam,
 )
 from .ui_cards import _format_worker_error
-
-
-def restart_steam_after_op(worker: Any, status: Any) -> bool:
-    """Start Steam again after a worker closed it; record failure on the worker for the window."""
-    status.emit(tr("add.restarting_steam"))
-    try:
-        ok = start_steam()
-    except Exception:
-        logging.exception("Failed restarting Steam after %s", type(worker).__name__)
-        ok = False
-    if not ok:
-        worker.restart_failed = True
-        status.emit(tr("steam.restart_failed"))
-    return ok
+from .ui_workers_library import close_steam_for_edit, restart_steam_after_edit
 
 
 class ExtractWorker(QThread):
@@ -128,6 +115,18 @@ class ExtractWorker(QThread):
         try:
             info = classify.classify_source(self.source)
             self.kind = info.kind
+            if not self.folder_name:
+                self.folder_name = classify.suggest_install_name(info)
+            if info.installer is not None and info.kind in (classify.GOG_SETUP, classify.REPACK, classify.INSTALLER):
+                target = self.dest_root / sanitize_folder_name(self.folder_name)
+                if info.installer.resolve().is_relative_to(target.resolve()):
+                    index = 2
+                    while True:
+                        candidate = target.with_name(f"{target.name} ({index})")
+                        if not candidate.exists() and not candidate.is_symlink():
+                            self.folder_name = candidate.name
+                            break
+                        index += 1
             on_progress = lambda p, msg: self.progress.emit(p, msg)  # noqa: E731
             if info.kind == classify.ARCHIVE:
                 out = extract_archive(
@@ -266,21 +265,17 @@ class SteamOpWorker(QThread):
         self.restart_failed = False
 
     def run(self) -> None:
-        was_running = False
         try:
             if self.need_steam_closed:
-                was_running = is_steam_running()
-                if was_running:
-                    self.status.emit(tr("add.closing_steam"))
-                    if not shutdown_steam():
-                        raise RuntimeError(tr("add.close_steam_timeout"))
-                    self.closed_steam = True
+                self.closed_steam = close_steam_for_edit(is_steam_running, shutdown_steam, self.status.emit)
             try:
                 result = self.fn()
             finally:
                 # Reopen Steam before reporting, whether the operation worked or not.
                 if self.closed_steam and self.restart_if_was_running:
-                    restart_steam_after_op(self, self.status)
+                    self.restart_failed = not restart_steam_after_edit(
+                        start_steam, type(self).__name__, self.status.emit,
+                    )
             self.finished_ok.emit(result)
         except Exception as exc:
             self.failed.emit(_format_worker_error(exc))
@@ -347,11 +342,7 @@ class AddToSteamWorker(QThread):
         done_msg: str | None = None
         err_msg: str | None = None
         try:
-            was_running = is_steam_running()
-            if was_running:
-                self.status.emit(tr("add.closing_steam"))
-                if not shutdown_steam():
-                    raise RuntimeError(tr("add.close_steam_timeout"))
+            was_running = close_steam_for_edit(is_steam_running, shutdown_steam, self.status.emit)
 
             self.status.emit(tr("add.writing_shortcut"))
             effective_launch = self.launch_options.strip()
@@ -406,7 +397,9 @@ class AddToSteamWorker(QThread):
             err_msg = _format_worker_error(exc)
         finally:
             if was_running and self.restart_steam and not is_steam_running():
-                restart_steam_after_op(self, self.status)
+                self.restart_failed = not restart_steam_after_edit(
+                    start_steam, type(self).__name__, self.status.emit,
+                )
         if err_msg is not None:
             self.failed.emit(err_msg, shortcut_written)
         elif done_msg is not None:
@@ -750,7 +743,7 @@ class RunExeInPrefixWorker(QThread):
                 **kwargs,
             )
             if isinstance(rc, int) and rc != 0:
-                self.failed.emit(f"{self.exe_path.name} exited with code {rc}")
+                self.failed.emit(tr("run_exe.exit_code", name=self.exe_path.name, code=rc))
                 return
             self.finished_ok.emit()
         except Exception as exc:
@@ -762,7 +755,6 @@ from .ui_workers_library import (  # noqa: E402, F401
     DirStatsWorker,
     ExtImportSavesWorker,
     LaunchPrepWorker,
-    ProtonPrepWorker,
     RemoveShortcutWorker,
     RestoreWorker,
     RuntimePreflightWorker,

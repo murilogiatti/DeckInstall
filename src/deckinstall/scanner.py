@@ -10,11 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .gameinfo import is_unreal_binary_name
-from .library import _unescape_mount
+from .library import LIBRARY_DIRNAME, _unescape_mount
 
 IGNORED_EXE_PATTERNS = (
     "unins",
     "crashhandler",
+    "crashreport",
     "unitycrashhandler",
     "crs-uploader",
     "crs-handler",
@@ -299,6 +300,7 @@ def _scan_game_tree_scandir(
 ) -> tuple[list[Path], int | None]:
     """Traverse game_dir once via os.scandir(), returning (ranked_exes, steam_appid)."""
     exe_scored: list[tuple[tuple[int, int, int, int, int], Path]] = []
+    native_scored: list[tuple[tuple[int, int, int], Path]] = []
     appid_files: list[Path] = []
     ini_files: dict[str, list[Path]] = {
         "steam_emu.ini": [],
@@ -350,6 +352,9 @@ def _scan_game_tree_scandir(
                             appid_files.append(Path(entry.path))
                         elif low in ini_files:
                             ini_files[low].append(Path(entry.path))
+                    if collect_exes and not exe_scored and _is_native_game_entry(entry):
+                        native_score = (0 if low == "start.sh" else 1, rel_depth, -entry.stat().st_size)
+                        native_scored.append((native_score, Path(entry.path)))
         except OSError:
             continue
 
@@ -358,8 +363,9 @@ def _scan_game_tree_scandir(
             for sub in subdirs:
                 queue.append((sub, dir_depth + 1))
 
-    exe_scored.sort(key=lambda item: item[0])
-    ranked_exes = [item[1] for item in exe_scored]
+    ranked_exes = (
+        [path for _, path in sorted(exe_scored)] if exe_scored else [path for _, path in sorted(native_scored)]
+    )
     steam_appid = _extract_steam_appid(appid_files, ini_files)
     return ranked_exes, steam_appid
 
@@ -410,16 +416,37 @@ _HOME_CONTAINERS = frozenset(
 )
 
 
+def _is_native_game_entry(entry: os.DirEntry[str]) -> bool:
+    name = entry.name.lower()
+    if (
+        name.startswith(".") or name.endswith((".so", ".exe")) or ".so." in name
+        or any(pattern in name for pattern in IGNORED_EXE_PATTERNS)
+    ):
+        return False
+    path = Path(entry.path)
+    try:
+        if not entry.stat(follow_symlinks=False).st_mode & 0o111:
+            return False
+        if name == "start.sh":
+            return is_native_linux_exe(path)
+        return detect_exe_kind(path) == "linux_elf"
+    except OSError:
+        return False
+
+
 def _dir_has_game_exe(path: Path) -> bool:
-    """True if the folder directly holds a Windows x86/x64 exe that is not an ignored installer/tool."""
+    """True if the folder directly holds a game executable."""
     try:
         with os.scandir(path) as it:
             for entry in it:
                 low = entry.name.lower()
-                if not low.endswith(".exe") or any(pat in low for pat in IGNORED_EXE_PATTERNS):
-                    continue
                 try:
-                    if entry.is_file(follow_symlinks=False) and is_proton_exe(Path(entry.path)):
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    if low.endswith(".exe") and not any(pat in low for pat in IGNORED_EXE_PATTERNS):
+                        if is_proton_exe(Path(entry.path)):
+                            return True
+                    elif _is_native_game_entry(entry):
                         return True
                 except OSError:
                     continue
@@ -462,7 +489,11 @@ def find_home_game_dirs(
             container = depth == 0 and sub.name.lower() in _HOME_CONTAINERS
             if not container and _dir_has_game_exe(sub):
                 game_dir = sub
-                while game_dir.name.lower() in _BIN_DIR_NAMES and game_dir.parent != home:
+                while (
+                    game_dir.name.lower() in _BIN_DIR_NAMES
+                    and game_dir.parent != home
+                    and not (game_dir.parent.parent == home and game_dir.parent.name.lower() in _HOME_CONTAINERS)
+                ):
                     game_dir = game_dir.parent
                 if game_dir not in found:
                     found.append(game_dir)
@@ -481,7 +512,7 @@ _SYSTEM_MOUNTS = frozenset(
 # Nothing under these is a games disk (except /run/media and /var/mnt).
 _SYSTEM_TREES = ("/proc", "/sys", "/dev", "/run", "/boot", "/efi", "/usr", "/nix", "/snap", "/var", "/sysroot", "/esp")
 _DISK_TREE_EXCEPTIONS = ("/run/media", "/var/mnt")
-_SKIP_DISK_CHILDREN = frozenset({"steamapps", "lost+found", "System Volume Information"})
+_SKIP_DISK_CHILDREN = frozenset({"steamapps", "prefixes", "caches", "lost+found", "system volume information"})
 
 
 def _read_mountinfo() -> str:
@@ -556,7 +587,7 @@ def _visible_subdirs(path: Path) -> list[Path]:
                 continue
         except OSError:
             continue
-        if entry.name not in _SKIP_DISK_CHILDREN:
+        if entry.name.lower() not in _SKIP_DISK_CHILDREN:
             out.append(Path(entry.path))
     return out
 
@@ -573,6 +604,8 @@ def default_scan_roots() -> list[Path]:
         if _safe_is_dir(games_sub):
             roots.append(games_sub)
         for sub in _visible_subdirs(disk):
+            if _dir_has_game_exe(sub):
+                continue
             sub_games = sub / "Games"
             roots.append(sub_games if _safe_is_dir(sub_games) else sub)
     deduped: list[Path] = []
@@ -603,7 +636,9 @@ def scan_all_games(roots: list[Path] | None = None) -> list[DetectedGame]:
         home_res = home.resolve()
     except OSError:
         home_res = home
-    for root in (roots if roots is not None else [home, *default_scan_roots()]):
+    scan_roots = roots if roots is not None else [home, *default_scan_roots()]
+    containers = {Path(os.path.realpath(root)) for root in scan_roots}
+    for root in scan_roots:
         try:
             is_home = root.resolve() == home_res
         except OSError:
@@ -625,7 +660,8 @@ def scan_all_games(roots: list[Path] | None = None) -> list[DetectedGame]:
                         entry
                         for entry in it
                         if not entry.name.startswith(".")
-                        and entry.name not in {"steamapps", "lost+found", "System Volume Information"}
+                        and entry.name.lower() not in _SKIP_DISK_CHILDREN
+                        and entry.name.lower() != LIBRARY_DIRNAME.lower()
                     ),
                     key=lambda e: e.name,
                 )
@@ -642,7 +678,7 @@ def scan_all_games(roots: list[Path] | None = None) -> list[DetectedGame]:
                 resolved = child.resolve()
             except OSError:
                 continue
-            if resolved in seen:
+            if resolved in seen or (resolved in containers and child.name.lower() in _HOME_CONTAINERS):
                 continue
             seen.add(resolved)
             candidates.append(child)
@@ -676,4 +712,11 @@ def scan_all_games(roots: list[Path] | None = None) -> list[DetectedGame]:
                 continue
             if detected is not None:
                 results.append(detected)
-    return results
+    by_root = {Path(os.path.realpath(game.root_dir)): set(game.executables) for game in results}
+    return [
+        game for game in results
+        if not any(
+            game.primary_exe in by_root.get(parent, ())
+            for parent in Path(os.path.realpath(game.root_dir)).parents
+        )
+    ]

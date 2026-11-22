@@ -199,6 +199,9 @@ def plan_uninstall(game: StandaloneGame) -> UninstallPlan:
             items.append(UninstallItem(SAVES, [pfx], requires=PREFIX))
         items.append(prefix_item)
 
+    if not any(item.id == PREFIX for item in items) and gd.is_dir() and not gd.is_symlink():
+        items.append(UninstallItem(SAVES, [gd], requires=GAME_FILES))
+
     link = _steam_link(game)
     if link is not None:
         paths = [link]
@@ -251,7 +254,8 @@ def execute_uninstall(
 ) -> UninstallResult:
     """Remove the selected (unlocked) items of plan; the game is always unregistered."""
     game = plan.game
-    chosen = {i.id for i in plan.items if not i.locked and i.id in set(selected_ids)}
+    selected = set(selected_ids)
+    chosen = {i.id for i in plan.items if not i.locked and i.id in selected}
     result = UninstallResult()
 
     def done(item: UninstallItem, ok: bool) -> None:
@@ -266,16 +270,27 @@ def execute_uninstall(
             result.skipped.append(item.id)
 
     prefix_item = plan.item(PREFIX)
-    if prefix_item is not None and PREFIX in chosen and SAVES in chosen:
-        snap = snapshot_fn or save_sync.auto_snapshot
+    if (PREFIX in chosen or GAME_FILES in chosen) and SAVES in chosen:
         try:
-            result.snapshot = snap(game.prefix_dir, game.name, "remove-game", "remove")
+            if snapshot_fn is not None:
+                result.snapshot = snapshot_fn(game.prefix_dir, game.name, "remove-game", "remove")
+            else:
+                raw_aid = (game.meta.get("steam") or {}).get("shortcut_appid")
+                aid = raw_aid if isinstance(raw_aid, int) and not isinstance(raw_aid, bool) and raw_aid > 0 else None
+                result.snapshot = save_sync.auto_snapshot(
+                    game.prefix_dir,
+                    game.name,
+                    "remove-game",
+                    "remove",
+                    game_dir=game.game_dir,
+                    steam_appid=game.steam_appid or aid,
+                )
             result.removed.append(SAVES)
         except Exception as exc:
-            # No snapshot, no prefix deletion: the saves live there.
+            # Saves may live in either the prefix or the game's own directory.
             logging.warning("Save snapshot failed before uninstalling %s: %s", game.name, exc)
             result.errors.append(f"{SAVES}: {exc}")
-            chosen.discard(PREFIX)
+            return result
 
     opti_item = plan.item(OPTISCALER)
     if opti_item is not None and OPTISCALER in chosen and GAME_FILES not in chosen:
@@ -289,10 +304,20 @@ def execute_uninstall(
 
     icons_item = plan.item(ICONS)
     if icons_item is not None and ICONS in chosen and GAME_FILES not in chosen:
+        icon_err = False
         for p in icons_item.paths:
-            if is_within(p, game.game_dir, strict=True):
+            if not is_within(p, game.game_dir, strict=True):
+                continue
+            if p.is_dir() and not p.is_symlink():
+                icon_err = True
+                result.errors.append(f"{ICONS}: {p} is a directory")
+                continue
+            try:
                 p.unlink(missing_ok=True)
-        done(icons_item, _gone(icons_item.paths))
+            except OSError as exc:
+                icon_err = True
+                result.errors.append(f"{ICONS}: {exc}")
+        done(icons_item, not icon_err and _gone(icons_item.paths))
 
     shortcuts_item = plan.item(SHORTCUTS)
     try:
@@ -310,10 +335,12 @@ def execute_uninstall(
         else:
             remove_path_or_tree(gd)
             prune_empty_parents(gd, _games_roots(gd))
-            done(game_item, _gone([gd]))
-            for covered in (opti_item, icons_item):
-                if covered is not None and covered.id in chosen:
-                    result.removed.append(covered.id)
+            removed_game = _gone([gd])
+            done(game_item, removed_game)
+            if removed_game:
+                for covered in (opti_item, icons_item):
+                    if covered is not None and covered.id in chosen:
+                        result.removed.append(covered.id)
 
     prefix_removed = False
     if prefix_item is not None and PREFIX in chosen:
@@ -331,14 +358,16 @@ def execute_uninstall(
         link = steam_item.paths[0]
         _unlink_steam_compatdata(game)
         unlinked = not link.exists() and not link.is_symlink()
+        restore_ok = True
         backup = steam_item.paths[1] if len(steam_item.paths) > 1 else None
         if unlinked and backup is not None and STEAM in chosen and backup.is_dir() and not backup.is_symlink():
             try:
                 os.replace(backup, link)
             except OSError as exc:
+                restore_ok = False
                 result.errors.append(f"{STEAM}: {exc}")
         if STEAM in chosen:
-            done(steam_item, unlinked)
+            done(steam_item, unlinked and restore_ok)
 
     cache_item = plan.item(CACHE)
     if cache_item is not None and CACHE in chosen:

@@ -11,6 +11,7 @@ from .. import __app_name__
 from .. import relocate as rl
 from ..i18n import tr
 from ..library import Library
+from ..play_monitor import LOADING, RUNNING, find_game_pids, watch_paths
 from ..standalone import StandaloneGame
 from ..ui_cards import _dialog_parent, _is_wine_game_running, format_size_bytes
 from ..ui_workers import SteamOpWorker
@@ -64,7 +65,17 @@ def move_game_to_disk(win: MainWindow, sa: StandaloneGame) -> None:
     """Choose a target library, plan in the background, confirm, then move in the background."""
     if win._steam_busy:
         return
-    if _is_wine_game_running():
+
+    def _files_in_use() -> bool:
+        return (
+            _is_wine_game_running()
+            or (sa.native_linux and bool(find_game_pids(watch_paths(sa.game_dir))))
+        )
+
+    def _game_running() -> bool:
+        return win._play.state(win._play_key("standalone", sa)) in (LOADING, RUNNING) or _files_in_use()
+
+    if _game_running():
         QMessageBox.warning(_dialog_parent(win), __app_name__, tr("cleanup.wine_running"))
         return
 
@@ -80,53 +91,59 @@ def move_game_to_disk(win: MainWindow, sa: StandaloneGame) -> None:
     win._track_worker(lister)
 
     def _on_libs(res: object) -> None:
-        win._end_busy()
         win.status_label.setText(tr("status.ready"))
         libs = [lib for lib in res if isinstance(lib, Library)] if isinstance(res, list) else []
         if win._closing_pending:
+            win._end_busy()
             return
         if not libs:
+            win._end_busy()
             QMessageBox.information(_dialog_parent(win), __app_name__, tr("relocate.no_target"))
             return
         labels = [_library_label(lib) for lib in libs]
         choice, ok = QInputDialog.getItem(
             _dialog_parent(win), __app_name__, tr("relocate.pick_target", name=sa.name), labels, 0, False
         )
-        if not ok:
+        if not ok or not choice:
+            win._end_busy()
             return
         _plan(libs[labels.index(choice)])
 
     def _plan(target: Library) -> None:
-        win._begin_busy()
         win.status_label.setText(tr("relocate.planning", name=sa.name))
         planner = SteamOpWorker(lambda: rl.plan_relocation(sa, target))
         win._track_worker(planner)
 
         def _on_planned(res: object) -> None:
-            win._end_busy()
             win.status_label.setText(tr("status.ready"))
             if win._closing_pending or not isinstance(res, rl.RelocatePlan):
+                win._end_busy()
                 return
             if not res.can_run:
+                win._end_busy()
                 QMessageBox.warning(_dialog_parent(win), __app_name__, plan_summary(res))
                 return
             ans = QMessageBox.question(_dialog_parent(win), __app_name__, plan_summary(res))
             if ans == QMessageBox.StandardButton.Yes:
                 _run(res)
+            else:
+                win._end_busy()
 
         planner.finished_ok.connect(_on_planned)
         planner.failed.connect(_fail)
         planner.start()
 
     def _run(plan: rl.RelocatePlan) -> None:
-        if _is_wine_game_running():
+        if _game_running():
+            win._end_busy()
             QMessageBox.warning(_dialog_parent(win), __app_name__, tr("cleanup.wine_running"))
             return
-        win._begin_busy()
         win.status_label.setText(tr("relocate.running", name=sa.name))
-        snap = win._make_pre_snapshot_fn(force=True)
+        snap = win._make_pre_snapshot_fn(force=True, game=sa)
 
         def _job() -> object:
+            if _files_in_use():
+                raise RuntimeError(tr("cleanup.wine_running"))
             try:
                 return rl.relocate_game(plan, snapshot_fn=snap)
             except rl.RelocateError as exc:
@@ -136,9 +153,16 @@ def move_game_to_disk(win: MainWindow, sa: StandaloneGame) -> None:
         win._track_worker(worker)
 
         def _done(res: object) -> None:
-            win._end_busy()
-            win._refresh_games()
-            win._refresh_shortcuts()
+            refreshes_left = 2
+
+            def _refreshed() -> None:
+                nonlocal refreshes_left
+                refreshes_left -= 1
+                if refreshes_left == 0:
+                    win._end_busy()
+
+            win._refresh_games(on_done=_refreshed)
+            win._refresh_shortcuts(on_done=_refreshed)
             if isinstance(res, rl.RelocateError):
                 problems = "\n".join(res.problems)
                 if res.rolled_back:

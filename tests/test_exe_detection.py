@@ -49,7 +49,7 @@ def test_only_x86_and_x64_pe_run_with_proton(tmp_path: Path) -> None:
     assert scanner.detect_exe_kind(tmp_path / "le.exe") == "unknown"
 
 
-def test_dos_and_native_only_folders_are_not_games(tmp_path: Path) -> None:
+def test_native_launchers_are_discovered_and_dos_executables_are_skipped(tmp_path: Path) -> None:
     dos = tmp_path / "Alien Carnage"
     _write(dos / "CARNAGE.EXE", b"MZ" + b"\x00" * 64)
     _write(dos / "ac-help.exe", _header(b"LE\x00\x00"))
@@ -57,8 +57,11 @@ def test_dos_and_native_only_folders_are_not_games(tmp_path: Path) -> None:
 
     native = tmp_path / "Hollow Knight"
     start = _write(native / "start.sh", b"#!/bin/sh\nexec game/hollow_knight.x86_64\n")
-    _write(native / "game" / "hollow_knight.x86_64", b"\x7fELF" + b"\x00" * 60)
-    assert scanner.scan_game_folder(native) is None
+    start.chmod(0o755)
+    elf = _write(native / "game" / "hollow_knight.x86_64", b"\x7fELF" + b"\x00" * 60)
+    elf.chmod(0o755)
+    game = scanner.scan_game_folder(native)
+    assert game is not None and game.executables == [start, elf]
     assert scanner.is_native_linux_exe(start)
     assert not scanner.is_native_linux_exe(_write(tmp_path / "w.exe"))
 

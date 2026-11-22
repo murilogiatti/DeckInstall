@@ -248,11 +248,6 @@ def test_update_with_pending_edits_offers_apply_update_or_cancel() -> None:
         relaunch, quit_app = _run_update_prompt(win, 2)  # Cancel
         relaunch.assert_not_called()
         quit_app.assert_not_called()
-        relaunch, quit_app = _run_update_prompt(win, 1)  # update without applying: queue stays saved
-        relaunch.assert_called_once()
-        quit_app.assert_called_once()
-        assert win._skip_vdf_close_prompt
-        win._skip_vdf_close_prompt = False
         with mock.patch.object(win, "_apply_vdf_queue") as apply_q:
             with (
                 mock.patch.object(ui.QMessageBox, "exec", lambda box: 0),
@@ -260,10 +255,16 @@ def test_update_with_pending_edits_offers_apply_update_or_cancel() -> None:
                 mock.patch.object(ui, "relaunch_appimage") as relaunch,
             ):
                 win._ask_update_with_pending_edits(2, Path("/tmp/new.AppImage"))
-            apply_q.assert_called_once()
-            relaunch.assert_not_called()  # restarts only after the edits went in
-            apply_q.call_args.kwargs["on_done"](False)
-            relaunch.assert_not_called()  # failed apply: no restart
+                apply_q.assert_called_once()
+                relaunch.assert_not_called()
+                apply_q.call_args.kwargs["on_done"](False)
+                relaunch.assert_not_called()
+                assert not win._closed
+        _drain(win, app)
+        relaunch, quit_app = _run_update_prompt(win, 1)
+        relaunch.assert_called_once_with(Path("/tmp/new.AppImage"))
+        quit_app.assert_not_called()
+        assert win._closed and win._skip_vdf_close_prompt
     finally:
         win._skip_vdf_close_prompt = False
         win._vdf_queue.clear()

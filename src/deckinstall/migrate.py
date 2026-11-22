@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,7 +25,7 @@ from typing import Any
 from . import library as _lib
 from . import save_sync, standalone
 from .extractor import check_disk_space
-from .fsutil import atomic_write_text, is_within, move_dir_safely
+from .fsutil import _safe_chmod, atomic_write_text, is_within, move_dir_safely, unique_dir
 from .manifest import MANIFEST_V1, MANIFEST_V2, new_uid, now_iso
 from .standalone import StandaloneGame
 from .steam_paths import SteamPaths, dir_size_bytes
@@ -71,26 +72,27 @@ def _shortcut_paths(paths: SteamPaths | None) -> list[str]:
         for raw in (e.exe, e.start_dir, e.icon):
             val = _strip_vdf_quotes(raw)
             if val:
-                out.append(os.path.abspath(os.path.expanduser(val)))
+                expanded = os.path.expanduser(val)
+                abs_p = os.path.abspath(expanded)
+                out.append(abs_p)
+                real_p = os.path.realpath(expanded)
+                if real_p != abs_p:
+                    out.append(real_p)
         if e.launch_options:
             out.append(e.launch_options)
     return out
 
 
 def _referenced(path: Path, refs: list[str]) -> bool:
-    key = os.path.abspath(path)
-    return any(r == key or r.startswith(key + os.sep) or key in r for r in refs)
-
-
-def _unique_dir(target: Path) -> Path:
-    if not target.exists() and not target.is_symlink():
-        return target
-    idx = 2
-    while True:
-        cand = target.with_name(f"{target.name} ({idx})")
-        if not cand.exists() and not cand.is_symlink():
-            return cand
-        idx += 1
+    keys = {os.path.abspath(path), os.path.realpath(path)}
+    for ref in refs:
+        if any(key in ref for key in keys):
+            return True
+        if os.path.isabs(ref):
+            resolved = os.path.realpath(ref)
+            if any(resolved == key or resolved.startswith(key + os.sep) for key in keys):
+                return True
+    return False
 
 
 def plan_migration(paths: SteamPaths | None = None) -> list[MigrationItem]:
@@ -103,9 +105,10 @@ def plan_migration(paths: SteamPaths | None = None) -> list[MigrationItem]:
     legacy_prefixes = standalone.get_legacy_prefixes_dir()
     legacy_caches = legacy_games / ".caches"
     refs = _shortcut_paths(paths)
-    v1 = [g for g in standalone.list_standalone_games() if g.schema < 2]
+    all_games = standalone.list_standalone_games()
+    v1 = [g for g in all_games if g.schema < 2]
     prefix_users: dict[Path, int] = {}
-    for g in v1:
+    for g in all_games:
         try:
             key = g.prefix_dir.resolve()
         except OSError:
@@ -124,9 +127,9 @@ def plan_migration(paths: SteamPaths | None = None) -> list[MigrationItem]:
         item = MigrationItem(game, "migrate")
         if is_within(game.game_dir, legacy_games, strict=True):
             rel = game.game_dir.resolve().relative_to(legacy_games.resolve())
-            target = _unique_dir(games_dir / rel)
+            target = unique_dir(games_dir / rel)
             while target in planned_dirs:
-                target = _unique_dir(target.with_name(target.name + " (migrated)"))
+                target = unique_dir(target.with_name(target.name + " (migrated)"))
             planned_dirs.add(target)
             item.new_game_dir = target
             item.moves.append((game.game_dir, target))
@@ -240,6 +243,7 @@ def _undo_entry(entry: dict[str, Any]) -> list[str]:
             _remove_empty_parents(dst.parent, Path(str(move.get("dst_stop") or dst.parent)))
         except OSError as exc:
             problems.append(f"{dst} -> {src}: {exc}")
+    file_modes = entry.get("file_modes") or {}
     for raw_path, content in (entry.get("files") or {}).items():
         p = Path(raw_path)
         try:
@@ -248,6 +252,11 @@ def _undo_entry(entry: dict[str, Any]) -> list[str]:
                     p.unlink()
             else:
                 atomic_write_text(p, content)
+                mode = file_modes.get(raw_path)
+                if mode is None and p.name == "launch.sh":
+                    mode = 0o755
+                if isinstance(mode, int):
+                    _safe_chmod(p, mode)
         except OSError as exc:
             problems.append(f"{p}: {exc}")
     return problems
@@ -263,6 +272,7 @@ def _migrate_one(item: MigrationItem, journal: _Journal, lib: _lib.Library) -> S
         "status": "running",
         "snapshot": "",
         "files": {},
+        "file_modes": {},
         "moves": [],
         "created": [],
     }
@@ -288,6 +298,10 @@ def _migrate_one(item: MigrationItem, journal: _Journal, lib: _lib.Library) -> S
         content = _read_text(p)
         if content is not None:  # absent files are never deleted on undo
             entry["files"][str(p)] = content
+            try:
+                entry["file_modes"][str(p)] = stat.S_IMODE(p.stat().st_mode)
+            except OSError:
+                pass
     journal.save()
 
     # 3. Move folders, journaling each move before it runs.
@@ -314,8 +328,22 @@ def _migrate_one(item: MigrationItem, journal: _Journal, lib: _lib.Library) -> S
 
     keep_new_cache = moved_cache or game.cache_dir is None or not game.cache_dir.is_dir()
 
+    try:
+        old_resolved = game.game_dir.resolve()
+    except OSError:
+        old_resolved = game.game_dir
+
     def rebase(p: Path) -> Path:
-        return new_game_dir / p.relative_to(game.game_dir) if is_within(p, game.game_dir) else p
+        if not is_within(p, game.game_dir):
+            return p
+        try:
+            return new_game_dir / p.relative_to(game.game_dir)
+        except ValueError:
+            pass
+        try:
+            return new_game_dir / p.resolve().relative_to(old_resolved)
+        except (OSError, ValueError):
+            return p
 
     migrated = StandaloneGame(
         name=game.name,
@@ -345,7 +373,11 @@ def _migrate_one(item: MigrationItem, journal: _Journal, lib: _lib.Library) -> S
     # 4. New integration files, manifest and registration.
     new_v1 = new_game_dir / MANIFEST_V1
     new_v2 = new_game_dir / MANIFEST_V2
-    if new_game_dir != game.game_dir:
+    try:
+        moved_game_dir = new_game_dir.resolve() != old_resolved
+    except OSError:
+        moved_game_dir = new_game_dir != game.game_dir
+    if moved_game_dir:
         entry["files"][str(new_v1)] = None  # moved copy of the v1 manifest; restored at the old path
     entry["created"].extend([str(new_v2), str(standalone._library_index_path(new_game_dir))])
     if migrated.launch_script != game.launch_script:

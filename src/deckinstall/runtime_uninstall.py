@@ -12,9 +12,13 @@ import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import runtime_manager as rm
 from .steam_paths import SteamPaths, dir_size_bytes
+
+if TYPE_CHECKING:
+    from .standalone import StandaloneGame
 
 UMU, STEAMRT4, MANGOHUD, OPTISCALER, GE = "umu", "steamrt4", "mangohud", "optiscaler", "ge"
 
@@ -28,11 +32,11 @@ class RuntimeItem:
     users: tuple[str, ...] = ()  # games that use it (custom Proton tools)
 
 
-def _orphan_mangohud_layer_bytes() -> int:
-    """Total size of user Vulkan implicit layers pointing into DeckInstall's MangoHud dir."""
+def _managed_mangohud_layers() -> list[tuple[Path, int]]:
+    """List the user Vulkan manifests pointing into DeckInstall's MangoHud dir."""
     mh_resolved = rm.get_mangohud_dir().resolve()
     layer_dir = rm.get_user_vulkan_layer_dir()
-    total = 0
+    layers = []
     for json_name in ("MangoHud.x86_64.json", "MangoHud.x86.json", "MangoHud.json"):
         layer = layer_dir / json_name
         if not layer.is_file() or layer.is_symlink():
@@ -40,19 +44,18 @@ def _orphan_mangohud_layer_bytes() -> int:
         try:
             data = json.loads(layer.read_text(encoding="utf-8"))
             if Path(str(data["layer"]["library_path"])).resolve().is_relative_to(mh_resolved):
-                total += layer.stat().st_size
+                layers.append((layer, layer.stat().st_size))
         except (OSError, ValueError, KeyError, TypeError):
             continue
-    return total
+    return layers
 
 
-def _proton_users(paths: SteamPaths | None) -> dict[str, list[str]]:
+def _proton_users(paths: SteamPaths | None, games: list[StandaloneGame]) -> dict[str, list[str]]:
     """{Proton folder/tool name: games using it} for DeckInstall games and Steam shortcuts."""
     from .proton_policy import effective_proton_name
-    from .standalone import list_standalone_games
 
     users: dict[str, list[str]] = {}
-    for game in list_standalone_games():
+    for game in games:
         name = effective_proton_name(game)
         if name:
             users.setdefault(name, []).append(game.name)
@@ -88,7 +91,11 @@ def affected_steam_appids(paths: SteamPaths | None, tool_names: Iterable[str]) -
 
 def list_runtimes(paths: SteamPaths | None = None) -> list[RuntimeItem]:
     """What can be uninstalled now, with its size and (for custom Protons) the games using it."""
+    from .standalone import list_standalone_games
+
     items: list[RuntimeItem] = []
+    games = list_standalone_games()
+    standalone_users = tuple(game.name for game in games if not game.native_linux)
     mh_dir = rm.get_mangohud_dir()
     fixed = (
         (UMU, "umu-run", rm.get_umu_dir()),
@@ -97,14 +104,16 @@ def list_runtimes(paths: SteamPaths | None = None) -> list[RuntimeItem]:
     )
     for kind, name, path in fixed:
         if path.is_dir() and not path.is_symlink():
-            items.append(RuntimeItem(kind, name, path, dir_size_bytes(path)))
-    mh_layer_bytes = _orphan_mangohud_layer_bytes()
+            users_of_runtime = standalone_users if kind in (UMU, STEAMRT4) else ()
+            items.append(RuntimeItem(kind, name, path, dir_size_bytes(path), users_of_runtime))
+    mh_layers = _managed_mangohud_layers()
+    mh_layer_bytes = sum(size for _, size in mh_layers)
     if mh_dir.is_dir() and not mh_dir.is_symlink():
         items.append(RuntimeItem(MANGOHUD, "MangoHud", mh_dir, dir_size_bytes(mh_dir) + mh_layer_bytes))
-    elif mh_layer_bytes > 0:
-        items.append(RuntimeItem(MANGOHUD, "MangoHud", rm.get_user_vulkan_layer_dir(), mh_layer_bytes))
+    elif mh_layers:
+        items.append(RuntimeItem(MANGOHUD, "MangoHud", mh_layers[0][0], mh_layer_bytes))
 
-    users = _proton_users(paths)
+    users = _proton_users(paths, games)
     compat_dir = rm.get_compat_tools_dir()
     managed_tools: list[Path] = []
     if compat_dir.is_dir():
@@ -152,7 +161,8 @@ def uninstall(items: list[RuntimeItem]) -> tuple[list[str], list[str]]:
             elif item.kind == OPTISCALER:
                 changed = rm.uninstall_optiscaler_package()
             elif item.kind == GE and rm.is_managed_compat_tool(item.path):
-                changed = rm._remove_runtime_dir(item.path)
+                rm.remove_compat_tool(item.path, managed_only=True)
+                changed = True
             else:
                 raise ValueError(f"Runtime is not managed by DeckInstall: {item.path}")
             if changed:

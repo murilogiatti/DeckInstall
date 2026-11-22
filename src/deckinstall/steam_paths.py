@@ -78,6 +78,17 @@ def dir_size_bytes_many(paths: list[Path]) -> int:
         return sum(pool.map(dir_size_bytes, unique))
 
 
+def _has_active_steam_profile(candidate: Path) -> bool:
+    userdata = candidate / "userdata"
+    if not userdata.is_dir():
+        return False
+    for entry in _safe_iterdir(userdata):
+        if entry.name.isascii() and entry.name.isdigit() and entry.is_dir():
+            return True
+    cfg = candidate / "config"
+    return (cfg / "loginusers.vdf").is_file() or (cfg / "config.vdf").is_file()
+
+
 def find_steam_root() -> Path | None:
     """Return the active Steam installation directory, if present."""
     candidates = [
@@ -87,10 +98,15 @@ def find_steam_root() -> Path | None:
         Path.home() / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam",
         Path.home() / ".var" / "app" / "com.valvesoftware.Steam" / ".steam" / "steam",
     ]
+    fallback: Path | None = None
     for candidate in candidates:
-        if (candidate / "userdata").is_dir():
+        if not (candidate / "userdata").is_dir():
+            continue
+        if _has_active_steam_profile(candidate):
             return candidate.resolve()
-    return None
+        if fallback is None:
+            fallback = candidate.resolve()
+    return fallback
 
 
 def is_flatpak_steam(steam_root: Path | None = None) -> bool:

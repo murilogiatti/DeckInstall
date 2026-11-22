@@ -12,6 +12,8 @@ import os
 import re
 import struct
 from collections import deque
+from collections.abc import Callable
+from contextlib import ExitStack
 from pathlib import Path
 
 _MAX_DEPTH = 4
@@ -99,7 +101,7 @@ _CODE_DIRS = frozenset(
 )
 
 _DLL_STEM_W_RE = re.compile(rb"(?:[A-Za-z0-9_\-]\x00)+$")
-_DLL_UTF16_EXTS = (".dll".encode("utf-16-le"), ".DLL".encode("utf-16-le"))
+_DLL_EXT_RE = re.compile(rb"\.(?:[dD][lL][lL]|\x00[dD]\x00[lL]\x00[lL]\x00)")
 _cache: dict[tuple[str, str, int, int], tuple[str, str]] = {}
 
 
@@ -170,29 +172,20 @@ def _pe_imports(mm: mmap.mmap) -> set[str]:
 def _scan_mmap_gfx(mm: mmap.mmap) -> set[str]:
     """Extract graphics APIs from an already-opened PE/ELF mmap (imports, ASCII & UTF-16LE DLLs, .so)."""
     found: set[str] = {api for dll in _pe_imports(mm) if (api := _GFX_DLLS.get(dll))}
-    for ext in (b".dll", b".DLL"):
-        pos = mm.find(ext)
-        for _ in range(_MAX_DLL_STRINGS):
-            if pos == -1:
-                break
-            m = _DLL_STEM_RE.search(mm[max(0, pos - 24):pos])
-            if m and (api := _GFX_DLLS.get(m.group(0).decode("ascii", "ignore").lower() + ".dll")):
+    for idx, ext in enumerate(_DLL_EXT_RE.finditer(mm)):
+        if idx >= _MAX_DLL_STRINGS:
+            break
+        pos = ext.start()
+        wide = ext.end() - pos == 8
+        window = mm[max(0, pos - (48 if wide else 24)):pos]
+        if wide and len(window) % 2:
+            window = window[1:]
+        stem = (_DLL_STEM_W_RE if wide else _DLL_STEM_RE).search(window)
+        if stem:
+            encoding = "utf-16-le" if wide else "ascii"
+            api = _GFX_DLLS.get(stem.group(0).decode(encoding, "ignore").lower() + ".dll")
+            if api:
                 found.add(api)
-            pos = mm.find(ext, pos + 4)
-    for ext_w in _DLL_UTF16_EXTS:
-        pos = mm.find(ext_w)
-        for _ in range(_MAX_DLL_STRINGS):
-            if pos == -1:
-                break
-            window = mm[max(0, pos - 48):pos]
-            if len(window) % 2:
-                window = window[1:]
-            m = _DLL_STEM_W_RE.search(window)
-            if m:
-                stem = m.group(0).decode("utf-16-le", "ignore").lower()
-                if api := _GFX_DLLS.get(stem + ".dll"):
-                    found.add(api)
-            pos = mm.find(ext_w, pos + 8)
     if mm[:4] == b"\x7fELF":
         for lib, api in _GFX_SO.items():
             if api not in found and mm.find(lib) != -1:
@@ -200,29 +193,7 @@ def _scan_mmap_gfx(mm: mmap.mmap) -> set[str]:
     return found
 
 
-def _scan_binary(path: Path) -> set[str]:
-    """Graphics APIs referenced by a PE/ELF binary: {'dx9','dx11','dx12','vulkan','opengl'...}."""
-    try:
-        size = path.stat().st_size
-        if size == 0 or size > _MAX_SCAN_BYTES:
-            return set()
-        with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            return _scan_mmap_gfx(mm)
-    except (OSError, ValueError):
-        return set()
-
-
-def _find_regex(path: Path, pattern: re.Pattern[bytes], limit: int = _MAX_SCAN_BYTES) -> tuple[bytes, ...] | None:
-    """Groups of the first match of pattern in the file (group 0 when it has none)."""
-    try:
-        size = path.stat().st_size
-        if size == 0 or size > limit:
-            return None
-        with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            m = pattern.search(mm)
-            return (m.groups() or (m.group(0),)) if m else None
-    except (OSError, ValueError):
-        return None
+_MapBinary = Callable[[Path], mmap.mmap | None]
 
 
 def _read_head(path: Path | None, size: int = 1 << 16) -> bytes:
@@ -253,18 +224,6 @@ def _ue_full_version_mm(mm: mmap.mmap) -> tuple[str, str] | None:
     return None
 
 
-def _ue_full_version(path: Path) -> tuple[str, str] | None:
-    """(major, minor) from ENGINE_VERSION_STRING ("4.27.2-18319896+++<branch>"), ASCII or UTF-16."""
-    try:
-        size = path.stat().st_size
-        if size == 0 or size > _MAX_SCAN_BYTES:
-            return None
-        with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            return _ue_full_version_mm(mm)
-    except (OSError, ValueError):
-        return None
-
-
 def _ue_fixed_file_version_mm(mm: mmap.mmap) -> tuple[int, int] | None:
     """(major, minor) of the VS_FIXEDFILEINFO of an Unreal binary: Epic stamps the engine version."""
     try:
@@ -280,18 +239,6 @@ def _ue_fixed_file_version_mm(mm: mmap.mmap) -> tuple[int, int] | None:
     if (major == 4 and minor <= 27) or (major == 5 and minor <= 20):
         return major, minor
     return None
-
-
-def _ue_fixed_file_version(path: Path) -> tuple[int, int] | None:
-    """(major, minor) of the VS_FIXEDFILEINFO of an Unreal binary: Epic stamps the engine version."""
-    try:
-        size = path.stat().st_size
-        if size == 0 or size > _MAX_SCAN_BYTES:
-            return None
-        with open(path, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-            return _ue_fixed_file_version_mm(mm)
-    except (OSError, ValueError):
-        return None
 
 
 class _Tree:
@@ -365,7 +312,7 @@ def _unity(tree: _Tree) -> str | None:
     return ""
 
 
-def _unreal(tree: _Tree, exe: Path) -> tuple[str, Path | None] | None:
+def _unreal(tree: _Tree, exe: Path, map_binary: _MapBinary) -> tuple[str, Path | None] | None:
     """('UE4 4.27'/'UE5'/'UE3'..., the binary that carries the graphics imports); None when not Unreal."""
     shipping_bins = [p for _, p in tree.matching(_UE_EXE_RE)] or [p for _, p in tree.matching(_UE_ELF_RE)]
     if is_unreal_binary_name(exe.name):
@@ -387,39 +334,28 @@ def _unreal(tree: _Tree, exe: Path) -> tuple[str, Path | None] | None:
     if core is not None:  # modular build: the engine version lives in Core, not in the .exe
         probes.append(core)
     probes = list(dict.fromkeys(probes))
-    probe_results: list[tuple[bool, str | None, tuple[int, int] | None, str | None]] = []
+    fixed_versions = []
+    major_versions = []
     for probe in probes:
-        try:
-            size = probe.stat().st_size
-            if size == 0 or size > _MAX_SCAN_BYTES:
-                continue
-            with open(probe, "rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
-                exact: str | None = None
-                if m := _UE_VERSION_RE.search(mm):
-                    exact = f"UE{m.group(1).decode()} {m.group(2).decode()}"
-                elif w := _UE_VERSION_W_RE.search(mm):
-                    minor = w.group(3).decode() + (w.group(4).decode() if w.group(4) else "")
-                    exact = f"UE{w.group(1).decode()} {w.group(2).decode()}.{minor}"
-                elif full := _ue_full_version_mm(mm):
-                    exact = f"UE{full[0]} {full[0]}.{full[1]}"
-                if exact is not None:
-                    return exact, shipping
-                fixed = (
-                    _ue_fixed_file_version_mm(mm)
-                    if (probe is not exe or probe is shipping)
-                    else None
-                )
-                maj_m = _UE_MAJOR_RE.search(mm) or _UE_CC_RE.search(mm)
-                major = f"UE{maj_m.group(1).decode()}" if maj_m else None
-                probe_results.append((probe is not exe or probe is shipping, exact, fixed, major))
-        except (OSError, ValueError):
+        mm = map_binary(probe)
+        if mm is None:
             continue
-    for _allow_fixed, _exact, fixed, _major in probe_results:
-        if fixed is not None:
-            return f"UE{fixed[0]} {fixed[0]}.{fixed[1]}", shipping
-    for _allow_fixed, _exact, _fixed, major in probe_results:
-        if major is not None:
-            return major, shipping
+        if m := _UE_VERSION_RE.search(mm):
+            return f"UE{m.group(1).decode()} {m.group(2).decode()}", shipping
+        if w := _UE_VERSION_W_RE.search(mm):
+            minor = w.group(3).decode() + (w.group(4).decode() if w.group(4) else "")
+            return f"UE{w.group(1).decode()} {w.group(2).decode()}.{minor}", shipping
+        if full := _ue_full_version_mm(mm):
+            return f"UE{full[0]} {full[0]}.{full[1]}", shipping
+        if (probe != exe or probe == shipping) and (fixed := _ue_fixed_file_version_mm(mm)):
+            fixed_versions.append(fixed)
+        if major := _UE_MAJOR_RE.search(mm) or _UE_CC_RE.search(mm):
+            major_versions.append(major.group(1).decode())
+    if fixed_versions:
+        major_num, minor_num = fixed_versions[0]
+        return f"UE{major_num} {major_num}.{minor_num}", shipping
+    if major_versions:
+        return f"UE{major_versions[0]}", shipping
     return "Unreal Engine", shipping
 
 
@@ -468,22 +404,15 @@ def _rpg_maker(files: dict[str, Path]) -> str | None:
     return None
 
 
-def _engine(tree: _Tree, exe: Path) -> tuple[str, Path | None]:
+def _engine(tree: _Tree, exe: Path, map_binary: _MapBinary) -> tuple[str, Path | None]:
     """(engine label with version when known, the binary that carries the graphics imports)."""
     unity = _unity(tree)
     if unity is not None:
         return (f"Unity {unity}" if unity else "Unity"), None
-    unreal = _unreal(tree, exe)
+    unreal = _unreal(tree, exe, map_binary)
     if unreal is not None:
         return unreal[0], unreal[1]
     f, d = tree.files, tree.dirs
-    pck = _godot_pck(tree)
-    for probe in [exe] + ([pck] if pck is not None else []):
-        m = _find_regex(probe, _GODOT_VERSION_RE)
-        if m:
-            return f"Godot {m[0].decode()}", None
-    if pck is not None:
-        return "Godot", None
     if "data.win" in f or "game.droid" in f or "game.unx" in f or "game.ios" in f:
         return "GameMaker", None
     rpg = _rpg_maker(f)
@@ -542,6 +471,13 @@ def _engine(tree: _Tree, exe: Path) -> tuple[str, Path | None]:
         return "NW.js", None
     if "app.asar" in f or ("v8_context_snapshot.bin" in f and "libcef.dll" not in f):
         return "Electron", None
+    pck = _godot_pck(tree)
+    for probe in (exe, pck):
+        if probe is not None and (mm := map_binary(probe)) is not None:
+            if match := _GODOT_VERSION_RE.search(mm):
+                return f"Godot {match.group(0).decode()}", None
+    if pck is not None:
+        return "Godot", None
     return "Other", None
 
 
@@ -610,8 +546,31 @@ def detect_game_tech(exe_path: Path, game_dir: Path | None = None) -> tuple[str,
     if hit is not None:
         return hit
 
+    with ExitStack() as mappings:
+        by_path: dict[Path, mmap.mmap | None] = {}
+
+        def map_binary(path: Path) -> mmap.mmap | None:
+            if path not in by_path:
+                by_path[path] = None
+                try:
+                    with path.open("rb") as fh:
+                        size = os.fstat(fh.fileno()).st_size
+                        if 0 < size <= _MAX_SCAN_BYTES:
+                            by_path[path] = mappings.enter_context(
+                                mmap.mmap(fh.fileno(), size, access=mmap.ACCESS_READ)
+                            )
+                except (OSError, ValueError):
+                    pass
+            return by_path[path]
+
+        result = _detect_game_tech(exe_path, root, map_binary)
+    _cache[key] = result
+    return result
+
+
+def _detect_game_tech(exe_path: Path, root: Path, map_binary: _MapBinary) -> tuple[str, str]:
     tree = _Tree(root, must_list=exe_path.parent)
-    engine, engine_binary = _engine(tree, exe_path)
+    engine, engine_binary = _engine(tree, exe_path, map_binary)
 
     apis: set[str] = set()
     # Loose DLLs in the game folder: Agility SDK (D3D12/D3D12Core.dll), bundled Vulkan loader,
@@ -633,14 +592,12 @@ def detect_game_tech(exe_path: Path, game_dir: Path | None = None) -> tuple[str,
     if engine.startswith("Unity"):
         native = tree.files.get("unityplayer.so")
         if native is not None and "unityplayer.dll" not in tree.files:
-            apis |= _scan_binary(native)  # Linux player: Vulkan/OpenGL as built
+            if (mm := map_binary(native)) is not None:
+                apis |= _scan_mmap_gfx(mm)  # Linux player: Vulkan/OpenGL as built
         # Unity's Windows player carries every backend, so only the default (Direct3D 11) is claimed.
         apis = apis or {"dx11"}
     elif engine.startswith("Ren'Py"):
         apis = apis or {"opengl"}  # the launcher exe is Python; the renderer is OpenGL (ANGLE on Windows)
-    else:
-        apis |= _scan_binary(engine_binary or exe_path)
-
-    result = (_format_graphics(apis), engine)
-    _cache[key] = result
-    return result
+    elif (mm := map_binary(engine_binary or exe_path)) is not None:
+        apis |= _scan_mmap_gfx(mm)
+    return _format_graphics(apis), engine

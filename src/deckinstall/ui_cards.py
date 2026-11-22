@@ -16,6 +16,7 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
+    QCloseEvent,
     QDragEnterEvent,
     QDragLeaveEvent,
     QDropEvent,
@@ -61,7 +62,24 @@ def _dialog_guard(dlg: QDialog) -> Callable[[], bool]:
     """Return a callable that stays True while *dlg* has not finished."""
     state = {"open": True}
     dlg.finished.connect(lambda _r: state.__setitem__("open", False))
+    dlg.destroyed.connect(lambda: state.__setitem__("open", False))
     return lambda: state["open"]
+
+
+class _BusyGuardedDialog(QDialog):
+    def __init__(self, parent: QWidget, is_busy: Callable[[], bool]) -> None:
+        super().__init__(parent)
+        self._is_busy = is_busy
+
+    def reject(self) -> None:
+        if not self._is_busy():
+            super().reject()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if self._is_busy():
+            event.ignore()
+        else:
+            super().closeEvent(event)
 
 
 class _SortableTableItem(QTableWidgetItem):
@@ -226,9 +244,12 @@ def _proc_is_wine_game(args: list[str], environ_has_prefix: bool = False) -> boo
     return environ_has_prefix or any(m in joined for m in _WINE_PREFIX_MARKERS)
 
 
-def _is_wine_game_running(proc_root: Path | str = "/proc") -> bool:
+_PROC_ROOT = Path("/proc")
+
+
+def _is_wine_game_running(proc_root: Path | str | None = None) -> bool:
     """Return True if a real Windows game (.exe, wineserver or a wrapper on a Wine prefix) is running."""
-    proc = Path(proc_root)
+    proc = Path(proc_root) if proc_root is not None else _PROC_ROOT
     if not proc.is_dir():
         return False
     uid = os.getuid()

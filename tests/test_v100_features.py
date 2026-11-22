@@ -314,7 +314,8 @@ class RuntimeManagerV100Tests(unittest.TestCase):
                 remove_compat_tool(outside)
 
             # Valid removal
-            remove_compat_tool(tool_dir)
+            with patch("deckinstall.runtime_manager.get_compat_tools_dir", return_value=compat_dir):
+                remove_compat_tool(tool_dir)
             self.assertFalse(tool_dir.exists())
 
     def test_resolve_game_prefix_external(self) -> None:

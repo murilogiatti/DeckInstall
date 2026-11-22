@@ -262,6 +262,33 @@ def _resolve_existing_file(raw_path: str | Path | None, base_dir: Path | None = 
         return None
 
 
+def _wine_config_paths(raw: str, prefix: Path | None) -> list[Path]:
+    """Translate the conventional Wine C: and Z: drive paths used in launcher configs."""
+    val = raw.strip()
+    if not val:
+        return []
+    if len(val) < 3 or val[1] != ":" or val[2] not in ("\\", "/"):
+        return [Path(val.replace("\\", "/")).expanduser()]
+    drive = val[0].upper()
+    relative = val[3:].replace("\\", "/").lstrip("/")
+    if drive == "Z":
+        return [Path("/") / relative]
+    if drive == "C" and prefix is not None:
+        return [prefix / "drive_c" / relative, prefix / "pfx" / "drive_c" / relative]
+    return []
+
+
+def _resolve_lutris_exe(raw: object, base: Path | None, prefix: Path | None) -> Path | None:
+    for path in _wine_config_paths(str(raw or ""), prefix):
+        candidates = [path] if path.is_absolute() else [
+            root / path for root in (base, prefix) if root is not None
+        ]
+        for candidate in candidates:
+            if (exe := _resolve_existing_file(candidate)) is not None:
+                return exe
+    return None
+
+
 def _lutris_games_dir(home: Path) -> Path:
     """Lutris game configs: ~/.config/lutris/games, or its data dir when ~/.config/lutris is absent."""
     config = home / ".config" / "lutris"
@@ -397,12 +424,12 @@ def _lutris_entry_from_yaml(
     exe_raw = game_dict.get("exe") or data.get("exe")
     working_dir_raw = game_dict.get("working_dir") or data.get("working_dir") or row.get("directory")
     base_dir = _resolve_existing_dir(working_dir_raw)
-    exe_path = _resolve_existing_file(exe_raw, base_dir=base_dir)
+    prefix_raw = game_dict.get("prefix") or data.get("prefix") or row.get("prefix")
+    prefix_dir = _resolve_existing_dir(prefix_raw)
+    exe_path = _resolve_lutris_exe(exe_raw, base_dir, prefix_dir)
     if exe_path is None:
         return None
 
-    prefix_raw = game_dict.get("prefix") or data.get("prefix")
-    prefix_dir = _resolve_existing_dir(prefix_raw)
     game_dir = base_dir or exe_path.parent
     slug = (
         str(row.get("slug") or "").strip()
@@ -504,7 +531,8 @@ def _scan_lutris(home: Path) -> list[ExternalLauncherGame]:
                     continue
 
             dir_path = _resolve_existing_dir(row.get("directory"))
-            exe_path = _resolve_existing_file(row.get("exe"), base_dir=dir_path)
+            prefix_dir = _resolve_existing_dir(row.get("prefix"))
+            exe_path = _resolve_lutris_exe(row.get("exe"), dir_path, prefix_dir)
             if exe_path is None:
                 continue
             name = str(row.get("name") or "").strip() or exe_path.stem
@@ -516,7 +544,7 @@ def _scan_lutris(home: Path) -> list[ExternalLauncherGame]:
                     name=name,
                     exe_path=exe_path,
                     game_dir=dir_path or exe_path.parent,
-                    prefix_dir=_resolve_existing_dir(row.get("prefix")),
+                    prefix_dir=prefix_dir,
                     runner=_normalize_runner(str(row.get("runner") or ""), exe_path),
                     launch_cmd=_lutris_launch_cmd(is_flatpak, slug, game_id),
                     game_id=game_id,
@@ -730,15 +758,10 @@ def _scan_heroic(home: Path) -> list[ExternalLauncherGame]:
 
 def _resolve_bottles_exe(raw_path: str, bottle_dir: Path) -> Path | None:
     """Resolve a Bottles External_Programs path (POSIX, Z:\\... -> /, or C:\\... -> drive_c)."""
-    val = raw_path.strip()
-    if not val:
-        return None
-    if len(val) >= 3 and val[1] == ":" and val[2] in ("\\", "/"):
-        drive = val[0].upper()
-        rel = val[3:].replace("\\", "/").lstrip("/")
-        cand = Path("/") / rel if drive == "Z" else bottle_dir / "drive_c" / rel
-        return cand if cand.is_file() else None
-    return _resolve_existing_file(val)
+    for path in _wine_config_paths(raw_path, bottle_dir):
+        if (exe := _resolve_existing_file(path)) is not None:
+            return exe
+    return None
 
 
 def _scan_bottles(home: Path) -> list[ExternalLauncherGame]:
@@ -784,7 +807,8 @@ def _scan_bottles(home: Path) -> list[ExternalLauncherGame]:
                 seen_exes.add(resolved)
 
                 prog_name = str(prog_entry.get("name") or "").strip() or exe_path.stem
-                game_dir = _resolve_existing_dir(prog_entry.get("folder")) or exe_path.parent
+                folders = _wine_config_paths(str(prog_entry.get("folder") or ""), bottle_dir)
+                game_dir = next((folder for folder in folders if _resolve_existing_dir(folder)), exe_path.parent)
                 if is_flatpak:
                     launch_cmd = [
                         "flatpak",

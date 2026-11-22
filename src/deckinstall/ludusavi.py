@@ -39,6 +39,7 @@ import tempfile
 import time
 import zipfile
 from collections.abc import Callable, Iterator
+from contextlib import ExitStack
 from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -650,53 +651,62 @@ def _plan_sources(
     plan: list[tuple[_Source, str, tuple[str, ...]]] = []
     seen_targets: dict[tuple[str, tuple[str, ...]], int] = {}
     skipped = 0
-    for original, (backup, digest, size) in sorted(files.items()):
-        drive, parts = _split_drive(original)
-        if not parts:
-            raise LudusaviError(f"Unsafe path in backup: {original!r}")
-        dfolder = drives.get(drive) or ("drive-0" if drive == "" else f"drive-{drive[:1]}")
-        base = folder if backup == "." else folder / backup
-        if backup == ".":
-            zip_path = None
-        elif base.is_dir():
-            zip_path = None
-        elif base.is_file() and backup.lower().endswith(".zip"):
-            zip_path = base
-        else:
-            zip_path = folder / f"{backup}.zip"
-        member = "/".join((dfolder, *parts))
-        file_path = base.joinpath(dfolder, *parts)
-        if zip_path is None and (not is_within(file_path, folder, strict=True) or not file_path.is_file()):
-            raise LudusaviError(f"Missing in backup: {original}")
-        if zip_path is not None and (
-            zip_path.is_symlink() or not is_within(zip_path, folder, strict=True) or not zip_path.is_file()
-        ):
-            raise LudusaviError(f"Missing in backup: {original}")
-        target = mapper(drive, parts) if mapper is not None else _target_for(drive, parts, home)
-        src = _Source(original, zip_path, member, file_path, digest, size)
-        if target is None or (target[0] == "home" and not save_sync.home_entry_allowed(target[1], _source_mode(src))):
-            skipped += 1
-            continue
-        kind, norm_parts = target
-        tkey = (kind, tuple(p.lower() for p in norm_parts) if kind == "prefix" else norm_parts)
-        if tkey in seen_targets:
-            plan[seen_targets[tkey]] = (src, kind, norm_parts)
-            skipped += 1
-            continue
-        seen_targets[tkey] = len(plan)
-        plan.append((src, kind, norm_parts))
+    archives: dict[Path, zipfile.ZipFile | None] = {}
+    with ExitStack() as stack:
+        for original, (backup, digest, size) in sorted(files.items()):
+            drive, parts = _split_drive(original)
+            if not parts:
+                raise LudusaviError(f"Unsafe path in backup: {original!r}")
+            dfolder = drives.get(drive) or ("drive-0" if drive == "" else f"drive-{drive[:1]}")
+            base = folder if backup == "." else folder / backup
+            if backup == ".":
+                zip_path = None
+            elif base.is_dir():
+                zip_path = None
+            elif base.is_file() and backup.lower().endswith(".zip"):
+                zip_path = base
+            else:
+                zip_path = folder / f"{backup}.zip"
+            member = "/".join((dfolder, *parts))
+            file_path = base.joinpath(dfolder, *parts)
+            if zip_path is None and (not is_within(file_path, folder, strict=True) or not file_path.is_file()):
+                raise LudusaviError(f"Missing in backup: {original}")
+            if zip_path is not None and (
+                zip_path.is_symlink() or not is_within(zip_path, folder, strict=True) or not zip_path.is_file()
+            ):
+                raise LudusaviError(f"Missing in backup: {original}")
+            target = mapper(drive, parts) if mapper is not None else _target_for(drive, parts, home)
+            src = _Source(original, zip_path, member, file_path, digest, size)
+            if target is None or (
+                target[0] == "home" and not save_sync.home_entry_allowed(target[1], _source_mode(src, stack, archives))
+            ):
+                skipped += 1
+                continue
+            kind, norm_parts = target
+            tkey = (kind, tuple(p.lower() for p in norm_parts) if kind == "prefix" else norm_parts)
+            if tkey in seen_targets:
+                plan[seen_targets[tkey]] = (src, kind, norm_parts)
+                skipped += 1
+                continue
+            seen_targets[tkey] = len(plan)
+            plan.append((src, kind, norm_parts))
 
     return label, plan, skipped
 
 
-def _source_mode(src: _Source) -> int:
+def _source_mode(src: _Source, stack: ExitStack, archives: dict[Path, zipfile.ZipFile | None]) -> int:
     """Unix mode recorded for a zipped backup file (0 for plain files: exFAT/NTFS mark everything executable)."""
     if src.zip_path is None:
         return 0
+    if src.zip_path not in archives:
+        try:
+            archives[src.zip_path] = stack.enter_context(zipfile.ZipFile(src.zip_path))
+        except (OSError, zipfile.BadZipFile):
+            archives[src.zip_path] = None
+    archive = archives[src.zip_path]
     try:
-        with zipfile.ZipFile(src.zip_path) as zf:
-            return zf.getinfo(src.member).external_attr >> 16
-    except (OSError, KeyError, zipfile.BadZipFile):
+        return archive.getinfo(src.member).external_attr >> 16 if archive is not None else 0
+    except KeyError:
         return 0
 
 

@@ -15,11 +15,12 @@ import time
 import zipfile
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
-from .fsutil import atomic_write_bytes, file_sha256, is_within
+from .fsutil import FileIdentity, atomic_write_bytes, file_identity, file_sha256, is_within, open_regular_fd
 from .steam_vdf import (
     _RESTORE_MAX_ENTRIES,
     _RESTORE_MAX_FILE_BYTES,
@@ -32,7 +33,6 @@ from .steam_vdf import (
     _prefix_programdata_dir,
     _prefix_users_dir,
     _safe_parents_within,
-    _write_prefix_saves_to_zip,
 )
 
 DEFAULT_SNAPSHOTS_DIR = DEFAULT_SAVES_DIR / "snapshots"
@@ -292,7 +292,7 @@ def _collect_prefix_state_entries(
 class _LudusaviManifestIndex:
     """Data-oriented flat lookup tables for the cached Ludusavi manifest."""
 
-    key: tuple[Path, int, int, int]
+    key: tuple[Path, FileIdentity]
     entries: dict[str, dict[str, object]]
     by_appid: dict[str, dict[str, object]]
     by_norm_name: dict[str, dict[str, object]]
@@ -303,7 +303,7 @@ _LUDUSAVI_CACHE: _LudusaviManifestIndex | None = None
 
 
 def _build_ludusavi_index(
-    cache_key: tuple[Path, int, int, int], raw: dict[object, object]
+    cache_key: tuple[Path, FileIdentity], raw: dict[object, object]
 ) -> _LudusaviManifestIndex:
     entries: dict[str, dict[str, object]] = {}
     by_appid: dict[str, dict[str, object]] = {}
@@ -332,29 +332,27 @@ def _build_ludusavi_index(
 def _get_ludusavi_index(manifest_path: Path | None = None) -> _LudusaviManifestIndex | None:
     global _LUDUSAVI_CACHE
     target = manifest_path if manifest_path is not None else DEFAULT_LUDUSAVI_MANIFEST_PATH
-    if not target.is_file() or target.is_symlink():
-        return None
-    try:
-        resolved = target.resolve()
-        st = target.stat()
-    except OSError:
-        return None
-    if st.st_size > _LUDUSAVI_MANIFEST_MAX_BYTES:
-        return None
-    cache_key = (resolved, st.st_ino, st.st_mtime_ns, st.st_size)
     with _LUDUSAVI_CACHE_LOCK:
-        if _LUDUSAVI_CACHE is not None and _LUDUSAVI_CACHE.key == cache_key:
-            return _LUDUSAVI_CACHE
-    try:
-        raw = json.loads(target.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(raw, dict):
-        return None
-    index = _build_ludusavi_index(cache_key, raw)
-    with _LUDUSAVI_CACHE_LOCK:
-        _LUDUSAVI_CACHE = index
-    return index
+        try:
+            st = target.lstat()
+            if not stat.S_ISREG(st.st_mode) or st.st_size > _LUDUSAVI_MANIFEST_MAX_BYTES:
+                return None
+            cache_key = (target.absolute(), file_identity(st))
+            if _LUDUSAVI_CACHE is not None and _LUDUSAVI_CACHE.key == cache_key:
+                return _LUDUSAVI_CACHE
+            with os.fdopen(open_regular_fd(target), "rb") as source:
+                if file_identity(os.fstat(source.fileno())) != cache_key[1]:
+                    return None
+                data = source.read(_LUDUSAVI_MANIFEST_MAX_BYTES + 1)
+                if len(data) > _LUDUSAVI_MANIFEST_MAX_BYTES or file_identity(os.fstat(source.fileno())) != cache_key[1]:
+                    return None
+            raw = json.loads(data.decode("utf-8", errors="replace"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(raw, dict):
+            return None
+        _LUDUSAVI_CACHE = _build_ludusavi_index(cache_key, raw)
+        return _LUDUSAVI_CACHE
 
 
 def load_ludusavi_manifest(
@@ -362,7 +360,7 @@ def load_ludusavi_manifest(
 ) -> dict[str, dict[str, object]]:
     """Load a Ludusavi JSON manifest mapping game names to save/registry definitions."""
     idx = _get_ludusavi_index(manifest_path)
-    return dict(idx.entries) if idx is not None else {}
+    return deepcopy(idx.entries) if idx is not None else {}
 
 
 def find_manifest_game_entry(
@@ -378,11 +376,11 @@ def find_manifest_game_entry(
         if steam_appid is not None:
             hit = idx.by_appid.get(str(steam_appid))
             if hit is not None:
-                return hit
+                return deepcopy(hit)
         if game_name in idx.entries:
-            return idx.entries[game_name]
+            return deepcopy(idx.entries[game_name])
         target_key = _norm_key(game_name)
-        return idx.by_norm_name.get(target_key) if target_key else None
+        return deepcopy(idx.by_norm_name.get(target_key)) if target_key else None
 
     if not manifest:
         return None
@@ -923,6 +921,8 @@ def _collect_prefix_save_entries(
     steam_appid: int | None = None,
     extra_dirs: ExtraDirs | None = None,
     home_files: tuple[str, ...] = (),
+    *,
+    strict: bool = False,
 ) -> list[tuple[str, Path, Path]]:
     """Collect sorted (section, src_file, rel_path) tuples for save files in prefix_dir (and extra_dirs).
 
@@ -935,7 +935,7 @@ def _collect_prefix_save_entries(
         if src_users is not None:
             dummy_users = prefix_dir / "__fp_users__"
             for src_file, dst_rel in _iter_prefix_save_pairs(
-                src_users, dummy_users, preserve_user_dirs=True, raise_on_error=False
+                src_users, dummy_users, preserve_user_dirs=True, raise_on_error=strict
             ):
                 rel = dst_rel.relative_to(dummy_users)
                 seen.add(("users", rel.as_posix()))
@@ -944,7 +944,7 @@ def _collect_prefix_save_entries(
         if src_progdata is not None:
             dummy_pd = prefix_dir / "__fp_pd__"
             for src_file, dst_rel in _iter_programdata_save_pairs(
-                src_progdata, dummy_pd, raise_on_error=False
+                src_progdata, dummy_pd, raise_on_error=strict
             ):
                 rel = dst_rel.relative_to(dummy_pd)
                 seen.add(("ProgramData", rel.as_posix()))
@@ -997,63 +997,64 @@ def _write_saves_zip_atomic(
     steam_appid: int | None = None,
     extra_dirs: ExtraDirs | None = None,
     home_files: tuple[str, ...] = (),
-) -> int:
-    """Write prefix saves (and extra_dirs, home_files) to target_zip atomically; return count of backed-up files."""
-    target_zip.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{target_zip.stem}-", suffix=".zip.tmp", dir=str(target_zip.parent)
+) -> tuple[int, str]:
+    """Write and fingerprint the same save bytes in one pass."""
+    entries = _collect_prefix_save_entries(
+        prefix_dir, game_name, game_dir, steam_appid, extra_dirs, home_files, strict=True,
     )
+    reg_bytes = _extract_manifest_reg_bytes(prefix_dir, game_name, steam_appid)
+    written = 0
+    total_bytes = 0
+    has_content = False
+    digest = hashlib.sha256()
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{target_zip.stem}-", suffix=".zip.tmp", dir=target_zip.parent)
     os.close(fd)
     tmp_zip = Path(tmp_name)
     try:
         with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            game_files, _, total_bytes = _write_prefix_saves_to_zip(
-                zf, prefix_dir, key_prefix, 0, 0
-            )
-            written = set(zf.namelist())
-            for section, src_file, rel_path in _collect_prefix_save_entries(
-                prefix_dir, game_name=game_name, game_dir=game_dir, steam_appid=steam_appid,
-                extra_dirs=extra_dirs, home_files=home_files,
-            ):
-                arcname = f"{key_prefix}/{section}/{rel_path.as_posix()}"
-                if arcname in written:
+            seen: set[str] = set()
+            for section, src_file, rel_path in entries:
+                name = f"{section}/{rel_path.as_posix()}"
+                if name in seen:
                     continue
-                if game_files + 1 > _RESTORE_MAX_ENTRIES:
-                    raise RuntimeError(f"Snapshot exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})")
-                sfd = os.open(str(src_file), os.O_RDONLY | os.O_NOFOLLOW)
-                copied = 0
-                with os.fdopen(sfd, "rb") as src_fh, zf.open(arcname, "w") as dst_fh:
-                    while chunk := src_fh.read(65536):
-                        copied += len(chunk)
-                        total_bytes += len(chunk)
-                        if copied > _RESTORE_MAX_FILE_BYTES or total_bytes > _RESTORE_MAX_TOTAL_BYTES:
-                            raise RuntimeError(f"Snapshot size limit exceeded on {src_file.name}")
-                        dst_fh.write(chunk)
-                game_files += 1
-                written.add(arcname)
-
-            reg_bytes = _extract_manifest_reg_bytes(prefix_dir, game_name, steam_appid)
+                with os.fdopen(open_regular_fd(src_file), "rb") as source:
+                    before = os.fstat(source.fileno())
+                    size = before.st_size
+                    if written >= _RESTORE_MAX_ENTRIES:
+                        raise RuntimeError(f"Snapshot exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})")
+                    if size > _RESTORE_MAX_FILE_BYTES or total_bytes + size > _RESTORE_MAX_TOTAL_BYTES:
+                        raise RuntimeError(f"Snapshot size limit exceeded on {src_file.name}")
+                    if size:
+                        digest.update(f"{name}\0{size}\0".encode())
+                        has_content = True
+                    copied = 0
+                    with zf.open(f"{key_prefix}/{name}", "w") as dest:
+                        while chunk := source.read(65536):
+                            copied += len(chunk)
+                            if copied > size:
+                                raise RuntimeError(f"Save changed during snapshot: {src_file}")
+                            dest.write(chunk)
+                            digest.update(chunk)
+                    if copied != size or file_identity(os.fstat(source.fileno())) != file_identity(before):
+                        raise RuntimeError(f"Save changed during snapshot: {src_file}")
+                    total_bytes += size
+                    written += 1
+                    seen.add(name)
             if reg_bytes:
-                if game_files + 1 > _RESTORE_MAX_ENTRIES:
+                if written >= _RESTORE_MAX_ENTRIES:
                     raise RuntimeError(f"Snapshot exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})")
                 if len(reg_bytes) > _RESTORE_MAX_FILE_BYTES or total_bytes + len(reg_bytes) > _RESTORE_MAX_TOTAL_BYTES:
                     raise RuntimeError("Snapshot size limit exceeded on registry.json")
+                digest.update(f"registry/registry.json\0{len(reg_bytes)}\0".encode())
+                digest.update(reg_bytes)
                 zf.writestr(f"{key_prefix}/registry/registry.json", reg_bytes)
-                game_files += 1
-        if game_files == 0:
-            try:
-                tmp_zip.unlink()
-            except OSError:
-                pass
-            return 0
-        os.replace(tmp_zip, target_zip)
-        return game_files
-    except Exception:
-        try:
-            tmp_zip.unlink()
-        except OSError:
-            pass
-        raise
+                written += 1
+                has_content = True
+        if written:
+            os.replace(tmp_zip, target_zip)
+        return written, digest.hexdigest() if has_content else ""
+    finally:
+        tmp_zip.unlink(missing_ok=True)
 
 
 @dataclass
@@ -1258,49 +1259,42 @@ def snapshot_prefix_saves(
 ) -> Path | None:
     """Create a rotated ZIP snapshot of prefix saves (max_keep <= 0: no rotation).
 
-    With dedup, saves whose content hash matches the newest snapshot return that snapshot
-    instead of writing an identical ZIP.
+    With dedup, a matching content hash reuses the newest snapshot.
     """
     snap_dir = snapshot_dir_for(game_name, dest_root)
     with _snapshot_dir_lock(snap_dir):
         home_files = snapshot_home_files(snap_dir)
-        if not prefix_dir.is_dir() and not extra_dirs and not home_files:
+        if not prefix_dir.is_dir() and not extra_dirs and not home_files and not (game_dir and game_dir.is_dir()):
             return None
-        digest = ""
-        if dedup:
-            digest = compute_prefix_saves_fingerprint(
-                prefix_dir, game_name=game_name, game_dir=game_dir, steam_appid=steam_appid,
-                extra_dirs=extra_dirs, home_files=home_files,
-            ).digest
-            if not digest:
+        safe_reason = _slugify(reason, fallback="op")
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        target_zip = _reserve_snapshot_zip(snap_dir, f"{stamp}-{safe_reason}")
+        try:
+            written, digest = _write_saves_zip_atomic(
+                prefix_dir, target_zip, key_prefix, game_name=game_name,
+                game_dir=game_dir, steam_appid=steam_appid, extra_dirs=extra_dirs, home_files=home_files,
+            )
+            if written == 0 or (dedup and not digest):
+                target_zip.unlink(missing_ok=True)
                 return None
+        except BaseException:
+            target_zip.unlink(missing_ok=True)
+            raise
+        if dedup:
             index = _read_snapshot_index(snap_dir)
-            last_zip = snap_dir / str(index.get("zip") or "")
+            last_zip = snap_dir / Path(str(index.get("zip") or "")).name
             if (
                 index.get("digest") == digest
                 and last_zip.suffix == ".zip"
                 and last_zip.is_file()
                 and not last_zip.is_symlink()
             ):
+                target_zip.unlink()
                 return last_zip
-        safe_reason = _slugify(reason, fallback="op")
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        target_zip = _reserve_snapshot_zip(snap_dir, f"{stamp}-{safe_reason}")
-        try:
-            written = _write_saves_zip_atomic(
-                prefix_dir, target_zip, key_prefix, game_name=game_name,
-                game_dir=game_dir, steam_appid=steam_appid, extra_dirs=extra_dirs, home_files=home_files,
-            )
-            if written == 0:
-                target_zip.unlink(missing_ok=True)
-                return None
-        except BaseException:
-            target_zip.unlink(missing_ok=True)
-            raise
         if steam_appid is not None and any(name == "steamcloud" for name, _ in extra_dirs or ()):
             remember_steamcloud_appid(snap_dir, target_zip.name, str(steam_appid))
         index = _read_snapshot_index(snap_dir)
-        if digest:
+        if dedup:
             index.update(digest=digest, zip=target_zip.name)
         index["name"] = game_name
         _write_snapshot_index(snap_dir, index)
@@ -1749,19 +1743,18 @@ def compute_prefix_saves_fingerprint(
     file_count = 0
     for section, src_file, rel_path in entries:
         try:
-            st = src_file.stat()
+            sfd = open_regular_fd(src_file)
         except OSError:
             continue
-        if st.st_size == 0:
-            continue
-        try:
-            sfd = os.open(str(src_file), os.O_RDONLY | os.O_NOFOLLOW)
-        except OSError:
-            continue
-        h.update(f"{section}/{rel_path.as_posix()}\0{st.st_size}\0".encode())
         with os.fdopen(sfd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if st.st_size == 0:
+                continue
+            h.update(f"{section}/{rel_path.as_posix()}\0{st.st_size}\0".encode())
             while chunk := fh.read(65536):
                 h.update(chunk)
+            if file_identity(os.fstat(fh.fileno())) != file_identity(st):
+                raise RuntimeError(f"Save changed while calculating its fingerprint: {src_file}")
         latest_mtime = max(latest_mtime, float(st.st_mtime))
         file_count += 1
 
@@ -2368,6 +2361,14 @@ def _read_sync_meta(meta_path: Path) -> dict[str, object] | None:
     return raw if isinstance(raw, dict) else None
 
 
+def _save_file_nonempty(path: Path) -> bool:
+    try:
+        info = path.lstat()
+        return stat.S_ISREG(info.st_mode) and info.st_size > 0
+    except OSError:
+        return False
+
+
 def plan_sync_all(
     games: Sequence[tuple[str, Path] | SyncGameTarget],
     sync_root: Path,
@@ -2393,18 +2394,23 @@ def plan_sync_all(
             item_source = "deckinstall"
 
         slug = _slugify(game_name)
-        local_fp = compute_prefix_saves_fingerprint(
-            prefix_dir,
-            game_name=game_name,
-            game_dir=item_game_dir,
-            steam_appid=item_appid,
-            extra_dirs=item_extra,
-        )
-        has_local = local_fp.file_count > 0
-
         game_sync_dir = sync_root / slug
         latest_zip = game_sync_dir / "latest.zip"
         has_remote = not latest_zip.is_symlink() and latest_zip.is_file()
+        local_fp = None
+        if has_remote:
+            local_fp = compute_prefix_saves_fingerprint(
+                prefix_dir, game_name=game_name, game_dir=item_game_dir, steam_appid=item_appid,
+                extra_dirs=item_extra,
+            )
+            has_local = local_fp.file_count > 0
+        else:
+            entries = _collect_prefix_save_entries(
+                prefix_dir, game_name, item_game_dir, item_appid, item_extra,
+            )
+            has_local = any(_save_file_nonempty(path) for _, path, _ in entries) or bool(
+                _extract_manifest_reg_bytes(prefix_dir, game_name, item_appid)
+            )
 
         common = {
             "game_name": game_name,
@@ -2441,6 +2447,7 @@ def plan_sync_all(
         else:
             remote_updated_at = 0.0
 
+        assert local_fp is not None
         # Three-way decision against the last digests this machine synced (the "base").
         # Timestamps alone cannot tell "only one side changed" from "both sides changed".
         base_remote, base_local = _read_sync_base_pair(prefix_dir, sync_root, slug)
@@ -2481,16 +2488,20 @@ def preview_sync_operation(
 ) -> SyncDryRunPreview:
     """Build a dry-run preview of files and registry entries for a sync operation."""
     slug = _slugify(game_name)
-    target = SyncGameTarget(
-        game_name,
-        prefix_dir,
-        game_dir=game_dir,
-        steam_appid=steam_appid,
-        extra_dirs=tuple(extra_dirs or ()),
-    )
-    planned = plan_sync_all([target], sync_root)[0]
-    effective_action = action.strip().upper() if action else planned.action
-    reason = planned.reason if action is None else f"Requested {effective_action}"
+    if action:
+        effective_action = action.strip().upper()
+        reason = f"Requested {effective_action}"
+    else:
+        target = SyncGameTarget(
+            game_name,
+            prefix_dir,
+            game_dir=game_dir,
+            steam_appid=steam_appid,
+            extra_dirs=tuple(extra_dirs or ()),
+        )
+        planned = plan_sync_all([target], sync_root)[0]
+        effective_action = planned.action
+        reason = planned.reason
 
     files: list[SyncDryRunFile] = []
     total_bytes = 0

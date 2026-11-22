@@ -71,7 +71,7 @@ def test_interrupted_install_is_flagged_and_cleaned(tmp_path: Path) -> None:
 
     with (
         mock.patch.object(opti, "atomic_copy_file", side_effect=crash_copy),
-        mock.patch.object(opti, "uninstall_optiscaler_for_game"),
+        mock.patch.object(opti, "_restore_install_files", return_value=False),
         pytest.raises(KeyboardInterrupt),
     ):
         opti.install_optiscaler_for_game(

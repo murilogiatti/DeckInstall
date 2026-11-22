@@ -73,6 +73,45 @@ def test_already_installed_only_rewrites_layers(release: Path, monkeypatch: pyte
     assert rm.official_mangohud_installed()
 
 
+def test_incomplete_install_is_repaired_from_the_release(release: Path) -> None:
+    mh = rm.ensure_mangohud()
+    (mh / "lib32" / "libMangoHud.so").unlink()
+    (mh / "layers" / "MangoHud.x86.json").unlink()
+    assert rm.ensure_mangohud() == mh
+    assert rm.official_mangohud_installed()
+
+
+def test_failed_layer_update_restores_runtime_and_both_manifests(
+    release: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mh = rm.ensure_mangohud()
+    lib = mh / "lib64" / "libMangoHud.so"
+    lib.write_bytes(b"previous-version")
+    layers = rm.get_user_vulkan_layer_dir()
+    x64 = layers / "MangoHud.x86_64.json"
+    x86 = layers / "MangoHud.x86.json"
+    x64.write_bytes(x64.read_bytes() + b"\n")
+    expected = {p: p.read_bytes() for p in (x64, x86)}
+    write = rm.atomic_write_text
+
+    def fail_second_layer(path: Path, data: str, **kwargs: object) -> None:
+        if path == x86:
+            raise OSError("cannot update layer")
+        write(path, data, **kwargs)
+
+    monkeypatch.setattr(rm, "atomic_write_text", fail_second_layer)
+    with pytest.raises(OSError, match="cannot update layer"):
+        rm.ensure_mangohud(force_update=True)
+    assert lib.read_bytes() == b"previous-version"
+    assert all(p.read_bytes() == original for p, original in expected.items())
+
+
+def test_fresh_mangohud_version_cache_avoids_release_lookup(release: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    first = rm.mangohud_versions()
+    monkeypatch.setattr(rm, "_fetch_json", lambda *a, **k: pytest.fail("cache should supply the release tag"))
+    assert rm.mangohud_versions() == first
+
+
 def test_layer_pointing_elsewhere_is_not_official(release: Path) -> None:
     rm.ensure_mangohud()
     path = Path.home() / ".local/share/vulkan/implicit_layer.d/MangoHud.x86_64.json"

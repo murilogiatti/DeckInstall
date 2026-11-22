@@ -75,14 +75,14 @@ def _apply(game: StandaloneGame, tool_name: str, *, before: str) -> StandaloneGa
     return game
 
 
-def set_game_proton(game_dir: Path, tool_name: str) -> StandaloneGame:
+def set_game_proton(game_dir: Path, tool_name: str, *, previous_tool: str = "") -> StandaloneGame:
     """Pin a game to tool_name, or put it back on "Default (newest)" with an empty name."""
     game = _load(game_dir)
     cleaned = "" if tool_name.strip() == DEFAULT_PROTON_ID else tool_name.strip()
-    return _apply(game, cleaned, before=effective_proton_name(game))
+    return _apply(game, cleaned, before=previous_tool or effective_proton_name(game))
 
 
-def use_previous_proton(game_dir: Path) -> StandaloneGame:
+def use_previous_proton(game_dir: Path, *, previous_tool: str = "") -> StandaloneGame:
     """Pin the game to the Proton it used before the last change."""
     game = _load(game_dir)
     previous = previous_proton_name(game)
@@ -90,7 +90,7 @@ def use_previous_proton(game_dir: Path) -> StandaloneGame:
         raise ValueError(f"{game.name} has no previous Proton version recorded.")
     if not Path(_resolve_proton_path(previous)).is_dir():
         raise FileNotFoundError(f"{previous} is no longer installed.")
-    return _apply(game, previous, before=effective_proton_name(game))
+    return _apply(game, previous, before=previous_tool or effective_proton_name(game))
 
 
 def set_games_proton(game_dirs: Iterable[Path], tool_name: str) -> tuple[int, list[str]]:
@@ -160,7 +160,7 @@ def prune_ge_proton(keep: int = 2, protected: Iterable[str] = ()) -> list[Path]:
         ):
             continue
         try:
-            _rm.remove_compat_tool(tool_dir)
+            _rm.remove_compat_tool(tool_dir, managed_only=True)
             removed.append(tool_dir)
         except (OSError, ValueError) as exc:
             logging.warning("Could not remove old %s: %s", tool_dir, exc)

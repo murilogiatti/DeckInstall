@@ -36,6 +36,7 @@ from ..runtime_manager import (
     get_system_package_install_cmd,
     install_system_package,
     official_mangohud_installed,
+    system_mangohud_installed,
 )
 from ..standalone import StandaloneGame, update_standalone_launch_options
 from ..steam_vdf import (
@@ -313,8 +314,12 @@ def open_launch_presets_dialog(
         lay.addWidget(_muted_hint(hint_text))
         if extra_row is not None:
             lay.addLayout(extra_row)
-        official_mh = bin_name == "mangohud"  # always the upstream build, never the distro package
-        if (not official_mangohud_installed()) if official_mh else shutil.which(bin_name) is None:
+        official_mh = bin_name == "mangohud"
+        available = (
+            official_mangohud_installed() or system_mangohud_installed()
+            if official_mh else shutil.which(bin_name) is not None
+        )
+        if not available:
             warn_row = QWidget()
             warn_lay = QHBoxLayout(warn_row)
             warn_lay.setContentsMargins(20, 0, 0, 4)
@@ -418,7 +423,7 @@ def open_launch_presets_dialog(
     else:
         chk_nvapi.setVisible(False)
         chk_nvapi.setEnabled(False)
-    if gpu.is_hybrid or prime_active:
+    if (gpu.is_hybrid and gpu.has_nvidia) or prime_active:
         chk_prime.toggled.connect(_sync_preview)
         lay.addWidget(chk_prime)
         lay.addWidget(_muted_hint(tr("launch.prime_offload_hint")))
@@ -492,13 +497,15 @@ def open_launch_presets_dialog(
     btns.rejected.connect(dlg.reject)
     dlg_lay.addWidget(btns)
 
-    if dlg.exec() != QDialog.DialogCode.Accepted:
-        return None
-
-    new_opts_out = raw_edit.text().strip()
-    new_dll_out = winedll_edit.text().strip()
-    win._save_last_launch_prefs(new_opts_out, new_dll_out)
-    return new_opts_out, new_dll_out
+    try:
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        new_opts_out = raw_edit.text().strip()
+        new_dll_out = winedll_edit.text().strip()
+        win._save_last_launch_prefs(new_opts_out, new_dll_out)
+        return new_opts_out, new_dll_out
+    finally:
+        dlg.deleteLater()
 
 
 def edit_launch_options_presets(
@@ -599,20 +606,23 @@ def edit_launch_options_presets(
     entry = obj
     managed_game = win._managed_library_game(entry)
 
-    def _sync_managed_launch_opts() -> None:
+    def _sync_managed_launch_opts() -> StandaloneGame | None:
         if managed_game is None:
-            return
-        updated = update_standalone_launch_options(
+            return None
+        return update_standalone_launch_options(
             managed_game.game_dir,
             winedlloverrides=new_dll,
             launch_options=new_opts,
         )
-        managed_game.launch_options = updated.launch_options
-        managed_game.winedlloverrides = updated.winedlloverrides
+
+    def _apply_managed_result(result: object) -> None:
+        if managed_game is not None and isinstance(result, StandaloneGame):
+            managed_game.launch_options = result.launch_options
+            managed_game.winedlloverrides = result.winedlloverrides
 
     if win.should_queue_vdf_edits():
         try:
-            _sync_managed_launch_opts()
+            _apply_managed_result(_sync_managed_launch_opts())
         except Exception as exc:
             QMessageBox.critical(box_parent(), __app_name__, str(exc))
             return
@@ -637,16 +647,22 @@ def edit_launch_options_presets(
             return
         win._begin_busy()
 
-        def _do_update() -> None:
-            _sync_managed_launch_opts()
-            update_shortcut_launch_options(paths, entry.appid_u32, new_opts)
+        def _do_update() -> StandaloneGame | None:
+            if not update_shortcut_launch_options(paths, entry.appid_u32, new_opts):
+                raise RuntimeError(tr("add.steam_missing"))
+            try:
+                return _sync_managed_launch_opts()
+            except Exception:
+                update_shortcut_launch_options(paths, entry.appid_u32, opts_now)
+                raise
 
         worker = SteamOpWorker(_do_update, need_steam_closed=True)
         win._track_worker(worker)
         worker.status.connect(win.status_label.setText)
 
-        def _ok(_res: object) -> None:
+        def _ok(result: object) -> None:
             win._end_busy()
+            _apply_managed_result(result)
             win._refresh_shortcuts()
             msg = tr("launch.saved", name=title_name)
             win.status_label.setText(msg)

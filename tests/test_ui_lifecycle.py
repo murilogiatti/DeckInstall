@@ -45,32 +45,84 @@ class UiLifecycleTests(unittest.TestCase):
         from types import SimpleNamespace
 
         from PySide6.QtGui import QCloseEvent
+        from PySide6.QtWidgets import QApplication
 
-        from deckinstall import ui
+        from deckinstall import ui, ui_workers
+        from deckinstall.vdf_queue import QueuedVdfEdit
 
-        for failure in (RuntimeError("write failed"), SimpleNamespace(errors=["write failed"])):
-            with self.subTest(failure=failure):
-                win = mock.Mock()
-                win._force_closing = False
-                win._skip_vdf_close_prompt = False
-                win._vdf_queue.pending_count.return_value = 1
-                if isinstance(failure, Exception):
-                    win._vdf_queue.apply_all.side_effect = failure
-                else:
-                    win._vdf_queue.apply_all.return_value = failure
-                with (
-                    mock.patch.object(ui, "QMessageBox") as box_type,
-                    mock.patch.object(ui, "is_steam_running", return_value=False),
-                ):
-                    box = box_type.return_value
-                    apply_button = object()
-                    box.addButton.side_effect = [apply_button, object(), object()]
-                    box.clickedButton.return_value = apply_button
-                    ev = QCloseEvent()
-                    ui.MainWindow.closeEvent(win, ev)
-                    self.assertFalse(ev.isAccepted())
-                    win._vdf_queue.apply_all.assert_called_once_with(win.paths)
-                    win._update_vdf_queue_banner.assert_called_once()
+        app = QApplication.instance() or QApplication([])
+        self.assertIsNotNone(app)
+        with (
+            mock.patch.object(ui, "resolve_steam_paths", return_value=None),
+            mock.patch.object(ui, "find_steam_root", return_value=None),
+            mock.patch.object(ui, "scan_all_games", return_value=[]),
+            mock.patch.object(ui, "list_standalone_games", return_value=[]),
+            mock.patch.object(ui, "scan_external_launcher_games", return_value=[]),
+        ):
+            win = ui.MainWindow(app)
+        try:
+            for _ in range(200):
+                app.processEvents()
+                if not any(w.isRunning() for w in win._active_workers):
+                    break
+                for w in list(win._active_workers):
+                    w.wait(20)
+            app.processEvents()
+
+            win._vdf_queue.clear()
+            win.paths = SimpleNamespace(shortcuts_vdf=Path("/nonexistent"))  # type: ignore[assignment]
+            win._vdf_queue.enqueue(
+                QueuedVdfEdit(
+                    "set_launch_options:1",
+                    "set_launch_options",
+                    1,
+                    "Game",
+                    {"launch_options": "X=1"},
+                )
+            )
+            for failure in (RuntimeError("write failed"), SimpleNamespace(applied=0, errors=["write failed"])):
+                with self.subTest(failure=failure):
+                    apply_mock = mock.Mock()
+                    if isinstance(failure, Exception):
+                        apply_mock.side_effect = failure
+                    else:
+                        apply_mock.return_value = failure
+                    with (
+                        mock.patch.object(win._vdf_queue, "apply_all", apply_mock),
+                        mock.patch.object(win, "_refresh_shortcuts"),
+                        mock.patch.object(ui, "QMessageBox") as box_type,
+                        mock.patch.object(ui, "is_gamescope_session", return_value=False),
+                        mock.patch.object(ui_workers, "is_steam_running", return_value=False),
+                    ):
+                        box = box_type.return_value
+                        apply_button = object()
+                        box.addButton.side_effect = [apply_button, object(), object()]
+                        box.clickedButton.return_value = apply_button
+                        ev = QCloseEvent()
+                        win.closeEvent(ev)
+                        self.assertFalse(ev.isAccepted())
+                        for _ in range(200):
+                            app.processEvents()
+                            if not any(w.isRunning() for w in win._active_workers):
+                                break
+                            for w in list(win._active_workers):
+                                w.wait(20)
+                        app.processEvents()
+                        apply_mock.assert_called_once_with(win.paths)
+                        self.assertEqual(win._vdf_queue.pending_count(), 1)
+                        self.assertFalse(win._skip_vdf_close_prompt)
+                        self.assertFalse(win._vdf_applying)
+                        self.assertEqual(win._busy_count, 0)
+        finally:
+            win._vdf_queue.clear()
+            for _ in range(200):
+                app.processEvents()
+                if not any(w.isRunning() for w in win._active_workers):
+                    break
+                for w in list(win._active_workers):
+                    w.wait(20)
+            win._active_workers.clear()
+            win.close()
 
     def test_close_keeps_pending_vdf_edits_when_steam_is_missing(self) -> None:
         from PySide6.QtGui import QCloseEvent
@@ -78,7 +130,9 @@ class UiLifecycleTests(unittest.TestCase):
         from deckinstall import ui
 
         win = mock.Mock()
+        win._closed = False
         win._force_closing = False
+        win._vdf_applying = False
         win.paths = None
         win._vdf_queue.pending_count.return_value = 1
         busy = mock.Mock()

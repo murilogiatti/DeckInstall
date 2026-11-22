@@ -64,20 +64,19 @@ class AppUpdaterTests(unittest.TestCase):
             symlink_path = base / "DeckInstallLink"
             symlink_path.symlink_to(extensionless)
 
-            with mock.patch.dict(os.environ, {"APPIMAGE": str(extensionless)}, clear=False):
-                self.assertEqual(app_updater.get_running_appimage(), extensionless)
-
-            with mock.patch.dict(os.environ, {"APPIMAGE": str(symlink_path)}, clear=False):
+            mounted = base / "appdir"
+            mounted.mkdir()
+            (mounted / "AppRun").touch()
+            with mock.patch.dict(os.environ, {"APPIMAGE": str(extensionless), "APPDIR": str(mounted)}, clear=False):
                 self.assertIsNone(app_updater.get_running_appimage())
+                with mock.patch.object(sys, "executable", str(mounted / "deckinstall")):
+                    self.assertEqual(app_updater.get_running_appimage(), extensionless)
+                    with mock.patch.dict(os.environ, {"APPDIR": ""}):
+                        self.assertIsNone(app_updater.get_running_appimage())
+                    for invalid in (symlink_path, Path("DeckInstall"), base / "missing"):
+                        with mock.patch.dict(os.environ, {"APPIMAGE": str(invalid)}):
+                            self.assertIsNone(app_updater.get_running_appimage())
 
-            with mock.patch.dict(os.environ, {"APPIMAGE": "DeckInstall"}, clear=False):
-                self.assertIsNone(app_updater.get_running_appimage())
-
-            with mock.patch.dict(os.environ, {"APPIMAGE": str(base / "missing")}, clear=False):
-                self.assertIsNone(app_updater.get_running_appimage())
-
-            with mock.patch.dict(os.environ, {"APPIMAGE": ""}, clear=False):
-                self.assertIsNone(app_updater.get_running_appimage())
 
     def test_check_app_update_finds_x86_64_asset_and_digest(self) -> None:
         valid_x64_sha = "a" * 64
@@ -110,7 +109,7 @@ class AppUpdaterTests(unittest.TestCase):
                 mock.patch("deckinstall.app_updater.__version__", "0.8.0"),
                 mock.patch("deckinstall.app_updater.requests.get", return_value=mock_resp) as mock_get,
                 mock.patch("deckinstall.app_updater.platform.machine", return_value="x86_64"),
-                mock.patch.dict(os.environ, {"APPIMAGE": str(appimage_path)}, clear=False),
+                mock.patch.object(app_updater, "get_running_appimage", return_value=appimage_path),
                 mock.patch("deckinstall.app_updater.os.access", return_value=True),
             ):
                 info = app_updater.check_app_update()
@@ -164,7 +163,11 @@ class AppUpdaterTests(unittest.TestCase):
 
             progress_events: list[int] = []
             valid_resp = _make_streaming_response(new_chunks)
-            with mock.patch("deckinstall.app_updater.requests.get", return_value=valid_resp):
+            valid_resp.headers["Content-Length"] = "unavailable"
+            with (
+                mock.patch.object(app_updater, "get_running_appimage", return_value=target),
+                mock.patch("deckinstall.app_updater.requests.get", return_value=valid_resp),
+            ):
                 result = app_updater.download_and_replace_appimage(
                     valid_info,
                     progress_cb=progress_events.append,
@@ -193,8 +196,11 @@ class AppUpdaterTests(unittest.TestCase):
                 cannot_update_reason="",
             )
             bad_resp = _make_streaming_response(new_chunks)
-            with mock.patch("deckinstall.app_updater.requests.get", return_value=bad_resp):
-                with self.assertRaises(RuntimeError):
+            with (
+                mock.patch.object(app_updater, "get_running_appimage", return_value=target),
+                mock.patch("deckinstall.app_updater.requests.get", return_value=bad_resp),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "SHA256 mismatch"):
                     app_updater.download_and_replace_appimage(bad_info)
 
             self.assertEqual(target.read_bytes(), old_bytes)

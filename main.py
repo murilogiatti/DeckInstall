@@ -13,7 +13,7 @@ _LOG_DIR = Path.home() / ".local" / "share" / "DeckInstall"
 _LOG_FILE = _LOG_DIR / "deckinstall.log"
 try:
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
-    _fault_fh = _LOG_FILE.open("a", encoding="utf-8")
+    _fault_fh = (_LOG_DIR / "deckinstall-faults.log").open("a", encoding="utf-8")
     faulthandler.enable(file=_fault_fh, all_threads=True)
     _handler = logging.handlers.RotatingFileHandler(
         _LOG_FILE, maxBytes=1_048_576, backupCount=2, encoding="utf-8"

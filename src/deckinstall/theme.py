@@ -186,9 +186,28 @@ QProgressBar {
     color: $progress_fg;
 }
 QProgressBar::chunk {
-    background-color: $focus_border;
+    background-color: $progress_fill;
     border-radius: 7px;
 }
+QLabel#SteamReady { color: $good_fg; font-size: 11px; }
+QLabel#SteamWarning { color: $warning_fg; font-size: 11px; }
+QLabel#SteamUnavailable { color: $info_fg; font-size: 11px; }
+QLabel#VdfErrorBanner {
+    color: $error_fg; background-color: $error_bg; border: 1px solid $error_fg;
+    border-radius: 6px; padding: 8px;
+}
+QLabel#UnavailableBanner {
+    color: $warning_fg; background-color: $warning_bg; border: 1px solid $warning_fg;
+    border-radius: 6px; padding: 8px;
+}
+QLabel#SteamInfoBanner {
+    color: $info_fg; background-color: $info_bg; border: 1px solid $info_fg;
+    border-radius: 6px; padding: 8px;
+}
+QFrame#VdfQueueBanner {
+    background-color: $info_bg; border: 1px solid $info_fg; border-radius: 6px; padding: 6px;
+}
+QLabel#VdfQueueText { color: $info_fg; }
 """)
 
 _DARK_TOKENS: dict[str, str] = {
@@ -225,6 +244,14 @@ _DARK_TOKENS: dict[str, str] = {
     "progress_bg": "#11141a",
     "progress_border": "#2c3445",
     "progress_fg": "#ffffff",
+    "progress_fill": "#1d6fa5",
+    "warning_fg": "#ffd180",
+    "warning_bg": "#342819",
+    "error_fg": "#ff9b9b",
+    "error_bg": "#361e25",
+    "info_fg": "#90caf9",
+    "info_bg": "#1b2b3d",
+    "good_fg": "#a5d6a7",
     "bg_alt": "#181c26",
     "highlight_bg": "#1d6fa5",
     "highlight_fg": "#ffffff",
@@ -255,17 +282,25 @@ _LIGHT_TOKENS: dict[str, str] = {
     "primary_border": "#155885",
     "primary_disabled_bg": "#9dc0d9",
     "primary_disabled_border": "#88aecb",
-    "primary_disabled_fg": "#eef4f9",
+    "primary_disabled_fg": "#173a54",
     "danger_bg": "#c93b44",
     "danger_border": "#a62b33",
     "danger_hover_bg": "#df4952",
     "danger_disabled_bg": "#dfb2b5",
     "danger_disabled_border": "#d09fa3",
-    "danger_disabled_fg": "#f9eff0",
+    "danger_disabled_fg": "#542022",
     "input_disabled_bg": "#f1f4f9",
     "progress_bg": "#e9eef6",
     "progress_border": "#cbd4e3",
     "progress_fg": "#1b2230",
+    "progress_fill": "#83b7dc",
+    "warning_fg": "#744000",
+    "warning_bg": "#fff2d9",
+    "error_fg": "#9d2128",
+    "error_bg": "#fff1f1",
+    "info_fg": "#155885",
+    "info_bg": "#eaf5ff",
+    "good_fg": "#27602b",
     "bg_alt": "#e9eef6",
     "highlight_bg": "#1d6fa5",
     "highlight_fg": "#ffffff",
@@ -298,7 +333,7 @@ def resolve_is_dark(app: QApplication, mode: ThemeMode) -> bool:
             return False
     except AttributeError:
         pass
-    bg = app.palette().color(QPalette.ColorRole.Window)
+    bg = app.style().standardPalette().color(QPalette.ColorRole.Window)
     return bg.lightness() < 128
 
 

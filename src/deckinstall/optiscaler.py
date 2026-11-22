@@ -5,13 +5,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .fsutil import atomic_copy_file, atomic_write_text, prune_empty_parents
 from .gameinfo import safe_scan_root
-from .runtime_manager import ProgressCb, _load_versions, ensure_optiscaler
+from .runtime_manager import ProgressCb, _load_versions, ensure_optiscaler, get_optiscaler_dir
 from .scanner import detect_exe_kind, detect_pe_arch
 
 OPTISCALER_PROXY_DLLS: tuple[str, ...] = ("dxgi", "winmm", "version", "dbghelp")
@@ -492,6 +495,7 @@ def _backup_if_needed(
     target_path: Path,
     managed_paths: set[Path],
     backed_up_files: list[Path],
+    track: Callable[[Path], None] | None = None,
 ) -> None:
     """Move an existing unmanaged file to .deckinstall.bak if no backup exists yet."""
     backup_path = target_path.with_name(f"{target_path.name}.deckinstall.bak")
@@ -507,7 +511,11 @@ def _backup_if_needed(
         resolved = target_path
     if resolved in managed_paths:
         return
+    if track is not None:
+        track(target_path)
     if not (backup_path.exists() or backup_path.is_symlink()):
+        if track is not None:
+            track(backup_path)
         os.replace(target_path, backup_path)
     elif _same_file_content(target_path, backup_path):
         target_path.unlink(missing_ok=True)
@@ -519,6 +527,8 @@ def _backup_if_needed(
         while extra.exists() or extra.is_symlink():
             idx += 1
             extra = target_path.with_name(f"{backup_path.name}.{idx}")
+        if track is not None:
+            track(extra)
         os.replace(target_path, extra)
         logging.warning("Preserved unmanaged %s as %s (backup already existed)", target_path, extra)
     if target_path not in backed_up_files:
@@ -529,6 +539,7 @@ def _backup_optiscaler_ini_variants(
     exe_dir: Path,
     managed_paths: set[Path],
     backed_up_files: list[Path],
+    track: Callable[[Path], None],
 ) -> None:
     """Back up any case-variant optiscaler.ini files as well as OptiScaler.ini."""
     try:
@@ -537,8 +548,8 @@ def _backup_optiscaler_ini_variants(
         entries = []
     for p in entries:
         if p.name.lower() == "optiscaler.ini" and p.name != "OptiScaler.ini":
-            _backup_if_needed(p, managed_paths, backed_up_files)
-    _backup_if_needed(exe_dir / "OptiScaler.ini", managed_paths, backed_up_files)
+            _backup_if_needed(p, managed_paths, backed_up_files, track)
+    _backup_if_needed(exe_dir / "OptiScaler.ini", managed_paths, backed_up_files, track)
 
 
 def _write_patched_ini(
@@ -551,10 +562,12 @@ def _write_patched_ini(
     overlay_menu: bool,
     managed_paths: set[Path],
     backed_up_files: list[Path],
+    track: Callable[[Path], None],
 ) -> Path:
     """Back up any existing OptiScaler.ini (including case variants) and write patched INI."""
-    _backup_optiscaler_ini_variants(exe_dir, managed_paths, backed_up_files)
+    _backup_optiscaler_ini_variants(exe_dir, managed_paths, backed_up_files, track)
     dst_ini = exe_dir / "OptiScaler.ini"
+    track(dst_ini)
     if dst_ini.is_symlink():
         dst_ini.unlink()
     patched_ini = patch_optiscaler_ini(
@@ -566,6 +579,21 @@ def _write_patched_ini(
     )
     atomic_write_text(dst_ini, patched_ini)
     return dst_ini
+
+
+def _restore_install_files(originals: dict[Path, Path | None], exe_dir: Path) -> bool:
+    restored = True
+    for path, saved in reversed(list(originals.items())):
+        try:
+            if saved is None:
+                path.unlink(missing_ok=True)
+                prune_empty_parents(path, [exe_dir])
+            else:
+                os.replace(saved, path)
+        except OSError:
+            restored = False
+            logging.exception("Could not restore %s from %s", path, saved)
+    return restored
 
 
 def install_optiscaler_for_game(
@@ -580,6 +608,7 @@ def install_optiscaler_for_game(
     overlay_menu: bool = True,
     prefix_dir: Path | None = None,
     game_name: str = "",
+    auto_snapshot: bool = True,
 ) -> OptiScalerState:
     """Install OptiScaler alongside a Windows game executable."""
     if proxy_dll not in OPTISCALER_PROXY_DLLS:
@@ -624,20 +653,20 @@ def install_optiscaler_for_game(
                 managed_paths.add(p)
         backed_up_files.extend(existing_state.backed_up_files)
 
-    target_proxy_path = exe_dir / f"{proxy_dll}.dll"
-    if target_proxy_path.exists() or target_proxy_path.is_symlink():
-        try:
-            resolved_proxy = target_proxy_path.resolve()
-        except OSError:
-            resolved_proxy = target_proxy_path
-        if resolved_proxy not in managed_paths:
-            if not overwrite_existing:
-                raise OptiScalerConflictError(target_proxy_path)
+    proxy_name = f"{proxy_dll}.dll"
+    variants = sorted(p for p in exe_dir.iterdir() if p.name.casefold() == proxy_name)
+    if len(variants) > 1:
+        raise OptiScalerConflictError(variants[0])
+    target_proxy_path = variants[0] if variants else exe_dir / proxy_name
+    if target_proxy_path.is_symlink() or target_proxy_path.is_dir():
+        raise OptiScalerConflictError(target_proxy_path)
+    if variants and target_proxy_path not in managed_paths and not overwrite_existing:
+        raise OptiScalerConflictError(target_proxy_path)
 
     prefix_snapshot: Path | None = (
         existing_state.prefix_snapshot if existing_state is not None else None
     )
-    if prefix_dir is not None and prefix_dir.is_dir():
+    if auto_snapshot and prefix_dir is not None and prefix_dir.is_dir():
         from .save_sync import snapshot_prefix_state
 
         snap = snapshot_prefix_state(
@@ -652,7 +681,7 @@ def install_optiscaler_for_game(
     # Complete the snapshot before moving any existing game DLL. OptiScaler
     # modifies game-folder files, so system DLLs do not belong in its snapshot.
     version = ""
-    if payload_dir is None:
+    if payload_dir is None or payload_dir == get_optiscaler_dir():
         version = str(_load_versions().get("optiscaler_installed_version", "")).strip()
     added_override = f"{proxy_dll}=n,b"
     installed_files: list[Path] = []
@@ -680,20 +709,46 @@ def install_optiscaler_for_game(
     def _journal() -> None:
         _write_state_manifest(_state(False))
 
+    rollback_dir = Path(tempfile.mkdtemp(prefix=".deckinstall-optiscaler-", dir=exe_dir))
+    originals: dict[Path, Path | None] = {}
+
+    def track(path: Path) -> None:
+        if path in originals:
+            return
+        if not path.parent.resolve().is_relative_to(exe_dir):
+            raise ValueError(f"OptiScaler path escapes game folder: {path}")
+        saved = rollback_dir / str(len(originals))
+        if path.is_symlink():
+            saved.symlink_to(path.readlink())
+        elif path.is_file():
+            shutil.copy2(path, saved)
+        elif path.exists():
+            raise OSError(f"OptiScaler expected a file: {path}")
+        else:
+            originals[path] = None
+            return
+        originals[path] = saved
+
     try:
+        track(exe_dir / OPTISCALER_MANIFEST)
         _journal()
-        _backup_if_needed(target_proxy_path, managed_paths, backed_up_files)
+        _backup_if_needed(target_proxy_path, managed_paths, backed_up_files, track)
         _journal()
 
         # Remove stale files from a previous DeckInstall OptiScaler install (e.g. proxy DLL change)
         if existing_state is not None:
             for old_file in existing_state.installed_files:
                 if old_file.is_file() or old_file.is_symlink():
+                    track(old_file)
                     old_file.unlink(missing_ok=True)
             installed_files.clear()
             _journal()
             if existing_state.proxy_dll != proxy_dll:
-                prior_proxy_path = exe_dir / f"{existing_state.proxy_dll}.dll"
+                prior_proxy_name = f"{existing_state.proxy_dll}.dll"
+                prior_proxy_path = next(
+                    (p for p in backed_up_files if p.parent == exe_dir and p.name.casefold() == prior_proxy_name),
+                    exe_dir / prior_proxy_name,
+                )
                 prior_backup = prior_proxy_path.with_name(f"{prior_proxy_path.name}.deckinstall.bak")
                 if (
                     prior_backup.is_file()
@@ -701,6 +756,8 @@ def install_optiscaler_for_game(
                     and not prior_proxy_path.exists()
                     and not prior_proxy_path.is_symlink()
                 ):
+                    track(prior_backup)
+                    track(prior_proxy_path)
                     os.replace(prior_backup, prior_proxy_path)
                     backed_up_files = [p for p in backed_up_files if p != prior_proxy_path]
 
@@ -725,6 +782,7 @@ def install_optiscaler_for_game(
 
                 if is_payload_root and low_name == "optiscaler.dll":
                     dst_file = target_proxy_path
+                    track(dst_file)
                     dst_file.parent.mkdir(parents=True, exist_ok=True)
                     if dst_file.is_symlink():
                         dst_file.unlink()
@@ -745,6 +803,7 @@ def install_optiscaler_for_game(
                         overlay_menu=overlay_menu,
                         managed_paths=managed_paths,
                         backed_up_files=backed_up_files,
+                        track=track,
                     )
                     installed_files.append(dst_ini)
                     _journal()
@@ -760,7 +819,8 @@ def install_optiscaler_for_game(
                     raise RuntimeError(f"Destination directory escapes game folder: {target_dir}")
                 dst_file = exe_dir / rel_dir / fname
                 dst_file.parent.mkdir(parents=True, exist_ok=True)
-                _backup_if_needed(dst_file, managed_paths, backed_up_files)
+                track(dst_file)
+                _backup_if_needed(dst_file, managed_paths, backed_up_files, track)
                 _journal()
                 if dst_file.is_symlink():
                     dst_file.unlink()
@@ -778,20 +838,18 @@ def install_optiscaler_for_game(
                 overlay_menu=overlay_menu,
                 managed_paths=managed_paths,
                 backed_up_files=backed_up_files,
+                track=track,
             )
             installed_files.append(dst_ini)
             _journal()
 
+        state = _state(True)
+        _write_state_manifest(state)
     except BaseException:
-        # Leave the game as it was: drop what was copied and put the originals back.
-        try:
-            uninstall_optiscaler_for_game(exe_path)
-        except Exception:
-            logging.exception("OptiScaler rollback failed for %s; its journal is kept", exe_dir)
+        if _restore_install_files(originals, exe_dir):
+            shutil.rmtree(rollback_dir, ignore_errors=True)
         raise
-
-    state = _state(True)
-    _write_state_manifest(state)
+    shutil.rmtree(rollback_dir, ignore_errors=True)
     _record_in_game_manifest(exe_dir, state)
     return state
 
@@ -858,8 +916,9 @@ def _record_in_game_manifest(exe_dir: Path, state: OptiScalerState | None) -> No
         from .standalone import _load_manifest, _write_manifest
 
         game = None
+        home = Path.home().resolve()
         for folder in (exe_dir, *exe_dir.parents):
-            if folder == Path.home() or folder == Path(folder.anchor):
+            if folder == home or folder == Path(folder.anchor):
                 break
             found = find_manifest(folder)
             if found is not None:
@@ -930,6 +989,7 @@ def bulk_optiscaler_targets(
     spoof_mode: str = "auto",
     overlay_menu: bool = True,
     progress_cb: ProgressCb | None = None,
+    auto_snapshot: bool = True,
 ) -> list[tuple[BulkOutcome, str | None]]:
     """Install (or remove) OptiScaler files on several games; return each outcome and its new DLL overrides.
 
@@ -940,6 +1000,7 @@ def bulk_optiscaler_targets(
     from .steam_vdf import merge_winedlloverride, remove_winedlloverride
 
     out: list[tuple[BulkOutcome, str | None]] = []
+    payload: Path | None = None
     for index, t in enumerate(targets):
         if progress_cb is not None:
             progress_cb(t.name, int(index * 100 / max(1, len(targets))))
@@ -953,17 +1014,22 @@ def bulk_optiscaler_targets(
                 out.append((BulkOutcome(t.name, "removed"), dll))
                 continue
 
-            compat = check_optiscaler_compatibility(t.exe_path, t.game_dir)
-            if not compat.compatible or t.native_linux:
-                out.append((BulkOutcome(t.name, "skipped", compat.pe_arch), None))
+            arch = detect_pe_arch(t.exe_path)
+            if t.native_linux or arch in ("linux_elf", "x86", "arm64") or detect_exe_kind(t.exe_path) != "windows_pe":
+                out.append((BulkOutcome(t.name, "skipped", arch), None))
                 continue
-            if "all_taken" in compat.notes:
+            prev = inspect_optiscaler_state(t.exe_path)
+            proxy, notes = recommend_proxy(t.exe_path, t.game_dir, prev)
+            if "all_taken" in notes:
                 out.append((BulkOutcome(t.name, "conflict", "all_taken"), None))
                 continue
-            prev = compat.installed_state
+            if payload is None:
+                payload = ensure_optiscaler()
             state = install_optiscaler_for_game(
                 t.exe_path,
-                proxy_dll=compat.recommended_proxy,
+                proxy_dll=proxy,
+                payload_dir=payload,
+                auto_snapshot=auto_snapshot,
                 backend=backend,
                 fg_mode=fg_mode,
                 spoof_mode=spoof_mode,

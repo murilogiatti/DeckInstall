@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QRadioButton,
@@ -38,6 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from .. import adopt as ad
+from ..fsutil import unique_dir
 from ..i18n import tr
 from ..steam_paths import SteamPaths, is_gamescope_session
 from ..ui_cards import FlowLayout, _pick_dir_async, _pick_file_async, format_size_bytes, shortcut_target_button
@@ -342,6 +344,14 @@ class AdoptWizard(QDialog):
         _pick_dir_async(self, tr("adopt.pick_folder"), Path.home(), _on_dir)
 
     def add_candidate(self, cand: ad.AdoptionCandidate) -> None:
+        for existing in self._candidates:
+            if (
+                cand.game_dir is not None and existing.game_dir is not None
+                and ad._resolved(cand.game_dir) == ad._resolved(existing.game_dir)
+            ):
+                self._checked_keys.add(existing.key)
+                self._fill_tree()
+                return
         self._extra = [c for c in self._extra if c.key != cand.key] + [cand]
         self._checked_keys.add(cand.key)
         self._fill_tree()
@@ -417,7 +427,7 @@ class AdoptWizard(QDialog):
         self.lbl_steam_note.setWordWrap(True)
         self.lbl_steam_note.setObjectName("MutedText")
         self.lbl_steam_note.setVisible(not self._steam_writable and bool(self._steam_note))
-        if not self._steam_writable:
+        if not self._steam_add_allowed:
             self.rb_steam_remove.setEnabled(False)
             self.rb_steam_remove.setToolTip(self._steam_note)
         slay.addWidget(self.rb_steam_link)
@@ -502,7 +512,7 @@ class AdoptWizard(QDialog):
         idx = self._item_by_req(req_id)
         if self._closed or idx < 0 or not isinstance(plan, ad.AdoptionPlan):
             return
-        self.items[idx].plan = plan
+        self.items[idx].plan = replace(plan, options=self.items[idx].opts)
         self._refresh_list_marks()
         if idx == self._current:
             self._render_plan(self.items[idx])
@@ -588,7 +598,7 @@ class AdoptWizard(QDialog):
         self.btn_shortcut_menu.setChecked(it.opts.create_menu_shortcut)
         self.btn_shortcut_desktop.setChecked(it.opts.create_desktop_shortcut)
         has_steam = c.shortcut_appid is not None
-        remove_steam = has_steam and it.opts.remove_from_steam and self._steam_writable
+        remove_steam = has_steam and it.opts.remove_from_steam and self._steam_add_allowed
         self.steam_box.setVisible(has_steam)
         steam_label = self._plan_form.labelForField(self.steam_box)
         if steam_label is not None:
@@ -629,7 +639,10 @@ class AdoptWizard(QDialog):
         if plan.prefix_dir is not None:
             lines.append(tr("adopt.plan_prefix_at", path=str(plan.prefix_dir)))
         lines.append(tr("adopt.plan_proton", name=plan.proton_name or tr("adopt.proton_default")))
-        if plan.candidate.shortcut_appid is not None and not it.opts.remove_from_steam:
+        if (
+            self._steam_add_allowed and plan.candidate.shortcut_appid is not None
+            and not it.opts.remove_from_steam and any(move.what == "game" for move in plan.moves)
+        ):
             lines.append(tr("adopt.plan_steam_update"))
         elif it.opts.add_to_steam and self._paths is not None:
             lines.append(tr("adopt.plan_steam_add"))
@@ -688,7 +701,7 @@ class AdoptWizard(QDialog):
         it.library_root = Path(str(self.cmb_library.currentData())) if self.cmb_library.count() else None
         proton_data = self.cmb_proton.currentData()
         has_steam = it.cand.shortcut_appid is not None
-        remove_steam = has_steam and self.rb_steam_remove.isChecked() and self._steam_writable
+        remove_steam = has_steam and self.rb_steam_remove.isChecked() and self._steam_add_allowed
         self._sync_steam_shortcut_pill(has_steam, remove_steam)
         it.opts = ad.AdoptOptions(
             move_game=self.chk_move_game.isChecked(),
@@ -776,6 +789,20 @@ class AdoptWizard(QDialog):
         return page
 
     def start_run(self) -> None:
+        plans = [it.plan for it in self.items if it.ready and it.plan is not None]
+        moves = [move for plan in plans for move in plan.moves]
+        if not ad._adoption_space(moves)[1]:
+            QMessageBox.warning(self, self.windowTitle(), blocker_text(ad.B_NO_SPACE))
+            return
+        taken: set[Path] = set()
+        for plan in plans:
+            for move in plan.moves:
+                if move.what == "game":
+                    destination = unique_dir(move.dst, taken)
+                    taken.add(destination)
+                    plan.exe = destination / plan.exe.relative_to(plan.game_dir)
+                    plan.game_dir = destination
+                    move.dst = destination
         self.stack.setCurrentIndex(self.PAGE_RUN)
         self._running = True
         self.run_list.clear()

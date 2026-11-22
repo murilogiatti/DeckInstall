@@ -201,6 +201,8 @@ def download_steam_artwork(
 ) -> ArtworkResult:
     """Download official capsule, header, hero, and logo into Steam's grid folder."""
     appid = _validate_appid(steam_appid)
+    if grid_dir.is_symlink():
+        raise OSError(f"Refusing symlinked Steam grid folder: {grid_dir}")
     grid_dir.mkdir(parents=True, exist_ok=True)
     backup_steam_artwork(shortcut_appid_u32, grid_dir)
     base = f"{STEAM_CDN_BASE}/{appid}"

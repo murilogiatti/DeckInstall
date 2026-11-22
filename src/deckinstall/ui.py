@@ -8,6 +8,7 @@ import os
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import NoReturn, TypedDict, cast
 
@@ -86,18 +87,17 @@ from .library import (
     list_unavailable_games,
 )
 from .migrate import (
+    MigrationItem,
     MigrationResult,
     migrate_legacy_games,
     plan_migration,
 )
 from .play_monitor import ERROR, LOADING, RUNNING, PlayMonitor, process_start_epoch, stale_instance_pids, watch_paths
-from .proton_policy import DEFAULT_PROTON_ID, set_game_proton
 from .runtime_manager import (
     detect_gpu_profile,
     fix_bwrap_userns,
     get_umu_run_path,
     is_win32_prefix,
-    list_ge_proton10_dirs,
     list_ge_proton11_dirs,
 )
 from .save_sync import auto_snapshot
@@ -111,6 +111,7 @@ from .scanner import (
 )
 from .standalone import (
     StandaloneGame,
+    add_installed_game_to_steam,
     game_log_dir,
     get_games_dir,
     import_standalone_to_steam,
@@ -136,8 +137,6 @@ from .steam_vdf import (
     _strip_vdf_quotes,
     infer_game_root_from_exe,
     load_shortcuts,
-    set_shortcut_proton,
-    shutdown_steam,
     start_steam,
 )
 from .theme import ThemeMode, apply_theme
@@ -200,7 +199,6 @@ from .ui_workers import (  # noqa: F401
     LaunchPrepWorker,
     PkexecWorker,
     PreviewWorker,
-    ProtonPrepWorker,
     RemoveShortcutWorker,
     RestoreWorker,
     RuntimePreflightWorker,
@@ -214,7 +212,7 @@ from .ui_workers import (  # noqa: F401
     SteamSearchWorker,
     compute_library_runner_labels,
 )
-from .uninstall import GAME_FILES, UninstallPlan, UninstallResult, execute_uninstall, plan_uninstall
+from .uninstall import GAME_FILES, SHORTCUTS, UninstallPlan, UninstallResult, execute_uninstall, plan_uninstall
 from .vdf_queue import BatchApplyResult, QueuedVdfEdit, VdfEditQueue
 
 
@@ -340,14 +338,18 @@ class MainWindow(QMainWindow):
         self._steam_shortcuts: list[ShortcutEntry] = []
         self._active_workers: set[QThread] = set()
         self._closing_pending = False
+        self._closed = False
+        self._relaunch_after_close: Path | None = None
         self._force_closing = False
         self._close_force_timer: QTimer | None = None
         self._busy_count = 0
         self._vdf_corrupt = False
         self._migration_prompted = False
+        self._install_probe = 0
         self._vdf_queue = VdfEditQueue(vdf_queue.default_queue_file())
         self._vdf_steam_open = False  # last poll saw Steam running while edits were queued
         self._vdf_checking = False
+        self._vdf_applying = False
         self._vdf_auto_paused = False  # an automatic apply failed: wait for the user
         self._skip_vdf_close_prompt = False  # set when restarting into an update: the queue stays saved
         self._restart_prompt: QMessageBox | None = None
@@ -437,10 +439,38 @@ class MainWindow(QMainWindow):
             if self._close_force_timer is not None:
                 self._close_force_timer.start(5000)
 
+    def _defer_close_for_workers(self, event: QCloseEvent) -> None:
+        """Keep the window open while background workers finish and arm the force-close timer."""
+        self._closing_pending = True
+        self.status_label.setText(tr("status.closing_wait"))
+        if self._close_force_timer is None:
+            self._close_force_timer = QTimer(self)
+            self._close_force_timer.setSingleShot(True)
+            self._close_force_timer.timeout.connect(self._on_close_force_timeout)
+        if not self._close_force_timer.isActive():
+            self._close_force_timer.start(5000)
+        event.ignore()
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._closed:
+            super().closeEvent(event)
+            return
         if self._force_closing:
+            self._closed = True
             self._play.release()
             super().closeEvent(event)
+            return
+        if self._vdf_applying:
+            # Never cancel or double-prompt while an async VDF queue write is in flight.
+            self._defer_close_for_workers(event)
+            return
+        for w in list(self._active_workers):
+            if hasattr(w, "cancel") and callable(w.cancel):
+                w.cancel()
+            else:
+                w.requestInterruption()
+        if any(w.isRunning() for w in self._active_workers):
+            self._defer_close_for_workers(event)
             return
         if (
             self._vdf_queue.pending_count() > 0
@@ -458,6 +488,7 @@ class MainWindow(QMainWindow):
             box.setDefaultButton(btn_apply)
             box.exec()
             clicked = box.clickedButton()
+            box.deleteLater()
             if clicked == btn_cancel or clicked not in (btn_apply, btn_later):
                 event.ignore()
                 return
@@ -466,57 +497,29 @@ class MainWindow(QMainWindow):
                     QMessageBox.warning(_dialog_parent(self), __app_name__, tr("add.steam_missing"))
                     event.ignore()
                     return
-                was_running = False
-                apply_failed = False
-                try:
-                    was_running = is_steam_running()
-                    if was_running and not shutdown_steam():
-                        # Steam rewrites its VDFs on exit; writing now would be silently lost.
-                        was_running = False
-                        raise RuntimeError(tr("add.close_steam_timeout"))
-                    batch_res = self._vdf_queue.apply_all(self.paths)
-                    if batch_res.errors:
-                        apply_failed = True
-                        QMessageBox.warning(
-                            _dialog_parent(self),
-                            __app_name__,
-                            tr(
-                                "vdf_queue.applied_errors",
-                                applied=batch_res.applied,
-                                errs="\n".join(batch_res.errors),
-                            ),
-                        )
-                except Exception as exc:
-                    apply_failed = True
-                    QMessageBox.warning(_dialog_parent(self), __app_name__, str(exc))
-                finally:
-                    if was_running and not start_steam():
-                        logging.warning("Steam did not start again after applying the VDF queue on close")
-                self._update_vdf_queue_banner()
-                if apply_failed or self._vdf_queue.pending_count() > 0:
-                    event.ignore()
-                    return
-        for w in list(self._active_workers):
-            if hasattr(w, "cancel") and callable(w.cancel):
-                w.cancel()
-            else:
-                w.requestInterruption()
-        if any(w.isRunning() for w in self._active_workers):
-            self._closing_pending = True
-            self.status_label.setText(tr("status.closing_wait"))
-            if self._close_force_timer is None:
-                self._close_force_timer = QTimer(self)
-                self._close_force_timer.setSingleShot(True)
-                self._close_force_timer.timeout.connect(self._on_close_force_timeout)
-            if not self._close_force_timer.isActive():
-                self._close_force_timer.start(5000)
-            event.ignore()
-            return
+                event.ignore()
+
+                def _after_apply(ok: bool) -> None:
+                    if ok and self._vdf_queue.pending_count() == 0:
+                        self._skip_vdf_close_prompt = True
+                        self.close()
+
+                self._apply_vdf_queue(on_done=_after_apply)
+                return
+            self._skip_vdf_close_prompt = True
         if self._close_force_timer is not None:
             self._close_force_timer.stop()
         self._auto_art_timer.stop()
+        self._vdf_watch_timer.stop()
         self._play.release()  # stop following running games; they keep running
+        self._closed = True
         super().closeEvent(event)
+        updated_path, self._relaunch_after_close = self._relaunch_after_close, None
+        if updated_path is not None:
+            try:
+                relaunch_appimage(updated_path)
+            except OSError:
+                logging.exception("Could not relaunch updated AppImage")
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -619,13 +622,11 @@ class MainWindow(QMainWindow):
 
     def _update_steam_status_style(self) -> None:
         """Apply subtle semantic color to the sidebar Steam status label."""
-        if self.paths:
-            color = "#4caf50"
-        elif self._steam_root_found:
-            color = "#ffb74d"
-        else:
-            color = "#64b5f6"
-        self.steam_status_lbl.setStyleSheet(f"color: {color}; font-size: 11px;")
+        name = "SteamReady" if self.paths else ("SteamWarning" if self._steam_root_found else "SteamUnavailable")
+        self.steam_status_lbl.setObjectName(name)
+        style = self.steam_status_lbl.style()
+        style.unpolish(self.steam_status_lbl)
+        style.polish(self.steam_status_lbl)
 
     def _show_page(self, idx: int) -> None:
         self.stack.setCurrentIndex(idx)
@@ -812,10 +813,7 @@ class MainWindow(QMainWindow):
 
         self.add_no_steam_banner = QLabel(tr("add.no_steam_banner"))
         self.add_no_steam_banner.setWordWrap(True)
-        self.add_no_steam_banner.setStyleSheet(
-            "background-color: rgba(61, 174, 233, 0.14); "
-            "border: 1px solid rgba(61, 174, 233, 0.55); border-radius: 6px; padding: 8px;"
-        )
+        self.add_no_steam_banner.setObjectName("SteamInfoBanner")
         self.add_no_steam_banner.setVisible(False)
         layout.addWidget(self.add_no_steam_banner)
 
@@ -872,6 +870,10 @@ class MainWindow(QMainWindow):
         form.setContentsMargins(0, 0, 8, 0)
         form.setSpacing(10)
 
+        self._match_install_timer = QTimer(self)
+        self._match_install_timer.setSingleShot(True)
+        self._match_install_timer.setInterval(180)
+        self._match_install_timer.timeout.connect(self._update_remove_existing_state)
         self.add_exe_combo = QComboBox()
         self.add_exe_combo.setEditable(True)
         self.add_exe_combo.setSizeAdjustPolicy(
@@ -883,7 +885,7 @@ class MainWindow(QMainWindow):
 
         self.add_name = QLineEdit()
         self.add_name.setPlaceholderText(tr("install.dest_placeholder"))
-        self.add_name.textChanged.connect(self._update_remove_existing_state)
+        self.add_name.textChanged.connect(lambda: self._match_install_timer.start())
         self.add_name.textEdited.connect(self._on_add_name_edited)
         form.addRow(tr("install.folder_label"), self.add_name)
 
@@ -1153,30 +1155,22 @@ class MainWindow(QMainWindow):
 
         self.vdf_error_banner = QLabel()
         self.vdf_error_banner.setWordWrap(True)
-        self.vdf_error_banner.setStyleSheet(
-            "color: #ff8a8a; background-color: rgba(180, 40, 40, 0.18); "
-            "border: 1px solid #b83b44; border-radius: 6px; padding: 8px;"
-        )
+        self.vdf_error_banner.setObjectName("VdfErrorBanner")
         self.vdf_error_banner.setVisible(False)
         lib_layout.addWidget(self.vdf_error_banner)
 
         self.unavailable_banner = QLabel()
         self.unavailable_banner.setWordWrap(True)
-        self.unavailable_banner.setStyleSheet(
-            "color: #ffd180; background-color: rgba(180, 110, 20, 0.18); "
-            "border: 1px solid #c77c1a; border-radius: 6px; padding: 8px;"
-        )
+        self.unavailable_banner.setObjectName("UnavailableBanner")
         self.unavailable_banner.setVisible(False)
         lib_layout.addWidget(self.unavailable_banner)
 
         self.vdf_queue_banner = QFrame()
-        self.vdf_queue_banner.setStyleSheet(
-            "background-color: rgba(40, 110, 180, 0.18); "
-            "border: 1px solid #3b7db8; border-radius: 6px; padding: 6px;"
-        )
+        self.vdf_queue_banner.setObjectName("VdfQueueBanner")
         vq_lay = QHBoxLayout(self.vdf_queue_banner)
         vq_lay.setContentsMargins(8, 4, 8, 4)
         self.lbl_vdf_queue = QLabel()
+        self.lbl_vdf_queue.setObjectName("VdfQueueText")
         self.lbl_vdf_queue.setWordWrap(True)
         self.btn_vdf_apply = QPushButton(tr("vdf_queue.btn_apply"))
         self.btn_vdf_apply.setObjectName("primaryBtn")
@@ -1257,6 +1251,9 @@ class MainWindow(QMainWindow):
         self.shortcuts_list.horizontalHeader().setStretchLastSection(True)
         self.shortcuts_list.horizontalHeader().setSectionsClickable(True)
         self.shortcuts_list.setSortingEnabled(True)
+        self.shortcuts_list.horizontalHeader().sortIndicatorChanged.connect(
+            lambda *_args: QTimer.singleShot(0, self, self._filter_library_list)
+        )
         self.shortcuts_list.currentCellChanged.connect(lambda *_args: self._update_library_action_states())
         self.shortcuts_list.cellDoubleClicked.connect(lambda *_args: self._open_configure_game_dialog())
         del_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Delete), self.shortcuts_list)
@@ -1448,12 +1445,14 @@ class MainWindow(QMainWindow):
             )
 
     def _update_runtimes(self) -> None:
-        self.btn_update_runtimes.setEnabled(False)
+        if self._steam_busy:
+            return
+        self._begin_busy()
         self.status_label.setText(tr("runtime.checking"))
 
         def _on_preflight(needs_confirm: bool) -> None:
             if self._closing_pending:
-                self.btn_update_runtimes.setEnabled(True)
+                self._end_busy()
                 return
             if needs_confirm:
                 # Steam already installed -> installing the extras is optional: "No" is the default.
@@ -1466,7 +1465,7 @@ class MainWindow(QMainWindow):
                     _optional_install_default(steam_ok),
                 )
                 if ans != QMessageBox.StandardButton.Yes:
-                    self.btn_update_runtimes.setEnabled(True)
+                    self._end_busy()
                     self.status_label.setText(tr("status.ready"))
                     return
 
@@ -1475,16 +1474,18 @@ class MainWindow(QMainWindow):
             worker.status.connect(self.status_label.setText)
 
             def _ok(msg: str, bwrap_warn: str) -> None:
-                self.btn_update_runtimes.setEnabled(True)
+                self._end_busy()
                 self.status_label.setText(msg)
                 if self._closing_pending:
                     return
+                self._refresh_maintenance_health()
+                self._refresh_shortcuts()
                 if bwrap_warn:
                     self._show_bwrap_warning_dialog(bwrap_warn)
                 QMessageBox.information(_dialog_parent(self), __app_name__, msg)
 
             def _err(err: str) -> None:
-                self.btn_update_runtimes.setEnabled(True)
+                self._end_busy()
                 msg = tr("runtime.error", err=err)
                 self.status_label.setText(msg)
                 if not self._closing_pending:
@@ -1506,22 +1507,26 @@ class MainWindow(QMainWindow):
         preflight.start()
 
     def _check_and_update_app(self) -> None:
-        self.btn_app_update.setEnabled(False)
+        if self._steam_busy:
+            return
+        self._begin_busy()
         self.status_label.setText(tr("app_update.checking"))
         worker = AppUpdateCheckWorker()
         self._track_worker(worker)
 
         def _on_checked(info: AppUpdateInfo) -> None:
-            self.btn_app_update.setEnabled(True)
             if self._closing_pending:
+                self._end_busy()
                 return
             if not info.has_update:
+                self._end_busy()
                 msg = tr("app_update.up_to_date", version=info.current_version)
                 self.status_label.setText(msg)
                 QMessageBox.information(_dialog_parent(self), __app_name__, msg)
                 return
 
             if not info.can_self_update:
+                self._end_busy()
                 url = info.html_url or GITHUB_RELEASES_URL
                 if info.cannot_update_reason == "not_appimage":
                     msg = tr(
@@ -1540,12 +1545,11 @@ class MainWindow(QMainWindow):
                         url=url,
                     )
                     QMessageBox.warning(_dialog_parent(self), __app_name__, msg)
+                elif info.cannot_update_reason == "no_checksum":
+                    msg = tr("app_update.manual_no_checksum", latest=info.latest_version, url=url)
+                    QMessageBox.information(_dialog_parent(self), __app_name__, msg)
                 else:
-                    msg = tr(
-                        "app_update.manual_no_asset",
-                        latest=info.latest_version,
-                        url=url,
-                    )
+                    msg = tr("app_update.manual_no_asset", latest=info.latest_version, url=url)
                     QMessageBox.information(_dialog_parent(self), __app_name__, msg)
                 self.status_label.setText(msg.splitlines()[0])
                 return
@@ -1560,6 +1564,7 @@ class MainWindow(QMainWindow):
                 ),
             )
             if ans != QMessageBox.StandardButton.Yes:
+                self._end_busy()
                 return
 
             prog_dlg = QProgressDialog(
@@ -1582,6 +1587,7 @@ class MainWindow(QMainWindow):
             dl_worker.progress.connect(prog_dlg.setValue)
 
             def _dl_ok(updated_path: Path) -> None:
+                self._end_busy()
                 prog_dlg.close()
                 prog_dlg.deleteLater()
                 if self._closing_pending:
@@ -1602,10 +1608,10 @@ class MainWindow(QMainWindow):
                         tr("app_update.done_relaunch", latest=info.latest_version),
                     )
                     if relaunch == QMessageBox.StandardButton.Yes:
-                        relaunch_appimage(updated_path)
-                        QApplication.quit()
+                        self._restart_updated_appimage(updated_path)
 
             def _dl_err(err: str) -> None:
+                self._end_busy()
                 prog_dlg.close()
                 prog_dlg.deleteLater()
                 msg = tr("app_update.error", err=err)
@@ -1618,7 +1624,7 @@ class MainWindow(QMainWindow):
             dl_worker.start()
 
         def _on_err(err: str) -> None:
-            self.btn_app_update.setEnabled(True)
+            self._end_busy()
             msg = tr("app_update.error", err=err)
             self.status_label.setText(msg)
             if not self._closing_pending:
@@ -1628,25 +1634,48 @@ class MainWindow(QMainWindow):
         worker.failed.connect(_on_err)
         worker.start()
 
+    def _probe_install_source(self, inspect: Callable[[], object], ready: Callable[[object], None]) -> None:
+        self._install_probe += 1
+        request = self._install_probe
+        worker = SteamOpWorker(inspect)
+        self._track_worker(worker)
+
+        def _on_ready(result: object) -> None:
+            if request == self._install_probe and not self._closing_pending and not self._closed:
+                ready(result)
+
+        worker.finished_ok.connect(_on_ready)
+        worker.failed.connect(self._on_background_failed)
+        worker.start()
+
     def _set_extract_source(self, path_str: str) -> None:
-        p = Path(path_str)
-        info = classify.classify_source(p)
-        if info.needs_install and info.installer is not None:
-            self.extract_src.setText(str(info.installer if info.kind != classify.ARCHIVE else p))
-            self.add_name.setText(classify.suggest_install_name(info))
-            self.extract_details_box.setVisible(True)
-            self.status_label.setText(self._detected_kind_text(info))
-            return
-        if p.is_dir():
-            game = scan_game_folder(p)
-            if game is not None:
+        path = Path(path_str)
+
+        def _inspect() -> tuple[classify.SourceInfo, bool, DetectedGame | None]:
+            info = classify.classify_source(path)
+            is_dir = path.is_dir()
+            folder = path if is_dir else path.parent
+            game = None if info.needs_install else scan_game_folder(folder)
+            return info, is_dir, game
+
+        def _ready(result: object) -> None:
+            if not isinstance(result, tuple):
+                return
+            info, is_dir, game = result
+            if info.needs_install and info.installer is not None:
+                self.extract_src.setText(str(path if info.kind == classify.ARCHIVE else info.installer))
+                self.add_name.setText(classify.suggest_install_name(info))
+                self.extract_details_box.setVisible(True)
+                self.status_label.setText(self._detected_kind_text(info))
+            elif is_dir and game is not None:
                 self._populate_game_form(game)
                 self._show_page(PAGE_INSTALL)
                 self.add_name.setFocus()
-            return
-        if p.is_file():
-            self._on_manual_exe_picked(str(p))
-            self._show_page(PAGE_INSTALL)
+            elif path.is_file():
+                self._populate_manual_exe(path, game)
+                self._show_page(PAGE_INSTALL)
+
+        self._probe_install_source(_inspect, _ready)
 
     def _detected_kind_text(self, info: classify.SourceInfo) -> str:
         texts = {
@@ -1689,12 +1718,13 @@ class MainWindow(QMainWindow):
         )
 
     def _start_extract(self) -> None:
+        if self._steam_busy or self._extract_worker is not None:
+            return
         src = Path(self.extract_src.text().strip())
         if not src.is_file():
             QMessageBox.warning(_dialog_parent(self), __app_name__, tr("install.invalid_file"))
             return
-        # suggest_install_name: a repack's setup.exe is named after its folder, not "setup".
-        name = self.add_name.text().strip() or classify.suggest_install_name(classify.classify_source(src))
+        name = self.add_name.text().strip()
         typed_dst = self.extract_dst_root.text().strip()
         if typed_dst:
             dst = Path(typed_dst)
@@ -1707,11 +1737,10 @@ class MainWindow(QMainWindow):
         self.extract_details_box.setVisible(True)
         self.extract_log.clear()
         self.extract_progress.setValue(0)
-        self.btn_extract.setEnabled(False)
+        self._begin_busy()
         self.btn_cancel_extract.setEnabled(True)
         self.btn_use_extracted.setEnabled(False)
 
-        self._extract_source_kind = classify.classify_source(src).kind
         self._extract_worker = ExtractWorker(
             src,
             dst,
@@ -1719,7 +1748,8 @@ class MainWindow(QMainWindow):
         )
         self._track_worker(self._extract_worker)
         self._extract_worker.progress.connect(self._on_extract_progress)
-        self._extract_worker.finished_ok.connect(self._on_extract_done)
+        worker = self._extract_worker
+        worker.finished_ok.connect(lambda path: self._on_extract_done(path, worker.kind))
         self._extract_worker.cancelled.connect(self._on_extract_cancelled)
         self._extract_worker.failed.connect(self._on_extract_failed)
         self._extract_worker.start()
@@ -1731,7 +1761,7 @@ class MainWindow(QMainWindow):
             self._extract_worker.cancel()
 
     def _on_extract_cancelled(self) -> None:
-        self.btn_extract.setEnabled(True)
+        self._end_busy()
         self.btn_cancel_extract.setEnabled(False)
         msg = tr("install.cancelled")
         self.extract_log.append(msg)
@@ -1742,26 +1772,35 @@ class MainWindow(QMainWindow):
         self.extract_log.append(msg)
         self.status_label.setText(msg)
 
-    def _on_extract_done(self, out_dir: str) -> None:
-        self.btn_extract.setEnabled(True)
+    def _on_extract_done(self, out_dir: str, source_kind: str) -> None:
+        self._end_busy()
         self.btn_cancel_extract.setEnabled(False)
         self.btn_use_extracted.setEnabled(True)
         self._last_extracted_dir = Path(out_dir)
         self.status_label.setText(tr("install.done_prefix", path=out_dir))
         self._refresh_games()
-        if getattr(self, "_extract_source_kind", "") == classify.ARCHIVE:
-            inner = classify.classify_source(Path(out_dir))
-            if inner.kind in (classify.REPACK, classify.GOG_SETUP, classify.INSTALLER) and inner.installer:
-                # The archive held an installer: offer to run it instead of picking an exe.
-                self.extract_src.setText(str(inner.installer))
-                self.extract_log.append(tr("install.archive_has_installer", name=inner.installer.name))
-                self.status_label.setText(tr("install.archive_has_installer", name=inner.installer.name))
-                return
-        if not self._closing_pending and self.isVisible():
+        if self._closing_pending or self._closed:
+            return
+        if source_kind == classify.ARCHIVE:
+            def _ready(result: object) -> None:
+                if (
+                    isinstance(result, classify.SourceInfo)
+                    and result.kind in (classify.REPACK, classify.GOG_SETUP, classify.INSTALLER)
+                    and result.installer is not None
+                ):
+                    self.extract_src.setText(str(result.installer))
+                    msg = tr("install.archive_has_installer", name=result.installer.name)
+                    self.extract_log.append(msg)
+                    self.status_label.setText(msg)
+                elif self.isVisible():
+                    self._send_extracted_to_add_tab()
+
+            self._probe_install_source(lambda: classify.classify_source(Path(out_dir)), _ready)
+        elif self.isVisible():
             self._send_extracted_to_add_tab()
 
     def _on_extract_failed(self, err: str) -> None:
-        self.btn_extract.setEnabled(True)
+        self._end_busy()
         self.btn_cancel_extract.setEnabled(False)
         self.extract_log.append(tr("install.error_prefix", err=err))
         if not self._closing_pending:
@@ -1769,11 +1808,15 @@ class MainWindow(QMainWindow):
 
     def _send_extracted_to_add_tab(self) -> None:
         target = getattr(self, "_last_extracted_dir", None)
-        if isinstance(target, Path) and target.is_dir():
-            game = scan_game_folder(target)
-            if game:
-                self._populate_game_form(game, from_extract=True)
-        self._switch_library_subview(1)
+        if not isinstance(target, Path) or not target.is_dir():
+            return
+
+        def _ready(result: object) -> None:
+            if isinstance(result, DetectedGame):
+                self._populate_game_form(result, from_extract=True)
+            self._switch_library_subview(1)
+
+        self._probe_install_source(lambda: scan_game_folder(target), _ready)
 
     def _load_scan_folders(self) -> tuple[list[tuple[Path, bool]], list[dict[str, object]]]:
         """Return (default_entries, custom_entries) from QSettings."""
@@ -1861,7 +1904,7 @@ class MainWindow(QMainWindow):
     def _open_scan_folders_dialog(self) -> None:
         open_scan_folders_dialog(self)
 
-    def _refresh_games(self) -> None:
+    def _refresh_games(self, *, on_done: Callable[[], None] | None = None) -> None:
         self.btn_scan.setEnabled(False)
         self._update_scan_folders_label()
         worker = ScanWorker(roots=self._enabled_scan_roots(), scan_fn=scan_all_games)
@@ -1870,6 +1913,8 @@ class MainWindow(QMainWindow):
         worker.finished_scan.connect(
             lambda games, w=worker: self._on_games_scanned(w, games)
         )
+        if on_done is not None:
+            worker.finished.connect(on_done)
         worker.start()
 
     def _on_games_scanned(self, worker: ScanWorker, games: list[DetectedGame]) -> None:
@@ -2040,11 +2085,17 @@ class MainWindow(QMainWindow):
     def _on_manual_exe_picked(self, path: str) -> None:
         if not path:
             return
+        exe = Path(path)
+
+        def _ready(result: object) -> None:
+            self._populate_manual_exe(exe, result if isinstance(result, DetectedGame) else None)
+
+        self._probe_install_source(lambda: scan_game_folder(exe.parent), _ready)
+
+    def _populate_manual_exe(self, exe: Path, game: DetectedGame | None) -> None:
         self._auto_art_timer.stop()
         self._search_req_id += 1
         self._reset_add_launch_options()
-        exe = Path(path)
-        game = scan_game_folder(exe.parent)
         name = game.name if game else exe.stem
         self.add_name.setText(name)
         self.add_exe_combo.clear()
@@ -2081,7 +2132,7 @@ class MainWindow(QMainWindow):
             self.chk_proton.setEnabled(True)
             if was_disabled:
                 self.chk_proton.setChecked(True)
-        self._update_remove_existing_state()
+        self._match_install_timer.start()
 
     def _display_preview_pixmap(self, pix: QPixmap) -> None:
         dpr = max(1.0, self.preview_label.devicePixelRatioF())
@@ -2200,6 +2251,8 @@ class MainWindow(QMainWindow):
         return steam_appid
 
     def _add_selected_to_steam(self) -> None:
+        if self._steam_busy:
+            return
         if not self.paths:
             QMessageBox.critical(_dialog_parent(self), __app_name__, tr("add.steam_missing"))
             return
@@ -2214,17 +2267,18 @@ class MainWindow(QMainWindow):
         if validated is None:
             return
         app_name, exe_path = validated
+        paths = self.paths
 
         def _proceed_add() -> None:
-            if self._closing_pending or not self.paths:
+            if self._closing_pending or self.paths != paths:
+                self._end_busy()
                 return
             steam_appid = self._resolve_selected_steam_appid()
             launch_opts, winedll = self._resolve_add_launch_options()
             self._save_last_launch_prefs(launch_opts, winedll)
 
-            self._begin_busy()
             self._add_worker = AddToSteamWorker(
-                paths=self.paths,
+                paths=paths,
                 app_name=app_name,
                 exe_path=exe_path,
                 steam_appid=steam_appid,
@@ -2271,7 +2325,8 @@ class MainWindow(QMainWindow):
             if not self._closing_pending:
                 QMessageBox.information(_dialog_parent(self), __app_name__, msg)
             return
-        _proceed_add()
+        self._begin_busy()
+        self._confirm_close_steam_async(_proceed_add, on_cancelled=self._end_busy)
 
     def _add_selected_standalone(self) -> None:
         validated = self._validate_add_inputs()
@@ -2319,7 +2374,7 @@ class MainWindow(QMainWindow):
                 and (self.paths is not None or self._steam_root_found)
                 and (
                     not get_umu_run_path().is_file()
-                    or not (list_ge_proton11_dirs() or list_ge_proton10_dirs())
+                    or not list_ge_proton11_dirs()
                 )
             ):
                 ans = QMessageBox.question(
@@ -2401,9 +2456,8 @@ class MainWindow(QMainWindow):
                     size=format_size_bytes(total_bytes),
                 )
             )
-            box.addButton(
-                tr("add.btn_move_folder"), QMessageBox.ButtonRole.AcceptRole
-            )
+            if not inferred_container:
+                box.addButton(tr("add.btn_move_folder"), QMessageBox.ButtonRole.AcceptRole)
             btn_keep = box.addButton(
                 tr("add.btn_keep_in_place"), QMessageBox.ButtonRole.ActionRole
             )
@@ -2555,19 +2609,37 @@ class MainWindow(QMainWindow):
 
     def _start_legacy_migration(self, from_startup: bool = False) -> None:
         """Plan, confirm and run the migration of v1 games into ~/DeckInstall."""
-        if self._closing_pending:
+        if self._closing_pending or self._steam_busy or not uses_library_layout():
             return
-        if not uses_library_layout():
-            return
-        if _is_wine_game_running():
-            if not from_startup:
+        paths = self.paths
+        self._begin_busy()
+
+        def _inspect() -> list[MigrationItem] | None:
+            return None if _is_wine_game_running() else plan_migration(paths)
+
+        def _planned(result: object) -> None:
+            self._end_busy()
+            if self._closed or self._closing_pending or self.paths != paths:
+                return
+            if isinstance(result, list):
+                self._confirm_legacy_migration(result, from_startup, paths)
+            elif not from_startup:
                 QMessageBox.warning(_dialog_parent(self), __app_name__, tr("migrate.game_running"))
-            return
-        try:
-            plan = plan_migration(self.paths)
-        except Exception as exc:
-            QMessageBox.critical(_dialog_parent(self), __app_name__, tr("migrate.failed", err=str(exc)))
-            return
+
+        def _failed(err: str) -> None:
+            self._end_busy()
+            if not self._closed and not self._closing_pending:
+                QMessageBox.critical(_dialog_parent(self), __app_name__, tr("migrate.failed", err=err))
+
+        planner = SteamOpWorker(_inspect)
+        self._track_worker(planner)
+        planner.finished_ok.connect(_planned)
+        planner.failed.connect(_failed)
+        planner.start()
+
+    def _confirm_legacy_migration(
+        self, plan: list[MigrationItem], from_startup: bool, paths: SteamPaths | None,
+    ) -> None:
         todo = [i for i in plan if i.action == "migrate"]
         skipped = [i for i in plan if i.action != "migrate"]
         reasons = {
@@ -2599,16 +2671,21 @@ class MainWindow(QMainWindow):
         )
         box.exec()
         clicked = box.clickedButton()
+        box.deleteLater()
         if btn_never is not None and clicked is btn_never:
             self.settings.setValue("migration/dont_ask", True)
             return
         if clicked is not btn_go:
             return
 
-        paths = self.paths
         self._begin_busy()
         self.status_label.setText(tr("migrate.running"))
-        worker = SteamOpWorker(lambda: migrate_legacy_games(todo, paths))
+        def _migrate() -> MigrationResult:
+            if _is_wine_game_running():
+                raise RuntimeError(tr("migrate.game_running"))
+            return migrate_legacy_games(todo, paths)
+
+        worker = SteamOpWorker(_migrate)
         self._track_worker(worker)
 
         def _ok(res: object) -> None:
@@ -2620,7 +2697,7 @@ class MainWindow(QMainWindow):
             if res.failed:
                 lines.append(tr("migrate.failed_items", items="\n".join(f"• {n}: {e}" for n, e in res.failed)))
             if res.journal is not None:
-                lines.append(tr("migrate.undo_hint"))
+                lines.append(tr("migrate.undo_hint", path=str(res.journal)))
             self.status_label.setText(lines[0])
             show = QMessageBox.warning if res.failed else QMessageBox.information
             show(_dialog_parent(self), __app_name__, "\n\n".join(lines))
@@ -2634,7 +2711,7 @@ class MainWindow(QMainWindow):
         worker.failed.connect(_err)
         worker.start()
 
-    def _refresh_shortcuts(self) -> None:
+    def _refresh_shortcuts(self, *, on_done: Callable[[], None] | None = None) -> None:
         self._refresh_libraries()
         self._shortcuts_req_id += 1
         req_id = self._shortcuts_req_id
@@ -2669,12 +2746,14 @@ class MainWindow(QMainWindow):
         self._track_worker(worker)
         worker.ready.connect(_on_loaded)
         worker.failed.connect(self._on_background_failed)
+        if on_done is not None:
+            worker.finished.connect(on_done)
         worker.start()
 
     def _queue_shortcut_repairs(self, entries: list[ShortcutEntry], games: list[StandaloneGame]) -> None:
         """Steam shortcuts of adopted/moved games still pointing at the old folder (Steam was open):
         queue the fix, applied as soon as Steam is closed (AppID, artwork and playtime are kept)."""
-        if self.paths is None or self._vdf_corrupt:
+        if self.paths is None or self._vdf_corrupt or self._vdf_applying:
             return
         pending = {e.edit_id: e for e in self._vdf_queue.list_pending()}
         for entry, game in shortcut_path_repairs(entries, games, self.paths.user_id):
@@ -2757,9 +2836,10 @@ class MainWindow(QMainWindow):
         is_steam = sel is not None and sel[0] == "steam"
         is_standalone = sel is not None and sel[0] == "standalone"
         is_external = sel is not None and sel[0] == "external"
-        can_write_vdf = bool(self.paths) and not self._vdf_corrupt
+        idle = not self._steam_busy
+        can_write_vdf = idle and bool(self.paths) and not self._vdf_corrupt
 
-        self.btn_configure_game.setEnabled(sel is not None)
+        self.btn_configure_game.setEnabled(idle and sel is not None)
         self._update_play_button(sel)
         managed = self._managed_library_game(sel[1]) if sel is not None else None
         self.btn_move_game.setEnabled(managed is not None and not self._steam_busy)
@@ -2777,8 +2857,8 @@ class MainWindow(QMainWindow):
 
         self.act_import_steam.setEnabled(is_standalone and can_write_vdf)
         self.act_ext_to_steam.setEnabled(is_external and can_write_vdf)
-        self.act_ext_import_saves.setEnabled(is_external and has_ext_prefix)
-        self.btn_remove_game.setEnabled((is_steam and can_write_vdf) or is_standalone)
+        self.act_ext_import_saves.setEnabled(idle and has_ext_prefix)
+        self.btn_remove_game.setEnabled((is_steam and can_write_vdf) or (idle and is_standalone))
         self.btn_remove_game.setVisible(not is_external)
 
     def should_queue_vdf_edits(self) -> bool:
@@ -2787,6 +2867,16 @@ class MainWindow(QMainWindow):
 
     def enqueue_vdf_edit(self, edit: QueuedVdfEdit, *, trigger_watch: bool = True) -> None:
         """Enqueue a VDF edit; it is applied once Steam is closed."""
+        if self.paths is not None:
+            payload = dict(edit.payload)
+            path_user_id = getattr(self.paths, "user_id", None)
+            path_steam_root = getattr(self.paths, "steam_root", None)
+            if not payload.get("user_id") and path_user_id:
+                payload["user_id"] = str(path_user_id)
+            if not payload.get("steam_root") and path_steam_root is not None:
+                payload["steam_root"] = str(path_steam_root)
+            if payload != edit.payload:
+                edit = replace(edit, payload=payload)
         self._vdf_queue.enqueue(edit)
         self._vdf_auto_paused = False
         self._update_vdf_queue_banner()
@@ -2827,7 +2917,9 @@ class MainWindow(QMainWindow):
         """Poll (off the UI thread) whether Steam is closed; queued edits apply as soon as it is."""
         if (
             self._vdf_checking
+            or self._vdf_applying
             or self._vdf_auto_paused
+            or self._closed
             or self._closing_pending
             or self._busy_count > 0
             or not self.paths
@@ -2845,7 +2937,18 @@ class MainWindow(QMainWindow):
             prev_steam_open = self._vdf_steam_open
             self._vdf_steam_open = running
             self._update_vdf_queue_banner()
-            if not running and not self._closing_pending and not is_gamescope_session():
+            if (
+                not running
+                and not self._closed
+                and not self._closing_pending
+                and not self._vdf_auto_paused
+                and not self._vdf_applying
+                and not self._vdf_corrupt
+                and self._busy_count == 0
+                and self.paths is not None
+                and self._vdf_queue.pending_count() > 0
+                and not is_gamescope_session()
+            ):
                 self._auto_apply_vdf_queue(offer_restart=prev_steam_open)
 
         def _failed(err: str) -> None:
@@ -2860,7 +2963,13 @@ class MainWindow(QMainWindow):
         """Apply the queue now that Steam is closed (never while it runs)."""
         paths = self.paths
         queue = self._vdf_queue
-        if paths is None or queue.pending_count() <= 0:
+        if (
+            paths is None
+            or self._vdf_applying
+            or self._vdf_corrupt
+            or self._busy_count > 0
+            or queue.pending_count() <= 0
+        ):
             return
         should_offer_restart = self._vdf_steam_open if offer_restart is None else offer_restart
 
@@ -2869,11 +2978,13 @@ class MainWindow(QMainWindow):
                 return None
             return queue.apply_all(paths)
 
+        self._vdf_applying = True
         self._begin_busy()
         worker = SteamOpWorker(_apply)
         self._track_worker(worker)
 
         def _ok(res: object) -> None:
+            self._vdf_applying = False
             self._end_busy()
             self._update_vdf_queue_banner()
             if res is None:
@@ -2895,6 +3006,7 @@ class MainWindow(QMainWindow):
                 self._offer_steam_restart()
 
         def _err(err: str) -> None:
+            self._vdf_applying = False
             self._end_busy()
             self._vdf_auto_paused = True
             self._update_vdf_queue_banner()
@@ -2905,13 +3017,15 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _maybe_offer_steam_restart(self, worker: QThread) -> None:
+        if self._closed or self._closing_pending or self._relaunch_after_close is not None:
+            return
         if getattr(worker, "restart_failed", False):
             self._warn_steam_restart_failed()
         elif getattr(worker, "closed_steam", False) and not getattr(worker, "restart_if_was_running", False):
             self._offer_steam_restart()
 
     def _warn_steam_restart_failed(self) -> None:
-        if self._closing_pending or self._force_closing:
+        if self._closed or self._closing_pending or self._force_closing:
             return
         self.status_label.setText(tr("steam.restart_failed"))
         box = QMessageBox(
@@ -2922,7 +3036,7 @@ class MainWindow(QMainWindow):
 
     def _offer_steam_restart(self) -> None:
         """Ask (without blocking) whether to start Steam again after it was closed for an edit."""
-        if self._closing_pending or self._force_closing or self.paths is None:
+        if self._closed or self._closing_pending or self._force_closing or self.paths is None:
             return
         if self._restart_prompt is not None:
             return
@@ -2939,7 +3053,7 @@ class MainWindow(QMainWindow):
 
         def _answered(result: int) -> None:
             self._restart_prompt = None
-            if result != QMessageBox.StandardButton.Yes.value or self._closing_pending:
+            if result != QMessageBox.StandardButton.Yes.value or self._closed or self._closing_pending:
                 return
             worker = SteamOpWorker(lambda: start_steam(steam_root))
             self._track_worker(worker)
@@ -2954,6 +3068,13 @@ class MainWindow(QMainWindow):
         self._vdf_queue.clear()
         self._update_vdf_queue_banner()
         self.status_label.setText(tr("vdf_queue.cleared"))
+
+    def _restart_updated_appimage(self, updated_path: Path) -> None:
+        if self._closed:
+            return
+        self._relaunch_after_close = updated_path
+        self._skip_vdf_close_prompt = True
+        self.close()
 
     def _ask_update_with_pending_edits(self, pending: int, updated_path: Path) -> None:
         """Before restarting into the new version, offer to send the queued edits to Steam."""
@@ -2972,9 +3093,7 @@ class MainWindow(QMainWindow):
         def _restart() -> None:
             if self._closing_pending:
                 return
-            self._skip_vdf_close_prompt = True  # the queue is saved on disk; the new version picks it up
-            relaunch_appimage(updated_path)
-            QApplication.quit()
+            self._restart_updated_appimage(updated_path)
 
         if clicked == btn_apply:
             self._apply_vdf_queue(on_done=lambda ok: _restart() if ok else None)
@@ -2987,6 +3106,10 @@ class MainWindow(QMainWindow):
         With ``on_done`` the user already agreed to close Steam: no extra question, and
         ``on_done(True)`` runs only when everything was applied (errors are still shown).
         """
+        if self._vdf_applying:
+            if on_done is not None:
+                on_done(False)
+            return
         if not self.paths or self._vdf_queue.pending_count() <= 0:
             if on_done is not None:
                 on_done(True)
@@ -2994,8 +3117,15 @@ class MainWindow(QMainWindow):
         paths = self.paths
 
         def _proceed() -> None:
-            if self._closing_pending:
+            if self._closing_pending or self._vdf_applying or not self.paths:
+                if on_done is not None:
+                    on_done(False)
                 return
+            if self._vdf_queue.pending_count() <= 0:
+                if on_done is not None:
+                    on_done(True)
+                return
+            self._vdf_applying = True
             self._begin_busy()
             worker = SteamOpWorker(
                 lambda: self._vdf_queue.apply_all(paths),
@@ -3005,6 +3135,7 @@ class MainWindow(QMainWindow):
             worker.status.connect(self.status_label.setText)
 
             def _ok(res: object) -> None:
+                self._vdf_applying = False
                 self._end_busy()
                 self._update_vdf_queue_banner()
                 self._refresh_shortcuts()
@@ -3015,6 +3146,8 @@ class MainWindow(QMainWindow):
                     self.status_label.setText(msg.splitlines()[0])
                     if not self._closing_pending:
                         QMessageBox.warning(_dialog_parent(self), __app_name__, msg)
+                    if on_done is not None:
+                        on_done(False)
                 else:
                     msg = tr("vdf_queue.applied_ok", applied=applied)
                     self.status_label.setText(msg)
@@ -3024,10 +3157,13 @@ class MainWindow(QMainWindow):
                         QMessageBox.information(_dialog_parent(self), __app_name__, msg)
 
             def _err(err: str) -> None:
+                self._vdf_applying = False
                 self._end_busy()
                 self._update_vdf_queue_banner()
                 if not self._closing_pending:
                     QMessageBox.critical(_dialog_parent(self), __app_name__, err)
+                if on_done is not None:
+                    on_done(False)
 
             worker.finished_ok.connect(_ok)
             worker.failed.connect(_err)
@@ -3105,6 +3241,8 @@ class MainWindow(QMainWindow):
         self._confirm_close_steam_async(_proceed)
 
     def _external_import_saves(self) -> None:
+        if self._steam_busy:
+            return
         sel = self._selected_library_item()
         if not sel or sel[0] != "external" or not isinstance(sel[1], ExternalLauncherGame):
             return
@@ -3119,7 +3257,7 @@ class MainWindow(QMainWindow):
                 targets.append((f"[Steam] {sc.app_name}", self.paths.compatdata_dir / str(sc.appid_u32) / "pfx"))
         for sg in self._standalone_games:
             if not sg.native_linux:
-                targets.append((f"[Standalone] {sg.name}", sg.prefix_dir))
+                targets.append((f"{tr('library.tag_standalone')} {sg.name}", sg.prefix_dir))
 
         if not targets:
             QMessageBox.information(_dialog_parent(self), __app_name__, tr("library.ext_no_import_targets"))
@@ -3137,18 +3275,24 @@ class MainWindow(QMainWindow):
         if not ok or not picked:
             return
         target_label, target_pfx = targets[labels.index(picked)]
+        if _is_wine_game_running():
+            QMessageBox.warning(_dialog_parent(self), __app_name__, tr("saves.game_running"))
+            return
+        self._begin_busy()
         worker = ExtImportSavesWorker(
             ext, target_pfx, target_label, snapshot_fn=self._make_pre_snapshot_fn()
         )
         self._track_worker(worker)
 
         def _ok(copied: int) -> None:
+            self._end_busy()
             msg = tr("library.ext_saves_imported", count=copied, target=target_label)
             self.status_label.setText(msg)
             if not self._closing_pending:
                 QMessageBox.information(_dialog_parent(self), __app_name__, msg)
 
         def _err(err: str) -> None:
+            self._end_busy()
             if not self._closing_pending:
                 QMessageBox.critical(_dialog_parent(self), __app_name__, err)
 
@@ -3160,13 +3304,17 @@ class MainWindow(QMainWindow):
         """Read safety/auto_snapshot on the main thread."""
         return _setting_bool(self.settings, AUTO_SNAPSHOT_KEY, True)
 
-    def _make_pre_snapshot_fn(self, force: bool = False) -> Callable[[Path, str, str, str], Path | None]:
+    def _make_pre_snapshot_fn(
+        self, force: bool = False, *, game: StandaloneGame | None = None,
+    ) -> Callable[[Path, str, str, str], Path | None]:
         """Capture the snapshot settings on the main thread for worker threads.
 
         force=True snapshots even when automatic snapshots are off (uninstall, adopt, move).
         """
         enabled = force or self._is_auto_snapshot_enabled()
         keep = snapshot_keep(self.settings)
+        game_dir = game.game_dir if game is not None else None
+        steam_appid = game.steam_appid if game is not None else None
 
         def _snap(
             prefix_dir: Path,
@@ -3174,9 +3322,11 @@ class MainWindow(QMainWindow):
             reason: str,
             key_prefix: str = "snap",
         ) -> Path | None:
-            if not enabled or not prefix_dir.is_dir():
+            if not enabled or (game_dir is None and not prefix_dir.is_dir()):
                 return None
-            return auto_snapshot(prefix_dir, game_name, reason, key_prefix, keep=keep)
+            return auto_snapshot(
+                prefix_dir, game_name, reason, key_prefix, keep=keep, game_dir=game_dir, steam_appid=steam_appid,
+            )
 
         return _snap
 
@@ -3224,7 +3374,8 @@ class MainWindow(QMainWindow):
         run_exe_in_prefix_dialog(self, kind=kind, obj=obj)
 
     def _open_configure_game_dialog(self) -> None:
-        open_configure_game_dialog(self)
+        if not self._steam_busy:
+            open_configure_game_dialog(self)
 
     @staticmethod
     def _play_key(kind: str, obj: object) -> str:
@@ -3280,9 +3431,10 @@ class MainWindow(QMainWindow):
         if not steam:
             QMessageBox.warning(_dialog_parent(self), __app_name__, msg)
 
-    def _close_stale_instance(self, obj: ShortcutEntry | StandaloneGame | ExternalLauncherGame) -> bool:
-        """An old instance of the game still running (often hung without a window) blocks a new launch:
-        Proton waits for it before opening another. Offer to close it; False when the user cancels."""
+    def _close_stale_instance(
+        self, key: str, obj: ShortcutEntry | StandaloneGame | ExternalLauncherGame, launch: Callable[[], None],
+    ) -> None:
+        """Launch immediately or after the confirmed cleanup of an old instance."""
         if isinstance(obj, ShortcutEntry):
             exe = Path(_strip_vdf_quotes(obj.exe))
             try:
@@ -3294,24 +3446,58 @@ class MainWindow(QMainWindow):
         else:
             exe = Path(obj.exe_path)
             name, watch = obj.name, watch_paths(obj.game_dir, obj.prefix_dir)
-        pids = stale_instance_pids(exe.name, watch)
-        if not pids:
-            return True
-        starts = [t for p in pids if (t := process_start_epoch(p)) is not None]
-        since = time.strftime("%H:%M", time.localtime(min(starts))) if starts else "?"
-        box = QMessageBox(
-            QMessageBox.Icon.Warning, __app_name__, tr("play.stale_instance", name=name, since=since),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, _dialog_parent(self),
-        )
-        box.button(QMessageBox.StandardButton.Yes).setText(tr("play.stale_close_and_play"))
-        box.setDefaultButton(QMessageBox.StandardButton.Yes)
-        answer = box.exec()
-        box.deleteLater()
-        if answer != QMessageBox.StandardButton.Yes:
-            return False
-        logging.info("Closing old instance of %s: %s", name, sorted(pids))
-        self._play.kill_pids(pids)  # the new launch then starts once Proton sees the old one gone
-        return True
+        attempt = self._play.prepare(key, name)
+
+        def _inspect() -> tuple[set[int], dict[int, float]]:
+            pids = stale_instance_pids(exe.name, watch)
+            epochs = {pid: epoch for pid in pids if (epoch := process_start_epoch(pid)) is not None}
+            return pids, epochs
+
+        def _ready(result: object) -> None:
+            if self._closed or self._closing_pending or not self._play.is_preparing(key, attempt):
+                return
+            if not isinstance(result, tuple):
+                self._play.cancel(key)
+                return
+            pids, epochs = result
+            if not pids:
+                launch_after_cleanup()
+                return
+            since = time.strftime("%H:%M", time.localtime(min(epochs.values()))) if epochs else "?"
+            box = QMessageBox(
+                QMessageBox.Icon.Warning, __app_name__, tr("play.stale_instance", name=name, since=since),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, _dialog_parent(self),
+            )
+            box.button(QMessageBox.StandardButton.Yes).setText(tr("play.stale_close_and_play"))
+            box.setDefaultButton(QMessageBox.StandardButton.Yes)
+            answer = box.exec()
+            box.deleteLater()
+            if answer != QMessageBox.StandardButton.Yes:
+                self._play.cancel(key)
+                return
+            surviving = {pid for pid, epoch in epochs.items() if process_start_epoch(pid) == epoch}
+            if not surviving:
+                launch_after_cleanup()
+                return
+            logging.info("Closing old instance of %s: %s", name, sorted(surviving))
+            self._play.kill_pids(surviving, on_finished=launch_after_cleanup)
+
+        def launch_after_cleanup() -> None:
+            if self._closed or self._closing_pending or not self._play.is_preparing(key, attempt):
+                return
+            self._play.cancel(key)
+            launch()
+
+        def _failed(err: str) -> None:
+            if self._play.is_preparing(key, attempt):
+                self._play.cancel(key)
+                self._on_background_failed(err)
+
+        worker = SteamOpWorker(_inspect)
+        self._track_worker(worker)
+        worker.finished_ok.connect(_ready)
+        worker.failed.connect(_failed)
+        worker.start()
 
     def _play_selected_game(self) -> None:
         """Play the selected game, or stop it when it is already running."""
@@ -3330,8 +3516,11 @@ class MainWindow(QMainWindow):
             return
         if state != "idle":
             return
-        if not self._close_stale_instance(obj):
-            return
+        self._close_stale_instance(key, obj, lambda: self._launch_library_game(key, kind, obj))
+
+    def _launch_library_game(
+        self, key: str, kind: str, obj: ShortcutEntry | StandaloneGame | ExternalLauncherGame,
+    ) -> None:
         if isinstance(obj, ShortcutEntry):
             rungameid = (obj.appid_u32 << 32) | 0x02000000
             try:
@@ -3434,6 +3623,7 @@ class MainWindow(QMainWindow):
             self.btn_configure_game,
             self.btn_move_game,
             self.btn_remove_game,
+            self.act_ext_import_saves,
             self.btn_save_backup,
             self.btn_save_restore,
             self.btn_save_sync,
@@ -3508,6 +3698,10 @@ class MainWindow(QMainWindow):
         def _on_checked(running: bool) -> None:
             if alive_fn is not None and not alive_fn():
                 return
+            if self._closed or self._closing_pending:
+                if on_cancelled is not None:
+                    on_cancelled()
+                return
             if running and not self.should_queue_vdf_edits():  # Gaming Mode queues: Steam stays open
                 ans = QMessageBox.question(
                     parent or self,
@@ -3521,186 +3715,6 @@ class MainWindow(QMainWindow):
             on_confirmed()
 
         self._check_steam_running_async(_on_checked)
-
-    def _change_selected_proton(self) -> None:
-        sel = self._selected_library_item()
-        if sel is None:
-            return
-        kind, obj = sel
-        if _is_native_linux_game(kind, obj):
-            return
-
-        if kind == "standalone" and isinstance(obj, StandaloneGame):
-            sa = obj
-            paths_snap = self.paths
-            auto_snap_enabled = self._is_auto_snapshot_enabled()
-
-            def _on_standalone_prep(
-                is_win32: bool, tools: list[tuple[str, str]], _current_id: str = ""
-            ) -> None:
-                if self._closing_pending:
-                    return
-                if is_win32:
-                    QMessageBox.warning(
-                        _dialog_parent(self),
-                        __app_name__,
-                        tr("prefix.win32_unsupported", path=str(sa.prefix_dir)),
-                    )
-                    return
-                if not tools:
-                    QMessageBox.warning(_dialog_parent(self), __app_name__, tr("proton.none_found"))
-                    return
-                current_id = sa.proton_name or DEFAULT_PROTON_ID
-                tool_opts = [(DEFAULT_PROTON_ID, tr("proton.default_label")), *tools]
-                labels = [disp for _, disp in tool_opts]
-                cur_idx = next((i for i, (tid, _) in enumerate(tool_opts) if tid == current_id), 0)
-                choice, ok = QInputDialog.getItem(
-                    _dialog_parent(self),
-                    tr("proton.title"),
-                    tr("proton.label", name=sa.name, current=sa.proton_name or tr("proton.default_label")),
-                    labels,
-                    cur_idx,
-                    False,
-                )
-                if not ok or not choice:
-                    return
-                tool_id = tool_opts[labels.index(choice)][0]
-                target_tool = "" if tool_id == DEFAULT_PROTON_ID else tool_id
-
-                def _do_set_standalone_proton() -> None:
-                    self._auto_snapshot_if_enabled(
-                        sa.prefix_dir,
-                        sa.name,
-                        "proton-change",
-                        "proton",
-                        enabled=auto_snap_enabled,
-                    )
-                    changed = set_game_proton(sa.game_dir, target_tool)
-                    sa.proton_name = changed.proton_name
-                    sa.meta = changed.meta
-
-                worker = SteamOpWorker(_do_set_standalone_proton, need_steam_closed=False)
-                self._track_worker(worker)
-                worker.status.connect(self.status_label.setText)
-
-                def _ok_standalone(_res: object) -> None:
-                    self._refresh_shortcuts()
-                    msg = tr(
-                        "proton.updated_standalone",
-                        name=sa.name,
-                        tool=sa.proton_name or tr("proton.default_label"),
-                    )
-                    self.status_label.setText(msg)
-                    if not self._closing_pending:
-                        QMessageBox.information(_dialog_parent(self), __app_name__, msg)
-
-                def _err_standalone(err: str) -> None:
-                    if not self._closing_pending:
-                        QMessageBox.critical(_dialog_parent(self), __app_name__, tr("proton.error", err=err))
-
-                worker.finished_ok.connect(_ok_standalone)
-                worker.failed.connect(_err_standalone)
-                worker.start()
-
-            prep_worker = ProtonPrepWorker("standalone", sa.prefix_dir, paths_snap)
-            self._track_worker(prep_worker)
-            prep_worker.ready.connect(_on_standalone_prep)
-            prep_worker.failed.connect(self._on_background_failed)
-            prep_worker.start()
-            return
-
-        if kind != "steam" or not isinstance(obj, ShortcutEntry) or not self.paths:
-            return
-        entry = obj
-        paths = self.paths
-        pfx_dir = paths.compatdata_dir / str(entry.appid_u32) / "pfx"
-        auto_snap_enabled = self._is_auto_snapshot_enabled()
-
-        def _on_steam_prep(is_win32: bool, protons: list[tuple[str, str]], current_id: str) -> None:
-            if self._closing_pending:
-                return
-            if is_win32:
-                QMessageBox.warning(
-                    _dialog_parent(self),
-                    __app_name__,
-                    tr("prefix.win32_unsupported", path=str(pfx_dir)),
-                )
-                return
-            if not protons:
-                QMessageBox.warning(_dialog_parent(self), __app_name__, tr("proton.none_found"))
-                return
-            managed_sa = self._managed_library_game(entry)
-            steam_default_id = "__steam_default__"
-            opts = [(steam_default_id, tr("proton.default_label")), *protons]
-            current_disp = current_id or tr("proton.default_label")
-            labels = [disp for _, disp in opts]
-            cur_idx = next((i for i, (tid, _) in enumerate(opts) if tid == (current_id or steam_default_id)), 0)
-            choice, ok = QInputDialog.getItem(
-                _dialog_parent(self),
-                tr("proton.title"),
-                tr("proton.label", name=entry.app_name, current=current_disp),
-                labels,
-                cur_idx,
-                False,
-            )
-            if not ok or not choice:
-                return
-            tool_id = opts[labels.index(choice)][0]
-            target_tool = "" if tool_id == steam_default_id else tool_id
-            display_tool = target_tool or tr("proton.default_label")
-
-            def _proceed_set_proton() -> None:
-                if self._closing_pending:
-                    return
-                self._begin_busy()
-                queued = self.should_queue_vdf_edits()  # Gaming Mode: save it for when Steam closes
-
-                def _do_set_proton() -> None:
-                    self._auto_snapshot_if_enabled(
-                        pfx_dir,
-                        entry.app_name,
-                        "proton-change",
-                        "proton",
-                        enabled=auto_snap_enabled,
-                    )
-                    if managed_sa is not None:
-                        changed = set_game_proton(managed_sa.game_dir, target_tool)
-                        managed_sa.proton_name = changed.proton_name
-                        managed_sa.meta = changed.meta
-                    if not queued:
-                        set_shortcut_proton(paths.config_vdf, entry.appid_u32, target_tool)
-
-                worker = SteamOpWorker(_do_set_proton, need_steam_closed=not queued)
-                self._track_worker(worker)
-                worker.status.connect(self.status_label.setText)
-
-                def _ok(_res: object) -> None:
-                    self._end_busy()
-                    msg = tr("proton.updated", name=entry.app_name, tool=display_tool)
-                    if queued:
-                        self.enqueue_vdf_edit(_proton_edit(entry.appid_u32, entry.app_name, target_tool))
-                        msg = tr("vdf_queue.enqueued", name=entry.app_name)
-                    self._refresh_shortcuts()
-                    self.status_label.setText(msg)
-                    if not self._closing_pending:
-                        QMessageBox.information(_dialog_parent(self), __app_name__, msg)
-
-                def _err(err: str) -> None:
-                    self._end_busy()
-                    if not self._closing_pending:
-                        QMessageBox.critical(_dialog_parent(self), __app_name__, tr("proton.error", err=err))
-
-                worker.finished_ok.connect(_ok)
-                worker.failed.connect(_err)
-                worker.start()
-
-            self._confirm_close_steam_async(_proceed_set_proton)
-
-        steam_prep = ProtonPrepWorker("steam", pfx_dir, paths, entry.appid_u32)
-        self._track_worker(steam_prep)
-        steam_prep.ready.connect(_on_steam_prep)
-        steam_prep.failed.connect(self._on_background_failed)
-        steam_prep.start()
 
     def _open_save_sync_dialog(self) -> None:
         open_save_sync_dialog(self)
@@ -3740,9 +3754,10 @@ class MainWindow(QMainWindow):
         open_winetricks_dialog(self, kind=kind, obj=obj)
 
     def _open_optiscaler_dialog(
-        self, kind: str | None = None, obj: object | None = None
+        self, kind: str | None = None, obj: object | None = None, *,
+        on_saved: Callable[[str], None] | None = None,
     ) -> None:
-        open_optiscaler_dialog(self, kind=kind, obj=obj)
+        open_optiscaler_dialog(self, kind=kind, obj=obj, on_saved=on_saved)
 
     def _backup_all_saves(self) -> None:
         if _is_wine_game_running():
@@ -4032,10 +4047,12 @@ class MainWindow(QMainWindow):
             if self._closing_pending:
                 return
             self._begin_busy()
-            worker = SteamOpWorker(
-                lambda: import_standalone_to_steam(paths, game, remove_standalone_files=False),
-                need_steam_closed=True,
-            )
+            def import_game() -> int:
+                if game.schema >= 2 and game.uid:
+                    return add_installed_game_to_steam(paths, game.game_dir, game.uid)
+                return import_standalone_to_steam(paths, game)
+
+            worker = SteamOpWorker(import_game, need_steam_closed=True)
             self._track_worker(worker)
             worker.status.connect(self.status_label.setText)
 
@@ -4134,12 +4151,15 @@ class MainWindow(QMainWindow):
         self.btn_remove_existing.setEnabled(has_match and not self._steam_busy)
 
     def _remove_steam_shortcut_async(
-        self, entry: ShortcutEntry, refresh_games: bool = False, done_msg: str = ""
+        self, entry: ShortcutEntry, refresh_games: bool = False, done_msg: str = "",
+        *, defer_on_cancel: bool = False,
     ) -> None:
         """Remove a Steam Non-Steam shortcut in a background thread (or queue it in Gaming Mode)."""
         if not self.paths or self._vdf_corrupt:
             return
-        if self.should_queue_vdf_edits():
+
+        def _queue_removal() -> None:
+            closing = self._closed or self._closing_pending
             self.enqueue_vdf_edit(
                 QueuedVdfEdit(
                     f"remove_shortcut:{entry.appid_u32}",
@@ -4147,12 +4167,17 @@ class MainWindow(QMainWindow):
                     entry.appid_u32,
                     entry.app_name,
                     {},
-                )
+                ),
+                trigger_watch=not closing,
             )
+            if closing:
+                return
             if refresh_games:
                 self._refresh_games()
             self._refresh_shortcuts()
             self.status_label.setText(done_msg or tr("vdf_queue.enqueued", name=entry.app_name))
+        if self.should_queue_vdf_edits():
+            _queue_removal()
             return
 
         paths = self.paths
@@ -4176,6 +4201,7 @@ class MainWindow(QMainWindow):
 
             def _on_remove_err(err: str) -> None:
                 self._end_busy()
+                self.status_label.setText(done_msg or tr("status.ready"))
                 if not self._closing_pending:
                     QMessageBox.critical(_dialog_parent(self), __app_name__, err)
 
@@ -4183,7 +4209,7 @@ class MainWindow(QMainWindow):
             worker.failed.connect(_on_remove_err)
             worker.start()
 
-        self._confirm_close_steam_async(_start_remove)
+        self._confirm_close_steam_async(_start_remove, on_cancelled=_queue_removal if defer_on_cancel else None)
 
     def _uninstall_standalone_async(
         self,
@@ -4193,6 +4219,9 @@ class MainWindow(QMainWindow):
         refresh_games: bool = False,
     ) -> None:
         """Plan the uninstall in the background, let the user pick the parts, then remove them."""
+        if _is_wine_game_running() or self._play.state(self._play_key("standalone", sa)) in (LOADING, RUNNING):
+            QMessageBox.warning(_dialog_parent(self), __app_name__, tr("cleanup.wine_running"))
+            return
         self._begin_busy()
         self.status_label.setText(tr("uninstall.planning", name=sa.name))
         planner = SteamOpWorker(lambda: plan_uninstall(sa))
@@ -4200,6 +4229,7 @@ class MainWindow(QMainWindow):
 
         def _on_err(err: str) -> None:
             self._end_busy()
+            self.status_label.setText(tr("status.ready"))
             if not self._closing_pending:
                 QMessageBox.critical(_dialog_parent(self), __app_name__, err)
 
@@ -4214,8 +4244,14 @@ class MainWindow(QMainWindow):
             self._begin_busy()
             self.status_label.setText(tr("uninstall.running", name=sa.name))
 
-            snap = self._make_pre_snapshot_fn(force=True)
-            worker = SteamOpWorker(lambda: execute_uninstall(plan, selected, snap))
+            snap = self._make_pre_snapshot_fn(force=True, game=sa)
+
+            def _uninstall() -> UninstallResult:
+                if _is_wine_game_running():
+                    raise RuntimeError(tr("cleanup.wine_running"))
+                return execute_uninstall(plan, selected, snap)
+
+            worker = SteamOpWorker(_uninstall)
             self._track_worker(worker)
             worker.finished_ok.connect(_on_done)
             worker.failed.connect(_on_err)
@@ -4226,17 +4262,18 @@ class MainWindow(QMainWindow):
             if self._closing_pending or not isinstance(result, UninstallResult):
                 return
             msg = tr("uninstall.done", name=sa.name, size=format_size_bytes(result.freed_bytes))
+            if refresh_games or GAME_FILES in result.removed:
+                self._refresh_games()
+            self._refresh_shortcuts()
+            self.status_label.setText(msg if not result.errors or result.removed else tr("status.ready"))
             if result.errors:
                 QMessageBox.warning(
                     _dialog_parent(self), __app_name__, tr("uninstall.errors", errors="\n".join(result.errors))
                 )
+                if SHORTCUTS not in result.removed:
+                    return
             if steam_entry is not None and self.paths is not None:
-                self._remove_steam_shortcut_async(steam_entry, refresh_games=True, done_msg=msg)
-                return
-            if refresh_games or GAME_FILES in result.removed:
-                self._refresh_games()
-            self._refresh_shortcuts()
-            self.status_label.setText(msg)
+                self._remove_steam_shortcut_async(steam_entry, done_msg=msg, defer_on_cancel=True)
 
         planner.finished_ok.connect(_on_planned)
         planner.failed.connect(_on_err)
@@ -4291,11 +4328,6 @@ class MainWindow(QMainWindow):
         if ans != QMessageBox.StandardButton.Yes:
             return
         self._remove_steam_shortcut_async(entry)
-
-
-def _proton_edit(appid_u32: int, name: str, tool_id: str) -> QueuedVdfEdit:
-    """Queued "use this Proton" for a Steam shortcut (Gaming Mode)."""
-    return QueuedVdfEdit(f"set_proton:{appid_u32}", "set_proton", appid_u32, name, {"tool_name": tool_id})
 
 
 def _optional_install_default(steam_installed: bool) -> QMessageBox.StandardButton:

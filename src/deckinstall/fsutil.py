@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import fcntl
 import hashlib
 import logging
 import os
@@ -10,7 +11,124 @@ import re
 import shutil
 import stat
 import tempfile
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
+
+_NON_UNIX_PERM_ERRNOS = frozenset({errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.ENOSYS, errno.EINVAL})
+
+
+_FILE_LOCKS_GUARD = threading.Lock()
+_FILE_LOCKS: dict[Path, threading.RLock] = {}
+_THREAD_LOCAL = threading.local()
+
+FileIdentity = tuple[int, int, int, int, int]
+
+
+def file_identity(st: os.stat_result) -> FileIdentity:
+    return st.st_dev, st.st_ino, st.st_ctime_ns, st.st_mtime_ns, st.st_size
+
+
+def open_regular_fd(path: Path, flags: int = os.O_RDONLY) -> int:
+    """Open a regular file without following its final component or blocking on a FIFO."""
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"Not a regular file: {path}")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+@contextmanager
+def file_lock(lock_path: Path) -> Iterator[None]:
+    """Acquire both per-path intra-process RLock and cross-process flock for a lockfile path."""
+    if lock_path.is_symlink():
+        raise RuntimeError(f"Refusing symlink lockfile: {lock_path}")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_key = Path(os.path.realpath(lock_path))
+    with _FILE_LOCKS_GUARD:
+        path_lock = _FILE_LOCKS.get(lock_key)
+        if path_lock is None:
+            path_lock = threading.RLock()
+            _FILE_LOCKS[lock_key] = path_lock
+    depths: dict[Path, int] | None = getattr(_THREAD_LOCAL, "flock_depths", None)
+    if depths is None:
+        depths = {}
+        _THREAD_LOCAL.flock_depths = depths
+    depth = depths.get(lock_key, 0)
+    with path_lock:
+        if depth > 0:
+            depths[lock_key] = depth + 1
+            try:
+                yield
+            finally:
+                depths[lock_key] = depth
+            return
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise OSError(f"Lock path is not a regular file: {lock_path}")
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            depths[lock_key] = 1
+            try:
+                yield
+            finally:
+                depths.pop(lock_key, None)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _safe_chmod(path: Path, mode: int) -> None:
+    """Apply mode, tolerating permission-unsupported errors on exFAT/vFAT/NTFS filesystems."""
+    try:
+        os.chmod(path, mode)
+    except OSError as exc:
+        if exc.errno not in _NON_UNIX_PERM_ERRNOS:
+            raise
+
+
+def _safe_copystat(src: Path, dst: Path, *, follow_symlinks: bool = False) -> None:
+    """Copy metadata timestamps/mode best-effort, tolerating exFAT/vFAT/NTFS limitations."""
+    try:
+        shutil.copystat(src, dst, follow_symlinks=follow_symlinks)
+    except OSError as exc:
+        if exc.errno not in _NON_UNIX_PERM_ERRNOS:
+            raise
+
+
+def _rmtree_force(path: Path, *, ignore_errors: bool = False) -> None:
+    """Retry removal after restoring owner permissions to read-only directories in the tree."""
+    if not path.exists() and not path.is_symlink():
+        return
+
+    try:
+        try:
+            shutil.rmtree(path)
+        except PermissionError:
+            pending = [path]
+            while pending:
+                directory = pending.pop()
+                try:
+                    mode = directory.lstat().st_mode
+                    if not stat.S_ISDIR(mode):
+                        continue
+                    if mode & 0o700 != 0o700:
+                        os.chmod(directory, stat.S_IMODE(mode) | 0o700, follow_symlinks=False)
+                    with os.scandir(directory) as entries:
+                        pending.extend(Path(e.path) for e in entries if e.is_dir(follow_symlinks=False))
+                except FileNotFoundError:
+                    continue
+            shutil.rmtree(path)
+    except FileNotFoundError:
+        if path.exists() and not ignore_errors:
+            raise
+    except OSError:
+        if not ignore_errors:
+            raise
 
 
 def atomic_write_bytes(path: Path, data: bytes, *, mode: int | None = None) -> None:
@@ -30,7 +148,7 @@ def atomic_write_bytes(path: Path, data: bytes, *, mode: int | None = None) -> N
             fh.flush()
             os.fsync(fh.fileno())
         if preserved_mode is not None:
-            os.chmod(tmp, preserved_mode)
+            _safe_chmod(tmp, preserved_mode)
         os.replace(tmp, path)
     except Exception:
         tmp.unlink(missing_ok=True)
@@ -51,13 +169,19 @@ def atomic_write_text(path: Path, text: str, *, mode: int | None = None) -> None
 
 
 def atomic_copy_file(src: Path, dst: Path) -> None:
-    """Atomically copy src to dst via a temporary file in dst.parent (metadata preserved)."""
+    """Atomically copy src to dst via a temporary file in dst.parent (metadata best-effort)."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=str(dst.parent))
     os.close(fd)
     tmp = Path(tmp_name)
     try:
-        shutil.copy2(src, tmp)
+        try:
+            shutil.copy2(src, tmp)
+        except OSError as exc:
+            if exc.errno not in _NON_UNIX_PERM_ERRNOS:
+                raise
+            shutil.copyfile(src, tmp)
+            _safe_copystat(src, tmp, follow_symlinks=True)
         os.replace(tmp, dst)
     except Exception:
         tmp.unlink(missing_ok=True)
@@ -76,9 +200,14 @@ def file_sha256(path: Path) -> str:
         return h.hexdigest()
 
 
-def short_hash(value: str, length: int = 8) -> str:
-    """Return the first `length` hex chars of the SHA-256 of a string."""
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:length]
+def unique_dir(target: Path, taken: set[Path] | None = None) -> Path:
+    """Find an unused sibling without following a dangling symlink."""
+    cand = target
+    idx = 2
+    while cand.exists() or cand.is_symlink() or (taken is not None and cand in taken):
+        cand = target.with_name(f"{target.name} ({idx})")
+        idx += 1
+    return cand
 
 
 def sanitize_dir_name(name: str) -> str:
@@ -128,7 +257,7 @@ def remove_path_or_tree(path: Path) -> None:
     if path.is_symlink() or path.is_file():
         path.unlink(missing_ok=True)
     elif path.exists():
-        shutil.rmtree(path, ignore_errors=True)
+        _rmtree_force(path, ignore_errors=True)
 
 
 def prune_empty_parents(path: Path, roots: list[Path]) -> None:
@@ -154,12 +283,65 @@ def prune_empty_parents(path: Path, roots: list[Path]) -> None:
         parent = parent.parent
 
 
+def _copytree_portable(src: Path, dst: Path) -> None:
+    """Copy a directory tree cross-device, tolerating non-Unix chmod/copystat/symlink limits."""
+    src_resolved = src.resolve()
+    visited: set[Path] = {src_resolved}
+
+    def _copy_dir(cur_src: Path, cur_dst: Path) -> None:
+        cur_dst.mkdir(parents=True, exist_ok=True)
+        for item in cur_src.iterdir():
+            target = cur_dst / item.name
+            if item.is_symlink():
+                try:
+                    os.symlink(os.readlink(item), target)
+                except OSError as exc:
+                    if exc.errno not in _NON_UNIX_PERM_ERRNOS:
+                        raise
+                    try:
+                        resolved = item.resolve()
+                    except OSError:
+                        logging.warning("Skipping broken symlink %s on non-Unix filesystem", item)
+                        continue
+                    if not resolved.is_relative_to(src_resolved) or resolved in visited:
+                        logging.warning("Skipping external/cyclic symlink %s on non-Unix filesystem", item)
+                        continue
+                    if resolved.is_file():
+                        shutil.copyfile(resolved, target)
+                        _safe_copystat(resolved, target, follow_symlinks=True)
+                    elif resolved.is_dir():
+                        visited.add(resolved)
+                        try:
+                            _copy_dir(resolved, target)
+                        finally:
+                            visited.discard(resolved)
+            elif item.is_dir():
+                try:
+                    r_dir = item.resolve()
+                except OSError:
+                    r_dir = item
+                if r_dir in visited:
+                    continue
+                visited.add(r_dir)
+                try:
+                    _copy_dir(item, target)
+                finally:
+                    visited.discard(r_dir)
+                _safe_copystat(item, target, follow_symlinks=False)
+            elif item.is_file():
+                shutil.copyfile(item, target)
+                _safe_copystat(item, target, follow_symlinks=False)
+        _safe_copystat(cur_src, cur_dst, follow_symlinks=False)
+
+    _copy_dir(src, dst)
+
+
 def move_dir_safely(src: Path, dst: Path) -> None:
     """Move a directory without ever leaving the only full copy at risk.
 
     Same filesystem: atomic rename. Across filesystems: copy everything first, and only
-    then delete the source. A failure while copying raises (source untouched, partial
-    destination may remain). A failure while deleting the source is only logged: the
+    then publish the destination and delete the source. A copy failure leaves the source
+    and destination untouched. A failure while deleting the source is only logged: the
     destination is already complete, so leftovers are preferable to data loss.
     """
     try:
@@ -168,9 +350,21 @@ def move_dir_safely(src: Path, dst: Path) -> None:
     except OSError as exc:
         if exc.errno != errno.EXDEV:
             raise
-    shutil.copytree(src, dst, symlinks=True)
+    stage_dir = Path(tempfile.mkdtemp(prefix=".deckinstall-move-", dir=dst.parent))
     try:
-        shutil.rmtree(src)
+        staged = stage_dir / "tree"
+        try:
+            shutil.copytree(src, staged, symlinks=True)
+        except OSError as exc:
+            if exc.errno not in _NON_UNIX_PERM_ERRNOS and not isinstance(exc, shutil.Error):
+                raise
+            _rmtree_force(staged)
+            _copytree_portable(src, staged)
+        os.replace(staged, dst)
+    finally:
+        _rmtree_force(stage_dir, ignore_errors=True)
+    try:
+        _rmtree_force(src)
     except OSError:
         logging.warning("Moved %s to %s but could not fully remove the source", src, dst, exc_info=True)
 
@@ -188,7 +382,8 @@ def copy_dir_no_symlinks(src_dir: Path, dst_dir: Path) -> None:
         for f in files_s:
             sf = Path(root_s) / f
             if not sf.is_symlink() and sf.is_file():
-                shutil.copy2(sf, target_sub / f)
+                shutil.copyfile(sf, target_sub / f)
+                _safe_copystat(sf, target_sub / f, follow_symlinks=True)
 
 
 def copy_or_move_dir_contents(src_dir: Path, dst_dir: Path, move: bool) -> None:
@@ -199,26 +394,61 @@ def copy_or_move_dir_contents(src_dir: Path, dst_dir: Path, move: bool) -> None:
     for item in src_dir.iterdir():
         target = dst_dir / item.name
         if move:
+            if item.is_dir() and not item.is_symlink() and target.is_dir() and not target.is_symlink():
+                copy_or_move_dir_contents(item, target, move=True)
+                try:
+                    item.rmdir()
+                except OSError:
+                    pass
+                continue
+            backup_path: Path | None = None
             if target.exists() or target.is_symlink():
-                if item.is_dir() and not item.is_symlink() and target.is_dir() and not target.is_symlink():
-                    copy_or_move_dir_contents(item, target, move=True)
+                fd, bak_name = tempfile.mkstemp(
+                    prefix=f".{target.name}.", suffix=".movebak", dir=str(dst_dir)
+                )
+                os.close(fd)
+                backup_path = Path(bak_name)
+                backup_path.unlink(missing_ok=True)
+                os.rename(target, backup_path)
+            try:
+                if item.is_dir() and not item.is_symlink():
+                    move_dir_safely(item, target)
+                else:
                     try:
-                        item.rmdir()
+                        os.rename(item, target)
+                    except OSError as exc:
+                        if exc.errno != errno.EXDEV:
+                            raise
+                        if item.is_symlink():
+                            os.symlink(os.readlink(item), target)
+                        else:
+                            atomic_copy_file(item, target)
+                        item.unlink()
+            except BaseException:
+                if backup_path is not None and (backup_path.exists() or backup_path.is_symlink()):
+                    try:
+                        if not target.exists() and not target.is_symlink():
+                            os.rename(backup_path, target)
                     except OSError:
                         pass
-                    continue
-                remove_path_or_tree(target)
-            shutil.move(str(item), str(target))
+                raise
+            if backup_path is not None:
+                remove_path_or_tree(backup_path)
         else:
             if item.is_symlink():
                 if not target.exists() and not target.is_symlink():
-                    target.symlink_to(item.readlink())
+                    try:
+                        target.symlink_to(item.readlink())
+                    except OSError as exc:
+                        if exc.errno not in _NON_UNIX_PERM_ERRNOS:
+                            raise
+                        logging.warning("Skipping symlink %s on non-Unix filesystem %s", item, target)
             elif item.is_dir():
                 if target.is_symlink() or (target.exists() and not target.is_dir()):
                     remove_path_or_tree(target)
                 copy_or_move_dir_contents(item, target, move=False)
-                shutil.copystat(item, target, follow_symlinks=False)
+                _safe_copystat(item, target, follow_symlinks=False)
             else:
                 if target.is_symlink() or target.is_dir():
                     remove_path_or_tree(target)
-                shutil.copy2(item, target)
+                atomic_copy_file(item, target)

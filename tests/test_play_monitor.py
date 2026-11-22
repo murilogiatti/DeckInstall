@@ -130,16 +130,18 @@ def test_prepare_and_cancel(mon: pm.PlayMonitor) -> None:
 def test_find_game_pids_matches_cmdline_cwd_and_prefix(tmp_path: Path) -> None:
     root = tmp_path / "proc"
     game = "/home/deck/Games/Hollow"
+    first_pid = os.getpid() + 1
     for pid, cmd, env in (
-        ("10", f"bash\0{game}/launch.sh\0", b""),
-        ("11", "Z:\\home\\deck\\Games\\Hollow\\game.exe\0", b""),
-        ("12", "wineserver\0", b"WINEPREFIX=/home/deck/Games/Hollow/pfx\0"),
-        ("13", "bash\0", b"PWD=/home/deck/Games/Hollow\0"),
+        (first_pid, f"bash\0{game}/launch.sh\0", b""),
+        (first_pid + 1, "Z:\\home\\deck\\Games\\Hollow\\game.exe\0", b""),
+        (first_pid + 2, "wineserver\0", b"WINEPREFIX=/home/deck/Games/Hollow/pfx\0"),
+        (first_pid + 3, "bash\0", b"PWD=/home/deck/Games/Hollow\0"),
     ):
-        (root / pid).mkdir(parents=True)
-        (root / pid / "cmdline").write_text(cmd)
-        (root / pid / "environ").write_bytes(env)
-    assert pm.find_game_pids((game,), str(root)) == {10, 11, 12}
+        proc = root / str(pid)
+        proc.mkdir(parents=True)
+        (proc / "cmdline").write_text(cmd)
+        (proc / "environ").write_bytes(env)
+    assert pm.find_game_pids((game,), str(root)) == {first_pid, first_pid + 1, first_pid + 2}
 
 
 def test_watch_paths_skip_system_and_home() -> None:

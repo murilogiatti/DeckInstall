@@ -17,6 +17,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from functools import cached_property
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .standalone import StandaloneGame
 
 
 @dataclass(frozen=True)
@@ -130,15 +134,12 @@ def collect_active_proton_tools(
             is_legacy = games_dir.resolve() == get_legacy_games_dir().resolve()
         except OSError:
             is_legacy = games_dir == get_legacy_games_dir()
-        if is_legacy:
-            seen_dirs: set[Path] = set()
-            games = []
-            for game in [*list_standalone_games(games_dir), *list_standalone_games(None)]:
-                if game.game_dir not in seen_dirs:
-                    seen_dirs.add(game.game_dir)
-                    games.append(game)
-        else:
-            games = list_standalone_games(games_dir)
+        games = list_standalone_games(None if is_legacy else games_dir)
+    return tools | _standalone_proton_tools(games)
+
+
+def _standalone_proton_tools(games: Iterable[StandaloneGame]) -> set[str]:
+    tools: set[str] = set()
     for game in games:
         if game.proton_name:
             tools.add(game.proton_name)
@@ -332,7 +333,14 @@ class _ScanContext:
         )
         self.games_dir = (home_dir / "Games") if home_dir is not None else get_legacy_games_dir()
         self.standalone_prefixes_dir = self.games_dir / ".prefixes"
-        self.standalone_prefix_paths = self._protected_standalone_prefixes(list_standalone_games)
+        self.standalone_games = list_standalone_games()
+        self.custom_home_games = []
+        if self._custom_home:
+            self.custom_home_games = [
+                *list_standalone_games(self.games_dir),
+                *list_standalone_games(self.home / "DeckInstall" / "Games"),
+            ]
+        self.standalone_prefix_paths = self._protected_standalone_prefixes()
         self.active_external_prefixes = self._active_external_prefixes()
         if extra_external_roots is not None:
             self.prefix_roots = list(extra_external_roots)
@@ -343,22 +351,113 @@ class _ScanContext:
         self._lock = threading.Lock()
         self._sha256_cache: dict[Path, tuple[int, int, str]] = {}
         self._save_index: dict[Path, dict[tuple[str, str], tuple[Path, int]] | None] = {}
-        if paths is not None:
-            for entry in self.current_entries:
-                self._target_save_index(paths.compatdata_dir / str(entry.appid_u32))
 
     def _active_external_prefixes(self) -> set[Path]:
         """Collect resolved Wine prefixes currently used by Heroic, Lutris, Bottles or Hydra."""
         active: set[Path] = set()
         try:
-            from .launcher_scan import scan_external_launcher_games
+            home_resolved = self.home.resolve()
+        except OSError:
+            home_resolved = self.home
+
+        def _add_prefix(raw: object) -> None:
+            if isinstance(raw, Path):
+                text = str(raw)
+            elif isinstance(raw, str):
+                text = raw.strip()
+            else:
+                return
+            if not text:
+                return
+            p = Path(text)
+            if p == self.home or p == Path("/"):
+                return
+            try:
+                resolved = p.resolve()
+            except OSError:
+                resolved = Path(os.path.abspath(p))
+            if resolved != home_resolved and resolved != Path("/"):
+                active.add(resolved)
+
+        try:
+            from .launcher_scan import (
+                _HEROIC_CONFIGS,
+                _expand_home,
+                _lutris_db_rows,
+                _lutris_games_dir,
+                _parse_simple_yaml,
+                _read_json_safe,
+                bottles_roots,
+                scan_external_launcher_games,
+            )
 
             for ext in scan_external_launcher_games(self.home):
                 if ext.prefix_dir is not None:
+                    _add_prefix(ext.prefix_dir)
+
+            # Empty bottles (before adding External_Programs) have bottle.yml and belong to Bottles.
+            for bottles_root, _ in bottles_roots(self.home):
+                if not bottles_root.is_dir():
+                    continue
+                try:
+                    subdirs = list(bottles_root.iterdir())
+                except OSError:
+                    continue
+                for bdir in subdirs:
+                    if bdir.is_dir() and not bdir.is_symlink() and (bdir / "bottle.yml").is_file():
+                        _add_prefix(bdir)
+
+            # Heroic defaults and per-game configs (covers prefixes whose game lives on an unmounted disk).
+            for rel in _HEROIC_CONFIGS:
+                hroot = self.home / rel
+                cfg = _read_json_safe(hroot / "config.json")
+                defaults = cfg.get("defaultSettings") if isinstance(cfg, dict) else None
+                if isinstance(defaults, dict):
+                    for key in ("defaultWinePrefix", "winePrefix"):
+                        val = defaults.get(key)
+                        if isinstance(val, str) and val.strip():
+                            _add_prefix(_expand_home(val, self.home))
+                try:
+                    game_cfgs = sorted((hroot / "GamesConfig").glob("*.json"))[:2000]
+                except OSError:
+                    game_cfgs = []
+                for gcfg_path in game_cfgs:
+                    raw = _read_json_safe(gcfg_path)
+                    if not isinstance(raw, dict):
+                        continue
+                    for entry in [raw, *(v for v in raw.values() if isinstance(v, dict))]:
+                        val = entry.get("winePrefix")
+                        if isinstance(val, str) and val.strip():
+                            _add_prefix(_expand_home(val, self.home))
+
+            # Lutris SQLite and YAML configs (protects prefixes when game folders are unmounted).
+            for db_path in (
+                self.home / ".local" / "share" / "lutris" / "pga.db",
+                self.home / ".var" / "app" / "net.lutris.Lutris" / "data" / "lutris" / "pga.db",
+            ):
+                for row in _lutris_db_rows(db_path):
+                    val = row.get("prefix")
+                    if isinstance(val, str) and val.strip():
+                        _add_prefix(_expand_home(val, self.home))
+            for games_dir in (
+                _lutris_games_dir(self.home),
+                self.home / ".var" / "app" / "net.lutris.Lutris" / "config" / "lutris" / "games",
+                self.home / ".var" / "app" / "net.lutris.Lutris" / "data" / "lutris" / "games",
+            ):
+                try:
+                    ymls = sorted(games_dir.glob("*.yml"))[:2000]
+                except OSError:
+                    continue
+                for yml in ymls:
                     try:
-                        active.add(ext.prefix_dir.resolve())
+                        data = _parse_simple_yaml(yml.read_text(encoding="utf-8", errors="replace"))
                     except OSError:
-                        pass
+                        continue
+                    game_sec = data.get("game")
+                    raw_pfx = game_sec.get("prefix") if isinstance(game_sec, dict) else None
+                    for val in (raw_pfx, data.get("prefix")):
+                        if isinstance(val, str) and val.strip():
+                            _add_prefix(_expand_home(val, self.home))
         except Exception:
             pass
         try:
@@ -366,19 +465,16 @@ class _ScanContext:
 
             for cand in _scan_hydra(self.home):
                 if cand.prefix_dir is not None:
-                    try:
-                        active.add(cand.prefix_dir.resolve())
-                    except OSError:
-                        pass
+                    _add_prefix(cand.prefix_dir)
         except Exception:
             pass
         return active
 
-    def _protected_standalone_prefixes(self, list_standalone_games: Callable) -> set[Path]:
+    def _protected_standalone_prefixes(self) -> set[Path]:
         protected: set[Path] = set()
         games_dir = self.games_dir
         # Protect the prefixes of every library game, not only the ones under games_dir.
-        for game in [*list_standalone_games(games_dir), *list_standalone_games()]:
+        for game in (*self.standalone_games, *self.custom_home_games):
             try:
                 protected.add(game.prefix_dir.resolve())
             except OSError:
@@ -420,14 +516,10 @@ class _ScanContext:
 
     @cached_property
     def active_tools(self) -> set[str]:
-        tools = collect_active_proton_tools(
-            self.paths,
-            games_dir=self.games_dir if self._custom_home else None,
-        )
-        if self._custom_home:
-            v2_games = self.home / "DeckInstall" / "Games"
-            if v2_games.is_dir():
-                tools.update(collect_active_proton_tools(None, games_dir=v2_games))
+        games = self.custom_home_games if self._custom_home else self.standalone_games
+        tools = _standalone_proton_tools(games)
+        if self.paths is not None:
+            tools.update(_active_compat_tools(self.paths.config_vdf, self.active_shortcuts | self.installed_steam))
         return tools
 
     @cached_property
@@ -590,6 +682,11 @@ def _scan_prefix_roots(ctx: _ScanContext, standalone: bool) -> Iterator[_Found]:
                 continue
             ctx.seen_prefixes.add(resolved)
             if resolved in ctx.standalone_prefix_paths or resolved in ctx.active_external_prefixes:
+                continue
+            if any(
+                p != resolved and p.is_relative_to(resolved)
+                for p in (ctx.standalone_prefix_paths | ctx.active_external_prefixes)
+            ):
                 continue
             if is_standalone_prefixes_root and (
                 find_manifest(ctx.games_dir / child.name) is not None or (ctx.games_dir / child.name).is_dir()
@@ -983,6 +1080,8 @@ def find_cleanup_candidates(
     extra_external_roots: list[Path] | None = None,
     include_system_caches: bool = False,
     home_dir: Path | None = None,
+    *,
+    selected_paths: set[Path] | None = None,
 ) -> list[CleanupCandidate]:
     """Run every cleanup rule and return candidates sorted by size (largest first)."""
     ctx = _ScanContext(paths, extra_external_roots, home_dir)
@@ -992,6 +1091,8 @@ def find_cleanup_candidates(
         if rule.deep and not include_system_caches:
             continue
         for cand, min_size in rule.finder(ctx):
+            if selected_paths is not None and cand.path not in selected_paths:
+                continue
             cand = replace(cand, group=rule.group)
             if min_size is None:
                 candidates.append(cand)
@@ -1036,6 +1137,8 @@ def delete_cleanup_candidates_checked(
     allow_unverified_saves: bool = False,
 ) -> tuple[int, int, list[str]]:
     """Revalidate each candidate immediately before deleting it and return (deleted, freed, errors)."""
+    if not candidates:
+        return 0, 0, []
     deleted = 0
     freed = 0
     errors: list[str] = []
@@ -1053,9 +1156,10 @@ def delete_cleanup_candidates_checked(
                 extra_external_roots=extra_external_roots,
                 include_system_caches=include_system_caches,
                 home_dir=home_dir,
+                selected_paths={item.path for item in candidates},
             )
         }
-        for item in candidates or []:
+        for item in candidates:
             if not item.path.exists():
                 continue
             try:
@@ -1075,6 +1179,19 @@ def delete_cleanup_candidates_checked(
                     shutil.rmtree(item.path)
                     if fresh.category == "Prefix Cache" and item.path.name.lower() == "temp":
                         item.path.mkdir(parents=True, exist_ok=True)
+                    elif fresh.category == "Trash":
+                        trash_info = item.path.parent / "info"
+                        if trash_info.is_dir() and not trash_info.is_symlink():
+                            for info_file in trash_info.iterdir():
+                                if (
+                                    info_file.is_file()
+                                    and not info_file.is_symlink()
+                                    and info_file.name.endswith(".trashinfo")
+                                ):
+                                    try:
+                                        info_file.unlink()
+                                    except OSError as exc:
+                                        errors.append(f"{item.label}/info/{info_file.name}: {exc}")
                 else:
                     item.path.unlink()
                 if item.label == "common/SteamLinuxRuntime_sniper" and paths is not None:

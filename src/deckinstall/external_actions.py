@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import json
 import shlex
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .fsutil import symlink_points_to
 from .launcher_scan import ExternalLauncherGame
 from .standalone import resolve_game_icon
 from .steam_paths import SteamPaths
@@ -34,13 +36,11 @@ def _external_game_preset_key(ext: ExternalLauncherGame) -> str:
 def _combine_launch_options(base_options: str, extra_args: str) -> str:
     base = base_options.strip()
     extra = extra_args.strip()
-    if not extra:
-        return base
     if not base:
-        return extra
-    if "%command%" in base:
-        return base.replace("%command%", f"%command% {extra}", 1)
-    return f"{base} {extra}"
+        base = "%command%"
+    elif "%command%" not in base:
+        base += " %command%"
+    return base.replace("%command%", f"%command% {extra}", 1) if extra else base
 
 
 def build_steam_shortcut_payload(
@@ -50,7 +50,10 @@ def build_steam_shortcut_payload(
 ) -> dict[str, Any]:
     """Build keyword payload for add_or_update_shortcut from an ExternalLauncherGame."""
     if use_launcher_cmd and ext.launch_cmd:
-        target_exe = Path(ext.launch_cmd[0])
+        launcher = shutil.which(ext.launch_cmd[0])
+        if launcher is None:
+            raise FileNotFoundError(f"Launcher executable not found: {ext.launch_cmd[0]}")
+        target_exe = Path(launcher).absolute()
         extra_args = shlex.join(ext.launch_cmd[1:]) if len(ext.launch_cmd) > 1 else ""
         resolved_launch = _combine_launch_options(launch_options, extra_args)
         start_dir = ext.game_dir if ext.game_dir.is_dir() else target_exe.parent
@@ -102,10 +105,11 @@ def import_prefix_saves(
     if auto_snapshot_fn is not None and target_prefix.is_dir():
         auto_snapshot_fn(target_prefix, target_name)
 
-    if target_prefix.name == "pfx" or (target_prefix / "drive_c").is_dir():
+    pfx = target_prefix / "pfx"
+    if target_prefix.name == "pfx" or (target_prefix / "drive_c").is_dir() or symlink_points_to(pfx, target_prefix):
         dst_drive_c = target_prefix / "drive_c"
-    elif (target_prefix / "pfx").is_dir():
-        dst_drive_c = target_prefix / "pfx" / "drive_c"
+    elif pfx.is_dir():
+        dst_drive_c = pfx / "drive_c"
     else:
         dst_drive_c = target_prefix / "drive_c"
 

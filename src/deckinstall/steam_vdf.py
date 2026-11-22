@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import glob
 import hashlib
 import json
@@ -28,6 +27,8 @@ import vdf
 
 from .extractor import check_disk_space
 from .fsutil import atomic_write_bytes, file_sha256
+from .fsutil import file_lock as _file_lock
+from .library import NON_UNIX_FS, fs_type_of
 from .manifest import read_manifest_fields
 from .scanner import clean_game_name, detect_steam_appid
 from .steam_paths import (
@@ -45,70 +46,66 @@ from .steam_paths import (
 DEFAULT_SAVES_DIR = Path.home() / "Games" / "saves"
 # Newest save snapshots kept per game and full saves-*.zip backups kept by cleanup.
 SNAPSHOT_KEEP_DEFAULT = 3
-_STEAM_LOCK = threading.RLock()
 _THREAD_LOCAL = threading.local()
 
 
-@contextmanager
-def _file_lock(lock_path: Path):
-    """Acquire both intra-process RLock and cross-process flock for a lockfile path."""
-    if lock_path.is_symlink():
-        raise RuntimeError(f"Refusing symlink lockfile: {lock_path}")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    lock_key = Path(os.path.abspath(lock_path))
-    depths: dict[Path, int] | None = getattr(_THREAD_LOCAL, "flock_depths", None)
-    if depths is None:
-        depths = {}
-        _THREAD_LOCAL.flock_depths = depths
-    depth = depths.get(lock_key, 0)
-    with _STEAM_LOCK:
-        if depth > 0:
-            depths[lock_key] = depth + 1
-            try:
-                yield
-            finally:
-                depths[lock_key] = depth
-            return
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            depths[lock_key] = 1
-            try:
-                yield
-            finally:
-                depths.pop(lock_key, None)
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+def _canonical_steam_lock_anchor(anchor: Path) -> Path:
+    """Resolve shortcuts/config/localconfig anchors under one Steam root to prevent AB-BA deadlocks."""
+    resolved = Path(os.path.realpath(anchor))
+    for cand in (resolved, *resolved.parents):
+        if (cand / "userdata").is_dir() or (cand / "config" / "config.vdf").is_file():
+            return cand
+    return resolved
 
 
 @contextmanager
 def _steam_transaction_lock(anchor: Path):
-    """Acquire both intra-process RLock and cross-process flock per lockfile for Steam VDF mutations."""
-    lock_dir: Path | None = None
-    xdg_runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
-    if xdg_runtime:
-        runtime_path = Path(xdg_runtime)
-        try:
-            if (
-                runtime_path.is_dir()
-                and not runtime_path.is_symlink()
-                and runtime_path.stat().st_uid == os.getuid()
-            ):
-                lock_dir = runtime_path / "deckinstall"
-        except OSError:
-            lock_dir = None
-    if lock_dir is None:
-        lock_dir = Path.home() / ".local" / "state" / "DeckInstall" / "locks"
+    """Acquire both intra-process RLock and cross-process flock per canonical Steam lock anchor."""
+    # Steam Deck Desktop and Gaming Mode must coordinate even with different session environments.
+    lock_dir = Path.home() / ".local" / "state" / "DeckInstall" / "locks"
     lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        os.chmod(lock_dir, 0o700)
-    except OSError:
-        pass
-    anchor_hash = hashlib.sha256(os.path.abspath(anchor).encode("utf-8")).hexdigest()[:16]
+    if lock_dir.is_symlink():
+        raise OSError(f"Refusing symlink lock directory: {lock_dir}")
+    canonical = _canonical_steam_lock_anchor(anchor)
+    anchor_hash = hashlib.sha256(str(canonical).encode("utf-8")).hexdigest()[:16]
     lock_path = lock_dir / f".deckinstall.{anchor_hash}.vdf.lock"
     with _file_lock(lock_path):
         yield
+
+
+@contextmanager
+def _vdf_batch_backup_scope():
+    """Deduplicate _backup_file calls within a single batch apply so pre-batch backups stay intact."""
+    depth = int(getattr(_THREAD_LOCAL, "vdf_batch_backup_depth", 0))
+    if depth == 0:
+        _THREAD_LOCAL.vdf_batch_backed_up = set()
+    _THREAD_LOCAL.vdf_batch_backup_depth = depth + 1
+    try:
+        yield
+    finally:
+        rem = int(getattr(_THREAD_LOCAL, "vdf_batch_backup_depth", 1)) - 1
+        if rem <= 0:
+            _THREAD_LOCAL.vdf_batch_backup_depth = 0
+            _THREAD_LOCAL.vdf_batch_backed_up = None
+        else:
+            _THREAD_LOCAL.vdf_batch_backup_depth = rem
+
+
+def _ci_dict_get(d: dict[Any, Any], key: str, default: Any = "") -> Any:
+    if key in d:
+        return d[key]
+    low = key.lower()
+    for k, v in d.items():
+        if str(k).lower() == low:
+            return v
+    return default
+
+
+def _ci_dict_set_unique(d: dict[Any, Any], canonical_key: str, value: Any) -> None:
+    low = canonical_key.lower()
+    for k in [k for k in d if str(k).lower() == low and k != canonical_key]:
+        del d[k]
+    d[canonical_key] = value
 
 
 @dataclass(frozen=True)
@@ -169,9 +166,8 @@ def _quote_path(path: str) -> str:
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Atomically write bytes to path while holding the global Steam lock."""
-    with _STEAM_LOCK:
-        atomic_write_bytes(path, data)
+    """Atomically write bytes to path."""
+    atomic_write_bytes(path, data)
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -182,6 +178,12 @@ def _atomic_write_text(path: Path, text: str) -> None:
 def _backup_file(path: Path, keep: int = 5, backup_dir: Path | None = None) -> Path | None:
     if path.is_symlink() or not path.is_file():
         return None
+    batch_set: set[Path] | None = getattr(_THREAD_LOCAL, "vdf_batch_backed_up", None)
+    batch_key = Path(os.path.abspath(path))
+    if batch_set is not None and backup_dir is None:
+        if batch_key in batch_set:
+            return None
+        batch_set.add(batch_key)
     dest_dir = backup_dir if backup_dir is not None else path.parent
     dest_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -245,9 +247,9 @@ def load_shortcuts(shortcuts_vdf: Path, *, strict: bool = False) -> list[Shortcu
             if strict:
                 raise ValueError("Invalid shortcut record")
             continue
-        app_name = str(item.get("AppName") or item.get("appname") or "")
-        exe = str(item.get("Exe") or item.get("exe") or "")
-        appid_raw = item.get("appid", 0)
+        app_name = str(_ci_dict_get(item, "AppName", ""))
+        exe = str(_ci_dict_get(item, "Exe", ""))
+        appid_raw = _ci_dict_get(item, "appid", 0)
         if isinstance(appid_raw, int) and not isinstance(appid_raw, bool) and appid_raw != 0:
             appid_u32 = s32_to_u32(appid_raw)
         else:
@@ -258,9 +260,9 @@ def load_shortcuts(shortcuts_vdf: Path, *, strict: bool = False) -> list[Shortcu
                 appid_u32=appid_u32,
                 app_name=app_name,
                 exe=exe,
-                start_dir=str(item.get("StartDir", "")),
-                icon=str(item.get("icon", "")),
-                launch_options=str(item.get("LaunchOptions", "")),
+                start_dir=str(_ci_dict_get(item, "StartDir", "")),
+                icon=str(_ci_dict_get(item, "icon", "")),
+                launch_options=str(_ci_dict_get(item, "LaunchOptions", "")),
             )
         )
     return entries
@@ -462,6 +464,7 @@ def add_or_update_shortcut(
     preserve_from_appid: int | None = None,
     *,
     match_existing_name: bool = True,
+    keep_matching_appid: bool = False,
 ) -> int:
     """Add or update a Non-Steam shortcut and optionally set default Proton.
 
@@ -484,6 +487,23 @@ def add_or_update_shortcut(
             data = {"shortcuts": {}}
 
         shortcuts = data.setdefault("shortcuts", {})
+        if keep_matching_appid and match_existing_name:
+            matching = {
+                aid for item in shortcuts.values()
+                if isinstance(item, dict)
+                and _ci_dict_get(item, "AppName") == app_name
+                and (aid := _entry_appid_u32(item)) is not None
+                and _is_same_game_entry(item, exe_path, start_dir or exe_path.parent)
+            }
+            if len(matching) == 1 and not any(
+                _entry_appid_u32(item) == appid_u32 for item in shortcuts.values() if isinstance(item, dict)
+            ):
+                matched_appid = next(iter(matching))
+                if _other_steam_user_has_shortcut(paths, matched_appid) is False:
+                    appid_u32 = matched_appid
+                    appid_s32 = struct.unpack("<i", struct.pack("<I", appid_u32))[0]
+            # The import can roll back the VDF files without moving another AppID's data.
+            match_existing_name = False
         existing_meta: dict = {}
         stale_appids: list[int] = []
         filtered = []
@@ -509,9 +529,11 @@ def add_or_update_shortcut(
                 continue
             filtered.append(item)
 
-        resolved_icon = str(icon_path) if icon_path is not None else str(existing_meta.get("icon", ""))
+        resolved_icon = str(icon_path) if icon_path is not None else str(_ci_dict_get(existing_meta, "icon", ""))
         resolved_launch = (
-            launch_options if launch_options is not None else str(existing_meta.get("LaunchOptions", ""))
+            launch_options
+            if launch_options is not None
+            else str(_ci_dict_get(existing_meta, "LaunchOptions", ""))
         )
         new_entry = {
             "appid": appid_s32,
@@ -519,33 +541,34 @@ def add_or_update_shortcut(
             "Exe": exe_quoted,
             "StartDir": dir_quoted,
             "icon": resolved_icon,
-            "ShortcutPath": existing_meta.get("ShortcutPath", ""),
+            "ShortcutPath": _ci_dict_get(existing_meta, "ShortcutPath", ""),
             "LaunchOptions": resolved_launch,
-            "IsHidden": existing_meta.get("IsHidden", 0),
-            "AllowDesktopConfig": existing_meta.get("AllowDesktopConfig", 1),
-            "AllowOverlay": existing_meta.get("AllowOverlay", 1),
-            "OpenVR": existing_meta.get("OpenVR", 0),
-            "Devkit": existing_meta.get("Devkit", 0),
-            "DevkitGameID": existing_meta.get("DevkitGameID", ""),
-            "DevkitOverrideAppID": existing_meta.get("DevkitOverrideAppID", 0),
-            "LastPlayTime": existing_meta.get("LastPlayTime", 0),
-            "FlatpakAppID": existing_meta.get("FlatpakAppID", ""),
-            "sortas": existing_meta.get("sortas", ""),
-            "tags": existing_meta.get("tags", {}),
+            "IsHidden": _ci_dict_get(existing_meta, "IsHidden", 0),
+            "AllowDesktopConfig": _ci_dict_get(existing_meta, "AllowDesktopConfig", 1),
+            "AllowOverlay": _ci_dict_get(existing_meta, "AllowOverlay", 1),
+            "OpenVR": _ci_dict_get(existing_meta, "OpenVR", 0),
+            "Devkit": _ci_dict_get(existing_meta, "Devkit", 0),
+            "DevkitGameID": _ci_dict_get(existing_meta, "DevkitGameID", ""),
+            "DevkitOverrideAppID": _ci_dict_get(existing_meta, "DevkitOverrideAppID", 0),
+            "LastPlayTime": _ci_dict_get(existing_meta, "LastPlayTime", 0),
+            "FlatpakAppID": _ci_dict_get(existing_meta, "FlatpakAppID", ""),
+            "sortas": _ci_dict_get(existing_meta, "sortas", ""),
+            "tags": _ci_dict_get(existing_meta, "tags", {}),
         }
         filtered.append(new_entry)
         data["shortcuts"] = {str(i): entry for i, entry in enumerate(filtered)}
         _atomic_write_bytes(paths.shortcuts_vdf, vdf.binary_dumps(data))
 
         if enable_proton:
-            existing_proton = get_shortcut_proton(paths.config_vdf, appid_u32)
+            proton_by_appid = get_compat_tool_map(paths.config_vdf)
+            existing_proton = proton_by_appid.get(appid_u32)
             if not existing_proton:
                 inherited_proton = ""
                 if preserve_from_appid is not None:
-                    inherited_proton = get_shortcut_proton(paths.config_vdf, preserve_from_appid)
+                    inherited_proton = proton_by_appid.get(preserve_from_appid, "")
                 elif stale_appids:
                     for sid in stale_appids:
-                        inherited_proton = get_shortcut_proton(paths.config_vdf, sid)
+                        inherited_proton = proton_by_appid.get(sid, "")
                         if inherited_proton:
                             break
                 target_proton = inherited_proton or find_default_proton_name(paths.steam_root)
@@ -564,12 +587,21 @@ def add_or_update_shortcut(
         shared_stale_ids: set[int] = set()
         if stale_appids:
             other_user_appids: set[int] = set()
+            unreadable_other = False
             for uid in list_steam_users(paths.steam_root):
                 if uid == paths.user_id:
                     continue
                 other_sv = paths.steam_root / "userdata" / uid / "config" / "shortcuts.vdf"
-                other_user_appids.update(e.appid_u32 for e in load_shortcuts(other_sv))
-            shared_stale_ids = {old_id for old_id in stale_appids if old_id in other_user_appids}
+                if other_sv.is_file():
+                    try:
+                        other_user_appids.update(e.appid_u32 for e in load_shortcuts(other_sv, strict=True))
+                    except (OSError, ValueError):
+                        unreadable_other = True
+                        break
+            if unreadable_other:
+                shared_stale_ids = set(stale_appids)
+            else:
+                shared_stale_ids = {old_id for old_id in stale_appids if old_id in other_user_appids}
 
         if preserve_from_appid is None and stale_appids:
             new_compat = paths.compatdata_dir / str(appid_u32)
@@ -581,19 +613,25 @@ def add_or_update_shortcut(
                         new_compat.unlink(missing_ok=True)
                     except OSError:
                         pass
-                if (
-                    old_compat.is_dir()
-                    and not old_compat.is_symlink()
-                    and not (new_compat.exists() or new_compat.is_symlink())
-                ):
-                    try:
-                        new_compat.parent.mkdir(parents=True, exist_ok=True)
-                        if used_by_other:
-                            shutil.copytree(old_compat, new_compat, symlinks=True)
-                        else:
-                            shutil.move(str(old_compat), str(new_compat))
-                    except OSError:
-                        logging.warning("Failed migrating compatdata %s -> %s", old_id, appid_u32)
+                if not (new_compat.exists() or new_compat.is_symlink()):
+                    if old_compat.is_symlink():
+                        try:
+                            link_target = os.readlink(old_compat)
+                            new_compat.parent.mkdir(parents=True, exist_ok=True)
+                            new_compat.symlink_to(link_target)
+                            if not used_by_other:
+                                old_compat.unlink(missing_ok=True)
+                        except OSError:
+                            logging.warning("Failed migrating compatdata symlink %s -> %s", old_id, appid_u32)
+                    elif old_compat.is_dir():
+                        try:
+                            new_compat.parent.mkdir(parents=True, exist_ok=True)
+                            if used_by_other:
+                                shutil.copytree(old_compat, new_compat, symlinks=True)
+                            else:
+                                shutil.move(str(old_compat), str(new_compat))
+                        except OSError:
+                            logging.warning("Failed migrating compatdata %s -> %s", old_id, appid_u32)
                 if paths.grid_dir.is_dir():
                     old_prefix = str(old_id)
                     for art_file in paths.grid_dir.iterdir():
@@ -634,7 +672,7 @@ def update_shortcut_launch_options(
                 continue
             item_u32 = _entry_appid_u32(item)
             if item_u32 is not None and item_u32 == appid_u32:
-                item["LaunchOptions"] = launch_options
+                _ci_dict_set_unique(item, "LaunchOptions", launch_options)
                 updated = True
                 break
         if not updated:
@@ -802,6 +840,18 @@ def _ensure_vdf_section(mapping: Any, key: str) -> Any:
     return _get_vdf_section(mapping, key)
 
 
+_COMPAT_TOOL_SECTIONS = ("InstallConfigStore", "Software", "Valve", "Steam", "CompatToolMapping")
+
+
+def _compat_tool_section(data: Any, *, create: bool = False) -> Any | None:
+    section = data
+    for key in _COMPAT_TOOL_SECTIONS:
+        section = _ensure_vdf_section(section, key) if create else _get_vdf_section(section, key)
+        if section is None:
+            return None
+    return section if hasattr(section, "items") else None
+
+
 def set_compat_tool(
     config_vdf: Path,
     appid_u32: int,
@@ -817,11 +867,8 @@ def set_compat_tool(
             data = getattr(vdf, "VDFDict", dict)()
         else:
             return
-        store = _ensure_vdf_section(data, "InstallConfigStore")
-        software = _ensure_vdf_section(store, "Software")
-        valve = _ensure_vdf_section(software, "Valve")
-        steam = _ensure_vdf_section(valve, "Steam")
-        mapping = _ensure_vdf_section(steam, "CompatToolMapping")
+        mapping = _compat_tool_section(data, create=True)
+        assert mapping is not None
         _vdf_set_unique(
             mapping,
             str(appid_u32),
@@ -840,12 +887,8 @@ def remove_compat_tool(config_vdf: Path, appid_u32: int) -> None:
         if not config_vdf.is_file():
             return
         data = _load_vdf_mapping(config_vdf)
-        mapping = data
-        for sec in ("InstallConfigStore", "Software", "Valve", "Steam", "CompatToolMapping"):
-            mapping = _get_vdf_section(mapping, sec)
-            if mapping is None:
-                return
-        if hasattr(mapping, "items") and _vdf_matching_keys(mapping, str(appid_u32)):
+        mapping = _compat_tool_section(data)
+        if mapping is not None and _vdf_matching_keys(mapping, str(appid_u32)):
             _backup_file(config_vdf)
             _vdf_delete_all(mapping, str(appid_u32))
             _dump_vdf_mapping(config_vdf, data)
@@ -1009,26 +1052,7 @@ def list_compat_tool_usage(paths: SteamPaths) -> list[CompatMappingEntry]:
 
     steam_names = _installed_steam_app_names(paths.steam_root)
     results: list[CompatMappingEntry] = []
-    if not paths.config_vdf.is_file():
-        return results
-    try:
-        data = vdf.loads(paths.config_vdf.read_text(encoding="utf-8", errors="replace"))
-    except Exception:
-        return results
-    mapping = (
-        data.get("InstallConfigStore", {})
-        .get("Software", {})
-        .get("Valve", {})
-        .get("Steam", {})
-        .get("CompatToolMapping", {})
-    )
-    if not isinstance(mapping, dict):
-        return results
-    for k, val in mapping.items():
-        if not (str(k).isascii() and str(k).isdigit()) or not isinstance(val, dict):
-            continue
-        appid = int(k)
-        tool = str(val.get("name") or "")
+    for appid, tool in get_compat_tool_map(paths.config_vdf).items():
         if appid in shortcut_names:
             source, name = "Non-Steam", shortcut_names[appid]
         elif appid in steam_names:
@@ -1053,18 +1077,15 @@ def bulk_migrate_compat_tool(config_vdf: Path, appids: list[int], target_tool: s
             return 0
         _backup_file(config_vdf)
         data = _load_vdf_mapping(config_vdf)
-        store = _ensure_vdf_section(data, "InstallConfigStore")
-        software = _ensure_vdf_section(store, "Software")
-        valve = _ensure_vdf_section(software, "Valve")
-        steam = _ensure_vdf_section(valve, "Steam")
-        mapping = _ensure_vdf_section(steam, "CompatToolMapping")
+        mapping = _compat_tool_section(data, create=True)
+        assert mapping is not None
         updated = 0
         for appid in appids:
             _vdf_set_unique(
                 mapping,
                 str(appid),
                 {
-                    "name": target_tool.strip(),
+                    "name": cleaned,
                     "config": "",
                     "priority": "250",
                 },
@@ -1082,12 +1103,8 @@ def remove_compat_tools(config_vdf: Path, appids: list[int]) -> int:
         if not config_vdf.is_file():
             return 0
         data = _load_vdf_mapping(config_vdf)
-        mapping = data
-        for sec in ("InstallConfigStore", "Software", "Valve", "Steam", "CompatToolMapping"):
-            mapping = _get_vdf_section(mapping, sec)
-            if mapping is None:
-                return 0
-        if not hasattr(mapping, "items"):
+        mapping = _compat_tool_section(data)
+        if mapping is None:
             return 0
         removed = 0
         for appid in appids:
@@ -1186,33 +1203,6 @@ def _raw_shell_tokens(s: str) -> list[str]:
     if cur:
         tokens.append("".join(cur))
     return tokens
-
-
-def _has_proton_mapping(
-    config_vdf: Path, appid_u32: int, expected_tool: str | None = None
-) -> bool:
-    if not config_vdf.is_file():
-        return False
-    try:
-        data = vdf.loads(config_vdf.read_text(encoding="utf-8", errors="replace"))
-        mapping = (
-            data.get("InstallConfigStore", {})
-            .get("Software", {})
-            .get("Valve", {})
-            .get("Steam", {})
-            .get("CompatToolMapping", {})
-        )
-        entry = mapping.get(str(appid_u32))
-        if not isinstance(entry, dict):
-            return False
-        name = str(entry.get("name") or "").strip()
-        if not name:
-            return False
-        if expected_tool:
-            return name == expected_tool
-        return True
-    except Exception:
-        return False
 
 
 def _dir_has_game_exe(directory: Path, max_depth: int = 3) -> bool:
@@ -1870,6 +1860,8 @@ def plan_bulk_migration(
     """Identify Windows .exe shortcuts needing standardization, Proton Stable, or external save import."""
     plan: list[MigrationPlanItem] = []
     games_resolved = games_root.resolve()
+    proton_by_appid = get_compat_tool_map(config_vdf) if config_vdf else {}
+    expected_proton = find_default_proton_name(config_vdf.parent.parent) if config_vdf else None
     for entry in entries:
         exe_path = Path(entry.exe.strip().strip('"'))
         if exe_path.suffix.lower() != ".exe" or not exe_path.is_file():
@@ -1884,10 +1876,9 @@ def plan_bulk_migration(
         already_named = entry.app_name == clean_name and old_root.resolve() == new_root.resolve()
         if already_in_games and already_named:
             steam_appid = detect_steam_appid(old_root)
-            expected_proton = find_default_proton_name(config_vdf.parent.parent) if config_vdf else None
-            needs_proton = bool(
-                config_vdf
-                and not _has_proton_mapping(config_vdf, entry.appid_u32, expected_tool=expected_proton)
+            mapped_tool = proton_by_appid.get(entry.appid_u32)
+            needs_proton = config_vdf is not None and (
+                not mapped_tool or bool(expected_proton and mapped_tool != expected_proton)
             )
             has_pending = _has_pending_external_saves(
                 compatdata_dir, entry.appid_u32, clean_name, steam_appid, search_roots
@@ -2179,29 +2170,11 @@ def _is_prefix_referenced_by_shortcuts(
 
 def _active_compat_tools(config_vdf: Path, active_appids: set[int]) -> set[str]:
     """Return compatibility tool names currently mapped to active games/shortcuts."""
-    used: set[str] = set()
-    if not config_vdf.is_file():
-        return used
-    try:
-        data = vdf.loads(config_vdf.read_text(encoding="utf-8", errors="replace"))
-        mapping = (
-            data.get("InstallConfigStore", {})
-            .get("Software", {})
-            .get("Valve", {})
-            .get("Steam", {})
-            .get("CompatToolMapping", {})
-        )
-        if isinstance(mapping, dict):
-            for k, val in mapping.items():
-                if not (str(k).isascii() and str(k).isdigit()):
-                    continue
-                if int(k) in active_appids and isinstance(val, dict):
-                    tname = str(val.get("name") or "").strip()
-                    if tname:
-                        used.add(tname)
-    except Exception:
-        pass
-    return used
+    return {
+        tname
+        for appid, tname in get_compat_tool_map(config_vdf).items()
+        if appid in active_appids and tname
+    }
 
 
 def _all_user_shortcuts(
@@ -2458,9 +2431,10 @@ def restore_saves_backup(paths: SteamPaths | None, zip_path: Path) -> tuple[int,
     with lock_ctx:
         entries = load_shortcuts(paths.shortcuts_vdf) if paths is not None else []
         active_ids = {str(e.appid_u32) for e in entries}
-        by_exact = {e.app_name: str(e.appid_u32) for e in entries}
+        by_exact: dict[str, str | None] = {}
         norm_counts: dict[str, list[str]] = {}
         for e in entries:
+            by_exact[e.app_name] = None if e.app_name in by_exact else str(e.appid_u32)
             nk = _norm_key(e.app_name)
             if nk:
                 norm_counts.setdefault(nk, []).append(str(e.appid_u32))
@@ -2468,7 +2442,8 @@ def restore_saves_backup(paths: SteamPaths | None, zip_path: Path) -> tuple[int,
 
         standalone_games = list_standalone_games()
         standalone_by_key: dict[str, Path] = {}
-        standalone_by_exact: dict[str, Path] = {}
+        standalone_names: dict[str, str] = {}
+        standalone_by_exact: dict[str, Path | None] = {}
         standalone_norm_counts: dict[str, list[Path]] = {}
         for sgame in standalone_games:
             slug_base = re.sub(r"[^a-zA-Z0-9._-]+", "-", sgame.game_dir.name).strip("-") or "game"
@@ -2478,7 +2453,8 @@ def restore_saves_backup(paths: SteamPaths | None, zip_path: Path) -> tuple[int,
                 skey = f"standalone-{slug_base}-{idx}"
                 idx += 1
             standalone_by_key[skey] = sgame.prefix_dir
-            standalone_by_exact[sgame.name] = sgame.prefix_dir
+            standalone_names[skey] = sgame.name
+            standalone_by_exact[sgame.name] = None if sgame.name in standalone_by_exact else sgame.prefix_dir
             snk = _norm_key(sgame.name)
             if snk:
                 standalone_norm_counts.setdefault(snk, []).append(sgame.prefix_dir)
@@ -2494,6 +2470,7 @@ def restore_saves_backup(paths: SteamPaths | None, zip_path: Path) -> tuple[int,
         restored_files = 0
         total_bytes = 0
         backed_up_targets: set[Path] = set()
+        trusted_pfx = {p.resolve() for p in standalone_by_key.values() if p.exists()}
         with zipfile.ZipFile(zip_path, "r") as zf:
             infolist = zf.infolist()
             if len(infolist) > _RESTORE_MAX_ENTRIES:
@@ -2535,21 +2512,38 @@ def restore_saves_backup(paths: SteamPaths | None, zip_path: Path) -> tuple[int,
                 if info.file_size > _RESTORE_MAX_FILE_BYTES:
                     raise RuntimeError(f"Backup file too large: {info.filename}")
 
+                mapped_standalone: Path | None = None
+                mapped_steam_appid: str | None = None
                 if prefix_key.isascii() and prefix_key.isdigit():
-                    if paths is None or compat_root_resolved is None:
-                        continue
-                    appid_str = prefix_key
-                    if appid_str not in active_ids:
-                        if manifest:
-                            old_name = manifest.get(appid_str, "")
-                            mapped = by_exact.get(old_name) or by_norm.get(_norm_key(old_name))
-                            if not mapped:
-                                continue
-                            appid_str = mapped
-                        else:
-                            continue
-                    compat_candidate = paths.compatdata_dir / appid_str
-                    trusted_pfx = {p.resolve() for p in standalone_by_key.values() if p.exists()}
+                    if paths is not None and compat_root_resolved is not None:
+                        if prefix_key in active_ids:
+                            mapped_steam_appid = prefix_key
+                        elif manifest:
+                            old_name = manifest.get(prefix_key, "")
+                            mapped_steam_appid = by_exact.get(old_name) or by_norm.get(_norm_key(old_name))
+                    if mapped_steam_appid is None and manifest:
+                        old_name = manifest.get(prefix_key, "")
+                        mapped_standalone = standalone_by_exact.get(old_name) or standalone_by_norm.get(
+                            _norm_key(old_name)
+                        )
+                elif prefix_key.startswith("standalone-"):
+                    old_name = manifest.get(prefix_key, "")
+                    sprefix = standalone_by_key.get(prefix_key)
+                    if old_name and standalone_names.get(prefix_key) != old_name:
+                        sprefix = standalone_by_exact.get(old_name) or standalone_by_norm.get(_norm_key(old_name))
+                    mapped_standalone = sprefix
+                    if (
+                        mapped_standalone is None
+                        and manifest
+                        and paths is not None
+                        and compat_root_resolved is not None
+                    ):
+                        mapped_steam_appid = by_exact.get(old_name) or by_norm.get(_norm_key(old_name))
+                else:
+                    continue
+
+                if mapped_steam_appid is not None and paths is not None and compat_root_resolved is not None:
+                    compat_candidate = paths.compatdata_dir / mapped_steam_appid
                     layout = _resolve_prefix_drive_c_layout(compat_candidate, trusted_pfx)
                     if layout is not None:
                         target_prefix, target_root_resolved, pfx_rel = layout
@@ -2562,18 +2556,12 @@ def restore_saves_backup(paths: SteamPaths | None, zip_path: Path) -> tuple[int,
                         target_root_resolved = compat_root_resolved
                         target_prefix = compat_candidate
                         pfx_rel = ("pfx", "drive_c")
-                        prefix_rel = (appid_str, *pfx_rel, section, *rel_parts[:-1])
-                    game_id_key = appid_str
-                elif prefix_key.startswith("standalone-"):
-                    sprefix = standalone_by_key.get(prefix_key)
-                    if sprefix is None and manifest:
-                        old_name = manifest.get(prefix_key, "")
-                        sprefix = standalone_by_exact.get(old_name) or standalone_by_norm.get(
-                            _norm_key(old_name)
-                        )
-                    if sprefix is None or not sprefix.is_dir() or sprefix.is_symlink():
+                        prefix_rel = (mapped_steam_appid, *pfx_rel, section, *rel_parts[:-1])
+                    game_id_key = mapped_steam_appid
+                elif mapped_standalone is not None:
+                    if not mapped_standalone.is_dir() or mapped_standalone.is_symlink():
                         continue
-                    layout = _resolve_prefix_drive_c_layout(sprefix)
+                    layout = _resolve_prefix_drive_c_layout(mapped_standalone)
                     if layout is None:
                         continue
                     target_prefix, target_root_resolved, pfx_rel = layout
@@ -2701,22 +2689,16 @@ def get_compat_tool_map(config_vdf: Path) -> dict[int, str]:
     if not config_vdf.is_file():
         return {}
     try:
-        data = vdf.loads(config_vdf.read_text(encoding="utf-8", errors="replace"))
-        mapping = (
-            data.get("InstallConfigStore", {})
-            .get("Software", {})
-            .get("Valve", {})
-            .get("Steam", {})
-            .get("CompatToolMapping", {})
-        )
+        data = _load_vdf_mapping(config_vdf)
     except Exception:
         return {}
-    if not isinstance(mapping, dict):
+    mapping = _compat_tool_section(data)
+    if mapping is None:
         return {}
     out: dict[int, str] = {}
     for k, val in mapping.items():
-        if str(k).isascii() and str(k).isdigit() and isinstance(val, dict):
-            name = str(val.get("name") or "").strip()
+        if str(k).isascii() and str(k).isdigit() and hasattr(val, "items"):
+            name = str(_get_vdf_section(val, "name") or "").strip()
             if name:
                 out[int(k)] = name
     return out
@@ -2972,6 +2954,7 @@ def apply_launch_presets(
     proton_wayland: bool = False,
     mangohud_position: str = "",
     mangohud_fps_limit: int | None = None,
+    preserve_mangohud_config: bool = False,
 ) -> str:
     """Toggle common SteamOS/Proton launch presets while preserving existing custom options."""
     _validate_launch_options(launch_options)
@@ -2990,15 +2973,16 @@ def apply_launch_presets(
 
     # Strip existing managed presets
     filtered: list[str] = []
-    for tok in tokens:
+    command_idx = tokens.index("%command%") if "%command%" in tokens else len(tokens)
+    for idx, tok in enumerate(tokens):
         if tok == "gamemoderun":
             continue
-        if mangohud and tok == "mangohud":
+        if idx < command_idx and not mangohud and tok == "mangohud":
             continue
         if _is_env_assignment(tok):
             env_key, env_val = tok.split("=", 1)
             if env_key == "MANGOHUD_CONFIG":
-                if (
+                if not preserve_mangohud_config and (
                     not mangohud
                     or bool(mh_parts)
                     or _is_managed_mangohud_config(env_val)
@@ -3024,8 +3008,9 @@ def apply_launch_presets(
 
     preset_envs: list[str] = []
     if mangohud:
-        preset_envs.append("MANGOHUD=1")
-        if mh_parts:
+        if "mangohud" not in wrappers_before:
+            preset_envs.append("MANGOHUD=1")
+        if mh_parts and not preserve_mangohud_config:
             preset_envs.append(f"MANGOHUD_CONFIG={','.join(mh_parts)}")
     if wined3d:
         preset_envs.append("PROTON_USE_WINED3D=1")
@@ -3057,7 +3042,7 @@ def apply_launch_presets(
     return " ".join(_format_launch_token(tok) for tok in final_tokens)
 
 
-_MOUNT_CONTAINER_PREFIXES = frozenset({"/", "/run", "/run/media", "/media", "/mnt"})
+_MOUNT_CONTAINER_PREFIXES = frozenset({"/", "/run", "/run/media", "/media", "/mnt", "/var/mnt"})
 
 
 def _is_path_on_mounted_volume(path: Path, mount_root: Path | None = None) -> bool:
@@ -3083,11 +3068,25 @@ def list_microsd_compatdata_targets(
     media_root: Path | None = None,
     steam_root: Path | None = None,
 ) -> list[Path]:
-    """Return candidate compatdata directories on mounted microSD/removable volumes."""
-    root = media_root or Path("/run/media")
+    """Return candidate compatdata directories on Unix-capable mounted removable volumes."""
+    search_roots = (
+        [media_root]
+        if media_root is not None
+        else [Path("/run/media"), Path("/media"), Path("/mnt"), Path("/var/mnt")]
+    )
     skip_names = {"lost+found", "System Volume Information"}
     volume_roots: list[Path] = []
-    if root.is_dir() and not root.is_symlink():
+    seen_roots: set[Path] = set()
+    for root in search_roots:
+        if not root.is_dir():
+            continue
+        try:
+            rroot = root.resolve()
+        except OSError:
+            rroot = root
+        if rroot in seen_roots:
+            continue
+        seen_roots.add(rroot)
         try:
             entries = sorted(root.iterdir(), key=lambda p: p.name)
         except OSError:
@@ -3132,13 +3131,15 @@ def list_microsd_compatdata_targets(
     targets: list[Path] = []
     seen: set[Path] = set()
     for vol in volume_roots:
+        if fs_type_of(vol).lower() in NON_UNIX_FS:
+            continue
         target = (
             vol / "steamapps" / "compatdata"
             if (vol / "steamapps").is_dir()
             else vol / "DeckInstall" / "compatdata"
         )
         try:
-            key = Path(os.path.abspath(target))
+            key = Path(os.path.realpath(target))
         except OSError:
             key = target
         if key not in seen:
@@ -3207,10 +3208,15 @@ def migrate_compatdata_to_microsd(
             raise FileNotFoundError(f"compatdata/{appid_u32} does not exist: {src_compat}")
         if target_compat_root.resolve().is_relative_to(src_compat.resolve()):
             raise ValueError("Migration destination cannot be inside the source prefix")
+        probe = target_compat_root
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        fstype = fs_type_of(probe)
+        if fstype.lower() in NON_UNIX_FS:
+            raise ValueError(
+                f"Target filesystem '{fstype}' does not support Wine symlinks/permissions: {target_compat_root}"
+            )
         if verify_mounted:
-            probe = target_compat_root
-            while not probe.exists() and probe != probe.parent:
-                probe = probe.parent
             if not _is_path_on_mounted_volume(probe):
                 raise ValueError(f"Target is not on a mounted volume: {target_compat_root}")
         target_compat_root.mkdir(parents=True, exist_ok=True)
@@ -3226,13 +3232,16 @@ def migrate_compatdata_to_microsd(
         )
         staged_compat = stage_dir / str(appid_u32)
         backup_local = paths.compatdata_dir / f".{appid_u32}.{int(time.time())}.{os.getpid()}.migrate.bak"
+        moved_to_dst = False
         try:
             shutil.copytree(src_compat, staged_compat, symlinks=True)
             _verify_compatdata_copy(src_compat, staged_compat)
             staged_compat.rename(dst_compat)
+            moved_to_dst = True
         except Exception:
             shutil.rmtree(stage_dir, ignore_errors=True)
-            shutil.rmtree(dst_compat, ignore_errors=True)
+            if moved_to_dst:
+                shutil.rmtree(dst_compat, ignore_errors=True)
             raise
         try:
             stage_dir.rmdir()

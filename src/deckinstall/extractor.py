@@ -18,8 +18,8 @@ from collections import deque
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
-from . import runtime_manager
-from .fsutil import copy_dir_no_symlinks, move_dir_safely
+from . import library, runtime_manager
+from .fsutil import _safe_chmod, copy_dir_no_symlinks, move_dir_safely
 from .scanner import clean_game_name
 from .steam_paths import find_proton_binary, find_steam_root
 
@@ -138,7 +138,7 @@ def _select_extract_cmd(archive: Path, out_dir: Path) -> list[str]:
     low = arc.name.lower()
     tar_exts = (".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.zst", ".tar.bz2", ".tar")
     if any(low.endswith(ext) for ext in tar_exts) and shutil.which("tar"):
-        return ["tar", "--no-same-owner", "--no-same-permissions", "-xf", str(arc), "-C", str(out_dir)]
+        return ["tar", "--force-local", "--no-same-owner", "--no-same-permissions", "-xf", str(arc), "-C", str(out_dir)]
     if low.endswith((".rar", ".part1.rar", ".rar.001")) and shutil.which("unrar"):
         return ["unrar", "x", "-o+", "-y", "-p-", "--", str(arc), str(out_dir) + "/"]
     if low.endswith(".zip") and shutil.which("unzip"):
@@ -260,6 +260,9 @@ def _extract_zip_safe(
                         if total_written > max_total:
                             raise _too_big_error(total_written)
                         dst.write(chunk)
+                mode = info.external_attr >> 16
+                if info.create_system == 3 and mode & 0o111:
+                    _safe_chmod(target_path, (target_path.stat().st_mode & 0o666) | (mode & 0o111))
             if on_progress:
                 pct = min(95, 10 + int(((idx + 1) * 85) / total_entries))
                 on_progress(pct, f"Extracting {archive.name}...")
@@ -441,7 +444,7 @@ def _precheck_tar_cli_archive(tar_bin: str, archive: Path) -> int:
     max_file, max_total = _archive_limits(archive)
     try:
         proc = subprocess.run(
-            [tar_bin, "-tvf", str(archive)],
+            [tar_bin, "--force-local", "-tvf", str(archive)],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -767,7 +770,21 @@ def _drain_stream_lines(
     cancel_msg: str,
 ) -> int:
     """Read subprocess stdout non-blockingly so cancel_flag is checked every <=0.2s."""
-    return runtime_manager.drain_stream_lines(proc, cancel_flag, on_line, cancel_msg)
+    try:
+        return runtime_manager.drain_stream_lines(proc, cancel_flag, on_line, cancel_msg)
+    finally:
+        if proc.poll() is None and isinstance(getattr(proc, "pid", None), int):
+            runtime_manager.kill_proc_group(proc, signal.SIGTERM)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                runtime_manager.kill_proc_group(proc, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    logging.warning("Installer or extractor did not exit after SIGKILL (PID=%s)", proc.pid)
+        if proc.stdout is not None and hasattr(proc.stdout, "close"):
+            proc.stdout.close()
 
 
 def extract_archive(
@@ -835,21 +852,7 @@ def extract_archive(
                 if on_progress:
                     on_progress(pct, clean[:120] or f"Extracting {archive.name}...")
 
-            try:
-                rc = _drain_stream_lines(proc, cancel_flag, _handle_line, "Extraction cancelled by user.")
-            finally:
-                if proc.poll() is None and isinstance(getattr(proc, "pid", None), int):
-                    try:
-                        os.killpg(proc.pid, signal.SIGTERM)
-                        proc.wait(timeout=2)
-                    except (OSError, subprocess.TimeoutExpired):
-                        try:
-                            proc.kill()
-                            proc.wait(timeout=2)
-                        except (OSError, subprocess.TimeoutExpired):
-                            pass
-                if proc.stdout is not None and hasattr(proc.stdout, "close"):
-                    proc.stdout.close()
+            rc = _drain_stream_lines(proc, cancel_flag, _handle_line, "Extraction cancelled by user.")
             if rc != 0:
                 detail = f": {' | '.join(tail_lines)}" if tail_lines else ""
                 raise RuntimeError(f"Failed to extract {archive.name} (code {rc}){detail}.")
@@ -1024,11 +1027,9 @@ def isolate_installer_prefix(wine_pfx: Path, drives: dict[str, Path], home: Path
 
 def _installer_prefix_parent(target_dir: Path) -> Path:
     """Folder for the throwaway installer prefix; never on exFAT/FAT/NTFS, where Wine cannot run."""
-    from .library import NON_UNIX_FS, PREFIXES, fs_type_of, internal_library_root
-
     parent = target_dir.parent
-    if fs_type_of(parent).lower() in NON_UNIX_FS:
-        parent = internal_library_root() / PREFIXES
+    if library.fs_type_of(parent).lower() in library.NON_UNIX_FS:
+        parent = library.internal_library_root() / library.PREFIXES
     parent.mkdir(parents=True, exist_ok=True)
     return parent
 
@@ -1184,7 +1185,7 @@ def run_windows_installer(
     their installer prefix is discarded. Other installers keep it as .deckinstall_installer_pfx
     (adopted when added to Steam).
     """
-    data_size = _repack_data_size(installer_exe) if repack else installer_exe.stat().st_size
+    data_size = _repack_data_size(installer_exe) if repack else _installer_data_size(installer_exe)
     check_disk_space(target_dir, max(data_size * 2, 512 * 1024 * 1024))
     keep = (not repack) if keep_prefix is None else keep_prefix
     args = [] if repack else installer_arguments(installer_exe, target_dir)
@@ -1195,7 +1196,10 @@ def run_windows_installer(
     watch_roots = _installed_elsewhere_roots(target_dir)
     dirs_before = _child_dirs(watch_roots)
     started = time.time()
-    with tempfile.TemporaryDirectory(prefix="deckinstall_pfx_", dir=str(_installer_prefix_parent(target_dir))) as tmp:
+    prefix_parent = _installer_prefix_parent(target_dir)
+    if prefix_parent.stat().st_dev != target_dir.stat().st_dev:
+        check_disk_space(prefix_parent, 512 * 1024 * 1024)
+    with tempfile.TemporaryDirectory(prefix="deckinstall_pfx_", dir=str(prefix_parent)) as tmp:
         tmp_pfx = Path(tmp)
         cmd, env, inst_pfx = _installer_command(installer_exe, args, tmp_pfx, on_log, cancel_flag)
         if repack:
@@ -1237,21 +1241,7 @@ def run_windows_installer(
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        try:
-            rc = _drain_stream_lines(proc, cancel_flag, _handle_inst_line, "Installer cancelled by user.")
-        finally:
-            if proc.poll() is None and isinstance(getattr(proc, "pid", None), int):
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                    proc.wait(timeout=2)
-                except (OSError, subprocess.TimeoutExpired):
-                    try:
-                        proc.kill()
-                        proc.wait(timeout=2)
-                    except (OSError, subprocess.TimeoutExpired):
-                        pass
-            if proc.stdout is not None and hasattr(proc.stdout, "close"):
-                proc.stdout.close()
+        rc = _drain_stream_lines(proc, cancel_flag, _handle_inst_line, "Installer cancelled by user.")
         leaked = unsafe_prefix_drives(inst_pfx)
         if leaked:
             logging.warning("Installer prefix drives reached / or home after the run: %s", ", ".join(leaked))
@@ -1272,14 +1262,18 @@ def run_windows_installer(
             if not moved and not _adopt_from_drive_c(inst_pfx / "drive_c", target_dir):
                 raise RuntimeError(f"No files were installed in {target_dir}.")
         game_root = game_root_from_new_files(target_dir, _collect_regular_files(target_dir) - pre_existing)
-        saved_pfx = target_dir / ".deckinstall_installer_pfx"
-        if keep and (inst_pfx / "drive_c").is_dir() and not inst_pfx.is_symlink():
-            if saved_pfx.is_symlink():
-                saved_pfx.unlink()
-            elif saved_pfx.exists():
-                shutil.rmtree(saved_pfx, ignore_errors=True)
+        saved_pfx = game_root / ".deckinstall_installer_pfx"
+        if (
+            keep
+            and (inst_pfx / "drive_c").is_dir()
+            and not inst_pfx.is_symlink()
+            and library.fs_type_of(game_root).lower() not in library.NON_UNIX_FS
+        ):
             if not saved_pfx.exists() and not saved_pfx.is_symlink():
-                copy_dir_no_symlinks(inst_pfx, saved_pfx)
+                with tempfile.TemporaryDirectory(prefix=".deckinstall-prefix-", dir=game_root) as staging:
+                    staged = Path(staging) / "prefix"
+                    copy_dir_no_symlinks(inst_pfx, staged)
+                    os.rename(staged, saved_pfx)
     return game_root
 
 
@@ -1384,9 +1378,8 @@ def extract_gog_installer(
 
 def _is_gog_linux_installer(script: Path) -> bool:
     try:
-        return zipfile.is_zipfile(script) and any(
-            n.startswith("data/noarch/") for n in zipfile.ZipFile(script).namelist()[:2000]
-        )
+        with zipfile.ZipFile(script) as archive:
+            return any(name.startswith(("data/noarch/", "data/x86_64/")) for name in archive.namelist())
     except (OSError, zipfile.BadZipFile):
         return False
 
@@ -1411,14 +1404,17 @@ def install_native_sh(
         with tempfile.TemporaryDirectory(prefix="deckinstall_sh_", dir=str(dest_root)) as tmp:
             tmp_path = Path(tmp)
             _extract_zip_safe(script, tmp_path, on_progress=on_progress, cancel_flag=cancel_flag)
-            root = tmp_path / "data" / "noarch"
+            data = tmp_path / "data"
+            root = data / "noarch"
+            if (data / "x86_64").is_dir():
+                _merge_staging_dir(data / "x86_64", root)
             if on_progress:
                 on_progress(96, "Organizing files...")
             _strip_symlinks_and_specials(root)
             _unwrap_single_folder(root, final_dir)
         start = final_dir / "start.sh"
         if start.is_file():
-            start.chmod(start.stat().st_mode | stat.S_IXUSR)
+            _safe_chmod(start, start.stat().st_mode | stat.S_IXUSR)
         if on_progress:
             on_progress(100, f"Completed in {final_dir}")
         return final_dir

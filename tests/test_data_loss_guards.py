@@ -67,13 +67,21 @@ def test_move_dir_safely_copy_failure_leaves_source_intact(tmp_path: Path) -> No
     src = tmp_path / "src"
     src.mkdir()
     (src / "save.dat").write_bytes(b"data")
+    dst = tmp_path / "dst"
+
+    def fail_after_creating_partial_copy(_src: Path, staged: Path, **_kwargs: object) -> None:
+        staged.mkdir()
+        (staged / "save.dat").write_bytes(b"partial")
+        raise OSError(errno.ENOSPC, "disk full")
+
     with (
         mock.patch.object(fsutil.os, "rename", side_effect=_exdev),
-        mock.patch.object(fsutil.shutil, "copytree", side_effect=OSError("disk full")),
+        mock.patch.object(fsutil.shutil, "copytree", side_effect=fail_after_creating_partial_copy),
         pytest.raises(OSError),
     ):
-        fsutil.move_dir_safely(src, tmp_path / "dst")
+        fsutil.move_dir_safely(src, dst)
     assert (src / "save.dat").read_bytes() == b"data"
+    assert list(tmp_path.iterdir()) == [src]
 
 
 # --- Standalone prefix collision -------------------------------------------------------

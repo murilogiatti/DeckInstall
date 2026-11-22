@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
-from contextlib import ExitStack
+import threading
+from contextlib import ExitStack, nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, cast, get_args
@@ -13,7 +14,9 @@ from .fsutil import atomic_write_text
 from .steam_paths import SteamPaths, list_steam_users
 from .steam_vdf import (
     _backup_file,
+    _file_lock,
     _steam_transaction_lock,
+    _vdf_batch_backup_scope,
     add_or_update_shortcut,
     bulk_migrate_compat_tool,
     remove_orphan_shortcut_mappings,
@@ -39,6 +42,13 @@ VdfEditOp = Literal[
 _COALESCIBLE_OPS = frozenset({"set_proton", "set_launch_options", "set_app_launch_options"})
 _KNOWN_OPS = frozenset(get_args(VdfEditOp))
 QUEUE_FILE_VERSION = 1
+
+
+def _coalescing_key(edit: QueuedVdfEdit) -> tuple[str, int, str, str]:
+    root = edit.payload.get("steam_root")
+    steam_root = str(Path(root)) if isinstance(root, str) and root else ""
+    user = str(edit.payload.get("user_id") or "") if edit.op != "set_proton" else ""
+    return edit.op, edit.appid_u32, steam_root, user
 
 
 def default_queue_file() -> Path:
@@ -73,10 +83,18 @@ class VdfEditQueue:
     """
 
     def __init__(self, store_path: Path | None = None) -> None:
+        self._lock = threading.RLock()
+        self._apply_lock = threading.Lock()
         self._queue: list[QueuedVdfEdit] = []
         self._store_path = store_path
         if store_path is not None:
-            self._queue = _load_edits(store_path)
+            with self._store_lock():
+                self._queue = _load_edits(store_path)
+
+    def _store_lock(self):
+        if self._store_path is None:
+            return nullcontext()
+        return _file_lock(self._store_path.with_suffix(".lock"))
 
     def _save(self) -> None:
         if self._store_path is None:
@@ -93,79 +111,117 @@ class VdfEditQueue:
     def reload(self) -> None:
         """Re-read the queue file (another DeckInstall instance may have changed it)."""
         if self._store_path is not None:
-            self._queue = _load_edits(self._store_path)
+            with self._lock, self._store_lock():
+                self._queue = _load_edits(self._store_path)
 
     def enqueue(self, edit: QueuedVdfEdit) -> None:
         """Add an edit to the queue, coalescing set_proton/set_launch_options by (op, appid_u32)."""
-        if edit.op in _COALESCIBLE_OPS:
-            self._queue = [
-                existing
-                for existing in self._queue
-                if not (existing.op == edit.op and existing.appid_u32 == edit.appid_u32)
-            ]
-        else:
-            self._queue = [
-                existing for existing in self._queue if existing.edit_id != edit.edit_id
-            ]
-        self._queue.append(edit)
-        self._save()
+        with self._lock, self._store_lock():
+            if self._store_path is not None:
+                self._queue = _load_edits(self._store_path)
+            if edit.op in _COALESCIBLE_OPS:
+                key = _coalescing_key(edit)
+                self._queue = [
+                    existing for existing in self._queue if _coalescing_key(existing) != key
+                ]
+            else:
+                self._queue = [
+                    existing for existing in self._queue if existing.edit_id != edit.edit_id
+                ]
+            self._queue.append(edit)
+            self._save()
 
     def remove(self, edit_id: str) -> bool:
         """Remove a queued edit by edit_id. Returns True if an entry was removed."""
-        before = len(self._queue)
-        self._queue = [edit for edit in self._queue if edit.edit_id != edit_id]
-        removed = len(self._queue) < before
-        if removed:
-            self._save()
-        return removed
+        with self._lock, self._store_lock():
+            if self._store_path is not None:
+                self._queue = _load_edits(self._store_path)
+            before = len(self._queue)
+            self._queue = [edit for edit in self._queue if edit.edit_id != edit_id]
+            removed = len(self._queue) < before
+            if removed:
+                self._save()
+            return removed
 
     def clear(self) -> None:
         """Discard all pending edits."""
-        self._queue.clear()
-        self._save()
+        with self._lock, self._store_lock():
+            self._queue.clear()
+            self._save()
 
     def pending_count(self) -> int:
         """Return the number of queued edits."""
-        return len(self._queue)
+        with self._lock:
+            return len(self._queue)
 
     def list_pending(self) -> list[QueuedVdfEdit]:
         """Return a shallow copy of pending edits in queue order."""
-        return list(self._queue)
+        with self._lock:
+            return list(self._queue)
 
     def apply_all(self, paths: SteamPaths) -> BatchApplyResult:
         """Apply all queued edits under a single transaction lock and single backup pass."""
-        if not self._queue:
+        apply_lock = (
+            _file_lock(self._store_path.with_suffix(".apply.lock"))
+            if self._store_path is not None
+            else self._apply_lock
+        )
+        with apply_lock:
+            return self._apply_batch(paths)
+
+    def _apply_batch(self, paths: SteamPaths) -> BatchApplyResult:
+        self.reload()
+        with self._lock:
+            batch = list(self._queue)
+        if not batch:
             return BatchApplyResult(applied=0, errors=[])
 
         applied = 0
         errors: list[str] = []
-        remaining: list[QueuedVdfEdit] = []
+        succeeded: list[QueuedVdfEdit] = []
 
         anchors = {paths.shortcuts_vdf, paths.config_vdf}
-        if any(e.op == "set_app_launch_options" for e in self._queue):
+        if any(e.op == "set_app_launch_options" for e in batch):
             anchors.add(paths.localconfig_vdf)
-        for edit in self._queue:
-            if edit.op in ("update_shortcut_paths", "add_installed_game"):
+        for edit in batch:
+            if "user_id" in edit.payload or "steam_root" in edit.payload:
                 try:
-                    anchors.add(self._account_paths(paths, edit.payload).shortcuts_vdf)
+                    anchors.add(self._resolve_edit_paths(paths, edit.payload).shortcuts_vdf)
                 except (KeyError, OSError, ValueError):
                     pass  # Dispatch reports invalid edits and keeps them in the queue.
         with ExitStack() as locks:
             for anchor in sorted(anchors):
                 locks.enter_context(_steam_transaction_lock(anchor))
+            locks.enter_context(_vdf_batch_backup_scope())
             _backup_file(paths.shortcuts_vdf)
             _backup_file(paths.config_vdf)
+            if any(e.op == "set_app_launch_options" for e in batch) and getattr(paths, "localconfig_vdf", None):
+                _backup_file(paths.localconfig_vdf)
 
-            for edit in self._queue:
+            for edit in batch:
                 try:
                     self._dispatch_edit(paths, edit)
                     applied += 1
+                    succeeded.append(edit)
                 except Exception as exc:
                     errors.append(f"{edit.label}: {exc}")
-                    remaining.append(edit)
 
-        self._queue = remaining
-        self._save()
+        with self._lock, self._store_lock():
+            if self._store_path is not None:
+                self._queue = _load_edits(self._store_path)
+            remaining: list[QueuedVdfEdit] = []
+            for current in self._queue:
+                if any(
+                    done.edit_id == current.edit_id
+                    and done.op == current.op
+                    and done.appid_u32 == current.appid_u32
+                    and done.payload == current.payload
+                    for done in succeeded
+                ):
+                    continue
+                remaining.append(current)
+            self._queue = remaining
+            self._save()
         return BatchApplyResult(applied=applied, errors=errors)
 
     @staticmethod
@@ -182,20 +238,47 @@ class VdfEditQueue:
                        shortcuts_vdf=userdata / "config" / "shortcuts.vdf", grid_dir=userdata / "config" / "grid")
 
     @staticmethod
+    def _resolve_edit_paths(paths: SteamPaths, payload: dict[str, Any]) -> SteamPaths:
+        raw_root = payload.get("steam_root")
+        if raw_root:
+            if Path(str(raw_root)).resolve() != paths.steam_root.resolve():
+                raise ValueError("The shortcut belongs to another Steam installation")
+        raw_user = payload.get("user_id")
+        if not raw_user:
+            return paths
+        account = str(raw_user)
+        if account == paths.user_id:
+            return paths
+        if account not in list_steam_users(paths.steam_root):
+            raise ValueError("The Steam account for this shortcut is unavailable")
+        userdata = paths.steam_root / "userdata" / account
+        return replace(
+            paths,
+            user_id=account,
+            userdata_dir=userdata,
+            shortcuts_vdf=userdata / "config" / "shortcuts.vdf",
+            grid_dir=userdata / "config" / "grid",
+        )
+
+    @staticmethod
     def _dispatch_edit(paths: SteamPaths, edit: QueuedVdfEdit) -> None:
         payload = edit.payload
         if edit.op == "set_proton":
+            target_paths = VdfEditQueue._resolve_edit_paths(paths, payload)
             tool_name = str(payload.get("tool_name") or payload.get("proton_name") or "")
-            set_shortcut_proton(paths.config_vdf, edit.appid_u32, tool_name)
+            set_shortcut_proton(target_paths.config_vdf, edit.appid_u32, tool_name)
         elif edit.op == "set_launch_options":
+            target_paths = VdfEditQueue._resolve_edit_paths(paths, payload)
             launch_options = str(payload.get("launch_options", ""))
-            if not update_shortcut_launch_options(paths, edit.appid_u32, launch_options):
+            if not update_shortcut_launch_options(target_paths, edit.appid_u32, launch_options):
                 raise RuntimeError(f"Atalho {edit.appid_u32} não encontrado em shortcuts.vdf")
         elif edit.op == "set_app_launch_options":
+            target_paths = VdfEditQueue._resolve_edit_paths(paths, payload)
             launch_options = str(payload.get("launch_options", ""))
-            if not set_steam_app_launch_options(paths, edit.appid_u32, launch_options):
+            if not set_steam_app_launch_options(target_paths, edit.appid_u32, launch_options):
                 raise RuntimeError(f"localconfig.vdf ausente para o jogo {edit.appid_u32}")
         elif edit.op == "bulk_migrate_compat":
+            target_paths = VdfEditQueue._resolve_edit_paths(paths, payload)
             raw_appids = payload.get("appids")
             appids = (
                 [int(a) for a in raw_appids]
@@ -203,22 +286,24 @@ class VdfEditQueue:
                 else ([edit.appid_u32] if edit.appid_u32 else [])
             )
             target_tool = str(payload.get("target_tool") or payload.get("tool_name") or "")
-            bulk_migrate_compat_tool(paths.config_vdf, appids, target_tool)
+            bulk_migrate_compat_tool(target_paths.config_vdf, appids, target_tool)
         elif edit.op == "remove_compat":
+            target_paths = VdfEditQueue._resolve_edit_paths(paths, payload)
             raw_appids = payload.get("appids")
             appids = (
                 [int(a) for a in raw_appids]
                 if raw_appids is not None
                 else ([edit.appid_u32] if edit.appid_u32 else [])
             )
-            remove_orphan_shortcut_mappings(paths, appids)
+            remove_orphan_shortcut_mappings(target_paths, appids)
         elif edit.op == "remove_shortcut":
-            if not remove_shortcut(paths, edit.appid_u32):
+            target_paths = VdfEditQueue._resolve_edit_paths(paths, payload)
+            if not remove_shortcut(target_paths, edit.appid_u32):
                 raise RuntimeError(f"Atalho {edit.appid_u32} não encontrado em shortcuts.vdf")
         elif edit.op == "update_shortcut_paths":
-            paths = VdfEditQueue._account_paths(paths, payload)
+            target_paths = VdfEditQueue._account_paths(paths, payload)
             if not update_shortcut_paths(
-                paths,
+                target_paths,
                 edit.appid_u32,
                 Path(payload["exe_path"]),
                 Path(payload["start_dir"]),
@@ -229,9 +314,10 @@ class VdfEditQueue:
         elif edit.op == "add_installed_game":
             from .standalone import add_installed_game_to_steam
 
-            paths = VdfEditQueue._account_paths(paths, payload)
-            add_installed_game_to_steam(paths, Path(payload["game_dir"]), payload["uid"])
+            target_paths = VdfEditQueue._account_paths(paths, payload)
+            add_installed_game_to_steam(target_paths, Path(payload["game_dir"]), payload["uid"])
         elif edit.op == "add_or_update_shortcut":
+            target_paths = VdfEditQueue._resolve_edit_paths(paths, payload)
             app_name = str(payload.get("app_name") or edit.label)
             exe_path = Path(payload["exe_path"])
             raw_start = payload.get("start_dir")
@@ -239,17 +325,17 @@ class VdfEditQueue:
             raw_icon = payload.get("icon_path")
             icon_path = Path(raw_icon) if raw_icon else None
             raw_launch = payload.get("launch_options")
-            launch_options = str(raw_launch) if raw_launch is not None else ""
+            opt_launch: str | None = str(raw_launch) if raw_launch is not None else None
             enable_proton = bool(payload.get("enable_proton", True))
             raw_preserve = payload.get("preserve_from_appid")
             preserve_from_appid = int(raw_preserve) if raw_preserve is not None else None
             add_or_update_shortcut(
-                paths,
+                target_paths,
                 app_name=app_name,
                 exe_path=exe_path,
                 start_dir=start_dir,
                 icon_path=icon_path,
-                launch_options=launch_options,
+                launch_options=opt_launch,
                 enable_proton=enable_proton,
                 preserve_from_appid=preserve_from_appid,
             )

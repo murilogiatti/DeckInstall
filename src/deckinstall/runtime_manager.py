@@ -5,7 +5,6 @@ from __future__ import annotations
 import codecs
 import contextlib
 import csv
-import fcntl
 import hashlib
 import inspect
 import json
@@ -23,15 +22,24 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 import requests
 
 from . import __version__
-from .fsutil import atomic_write_text, file_sha256
+from .fsutil import (
+    FileIdentity,
+    atomic_write_bytes,
+    atomic_write_text,
+    file_identity,
+    file_lock,
+    file_sha256,
+    open_regular_fd,
+)
 from .steam_paths import dir_size_bytes as _dir_size_bytes
 
 if TYPE_CHECKING:
@@ -70,9 +78,21 @@ _ALLOWED_UMU_DB_HOSTS = frozenset({"raw.githubusercontent.com"})
 # umu.openwinecomponents.org/umu-database.csv serves an HTML page, not the CSV.
 UMU_DATABASE_URL = "https://raw.githubusercontent.com/Open-Wine-Components/umu-database/main/umu-database.csv"
 UMU_DATABASE_TTL_SECONDS = 7 * 24 * 60 * 60
-_VERSIONS_LOCK = threading.Lock()
-_OPTISCALER_LOCK = threading.Lock()
-_MANGOHUD_LOCK = threading.Lock()
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+def _serialize_runtime(name: str) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+    """Share a lock across installs, repairs and removal of the same runtime."""
+    def decorate(fn: Callable[_P, _T]) -> Callable[_P, _T]:
+        @wraps(fn)
+        def locked(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+            with file_lock(get_runtime_dir() / ".locks" / f"{name}.lock"):
+                return fn(*args, **kwargs)
+
+        return locked
+
+    return decorate
 
 WINETRICKS_PRESETS: dict[str, str] = {
     "vcrun2022": "Visual C++ 2015-2022 Redistributable",
@@ -344,14 +364,34 @@ def system_mangohud_installed() -> bool:
     return False
 
 
-def _write_mangohud_layers(mh_dir: Path) -> None:
-    """User layer manifests copied from the release, pointing at mh_dir (same layer names: they win)."""
+def _mangohud_layers(mh_dir: Path, target: Path) -> dict[str, str]:
+    layers: dict[str, str] = {}
+    for json_name, lib in _MANGOHUD_LAYERS:
+        library = mh_dir / lib / "libMangoHud.so"
+        if not library.is_file():
+            raise FileNotFoundError(f"Incomplete MangoHud library: {library}")
+        layer = json.loads((mh_dir / "layers" / json_name).read_text(encoding="utf-8"))
+        layer["layer"]["library_path"] = str(target / lib / "libMangoHud.so")
+        layers[json_name] = json.dumps(layer, indent=4) + "\n"
+    return layers
+
+
+def _write_mangohud_layers(layers: dict[str, str]) -> None:
+    """Install both Vulkan manifests, restoring the originals if either write fails."""
     layer_dir = get_user_vulkan_layer_dir()
     layer_dir.mkdir(parents=True, exist_ok=True)
-    for json_name, lib in _MANGOHUD_LAYERS:
-        layer = json.loads((mh_dir / "layers" / json_name).read_text(encoding="utf-8"))
-        layer["layer"]["library_path"] = str(mh_dir / lib / "libMangoHud.so")
-        atomic_write_text(layer_dir / json_name, json.dumps(layer, indent=4) + "\n")
+    with contextlib.ExitStack() as rollback:
+        for name, content in layers.items():
+            path = layer_dir / name
+            if path.is_symlink():
+                raise ValueError(f"Refusing to replace a symlinked Vulkan layer: {path}")
+            previous = path.read_bytes() if path.is_file() else None
+            atomic_write_text(path, content)
+            if previous is None:
+                rollback.callback(path.unlink, missing_ok=True)
+            else:
+                rollback.callback(atomic_write_bytes, path, previous)
+        rollback.pop_all()
 
 
 def _pick_mangohud_asset(release: dict[str, Any]) -> dict[str, Any]:
@@ -362,6 +402,7 @@ def _pick_mangohud_asset(release: dict[str, Any]) -> dict[str, Any]:
     raise RuntimeError("No MangoHud binary package in the latest GitHub release.")
 
 
+@_serialize_runtime("mangohud")
 def ensure_mangohud(force_update: bool = False, progress_cb: ProgressCb | None = None) -> Path:
     """Install (or update) the official MangoHud from GitHub for this user, on any distro, without root.
 
@@ -371,83 +412,99 @@ def ensure_mangohud(force_update: bool = False, progress_cb: ProgressCb | None =
     """
     mh_dir = get_mangohud_dir()
     mh_dir.parent.mkdir(parents=True, exist_ok=True)
-    with _MANGOHUD_LOCK:
-        if not force_update and (mh_dir / "lib64" / "libMangoHud.so").is_file():
-            _write_mangohud_layers(mh_dir)
+    if mh_dir.is_symlink():
+        raise ValueError(f"Refusing a symlinked MangoHud directory: {mh_dir}")
+    if not force_update:
+        try:
+            layers = _mangohud_layers(mh_dir, mh_dir)
+        except (OSError, ValueError, TypeError, KeyError):
+            pass  # An incomplete cache is repaired with a fresh download.
+        else:
+            _write_mangohud_layers(layers)
             return mh_dir
-        _emit_progress(progress_cb, "Checking latest MangoHud release...", 0)
-        release = _fetch_json(MANGOHUD_RELEASES_API)
-        if not isinstance(release, dict):
-            raise RuntimeError("Unexpected GitHub release response for MangoHud.")
-        tag = str(release.get("tag_name", "")).strip()
-        asset = _pick_mangohud_asset(release)
-        asset_name = _sanitize_asset_name(str(asset["name"]))
-        with tempfile.TemporaryDirectory(prefix="deckinstall_mangohud_", dir=str(mh_dir.parent)) as tmp:
-            tmp_path = Path(tmp)
-            archive = tmp_path / asset_name
-            _download_file(str(asset.get("browser_download_url", "")), archive, asset_name, progress_cb)
-            _verify_release_asset_integrity(release, asset, archive, tmp_path, label="MangoHud")
-            _emit_progress(progress_cb, "Extracting MangoHud...", 90)
-            outer, inner = tmp_path / "outer", tmp_path / "pkg"
-            outer.mkdir()
-            inner.mkdir()
-            _safe_extract_tar(archive, outer)
-            package = next(outer.rglob("MangoHud-package.tar"), None)
-            if package is None:
-                raise RuntimeError("MangoHud-package.tar missing from the MangoHud release.")
-            _safe_extract_tar(package, inner)
-            staged = tmp_path / "mangohud"
-            (staged / "layers").mkdir(parents=True)
-            for json_name, lib in _MANGOHUD_LAYERS:
-                src_lib = inner / "usr" / "lib" / "mangohud" / lib
-                if not (src_lib / "libMangoHud.so").is_file():
-                    raise RuntimeError(f"MangoHud release has no {lib}/libMangoHud.so.")
-                shutil.copytree(src_lib, staged / lib, symlinks=False)
-                shutil.copy2(inner / "usr" / "share" / "vulkan" / "implicit_layer.d" / json_name, staged / "layers")
-            old = tmp_path / "old"
-            if mh_dir.exists():
-                os.replace(mh_dir, old)
-            os.replace(staged, mh_dir)
-        _write_mangohud_layers(mh_dir)
+    _emit_progress(progress_cb, "Checking latest MangoHud release...", 0)
+    release = _fetch_json(MANGOHUD_RELEASES_API)
+    if not isinstance(release, dict):
+        raise RuntimeError("Unexpected GitHub release response for MangoHud.")
+    tag = str(release.get("tag_name", "")).strip()
+    asset = _pick_mangohud_asset(release)
+    asset_name = _sanitize_asset_name(str(asset["name"]))
+    with tempfile.TemporaryDirectory(prefix="deckinstall_mangohud_", dir=str(mh_dir.parent)) as tmp:
+        tmp_path = Path(tmp)
+        archive = tmp_path / asset_name
+        _download_file(str(asset.get("browser_download_url", "")), archive, asset_name, progress_cb)
+        _verify_release_asset_integrity(release, asset, archive, tmp_path, label="MangoHud")
+        _emit_progress(progress_cb, "Extracting MangoHud...", 90)
+        outer, inner = tmp_path / "outer", tmp_path / "pkg"
+        outer.mkdir()
+        inner.mkdir()
+        _safe_extract_tar(archive, outer)
+        package = next(outer.rglob("MangoHud-package.tar"), None)
+        if package is None:
+            raise RuntimeError("MangoHud-package.tar missing from the MangoHud release.")
+        _safe_extract_tar(package, inner)
+        staged = tmp_path / "mangohud"
+        (staged / "layers").mkdir(parents=True)
+        for json_name, lib in _MANGOHUD_LAYERS:
+            src_lib = inner / "usr" / "lib" / "mangohud" / lib
+            if not (src_lib / "libMangoHud.so").is_file():
+                raise RuntimeError(f"MangoHud release has no {lib}/libMangoHud.so.")
+            shutil.copytree(src_lib, staged / lib, symlinks=False)
+            shutil.copy2(inner / "usr" / "share" / "vulkan" / "implicit_layer.d" / json_name, staged / "layers")
+        layers = _mangohud_layers(staged, mh_dir)
+        with _publish_runtime_directory(staged, mh_dir):
+            _write_mangohud_layers(layers)
 
-        def _record(versions: dict[str, Any]) -> None:
-            versions["mangohud_installed_version"] = tag
-            versions["mangohud_last_check"] = int(time.time())
+    def _record(versions: dict[str, Any]) -> None:
+        versions["mangohud_installed_version"] = tag
+        versions["mangohud_latest_version"] = tag
+        versions["mangohud_last_check"] = int(time.time())
 
-        _update_versions(_record)
-        _emit_progress(progress_cb, f"MangoHud {tag} installed.", 100)
-        return mh_dir
+    _update_versions(_record)
+    _emit_progress(progress_cb, f"MangoHud {tag} installed.", 100)
+    return mh_dir
 
 
+@_serialize_runtime("mangohud")
 def mangohud_versions() -> tuple[str, str]:
     """(installed tag or "", latest tag on GitHub or "") of the official MangoHud."""
-    installed = str(_load_versions().get("mangohud_installed_version") or "") if official_mangohud_installed() else ""
+    versions = _load_versions()
+    installed = str(versions.get("mangohud_installed_version") or "") if official_mangohud_installed() else ""
+    latest = str(versions.get("mangohud_latest_version") or "")
+    now = int(time.time())
+    last_check = versions.get("mangohud_last_check", 0)
+    if isinstance(last_check, int) and latest and 0 <= now - last_check < UPDATE_CACHE_TTL_SECONDS:
+        return installed, latest
     release = _fetch_json(MANGOHUD_RELEASES_API)
     latest = str(release.get("tag_name", "")).strip() if isinstance(release, dict) else ""
+    if latest:
+        _update_versions(lambda data: data.update(mangohud_latest_version=latest, mangohud_last_check=now))
     return installed, latest
 
 
+@_serialize_runtime("mangohud")
 def uninstall_mangohud() -> bool:
     """Remove DeckInstall's official MangoHud and its user layers (a layer pointing elsewhere is kept)."""
     mh_dir = get_mangohud_dir()
     mh_resolved = mh_dir.resolve()
     removed = False
     layer_names = (*[json_name for json_name, _lib in _MANGOHUD_LAYERS], "MangoHud.json")
-    with _MANGOHUD_LOCK:
-        layer_dir = get_user_vulkan_layer_dir()
-        for json_name in layer_names:
-            layer = layer_dir / json_name
-            try:
-                data = json.loads(layer.read_text(encoding="utf-8"))
-                ours = Path(str(data["layer"]["library_path"])).resolve().is_relative_to(mh_resolved)
-            except (OSError, ValueError, KeyError, TypeError):
-                ours = False
-            if ours:
-                layer.unlink(missing_ok=True)
-                removed = True
-        if mh_dir.is_dir() and not mh_dir.is_symlink():
-            shutil.rmtree(mh_dir)
+    layer_dir = get_user_vulkan_layer_dir()
+    for json_name in layer_names:
+        layer = layer_dir / json_name
+        if layer.is_symlink():
+            continue
+        try:
+            data = json.loads(layer.read_text(encoding="utf-8"))
+            ours = Path(str(data["layer"]["library_path"])).resolve().is_relative_to(mh_resolved)
+        except (OSError, ValueError, KeyError, TypeError):
+            ours = False
+        if ours:
+            layer.unlink(missing_ok=True)
             removed = True
+    if mh_dir.is_dir() and not mh_dir.is_symlink():
+        shutil.rmtree(mh_dir)
+        removed = True
 
     def _forget(versions: dict[str, Any]) -> None:
         versions.pop("mangohud_installed_version", None)
@@ -471,6 +528,7 @@ def _remove_runtime_dir(path: Path, version_keys: tuple[str, ...] = ()) -> bool:
     return True
 
 
+@_serialize_runtime("umu")
 def uninstall_umu_run() -> bool:
     """Remove the portable umu-run (installed again by "Update runtimes" or the next launch)."""
     return _remove_runtime_dir(get_umu_dir(), ("umu_installed_version",))
@@ -481,6 +539,7 @@ def uninstall_steamrt4() -> bool:
     return _remove_runtime_dir(get_steamrt4_dir())
 
 
+@_serialize_runtime("optiscaler")
 def uninstall_optiscaler_package() -> bool:
     """Remove the downloaded OptiScaler package (games keep the copy installed in their folder)."""
     return _remove_runtime_dir(get_optiscaler_dir().parent, ("optiscaler_installed_version",))
@@ -662,15 +721,8 @@ def list_ge_proton10_dirs() -> list[Path]:
 @contextlib.contextmanager
 def _versions_lock():
     """Serialize read/write access to versions.json across threads and processes."""
-    lock_path = get_versions_file().with_suffix(".lock")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with _VERSIONS_LOCK:
-        with open(lock_path, "a+", encoding="utf-8") as lock_fh:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+    with file_lock(get_versions_file().with_suffix(".lock")):
+        yield
 
 
 def _read_versions_unlocked() -> dict[str, Any]:
@@ -1089,6 +1141,7 @@ def _verify_release_asset_integrity(
     )
 
 
+@_serialize_runtime("umu")
 def ensure_umu_run(
     force_update: bool = False,
     progress_cb: ProgressCallback | None = None,
@@ -1196,31 +1249,46 @@ def _pick_optiscaler_asset(release: dict[str, Any]) -> dict[str, Any]:
     return chosen
 
 
+@contextlib.contextmanager
+def _publish_runtime_directory(staged: Path, target: Path) -> Iterator[None]:
+    """Publish a complete runtime and preserve the previous directory until commit."""
+    backup: Path | None = None
+    if target.is_symlink() or (target.exists() and not target.is_dir()):
+        raise ValueError(f"Refusing to replace a non-directory runtime: {target}")
+    if target.is_dir():
+        backup = Path(tempfile.mkdtemp(prefix=f".{target.name}_old_", dir=target.parent))
+        backup.rmdir()
+        os.replace(target, backup)
+    published = False
+    try:
+        os.replace(staged, target)
+        published = True
+        yield
+    except BaseException:
+        try:
+            if published:
+                os.replace(target, staged)
+            if backup is not None:
+                os.replace(backup, target)
+        except OSError:
+            logging.exception("Runtime rollback failed for %s. Previous runtime: %s", target, backup)
+        raise
+    if backup is not None:
+        shutil.rmtree(backup, ignore_errors=True)
+
+
 def _swap_directory_atomic(src_dir: Path, target_dir: Path) -> None:
     """Copy src_dir into a staging sibling and atomically swap it into target_dir."""
     parent = target_dir.parent
     parent.mkdir(parents=True, exist_ok=True)
-    staged_dir = Path(tempfile.mkdtemp(prefix=f".{target_dir.name}_stage_", dir=str(parent)))
-    backup_dir: Path | None = None
-    try:
-        shutil.copytree(src_dir, staged_dir, dirs_exist_ok=True, symlinks=False)
-        if target_dir.exists() or target_dir.is_symlink():
-            backup_dir = Path(tempfile.mkdtemp(prefix=f".{target_dir.name}_old_", dir=str(parent)))
-            backup_dir.rmdir()
-            os.replace(target_dir, backup_dir)
-        os.replace(staged_dir, target_dir)
-    except Exception:
-        if backup_dir is not None and backup_dir.exists() and not target_dir.exists():
-            try:
-                os.replace(backup_dir, target_dir)
-            except OSError:
-                pass
-        shutil.rmtree(staged_dir, ignore_errors=True)
-        raise
-    if backup_dir is not None:
-        shutil.rmtree(backup_dir, ignore_errors=True)
+    with tempfile.TemporaryDirectory(prefix=f".{target_dir.name}_stage_", dir=parent) as tmp:
+        staged = Path(tmp) / "payload"
+        shutil.copytree(src_dir, staged, symlinks=False)
+        with _publish_runtime_directory(staged, target_dir):
+            pass
 
 
+@_serialize_runtime("optiscaler")
 def ensure_optiscaler(
     force_update: bool = False,
     progress_cb: ProgressCb | None = None,
@@ -1230,17 +1298,7 @@ def ensure_optiscaler(
     """Ensure OptiScaler payload is cached under runtime/optiscaler/current."""
     opti_dir = get_optiscaler_dir()
     opti_dir.parent.mkdir(parents=True, exist_ok=True)
-    with _OPTISCALER_LOCK:
-        fd = os.open(str(opti_dir.parent / "install.lock"), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise RuntimeError("OptiScaler cache lock must be a regular file")
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            return _ensure_optiscaler_payload(
-                opti_dir, force_update, progress_cb, check_update=check_update
-            )
-        finally:
-            os.close(fd)
+    return _ensure_optiscaler_payload(opti_dir, force_update, progress_cb, check_update=check_update)
 
 
 def _ensure_optiscaler_payload(
@@ -1402,65 +1460,28 @@ def validate_ge_proton_integrity(proton_dir: Path) -> ProtonIntegrityReport:
     )
 
 
+@_serialize_runtime("compat-tools")
 def repair_ge_proton(
     proton_dir: Path,
     progress_cb: ProgressCallback | None = None,
 ) -> Path:
-    """Remove a broken GE-Proton directory under compatibilitytools.d and reinstall it."""
-    compat_parent = proton_dir.parent
-    expected_compat_dir = get_compat_tools_dir()
-    if (
-        compat_parent.name != "compatibilitytools.d"
-        and compat_parent.resolve() != expected_compat_dir.resolve()
-    ):
-        raise ValueError(
-            f"Refusing to repair {proton_dir}: must be a direct child of compatibilitytools.d."
-        )
-    if proton_dir.name in ("", ".", ".."):
-        raise ValueError(f"Unsafe GE-Proton directory name: {proton_dir!r}")
-
+    """Replace a managed GE-Proton after its replacement has been downloaded and validated."""
+    if not is_managed_compat_tool(proton_dir):
+        raise ValueError(f"Refusing to repair a compatibility tool installed outside DeckInstall: {proton_dir}")
     _emit_progress(progress_cb, f"Replacing broken GE-Proton directory {proton_dir.name}...", 0)
-    backup_dir: Path | None = None
-    if proton_dir.is_symlink():
-        proton_dir.unlink()
-    elif proton_dir.exists():
-        expected_compat_dir.mkdir(parents=True, exist_ok=True)
-        tmp_bk = Path(
-            tempfile.mkdtemp(prefix=f".{proton_dir.name}_repair_", dir=str(compat_parent))
-        )
-        tmp_bk.rmdir()
-        os.replace(proton_dir, tmp_bk)
-        backup_dir = tmp_bk
-
-    def _restore_backup() -> None:
-        if backup_dir is not None and backup_dir.exists() and not proton_dir.exists():
-            try:
-                os.replace(backup_dir, proton_dir)
-            except OSError:
-                pass
-
-    installed: Path | None = None
-    try:
-        tag = proton_dir.name
-        if _parse_ge_proton_version(tag, min_major=1) is not None:
-            try:
-                releases = fetch_available_proton_releases("ge-proton", limit=50)
-                for rel in releases:
-                    if rel.tag_name == tag:
-                        installed = install_compat_tool(rel, progress_cb=progress_cb)
-                        break
-            except Exception:
-                pass
-        if installed is None:
-            installed = ensure_ge_proton11(force_update=True, progress_cb=progress_cb)
-    except Exception:
-        _restore_backup()
-        raise
-    if backup_dir is not None and backup_dir.exists():
-        shutil.rmtree(backup_dir, ignore_errors=True)
-    return installed
+    tag = proton_dir.name
+    if _parse_ge_proton_version(tag, min_major=1) is not None:
+        try:
+            releases = fetch_available_proton_releases("ge-proton", limit=50)
+            for rel in releases:
+                if rel.tag_name == tag:
+                    return install_compat_tool(rel, progress_cb=progress_cb)
+        except Exception:
+            logging.warning("Could not reinstall %s; trying the latest GE-Proton", tag, exc_info=True)
+    return ensure_ge_proton11(force_update=True, progress_cb=progress_cb)
 
 
+@_serialize_runtime("compat-tools")
 def ensure_ge_proton11(
     force_update: bool = False,
     progress_cb: ProgressCallback | None = None,
@@ -1478,12 +1499,12 @@ def ensure_ge_proton11(
                 first_report = report
             if report.valid:
                 return candidate
-        logging.warning(
-            "GE-Proton11+ integrity check failed for %s (%s); attempting auto-repair.",
-            existing[0],
-            first_report.error if first_report else "unknown error",
-        )
-        return repair_ge_proton(existing[0], progress_cb=progress_cb)
+        managed = next((candidate for candidate in existing if is_managed_compat_tool(candidate)), None)
+        if managed is not None:
+            logging.warning("Repairing broken DeckInstall GE-Proton: %s (%s)", managed, first_report)
+            return repair_ge_proton(managed, progress_cb=progress_cb)
+        logging.warning("GE-Proton integrity check failed; preserving manually installed copies.")
+
 
     _emit_progress(progress_cb, "Checking latest GE-Proton11+ release...", 0)
     release = _fetch_latest_ge_proton11_release()
@@ -1521,6 +1542,10 @@ def ensure_ge_proton11(
     target_dir = compat_dir / tag
     if target_dir.resolve().parent != compat_dir.resolve():
         raise RuntimeError(f"Unsafe GE-Proton target directory: {target_dir}")
+    if (target_dir.exists() or target_dir.is_symlink()) and not is_managed_compat_tool(target_dir):
+        if not target_dir.is_symlink() and validate_ge_proton_integrity(target_dir).valid:
+            return target_dir
+        raise ValueError(f"Manually installed GE-Proton occupies {target_dir}; it was preserved.")
 
     with tempfile.TemporaryDirectory(prefix="deckinstall_ge_", dir=str(compat_dir)) as tmp_dir:
         tmp_path = Path(tmp_dir)
@@ -1544,25 +1569,15 @@ def ensure_ge_proton11(
             subdirs = [p for p in extract_dir.iterdir() if p.is_dir()]
             extracted_root = subdirs[0] if len(subdirs) == 1 else extract_dir
 
+        report = validate_ge_proton_integrity(extracted_root)
+        if not report.valid:
+            raise RuntimeError(f"Invalid GE-Proton package {tag}: {report.error}")
         atomic_write_text(extracted_root / _GE_MANAGED_MARKER, f"{tag}\n")
-        backup_dir: Path | None = None
-        try:
-            if target_dir.exists() or target_dir.is_symlink():
-                backup_dir = Path(
-                    tempfile.mkdtemp(prefix=f".{tag}_old_", dir=str(compat_dir))
-                )
-                backup_dir.rmdir()
-                os.replace(target_dir, backup_dir)
-            os.replace(extracted_root, target_dir)
-        except Exception:
-            if backup_dir is not None and backup_dir.exists() and not target_dir.exists():
-                try:
-                    os.replace(backup_dir, target_dir)
-                except OSError:
-                    pass
-            raise
-        if backup_dir is not None:
-            shutil.rmtree(backup_dir, ignore_errors=True)
+        if (target_dir.exists() or target_dir.is_symlink()) and not is_managed_compat_tool(target_dir):
+            raise ValueError(f"Refusing to overwrite a compatibility tool installed outside DeckInstall: {target_dir}")
+        with _publish_runtime_directory(extracted_root, target_dir):
+            pass
+
 
     def _set_ge(versions: dict[str, Any]) -> None:
         versions["ge_proton_latest_version"] = tag
@@ -1754,6 +1769,7 @@ def list_installed_compat_tools() -> list[InstalledCompatTool]:
     return tools
 
 
+@_serialize_runtime("compat-tools")
 def install_compat_tool(
     release: ProtonRelease,
     progress_cb: ProgressCb | None = None,
@@ -1829,40 +1845,32 @@ def install_compat_tool(
         target_dir = compat_dir / folder_name
         if ".." in folder_name or target_dir.resolve().parent != compat_dir.resolve():
             raise RuntimeError(f"Unsafe compatibility tool target directory: {target_dir}")
+        if not all((extracted_root / name).is_file() for name in ("proton", "compatibilitytool.vdf")):
+            raise RuntimeError(f"Compatibility tool package is incomplete: {folder_name}")
+        if release.family_id == "ge-proton":
+            report = validate_ge_proton_integrity(extracted_root)
+            if not report.valid:
+                raise RuntimeError(f"Invalid GE-Proton package {folder_name}: {report.error}")
         atomic_write_text(extracted_root / _GE_MANAGED_MARKER, f"{folder_name}\n")
-        backup_dir: Path | None = None
-        try:
-            if target_dir.exists() or target_dir.is_symlink():
-                backup_dir = Path(
-                    tempfile.mkdtemp(
-                        prefix=f".{folder_name}_old_", dir=str(compat_dir)
-                    )
-                )
-                backup_dir.rmdir()
-                os.replace(target_dir, backup_dir)
-            os.replace(extracted_root, target_dir)
-        except Exception:
-            if backup_dir is not None and backup_dir.exists() and not target_dir.exists():
-                try:
-                    os.replace(backup_dir, target_dir)
-                except OSError:
-                    pass
-            raise
-        if backup_dir is not None:
-            shutil.rmtree(backup_dir, ignore_errors=True)
+        if (target_dir.exists() or target_dir.is_symlink()) and not is_managed_compat_tool(target_dir):
+            raise ValueError(f"Refusing to overwrite a compatibility tool installed outside DeckInstall: {target_dir}")
+        with _publish_runtime_directory(extracted_root, target_dir):
+            pass
+
 
     _emit_progress(progress_cb, f"{folder_name} installed.", 100)
     return target_dir
 
 
-def remove_compat_tool(tool_path: Path) -> None:
+@_serialize_runtime("compat-tools")
+def remove_compat_tool(tool_path: Path, *, managed_only: bool = False) -> None:
     """Safely remove a custom compatibility tool directory from compatibilitytools.d."""
     if tool_path.is_symlink():
         raise ValueError(f"Refusing to remove symlink: {tool_path}")
     if not tool_path.exists() or not tool_path.is_dir():
         raise FileNotFoundError(f"Compatibility tool directory not found: {tool_path}")
     parent = tool_path.parent
-    if parent.name != "compatibilitytools.d" or tool_path.name in ("", ".", ".."):
+    if parent.resolve() not in {path.resolve() for path in _all_compat_tool_dirs()}:
         raise ValueError(
             f"Refusing to remove path outside compatibilitytools.d: {tool_path}"
         )
@@ -1870,6 +1878,8 @@ def remove_compat_tool(tool_path: Path) -> None:
         raise ValueError(
             f"Refusing to remove non-direct child of compatibilitytools.d: {tool_path}"
         )
+    if managed_only and not is_managed_compat_tool(tool_path):
+        raise ValueError(f"Runtime is not managed by DeckInstall: {tool_path}")
     shutil.rmtree(tool_path)
 
 
@@ -1984,6 +1994,9 @@ def check_ubuntu_bwrap_userns() -> str | None:
             timeout=5,
             check=False,
         )
+    except subprocess.TimeoutExpired:
+        logging.warning("Bubblewrap user namespace check timed out")
+        return None
     except OSError:
         return (
             "AppArmor restricts unprivileged user namespaces "
@@ -2136,19 +2149,17 @@ def drain_stream_lines(
     """Read subprocess stdout non-blockingly so cancel_flag is checked every <=0.2s."""
     assert proc.stdout is not None
     fd = proc.stdout.fileno()
-    os.set_blocking(fd, False)
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     buf = ""
+
+    def check_cancelled() -> None:
+        if cancel_flag and cancel_flag():
+            raise RuntimeError(cancel_msg)
+
     try:
+        os.set_blocking(fd, False)
         while True:
-            if cancel_flag and cancel_flag():
-                kill_proc_group(proc, signal.SIGTERM)
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    kill_proc_group(proc, signal.SIGKILL)
-                    proc.wait(timeout=2)
-                raise RuntimeError(cancel_msg)
+            check_cancelled()
             ready, _, _ = select.select([fd], [], [], 0.2)
             if ready:
                 try:
@@ -2177,10 +2188,25 @@ def drain_stream_lines(
                 if buf.strip():
                     on_line(buf)
                 break
-        rc = proc.wait()
-        if cancel_flag and cancel_flag():
-            raise RuntimeError(cancel_msg)
-        return rc
+        # A tool can close stdout long before it exits.
+        while True:
+            check_cancelled()
+            try:
+                return proc.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                continue
+    except BaseException:
+        if proc.poll() is None:
+            try:
+                kill_proc_group(proc, signal.SIGTERM)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    kill_proc_group(proc, signal.SIGKILL)
+                    proc.wait(timeout=2)
+            except (OSError, subprocess.TimeoutExpired):
+                logging.warning("Could not stop process group for PID %s", proc.pid, exc_info=True)
+        raise
     finally:
         try:
             proc.stdout.close()
@@ -2236,8 +2262,9 @@ def resolve_game_prefix(
         if raw_prefix is None:
             raise ValueError("Standalone game object has no prefix_dir attribute.")
         prefix_dir = Path(raw_prefix)
-        if (prefix_dir / "pfx").is_dir() and not (prefix_dir / "drive_c").is_dir():
-            prefix_dir = prefix_dir / "pfx"
+        inner = prefix_dir / "pfx"
+        if not inner.is_symlink() and inner.is_dir() and not (prefix_dir / "drive_c").is_dir():
+            prefix_dir = inner
 
         proton_dir = None
         proton_name = str(getattr(obj, "proton_name", "") or "").strip()
@@ -2254,8 +2281,9 @@ def resolve_game_prefix(
         if raw_prefix is None:
             raise ValueError("External game object has no prefix_dir attribute.")
         prefix_dir = Path(raw_prefix)
-        if (prefix_dir / "pfx").is_dir() and not (prefix_dir / "drive_c").is_dir():
-            prefix_dir = prefix_dir / "pfx"
+        inner = prefix_dir / "pfx"
+        if not inner.is_symlink() and inner.is_dir() and not (prefix_dir / "drive_c").is_dir():
+            prefix_dir = inner
         proton_dir = None
         if paths is not None:
             from .steam_paths import find_proton_binary
@@ -2448,7 +2476,7 @@ class _UmuDbIndex:
 
 
 _UMU_DB_CACHE_LOCK = threading.Lock()
-_UMU_DB_CACHE: tuple[tuple[str, int, int], _UmuDbIndex] | None = None
+_UMU_DB_CACHE: tuple[tuple[Path, FileIdentity], _UmuDbIndex] | None = None
 _GENERIC_EXE_PARENTS = frozenset(
     {"", "bin", "binaries", "game", "win32", "win64", "x64", "x86"}
 )
@@ -2471,7 +2499,7 @@ def _validate_umu_csv_header(csv_path: Path) -> None:
         raise RuntimeError(f"Invalid umu-database.csv header: {header!r}")
 
 
-def _build_umu_db_index(csv_path: Path) -> _UmuDbIndex:
+def _build_umu_db_index(fh: IO[str]) -> _UmuDbIndex:
     """Parse umu-database.csv into a Structure-of-Arrays index."""
     titles: list[str] = []
     norm_titles: list[str] = []
@@ -2484,53 +2512,52 @@ def _build_umu_db_index(csv_path: Path) -> _UmuDbIndex:
     by_codename: dict[str, list[int]] = {}
     by_umu_id: dict[str, list[int]] = {}
 
-    with csv_path.open("r", encoding="utf-8-sig", newline="") as fh:
-        reader = csv.reader(fh)
-        raw_header = next(reader, None)
-        if not raw_header:
-            raise RuntimeError("Empty umu-database.csv.")
-        col_map = {col.strip().upper(): idx for idx, col in enumerate(raw_header)}
-        if "TITLE" not in col_map or "UMU_ID" not in col_map:
-            raise RuntimeError(f"Invalid umu-database.csv header: {raw_header!r}")
+    reader = csv.reader(fh)
+    raw_header = next(reader, None)
+    if not raw_header:
+        raise RuntimeError("Empty umu-database.csv.")
+    col_map = {col.strip().upper(): idx for idx, col in enumerate(raw_header)}
+    if "TITLE" not in col_map or "UMU_ID" not in col_map:
+        raise RuntimeError(f"Invalid umu-database.csv header: {raw_header!r}")
 
-        title_i = col_map["TITLE"]
-        store_i = col_map.get("STORE", -1)
-        codename_i = col_map.get("CODENAME", -1)
-        umu_id_i = col_map["UMU_ID"]
-        redist_i = col_map.get("COMMON_REDIST", col_map.get("COMMONREDIST", -1))
-        note_i = col_map.get("NOTE", -1)
+    title_i = col_map["TITLE"]
+    store_i = col_map.get("STORE", -1)
+    codename_i = col_map.get("CODENAME", -1)
+    umu_id_i = col_map["UMU_ID"]
+    redist_i = col_map.get("COMMON_REDIST", col_map.get("COMMONREDIST", -1))
+    note_i = col_map.get("NOTE", -1)
 
-        def _cell(row: list[str], idx: int) -> str:
-            return row[idx].strip() if 0 <= idx < len(row) else ""
+    def _cell(row: list[str], idx: int) -> str:
+        return row[idx].strip() if 0 <= idx < len(row) else ""
 
-        for row in reader:
-            if not row:
-                continue
-            title = _cell(row, title_i)
-            umu_id = _cell(row, umu_id_i)
-            if not title and not umu_id:
-                continue
-            store = _cell(row, store_i)
-            codename = _cell(row, codename_i)
-            common_redist = _cell(row, redist_i)
-            note = _cell(row, note_i)
-            norm = _normalize_umu_title(title)
+    for row in reader:
+        if not row:
+            continue
+        title = _cell(row, title_i)
+        umu_id = _cell(row, umu_id_i)
+        if not title and not umu_id:
+            continue
+        store = _cell(row, store_i)
+        codename = _cell(row, codename_i)
+        common_redist = _cell(row, redist_i)
+        note = _cell(row, note_i)
+        norm = _normalize_umu_title(title)
 
-            row_idx = len(titles)
-            titles.append(title)
-            norm_titles.append(norm)
-            stores.append(store)
-            codenames.append(codename)
-            umu_ids.append(umu_id)
-            common_redists.append(common_redist)
-            notes.append(note)
+        row_idx = len(titles)
+        titles.append(title)
+        norm_titles.append(norm)
+        stores.append(store)
+        codenames.append(codename)
+        umu_ids.append(umu_id)
+        common_redists.append(common_redist)
+        notes.append(note)
 
-            if norm:
-                by_norm_title.setdefault(norm, []).append(row_idx)
-            if codename:
-                by_codename.setdefault(codename.lower(), []).append(row_idx)
-            if umu_id:
-                by_umu_id.setdefault(umu_id.lower(), []).append(row_idx)
+        if norm:
+            by_norm_title.setdefault(norm, []).append(row_idx)
+        if codename:
+            by_codename.setdefault(codename.lower(), []).append(row_idx)
+        if umu_id:
+            by_umu_id.setdefault(umu_id.lower(), []).append(row_idx)
 
     return _UmuDbIndex(
         titles=tuple(titles),
@@ -2549,26 +2576,24 @@ def _build_umu_db_index(csv_path: Path) -> _UmuDbIndex:
 def _get_umu_db_index(db_path: Path) -> _UmuDbIndex | None:
     """Return cached SoA index for db_path, rebuilding if file mtime/size changed."""
     global _UMU_DB_CACHE
-    try:
-        st = db_path.stat()
-    except OSError:
-        return None
-    if st.st_size <= 0:
-        return None
-    cache_key = (str(db_path.resolve()), st.st_mtime_ns, st.st_size)
-
     with _UMU_DB_CACHE_LOCK:
-        if _UMU_DB_CACHE is not None and _UMU_DB_CACHE[0] == cache_key:
-            return _UMU_DB_CACHE[1]
-
-    try:
-        index = _build_umu_db_index(db_path)
-    except (OSError, RuntimeError, csv.Error):
-        return None
-
-    with _UMU_DB_CACHE_LOCK:
+        try:
+            st = db_path.lstat()
+            if not stat.S_ISREG(st.st_mode) or st.st_size <= 0:
+                return None
+            cache_key = (db_path.absolute(), file_identity(st))
+            if _UMU_DB_CACHE is not None and _UMU_DB_CACHE[0] == cache_key:
+                return _UMU_DB_CACHE[1]
+            with os.fdopen(open_regular_fd(db_path), "r", encoding="utf-8-sig", newline="") as source:
+                if file_identity(os.fstat(source.fileno())) != cache_key[1]:
+                    return None
+                index = _build_umu_db_index(source)
+                if file_identity(os.fstat(source.fileno())) != cache_key[1]:
+                    return None
+        except (OSError, ValueError, RuntimeError, csv.Error):
+            return None
         _UMU_DB_CACHE = (cache_key, index)
-    return index
+        return index
 
 
 def _ensure_umu_database_impl(

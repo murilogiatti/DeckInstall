@@ -133,11 +133,11 @@ def test_failure_rolls_back(tmp_path: Path, disk: library.Library) -> None:
     real = relocate._move_tree
     calls: list[Path] = []
 
-    def flaky(src: Path, dst: Path, root: Path) -> None:
+    def flaky(src: Path, dst: Path) -> None:
         calls.append(src)
         if len(calls) == 2:  # the prefix
             raise OSError("disk full")
-        real(src, dst, root)
+        real(src, dst)
 
     with mock.patch.object(relocate, "_move_tree", flaky), pytest.raises(relocate.RelocateError) as err:
         relocate.relocate_game(plan)

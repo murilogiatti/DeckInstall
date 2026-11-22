@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
-    QDialog,
     QFormLayout,
     QHBoxLayout,
     QHeaderView,
@@ -32,6 +31,7 @@ from ..optiscaler import (
     OptiScalerCompatibility,
     bulk_optiscaler_targets,
     check_optiscaler_compatibility,
+    inspect_optiscaler_state,
     standalone_bulk_target,
 )
 from ..standalone import (
@@ -46,10 +46,12 @@ from ..steam_vdf import (
     get_steam_app_launch_options,
     list_steam_library_games,
     load_shortcuts,
+    merge_winedlloverride,
+    remove_winedlloverride,
     set_steam_app_launch_options,
     update_shortcut_launch_options,
 )
-from ..ui_cards import _dialog_guard, _dialog_parent
+from ..ui_cards import _BusyGuardedDialog, _dialog_guard, _dialog_parent
 from ..ui_workers import SteamOpWorker
 from ..vdf_queue import QueuedVdfEdit, VdfEditOp
 
@@ -138,29 +140,37 @@ def _source_text(t: BulkTarget) -> str:
 
 
 def _install_files(
-    targets: list[BulkTarget], remove: bool, backend: str
+    targets: list[BulkTarget], remove: bool, backend: str, *, auto_snapshot: bool = True,
 ) -> tuple[list[BulkOutcome], list[VdfWrite]]:
     """Copy/remove OptiScaler files (Steam may stay open); save DeckInstall games; return the Steam writes."""
     outcomes: list[BulkOutcome] = []
     writes: list[VdfWrite] = []
+    prior = {t.exe_path: inspect_optiscaler_state(t.exe_path) for t in targets if t.steam_shortcut is not None}
     for t, (outcome, dll) in zip(
-        targets, bulk_optiscaler_targets(targets, remove=remove, backend=backend), strict=True
+        targets, bulk_optiscaler_targets(targets, remove=remove, backend=backend, auto_snapshot=auto_snapshot),
+        strict=True,
     ):
         if dll is not None:
             try:
                 if t.source == "deckinstall":
-                    updated = update_standalone_launch_options(
+                    update_standalone_launch_options(
                         t.game_dir, winedlloverrides=dll, launch_options=t.ref.launch_options
                     )
-                    t.ref.winedlloverrides = updated.winedlloverrides
-                    t.ref.launch_options = updated.launch_options
                     if t.steam_shortcut is not None:
+                        opts = t.steam_shortcut.launch_options
+                        steam_dll = str(parse_presets(opts)["winedll"])
+                        previous = prior.get(t.exe_path)
+                        current = inspect_optiscaler_state(t.exe_path)
+                        if previous is not None and (current is None or current.proxy_dll != previous.proxy_dll):
+                            steam_dll = remove_winedlloverride(steam_dll, previous.proxy_dll)
+                        if current is not None:
+                            steam_dll = merge_winedlloverride(steam_dll, current.proxy_dll, "n,b")
                         writes.append(
                             (
                                 "shortcut",
                                 t.steam_shortcut.appid_u32,
                                 t.name,
-                                apply_presets(t.steam_shortcut.launch_options, winedlloverrides=dll),
+                                apply_presets(opts, winedlloverrides=steam_dll),
                             )
                         )
                 elif t.source == "shortcut":
@@ -257,20 +267,11 @@ def bulk_optiscaler_dialog(win: MainWindow) -> None:
 
 
 def _show(win: MainWindow, rows: list[Row]) -> None:
-    dlg = QDialog(_dialog_parent(win))
+    op_state = {"busy": False}
+    dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: op_state["busy"])
     dlg.setWindowTitle(tr("optiscaler_bulk.title"))
     dlg.resize(1100, 560)
     dlg_alive = _dialog_guard(dlg)
-    op_state = {"busy": False}
-    orig_close_event = dlg.closeEvent
-
-    def _close_event(event) -> None:
-        if op_state["busy"]:
-            event.ignore()
-            return
-        orig_close_event(event)
-
-    dlg.closeEvent = _close_event  # type: ignore[method-assign]
     lay = QVBoxLayout(dlg)
     hint = QLabel(tr("optiscaler_bulk.hint"))
     hint.setWordWrap(True)
@@ -387,14 +388,17 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
             QMessageBox.information(dlg, __app_name__, tr("proton_bulk.none_selected"))
             return
         backend = str(combo_backend.currentData() or "auto")
+        auto_snapshot = win._is_auto_snapshot_enabled()
         buttons = (btn_all, btn_install, btn_remove, btn_select_all, btn_select_none, btn_close, combo_backend)
         op_state["busy"] = True
+        win._begin_busy()
         for b in buttons:
             b.setEnabled(False)
         paths = win.paths
 
         def _finish(outcomes: list[BulkOutcome], fresh: object, extra: list[str]) -> None:
             op_state["busy"] = False
+            win._end_busy()
             win._refresh_shortcuts()
             lines = [_outcome_line(o) for o in outcomes] + extra
             if not dlg_alive():
@@ -409,6 +413,7 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
 
         def _fail(err: str) -> None:
             op_state["busy"] = False
+            win._end_busy()
             if not dlg_alive():
                 if not win._closing_pending:
                     QMessageBox.critical(_dialog_parent(win), __app_name__, tr("optiscaler.error", err=err))
@@ -417,9 +422,9 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
                 b.setEnabled(True)
             QMessageBox.critical(dlg, __app_name__, tr("optiscaler.error", err=err))
 
-        def _write_steam(outcomes: list[BulkOutcome], writes: list[VdfWrite]) -> None:
+        def _write_steam(outcomes: list[BulkOutcome], writes: list[VdfWrite], fresh: list[Row]) -> None:
             if paths is None:
-                _finish(outcomes, None, [tr("add.steam_missing")])
+                _finish(outcomes, fresh, [tr("add.steam_missing")])
                 return
             if win.should_queue_vdf_edits():
                 for source, appid, name, opts in writes:
@@ -433,14 +438,13 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
                             payload={"launch_options": opts},
                         )
                     )
-                _finish(outcomes, None, [tr("optiscaler_bulk.queued", count=len(writes))])
+                _finish(outcomes, fresh, [tr("optiscaler_bulk.queued", count=len(writes))])
                 return
 
             def _go_vdf() -> None:
                 if win._closing_pending:
-                    _finish(outcomes, None, [tr("proton_bulk.steam_skipped")])
+                    _finish(outcomes, fresh, [tr("proton_bulk.steam_skipped")])
                     return
-                win._begin_busy()
                 # One Steam shutdown and one restart for every game in the batch.
                 vdf_worker = SteamOpWorker(
                     lambda: (_write_vdf(paths, writes), _scan(paths)), need_steam_closed=True
@@ -449,13 +453,11 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
                 vdf_worker.status.connect(win.status_label.setText)
 
                 def _vdf_done(res: object) -> None:
-                    win._end_busy()
-                    errs, fresh = res if isinstance(res, tuple) else ([], None)
-                    _finish(outcomes, fresh, list(errs))
+                    errs, updated_rows = res if isinstance(res, tuple) else ([], None)
+                    _finish(outcomes, updated_rows or fresh, list(errs))
 
                 def _vdf_fail(err: str) -> None:
-                    win._end_busy()
-                    _fail(err)
+                    _finish(outcomes, fresh, [tr("optiscaler.error", err=err)])
 
                 vdf_worker.finished_ok.connect(_vdf_done)
                 vdf_worker.failed.connect(_vdf_fail)
@@ -463,15 +465,15 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
 
             win._confirm_close_steam_async(
                 _go_vdf,
-                on_cancelled=lambda: _finish(outcomes, None, [tr("proton_bulk.steam_skipped")]),
+                on_cancelled=lambda: _finish(outcomes, fresh, [tr("proton_bulk.steam_skipped")]),
                 parent=dlg if dlg_alive() else _dialog_parent(win),
             )
 
-        def _job() -> tuple[list[BulkOutcome], list[VdfWrite], list[Row] | None]:
+        def _job() -> tuple[list[BulkOutcome], list[VdfWrite], list[Row]]:
             # Files are copied with Steam open; the launch options then go to Steam in one write
             # (or to the saved queue in Gaming Mode, where Steam cannot be closed).
-            outcomes, writes = _install_files(list(picked), remove, backend)
-            return outcomes, writes, (None if writes else _scan(paths))
+            outcomes, writes = _install_files(list(picked), remove, backend, auto_snapshot=auto_snapshot)
+            return outcomes, writes, _scan(paths)
 
         worker = SteamOpWorker(_job, need_steam_closed=False)
         win._track_worker(worker)
@@ -482,7 +484,7 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
                 return
             outcomes, writes, fresh = result
             if writes:  # files are already in place: always write the launch options, even if the dialog closed
-                _write_steam(outcomes, writes)
+                _write_steam(outcomes, writes, fresh)
             else:
                 _finish(outcomes, fresh, [])
 

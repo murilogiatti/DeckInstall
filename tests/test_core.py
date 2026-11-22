@@ -1156,8 +1156,14 @@ class CoreTests(unittest.TestCase):
             troot = Path(tmp)
             with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(troot)}):
                 with _steam_transaction_lock(troot / "shortcuts.vdf"):
-                    with _steam_transaction_lock(troot / "shortcuts.vdf"):
-                        self.assertTrue(any((troot / "deckinstall").glob(".deckinstall.*.vdf.lock")))
+                    locks = Path.home() / ".local" / "state" / "DeckInstall" / "locks"
+                    before = set(locks.glob(".deckinstall.*.vdf.lock"))
+                    self.assertTrue(before)
+                    with (
+                        mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(troot / "alternate")}),
+                        _steam_transaction_lock(troot / "shortcuts.vdf"),
+                    ):
+                        self.assertEqual(set(locks.glob(".deckinstall.*.vdf.lock")), before)
 
             pfx = troot / "pfx"
             (pfx / "drive_c" / "users" / "Default" / "Documents").mkdir(parents=True)
@@ -1334,7 +1340,9 @@ class CoreTests(unittest.TestCase):
                         },
                     ),
                     mock.patch("deckinstall.steam_vdf.vdf.binary_dumps", side_effect=_cap_dumps),
-                    mock.patch("deckinstall.steam_vdf.get_shortcut_proton", return_value="Proton Experimental"),
+                    mock.patch("deckinstall.steam_vdf.get_compat_tool_map", return_value={
+                        sv.compute_shortcut_appid(f'"{exe}"', "MyGame")[0]: "Proton Experimental",
+                    }),
                     mock.patch("deckinstall.steam_vdf.set_compat_tool") as m_set_compat,
                     mock.patch("deckinstall.steam_vdf.remove_compat_tool") as m_rm_compat,
                 ):

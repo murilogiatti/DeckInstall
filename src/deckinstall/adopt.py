@@ -29,8 +29,10 @@ import logging
 import os
 import re
 import shutil
-from collections.abc import Callable
+import stat
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -38,22 +40,25 @@ from . import library as _lib
 from . import save_sync
 from .external_actions import import_prefix_saves
 from .extractor import _SYSTEM_DIRS, DRIVE_C_GAME_PARENTS, find_games_in_drive_c
-from .fsutil import is_within, move_dir_safely, remove_path_or_tree, sanitize_dir_name
+from .fsutil import atomic_write_bytes, is_within, move_dir_safely, remove_path_or_tree, sanitize_dir_name, unique_dir
 from .launcher_scan import ExternalLauncherGame, scan_external_launcher_games
-from .manifest import encode_path, find_manifest, new_uid
-from .scanner import clean_game_name, is_native_linux_exe, scan_game_folder
+from .manifest import MANIFEST_V1, MANIFEST_V2, encode_path, find_manifest, new_uid
+from .scanner import _BIN_DIR_NAMES, clean_game_name, is_native_linux_exe, scan_game_folder
 from .standalone import (
     StandaloneGame,
+    _foreign_launch_backup_path,
     _has_drive_c,
     _is_protected_dir,
     _is_shortcut_shared_across_users,
+    _library_index_path,
     _managed_roots,
+    _resolve_desktop_file_path,
+    _resolve_desktop_shortcut_path,
     _resolve_proton_path,
     _write_manifest,
     install_standalone_game,
     link_compatdata_to_prefix,
     list_standalone_games,
-    remove_standalone_game,
     shortcut_game_dir,
     shortcut_launch_options,
 )
@@ -290,15 +295,6 @@ def _dev(path: Path) -> int | None:
         return None
 
 
-def _unique_dir(target: Path, taken: set[Path] | None = None) -> Path:
-    cand = target
-    idx = 2
-    while cand.exists() or cand.is_symlink() or (taken is not None and cand in taken):
-        cand = target.with_name(f"{target.name} ({idx})")
-        idx += 1
-    return cand
-
-
 def _drive_c_game_root(exe: Path, drive_c: Path) -> Path | None:
     """Return the game's own folder for an exe inside drive_c (e.g. drive_c/Games/<X>)."""
     try:
@@ -400,11 +396,15 @@ def read_hydra_games(db_dir: Path) -> list[dict[str, Any]]:
             data = path.read_bytes()
         except OSError:
             continue
-        for m in _HYDRA_GAME_KEY.finditer(data):
-            start = data.find(b"{", m.end(), m.end() + 64)
+        keys = iter(_HYDRA_GAME_KEY.finditer(data))
+        next_match = next(keys, None)
+        while next_match is not None:
+            m, next_match = next_match, next(keys, None)
+            record_end = next_match.start() if next_match is not None else len(data)
+            start = data.find(b"{", m.end(), min(m.end() + 64, record_end))
             if start < 0:
                 continue
-            chunk = data[start : start + 256 * 1024].decode("utf-8", errors="replace")
+            chunk = data[start : min(start + 256 * 1024, record_end)].decode("utf-8", errors="replace")
             try:
                 obj, _ = decoder.raw_decode(chunk)
             except ValueError:
@@ -624,7 +624,7 @@ def _finish(c: AdoptionCandidate, prefix_users: dict[Path, int], managed_prefixe
             games, _ = find_games_in_drive_c(drive_c)
             if len(games) > 1:
                 c.prefix_shared = True
-    if c.exe is not None and c.game_dir is None and not c.in_drive_c:
+    if c.exe is not None and _needs_inferred_game_dir(c) and not c.in_drive_c:
         from .steam_vdf import infer_game_root_from_exe
 
         try:
@@ -718,8 +718,17 @@ def _merge_steam_into_candidate(primary: AdoptionCandidate, steam_cand: Adoption
             primary.extra_save_prefixes = (*primary.extra_save_prefixes, steam_pfx)
 
 
+def _needs_inferred_game_dir(c: AdoptionCandidate) -> bool:
+    return c.game_dir is None or (
+        c.kind in {LUTRIS, HEROIC, BOTTLES}
+        and c.exe is not None
+        and c.game_dir == c.exe.parent
+        and c.game_dir.name.lower() in _BIN_DIR_NAMES
+    )
+
+
 def _candidate_game_dir(c: AdoptionCandidate) -> Path | None:
-    if c.game_dir is not None:
+    if not _needs_inferred_game_dir(c):
         return c.game_dir
     if c.exe is None:
         return None
@@ -864,6 +873,28 @@ def _layout_conflicts(compat: Path) -> bool:
         return True
 
 
+def _adoption_space(moves: Iterable[PlannedMove]) -> tuple[dict[str, int], bool]:
+    """Measure the combined space needed on each destination filesystem."""
+    needed: dict[int | str, tuple[str, int]] = {}
+    for mv in moves:
+        if not mv.same_fs:
+            probe = str(_existing_ancestor(mv.dst.parent))
+            device = _dev(Path(probe))
+            key = device if device is not None else probe
+            representative, total = needed.get(key, (probe, 0))
+            needed[key] = (representative, total + mv.size_bytes)
+    free: dict[str, int] = {}
+    enough = True
+    for probe, bytes_needed in needed.values():
+        try:
+            free[probe] = shutil.disk_usage(probe).free
+        except OSError:
+            free[probe] = 0
+        if free[probe] < int(bytes_needed * 1.05):
+            enough = False
+    return free, enough
+
+
 def plan_adoption(
     candidate: AdoptionCandidate,
     library_root: Path | None = None,
@@ -911,7 +942,7 @@ def plan_adoption(
     native = c.native_linux or (exe.is_file() and exe.suffix.lower() != ".exe" and is_native_linux_exe(exe))
     games_root = root / _lib.GAMES
     move_game = (opts.move_game or c.in_drive_c) and not is_within(game_src, games_root, strict=True)
-    game_dst = _unique_dir(games_root / sanitize_dir_name(name)) if move_game else game_src
+    game_dst = unique_dir(games_root / sanitize_dir_name(name)) if move_game else game_src
     try:
         exe_dst = game_dst / exe.relative_to(game_src) if move_game else exe
     except ValueError:
@@ -956,19 +987,9 @@ def plan_adoption(
         size = dir_size_bytes(src_prefix) - (game_size if c.in_drive_c else 0)
         moves.append(PlannedMove("prefix", src_prefix, prefix_dst, max(size, 0), _dev(src_prefix) == _dev(prefix_dst)))
 
-    needed: dict[str, int] = {}
-    for mv in moves:
-        if not mv.same_fs:
-            probe = str(_existing_ancestor(mv.dst.parent))
-            needed[probe] = needed.get(probe, 0) + mv.size_bytes
-    free: dict[str, int] = {}
-    for probe, bytes_needed in needed.items():
-        try:
-            free[probe] = shutil.disk_usage(probe).free
-        except OSError:
-            free[probe] = 0
-        if free[probe] < int(bytes_needed * 1.05):
-            _add(blockers, B_NO_SPACE)
+    free, enough = _adoption_space(moves)
+    if not enough:
+        _add(blockers, B_NO_SPACE)
 
     if c.shortcut_appid is not None and move_game and not opts.remove_from_steam:
         _add(warnings, W_STEAM_SHORTCUT_BREAKS)
@@ -1011,23 +1032,14 @@ def plan_adoption(
 # --- execution --------------------------------------------------------------------------------
 
 
-def _move_tree(src: Path, dst: Path, cleanup_root: Path) -> None:
-    """Move a folder (rename, or copy-then-delete across disks) without ever losing the source.
-
-    A cross-device copy that fails leaves the source intact; the partial copy is removed when
-    it lies inside cleanup_root.
-    """
+def _move_tree(src: Path, dst: Path) -> None:
+    """Move a folder to a new location, staging the copy when crossing disks."""
     if src.is_symlink() or not src.is_dir():
         raise FileNotFoundError(f"Not a folder: {src}")
     if dst.exists() or dst.is_symlink():
         raise FileExistsError(f"Target already exists: {dst}")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        move_dir_safely(src, dst)
-    except Exception:
-        if src.is_dir() and (dst.exists() or dst.is_symlink()) and is_within(dst, cleanup_root, strict=True):
-            remove_path_or_tree(dst)
-        raise
+    move_dir_safely(src, dst)
 
 
 def _move_entry(src: Path, dst: Path) -> None:
@@ -1081,7 +1093,7 @@ def _move_back(src: Path, dst: Path) -> Callable[[], None]:
             raise FileExistsError(f"{src} already exists; left {dst} in place")
         src.parent.mkdir(parents=True, exist_ok=True)
         if dst.is_dir() and not dst.is_symlink():
-            _move_tree(dst, src, src.parent)
+            _move_tree(dst, src)
         else:
             _move_entry(dst, src)
 
@@ -1091,10 +1103,10 @@ def _move_back(src: Path, dst: Path) -> Callable[[], None]:
 def _move_prefix(plan: AdoptionPlan, src: Path, dst: Path, undo: _Undo) -> None:
     """Move the prefix to dst; Steam's compatdata/<appid>/{pfx,version,...} becomes dst/{drive_c,version,...}."""
     if plan.prefix_layout != "steam":
-        _move_tree(src, dst, plan.prefixes_root)
+        _move_tree(src, dst)
         undo.push(f"move {dst} back", _move_back(src, dst))
         return
-    _move_tree(src / "pfx", dst, plan.prefixes_root)
+    _move_tree(src / "pfx", dst)
     undo.push(f"move {dst} back", _move_back(src / "pfx", dst))
     for item in sorted(src.iterdir()):
         target = dst / item.name
@@ -1104,13 +1116,23 @@ def _move_prefix(plan: AdoptionPlan, src: Path, dst: Path, undo: _Undo) -> None:
     undo.push(f"recreate {src}", lambda: src.mkdir(exist_ok=False))
 
 
-def _read_bytes(path: Path) -> bytes | None:
-    try:
-        if path.is_file() and not path.is_symlink():
-            return path.read_bytes()
-    except OSError:
-        pass
-    return None
+def _track_install_file(undo: _Undo, path: Path) -> None:
+    """Restore integration files if registration fails, including a replaced symbolic link."""
+    if path.is_symlink():
+        target = path.readlink()
+
+        def restore_link() -> None:
+            if path.is_symlink() and path.readlink() == target:
+                return
+            path.unlink(missing_ok=True)
+            path.symlink_to(target)
+
+        undo.push(f"restore {path}", restore_link)
+    elif path.is_file():
+        data, mode = path.read_bytes(), stat.S_IMODE(path.stat().st_mode)
+        undo.push(f"restore {path}", lambda: atomic_write_bytes(path, data, mode=mode))
+    elif not path.exists():
+        undo.push(f"remove {path}", lambda: path.unlink(missing_ok=True))
 
 
 def _source_meta(plan: AdoptionPlan) -> dict[str, Any]:
@@ -1123,7 +1145,7 @@ def _source_meta(plan: AdoptionPlan) -> dict[str, Any]:
             meta["codename"] = c.game_id
     if c.game_id:
         meta["launcher_id"] = c.game_id
-    if c.shortcut_appid is not None:
+    if c.shortcut_appid is not None and not plan.options.remove_from_steam:
         meta["shortcut_appid"] = c.shortcut_appid
     if c.game_dir is not None:
         meta["original_game_dir"] = encode_path(c.game_dir, None)
@@ -1149,6 +1171,8 @@ def adopt(
     """
     if not plan.ok:
         raise AdoptionError(f"Adoption blocked: {', '.join(plan.blockers)}")
+    if not _adoption_space(plan.moves)[1]:
+        raise AdoptionError(f"Adoption blocked: {B_NO_SPACE}")
     c = plan.candidate
     opts = plan.options
 
@@ -1176,9 +1200,12 @@ def adopt(
 
         # 2. Game folder (first, so a game inside drive_c leaves the prefix before it moves).
         game_move = next((m for m in plan.moves if m.what == "game"), None)
+        icon_path = c.icon
         if game_move is not None:
+            if icon_path is not None and is_within(icon_path, game_move.src, strict=True):
+                icon_path = game_move.dst / _resolved(icon_path).relative_to(_resolved(game_move.src))
             progress(STEP_MOVE_GAME)
-            _move_tree(game_move.src, game_move.dst, lib.games_dir)
+            _move_tree(game_move.src, game_move.dst)
             undo.push(f"move {game_move.dst} back", _move_back(game_move.src, game_move.dst))
 
         # 3. Prefix: moved (never copied) to Prefixes/<uid>.
@@ -1189,9 +1216,37 @@ def adopt(
         # 4. launch.sh, .desktop, v2 manifest, library registration.
         progress(STEP_LAUNCHER)
         launch_sh = plan.game_dir / "launch.sh"
-        original_launch = _read_bytes(launch_sh)
-        prefix_existed = plan.prefix_dir is not None and plan.prefix_dir.exists()
-        cache_existed = (lib.caches_dir / plan.uid).exists()
+        backup_path = _foreign_launch_backup_path(launch_sh)
+        if backup_path is None:
+            _track_install_file(undo, launch_sh)
+        else:
+            def restore_launch() -> None:
+                if backup_path.is_file() and not backup_path.is_symlink():
+                    os.replace(backup_path, launch_sh)
+
+            undo.push(f"restore {launch_sh}", restore_launch)
+        for manifest_name in (MANIFEST_V1, MANIFEST_V2):
+            _track_install_file(undo, plan.game_dir / manifest_name)
+        index_path = _library_index_path(plan.game_dir)
+        if not index_path.parent.is_symlink():
+            _track_install_file(undo, index_path)
+        if opts.create_menu_shortcut:
+            _track_install_file(undo, _resolve_desktop_file_path(plan.name, plan.game_dir))
+        if opts.create_desktop_shortcut:
+            desktop_path = _resolve_desktop_shortcut_path(sanitize_dir_name(plan.name), plan.game_dir)
+            _track_install_file(undo, desktop_path)
+        icon_extensions = {".ico", ".jpg"}
+        if icon_path is not None:
+            icon_extensions.add(icon_path.suffix.lower())
+        for ext in icon_extensions:
+            _track_install_file(undo, plan.game_dir / f".deckinstall_icon{ext}")
+        cache_root = lib.caches_dir if lib.unix_fs else _lib.internal_library_root() / _lib.CACHES
+        for folder, root in ((plan.prefix_dir, plan.prefixes_root), (cache_root / plan.uid, cache_root)):
+            if folder is not None and not folder.exists() and is_within(folder, root, strict=True):
+                undo.push(f"remove {folder}", partial(remove_path_or_tree, folder))
+        if (game_library_root := _lib.find_library_root(plan.game_dir)) is not None:
+            undo.push(f"forget {plan.uid}", lambda: _lib.forget_game(game_library_root, plan.uid))
+
         game = install_standalone_game(
             game_name=plan.name,
             exe_path=plan.exe,
@@ -1200,7 +1255,7 @@ def adopt(
             steam_appid=c.steam_appid,
             winedlloverrides=c.winedlloverrides,
             launch_options=c.launch_options,
-            icon_path=c.icon,
+            icon_path=icon_path,
             create_menu_shortcut=opts.create_menu_shortcut,
             create_desktop_shortcut=opts.create_desktop_shortcut,
             keep_in_place=game_move is None,
@@ -1210,24 +1265,6 @@ def adopt(
             uid=plan.uid,
         )
 
-        def undo_install(g: StandaloneGame = game) -> None:
-            remove_standalone_game(g, delete_files=False, delete_prefix=False, delete_cache=not cache_existed)
-            for icon in g.meta.get("icons") or []:
-                p = Path(icon)
-                if is_within(p, g.game_dir, strict=True):
-                    p.unlink(missing_ok=True)
-            if original_launch is not None:
-                launch_sh.write_bytes(original_launch)
-
-        undo.push("remove launchers and manifest", undo_install)
-        if plan.prefix_dir is not None and not prefix_existed:
-            new_prefix = plan.prefix_dir
-
-            def undo_new_prefix() -> None:
-                if is_within(new_prefix, plan.prefixes_root, strict=True):
-                    remove_path_or_tree(new_prefix)
-
-            undo.push(f"remove {new_prefix}", undo_new_prefix)
         if plan.prefix_dir is not None and game.prefix_dir != plan.prefix_dir:
             raise RuntimeError(f"Unexpected prefix {game.prefix_dir} (planned {plan.prefix_dir})")
 

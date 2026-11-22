@@ -24,6 +24,7 @@ def parse_presets(opts: str) -> dict[str, Any]:
     except ValueError:
         tokens_list = opts.split()
     tokens_now = set(tokens_list)
+    command_idx = tokens_list.index("%command%") if "%command%" in tokens_now else len(tokens_list)
 
     mh_level = 0
     mh_position = ""
@@ -61,7 +62,7 @@ def parse_presets(opts: str) -> dict[str, Any]:
         "tokens_list": tokens_list,
         "tokens_now": tokens_now,
         "gamemode": "gamemoderun" in tokens_now,
-        "mangohud": "MANGOHUD=1" in tokens_now,
+        "mangohud": "MANGOHUD=1" in tokens_now or "mangohud" in tokens_list[:command_idx],
         "mh_level": mh_level,
         "mh_position": mh_position,
         "mh_fps_limit": mh_fps_limit,

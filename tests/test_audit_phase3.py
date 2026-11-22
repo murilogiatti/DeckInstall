@@ -373,8 +373,8 @@ def test_add_installed_game_to_steam_links_existing_and_cleans_pfx_on_rollback(
     paths2 = _steam_paths(tmp_path / "steam2")
     with (
         mock.patch.object(standalone, "resolve_game_icon", return_value=None),
-        mock.patch.object(standalone, "sync_prefix_symlinks", side_effect=OSError("sync boom")),
-        pytest.raises(OSError, match="sync boom"),
+        mock.patch.object(standalone, "_write_manifest", side_effect=OSError("manifest write failed")),
+        pytest.raises(OSError, match="manifest write failed"),
     ):
         standalone.add_installed_game_to_steam(paths2, game2.game_dir, game2.uid)
 

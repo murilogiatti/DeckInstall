@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -67,10 +68,12 @@ from ..steam_vdf import (
 )
 from ..ui_cards import (
     FlowLayout,
+    _BusyGuardedDialog,
     _dialog_guard,
     _dialog_parent,
     _format_worker_error,
     _is_native_linux_game,
+    _is_wine_game_running,
     _pick_dir_async,
     get_game_log_path,
 )
@@ -297,7 +300,8 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         exe_str = str(obj.exe_path)
         dir_str = str(obj.game_dir)
 
-    dlg = QDialog(_dialog_parent(win))
+    operation = {"migrating": False}
+    dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: operation["migrating"])
     dlg.setWindowTitle(tr("configure.title", name=title_name))
     dlg.resize(740, 560)
     dlg_alive = _dialog_guard(dlg)
@@ -333,6 +337,9 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         def _on_exe_activated(idx: int) -> None:
             new_exe = Path(str(exe_combo.itemData(idx)))
             if new_exe == game_obj.exe_path:
+                return
+            if win._steam_busy:
+                exe_combo.setCurrentIndex(exe_combo.findData(str(game_obj.exe_path)))
                 return
             try:
                 updated = change_standalone_exe(game_obj.game_dir, new_exe)
@@ -384,14 +391,19 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     btn_edit_opts = QPushButton(tr("configure.btn_edit_launch_opts"))
     btn_edit_opts.setEnabled(is_steam or is_standalone or is_external)
 
-    def _on_edit_opts() -> None:
-        def _saved(new_opts: str) -> None:
-            if dlg_alive():
-                opts_edit.setText(new_opts)
+    def _save_displayed_opts(new_opts: str) -> None:
+        nonlocal obj
+        if dlg_alive():
+            if isinstance(obj, ShortcutEntry):
+                obj = replace(obj, launch_options=new_opts)
+            opts_edit.setText(new_opts)
 
+    def _on_edit_opts() -> None:
+        if win._steam_busy:
+            return
         # Pass this game and this dialog explicitly: the library selection may differ (or be empty),
         # and without the parent the child can open behind this dialog under gamescope/Wayland.
-        win._edit_launch_options_presets((kind, obj), parent=dlg, on_saved=_saved)
+        win._edit_launch_options_presets((kind, obj), parent=dlg, on_saved=_save_displayed_opts)
 
     btn_edit_opts.clicked.connect(_on_edit_opts)
 
@@ -539,7 +551,13 @@ def open_configure_game_dialog(win: MainWindow) -> None:
 
         btn_opti = QPushButton(tr("library.btn_optiscaler"))
         btn_opti.setEnabled((is_steam and bool(win.paths)) or is_standalone or kind == "external")
-        btn_opti.clicked.connect(lambda: win._open_optiscaler_dialog(kind, obj))
+        def _open_opti() -> None:
+            current = obj
+            if isinstance(current, ShortcutEntry) and sa_obj is not None:
+                current = replace(current, exe=str(sa_obj.exe_path))
+            win._open_optiscaler_dialog(kind, current, on_saved=_save_displayed_opts)
+
+        btn_opti.clicked.connect(_open_opti)
         tools_flow.addWidget(btn_opti)
 
         btn_run_exe = QPushButton(tr("library.btn_run_exe_in_prefix"))
@@ -791,7 +809,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                     sa = obj
                     _set_proton_controls_enabled(False)
 
-                    def _do_sa() -> None:
+                    def _do_sa() -> StandaloneGame:
                         win._auto_snapshot_if_enabled(
                             sa.prefix_dir,
                             sa.name,
@@ -799,19 +817,20 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                             "proton",
                             enabled=auto_snap_enabled,
                         )
-                        changed = (
+                        return (
                             use_previous_proton(sa.game_dir)
                             if use_previous
                             else set_game_proton(sa.game_dir, "" if tool_id == DEFAULT_PROTON_ID else tool_id)
                         )
-                        sa.proton_name = changed.proton_name
-                        sa.meta = changed.meta
 
                     worker = SteamOpWorker(_do_sa, need_steam_closed=False)
                     win._track_worker(worker)
                     worker.status.connect(win.status_label.setText)
 
-                    def _sa_ok(_res: object) -> None:
+                    def _sa_ok(res: object) -> None:
+                        if isinstance(res, StandaloneGame):
+                            sa.proton_name = res.proton_name
+                            sa.meta = res.meta
                         active_proton_ref[0] = sa.proton_name or DEFAULT_PROTON_ID
                         win._refresh_shortcuts()
                         msg = tr(
@@ -844,17 +863,6 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                     display_tool = target_steam_tool or tr("proton.default_label")
                     _set_proton_controls_enabled(False)
 
-                    def _sync_managed_proton() -> None:
-                        if managed_game is None:
-                            return
-                        changed = (
-                            use_previous_proton(managed_game.game_dir)
-                            if use_previous
-                            else set_game_proton(managed_game.game_dir, target_steam_tool)
-                        )
-                        managed_game.proton_name = changed.proton_name
-                        managed_game.meta = changed.meta
-
                     def _proceed_steam_proton() -> None:
                         if not dlg_alive() or win._closing_pending:
                             return
@@ -862,7 +870,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                         queued = win.should_queue_vdf_edits()  # Gaming Mode: save it for when Steam closes
                         win._begin_busy()
 
-                        def _do_steam() -> None:
+                        def _do_steam() -> StandaloneGame | None:
                             win._auto_snapshot_if_enabled(
                                 pfx_dir,
                                 entry.app_name,
@@ -870,19 +878,35 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                                 "proton",
                                 enabled=auto_snap_enabled,
                             )
-                            _sync_managed_proton()
+                            before = get_shortcut_proton(paths_local_p.config_vdf, entry.appid_u32)
                             if not queued:
                                 if target_steam_tool:
                                     set_shortcut_proton(paths_local_p.config_vdf, entry.appid_u32, target_steam_tool)
                                 else:
                                     remove_compat_tool(paths_local_p.config_vdf, entry.appid_u32)
+                            if managed_game is None:
+                                return None
+                            try:
+                                if use_previous:
+                                    return use_previous_proton(managed_game.game_dir, previous_tool=before)
+                                return set_game_proton(managed_game.game_dir, target_steam_tool, previous_tool=before)
+                            except Exception:
+                                if not queued:
+                                    if before:
+                                        set_shortcut_proton(paths_local_p.config_vdf, entry.appid_u32, before)
+                                    else:
+                                        remove_compat_tool(paths_local_p.config_vdf, entry.appid_u32)
+                                raise
 
                         worker = SteamOpWorker(_do_steam, need_steam_closed=not queued)
                         win._track_worker(worker)
                         worker.status.connect(win.status_label.setText)
 
-                        def _st_ok(_res: object) -> None:
+                        def _st_ok(res: object) -> None:
                             win._end_busy()
+                            if managed_game is not None and isinstance(res, StandaloneGame):
+                                managed_game.proton_name = res.proton_name
+                                managed_game.meta = res.meta
                             active_proton_ref[0] = tool_id
                             msg = tr("proton.updated", name=entry.app_name, tool=display_tool)
                             if queued:
@@ -908,7 +932,10 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                             if dlg_alive():
                                 _set_proton_controls_enabled(True)
                                 _start_config_loader()
-                                QMessageBox.critical(dlg, __app_name__, tr("proton.error", err=err))
+                            if not win._closing_pending:
+                                QMessageBox.critical(
+                                    dlg if dlg_alive() else win, __app_name__, tr("proton.error", err=err),
+                                )
 
                         worker.finished_ok.connect(_st_ok)
                         worker.failed.connect(_st_err)
@@ -934,6 +961,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
 
         if btn_compat_migrate is not None and isinstance(obj, ShortcutEntry) and paths_snap is not None:
             paths_local = paths_snap
+            appid = obj.appid_u32
 
             def _on_compat_migrate_clicked() -> None:
                 st_now = str(compat_state_ref.get("state") or "missing")
@@ -980,8 +1008,13 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                 else:
                     return
 
+                if _is_wine_game_running():
+                    QMessageBox.warning(dlg, __app_name__, tr("cleanup.wine_running"))
+                    return
+                operation["migrating"] = True
                 btn_compat_migrate.setEnabled(False)
-                appid = obj.appid_u32
+                btn_close.setEnabled(False)
+                win._begin_busy()
 
                 class _CompatMigrateWorker(QThread):
                     finished_ok = Signal(str)
@@ -989,6 +1022,8 @@ def open_configure_game_dialog(win: MainWindow) -> None:
 
                     def run(self) -> None:
                         try:
+                            if _is_wine_game_running():
+                                raise RuntimeError(tr("cleanup.wine_running"))
                             if op_mode == "restore":
                                 restore_compatdata_from_microsd(paths_local, appid)
                                 self.finished_ok.emit(tr("configure.compat_restored", name=title_name))
@@ -1002,15 +1037,24 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                 win._track_worker(cm_worker)
 
                 def _cm_ok(msg: str) -> None:
+                    operation["migrating"] = False
+                    win._end_busy()
+                    if dlg_alive():
+                        btn_close.setEnabled(True)
                     win.status_label.setText(msg)
                     if dlg_alive():
                         _start_config_loader()
                         QMessageBox.information(dlg, __app_name__, msg)
 
                 def _cm_err(err: str) -> None:
+                    operation["migrating"] = False
+                    win._end_busy()
+                    if dlg_alive():
+                        btn_close.setEnabled(True)
                     if dlg_alive():
                         _start_config_loader()
-                        QMessageBox.critical(dlg, __app_name__, err)
+                    if not win._closing_pending:
+                        QMessageBox.critical(dlg if dlg_alive() else win, __app_name__, err)
 
                 cm_worker.finished_ok.connect(_cm_ok)
                 cm_worker.failed.connect(_cm_err)

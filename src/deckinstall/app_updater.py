@@ -18,11 +18,13 @@ from pathlib import Path
 import requests
 
 from . import __version__
+from .fsutil import file_lock
 
 GITHUB_RELEASES_API = "https://api.github.com/repos/murilogiatti/DeckInstall/releases/latest"
 GITHUB_RELEASES_URL = "https://github.com/murilogiatti/DeckInstall/releases"
 
 _CHUNK_SIZE = 65536
+_MAX_CHECKSUM_BYTES = 512 * 1024
 _APPIMAGE_ENV_KEYS = ("APPIMAGE", "APPDIR", "ARGV0", "OWD")
 _PATH_ENV_KEYS = ("PATH", "LD_LIBRARY_PATH", "QT_PLUGIN_PATH")
 _ALLOWED_URL_HOSTS = frozenset(
@@ -95,7 +97,7 @@ class AppUpdateInfo:
     is_appimage: bool
     appimage_path: Path | None
     can_self_update: bool
-    cannot_update_reason: str  # "", "not_appimage", "not_writable", "no_asset"
+    cannot_update_reason: str  # "", "not_appimage", "not_writable", "no_asset", "no_checksum"
 
 
 def parse_semver(version_str: str) -> tuple[int, ...]:
@@ -108,14 +110,23 @@ def parse_semver(version_str: str) -> tuple[int, ...]:
 def get_running_appimage() -> Path | None:
     """Return the path to the currently running AppImage, or None."""
     val = os.environ.get("APPIMAGE", "").strip()
-    if not val:
+    appdir_val = os.environ.get("APPDIR", "").strip()
+    if not val or not appdir_val:
         return None
     path = Path(val)
-    if (
-        not path.is_absolute()
-        or path.is_symlink()
-        or not path.is_file()
-    ):
+    appdir = Path(appdir_val)
+    if not path.is_absolute() or not appdir.is_absolute() or path.is_symlink() or not path.is_file():
+        return None
+    try:
+        mounted = appdir.resolve(strict=True)
+        if not (mounted / "AppRun").is_file():
+            return None
+        entrypoints = (Path(sys.executable).resolve(), Path(__file__).resolve())
+        if not any(entry.is_relative_to(mounted) for entry in entrypoints):
+            return None
+        if path.resolve().is_relative_to(mounted):
+            return None
+    except (OSError, RuntimeError):
         return None
     return path
 
@@ -170,6 +181,28 @@ def _extract_sha256(asset: dict) -> str:
     return digest.lower()
 
 
+def _release_checksum(assets: list[dict], name: str, headers: dict[str, str], timeout: float) -> str:
+    url = next((str(a.get("browser_download_url") or "") for a in assets if a.get("name") == "SHA256SUMS"), "")
+    if not url:
+        return ""
+    data = bytearray()
+    try:
+        with _request_github_with_validated_redirects(url, headers=headers, timeout=timeout, stream=True) as response:
+            response.raise_for_status()
+            for chunk in response.iter_content(chunk_size=_CHUNK_SIZE):
+                if len(data) + len(chunk) > _MAX_CHECKSUM_BYTES:
+                    return ""
+                data.extend(chunk)
+        matches = set()
+        for line in data.decode("utf-8").splitlines():
+            fields = line.split(maxsplit=1)
+            if len(fields) == 2 and fields[1].removeprefix("*") == name and _SHA256_HEX_RE.fullmatch(fields[0]):
+                matches.add(fields[0].lower())
+        return next(iter(matches)) if len(matches) == 1 else ""
+    except (requests.RequestException, OSError, ValueError, RuntimeError):
+        return ""
+
+
 def check_app_update(timeout: float = 10.0) -> AppUpdateInfo:
     """Query GitHub Releases for a newer DeckInstall AppImage release."""
     current_version = __version__
@@ -196,7 +229,10 @@ def check_app_update(timeout: float = 10.0) -> AppUpdateInfo:
     if download_url:
         download_url = _validate_github_url(download_url)
     asset_name = str(asset.get("name") or "") if asset else ""
-    expected_sha256 = _extract_sha256(asset) if asset else ""
+    try:
+        expected_sha256 = _extract_sha256(asset) if asset else ""
+    except ValueError:
+        expected_sha256 = ""
 
     release_notes = str(data.get("body") or "")
     raw_html_url = str(data.get("html_url") or GITHUB_RELEASES_URL)
@@ -216,8 +252,10 @@ def check_app_update(timeout: float = 10.0) -> AppUpdateInfo:
         can_self_update = False
         cannot_update_reason = "no_asset"
     else:
-        can_self_update = has_update
-        cannot_update_reason = ""
+        if has_update and not expected_sha256:
+            expected_sha256 = _release_checksum(assets, asset_name, headers, timeout)
+        can_self_update = has_update and bool(expected_sha256)
+        cannot_update_reason = "no_checksum" if has_update and not expected_sha256 else ""
 
     return AppUpdateInfo(
         current_version=current_version,
@@ -249,6 +287,16 @@ def download_and_replace_appimage(
     download_url = _validate_github_url(info.download_url)
 
     target_path = info.appimage_path
+    if target_path != get_running_appimage():
+        raise RuntimeError("The update target is not the running DeckInstall AppImage")
+    with file_lock(target_path.with_name(f".{target_path.name}.update.lock")):
+        return _replace_appimage(info, target_path, download_url, progress_cb)
+
+
+def _replace_appimage(
+    info: AppUpdateInfo, target_path: Path, download_url: str, progress_cb: Callable[[int], None] | None,
+) -> Path:
+    original = target_path.lstat()
     tmp_path: Path | None = None
 
     try:
@@ -257,7 +305,8 @@ def download_and_replace_appimage(
             download_url, headers=headers, stream=True, timeout=60.0
         ) as resp:
             resp.raise_for_status()
-            total_size = int(resp.headers.get("Content-Length") or 0)
+            length = (resp.headers.get("Content-Length") or "").strip()
+            total_size = int(length) if length.isascii() and length.isdecimal() and len(length) <= 20 else 0
             downloaded = 0
             last_percent = -1
             hasher = hashlib.sha256()
@@ -291,11 +340,14 @@ def download_and_replace_appimage(
         if actual_sha256.lower() != info.expected_sha256.lower():
             raise RuntimeError("SHA256 mismatch")
 
-        try:
-            old_mode = stat.S_IMODE(target_path.stat().st_mode)
-            new_mode = old_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
-        except OSError:
-            new_mode = 0o755
+        current = target_path.lstat()
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino, current.st_ctime_ns)
+            != (original.st_dev, original.st_ino, original.st_ctime_ns)
+        ):
+            raise RuntimeError("The AppImage changed during the download")
+        new_mode = (original.st_mode & 0o777) | stat.S_IXUSR
         os.chmod(tmp_path, new_mode)
 
         os.replace(tmp_path, target_path)

@@ -133,6 +133,7 @@ def default_mount_search_roots() -> list[Path]:
         Path("/media") / user,
         Path("/media"),
         Path("/mnt"),
+        Path("/var/mnt"),
     ]
     seen: set[Path] = set()
     out: list[Path] = []
@@ -150,20 +151,34 @@ def _is_mount(path: Path) -> bool:
 def list_mount_points(search_roots: list[Path] | None = None) -> list[Path]:
     """Return mounted removable disks (direct children of the search roots that are mount points)."""
     found: list[Path] = []
-    seen: set[Path] = set()
+    seen_roots: set[Path] = set()
+    seen_children: set[Path] = set()
     for root in search_roots if search_roots is not None else default_mount_search_roots():
-        if root.is_symlink() or not root.is_dir():
+        if not root.is_dir():
             continue
+        try:
+            rroot = root.resolve()
+        except OSError:
+            rroot = root
+        if rroot in seen_roots:
+            continue
+        seen_roots.add(rroot)
         try:
             children = sorted(root.iterdir(), key=lambda p: p.name)
         except OSError:
             continue
         for child in children:
-            if child.is_symlink() or not child.is_dir() or child in seen:
+            if child.is_symlink() or not child.is_dir():
+                continue
+            try:
+                rchild = child.resolve()
+            except OSError:
+                rchild = child
+            if rchild in seen_children:
                 continue
             if not _is_mount(child):
                 continue
-            seen.add(child)
+            seen_children.add(rchild)
             found.append(child)
     return found
 
@@ -286,8 +301,11 @@ def discover_libraries(search_roots: list[Path] | None = None) -> list[Library]:
     for lib_id, entry in _load_registry()["libraries"].items():
         if lib_id in seen_ids or not isinstance(entry, dict):
             continue
-        root = Path(str(entry.get("root") or ""))
-        data = read_library_file(root) if str(root) else None
+        raw_root = str(entry.get("root") or "").strip()
+        if not raw_root:
+            continue
+        root = Path(raw_root)
+        data = read_library_file(root)
         available = data is not None and str(data["id"]) == lib_id
         libs.append(
             Library(
@@ -319,6 +337,13 @@ def find_library_root(path: Path) -> Path | None:
     return None
 
 
+def _same_dir(a: Path, b: Path) -> bool:
+    try:
+        return a.resolve() == b.resolve()
+    except OSError:
+        return a == b
+
+
 def library_for_path(path: Path) -> Library | None:
     """Return the available Library holding path (its game folder), if any."""
     root = find_library_root(path)
@@ -331,7 +356,7 @@ def library_for_path(path: Path) -> Library | None:
         id=str(data["id"]),
         root=root,
         label=str(data.get("label") or root.parent.name),
-        internal=root == internal_library_root(),
+        internal=_same_dir(root, internal_library_root()),
         available=True,
         fs_type=fs_type_of(root),
     )

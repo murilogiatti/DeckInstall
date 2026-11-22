@@ -12,7 +12,10 @@ from __future__ import annotations
 import os
 import signal
 import time
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Signal
@@ -72,6 +75,9 @@ def _is_system_path(path: str, home: str | tuple[str, ...]) -> bool:
         return False
     return any(path == root or path.startswith(root + "/") for root in _SYSTEM_ROOTS)
 _ENV_KEYS = (b"WINEPREFIX=", b"STEAM_COMPAT_DATA_PATH=")
+_WINE_BACKGROUND_EXES = {
+    b"services.exe", b"winedevice.exe", b"plugplay.exe", b"rpcss.exe", b"svchost.exe", b"explorer.exe",
+}
 _READ_MAX = 256 * 1024
 _LOG_TAIL_LINES = 20
 # Released on close: kept referenced so nothing deletes (and so kills) them before os._exit.
@@ -88,11 +94,16 @@ def watch_paths(*candidates: object) -> tuple[str, ...]:
         text = str(cand).strip().strip('"')
         if not text.startswith("/"):
             continue
-        path = os.path.normpath(text)
-        if path in homes or len(Path(path).parts) < 3 or _is_system_path(path, homes):
+        normalized = os.path.normpath(text)
+        if normalized in homes or len(Path(normalized).parts) < 3 or _is_system_path(normalized, homes):
             continue
-        if path not in out:
-            out.append(path)
+        resolved = os.path.realpath(normalized)
+        for path in (normalized, resolved):
+            if (
+                path not in out and path not in homes
+                and len(Path(path).parts) >= 3 and not _is_system_path(path, homes)
+            ):
+                out.append(path)
     return tuple(out)
 
 
@@ -140,55 +151,102 @@ def _is_interactive_host_cwd_only(raw_cmd: bytes, unix: list[bytes]) -> bool:
     return base in _NON_GAME_CWD_BINARIES
 
 
-def find_game_pids(watch: tuple[str, ...], proc_root: str = "/proc") -> set[int]:
-    """PIDs (other than this app) whose cmdline, cwd or Wine prefix points inside a watched folder."""
-    if not watch:
-        return set()
-    unix = [w.encode() for w in watch if w and w != "/"]
-    if not unix:
-        return set()
-    dos = [("z:" + w.replace("/", "\\")).lower().encode() for w in watch if w and w != "/"]
-    ignored_env_roots = {b"", b"/"}
-    for h in _home_roots():
-        ignored_env_roots.add(h.rstrip("/").encode())
-    me = os.getpid()
-    found: set[int] = set()
+@dataclass
+class _ProcessSnapshot:
+    matches: dict[tuple[str, ...], set[int]]
+    states: dict[bytes, list[tuple[int, bool, int]]]
+    child_exes: set[int]
+
+    def exe_pids(self, name: str) -> set[int]:
+        return {pid for pid, zombie, _ in self.states.get(_exe_comm_bytes(name), ()) if not zombie}
+
+    def exe_state(self, name: str, scope: set[int] | None = None, session_id: int = 0) -> tuple[bool, bool]:
+        states = {
+            zombie for pid, zombie, session in self.states.get(_exe_comm_bytes(name), ())
+            if scope is None or pid in scope or (session_id != 0 and session == session_id)
+        }
+        return False in states, True in states
+
+
+_PROC_ROOT = "/proc"
+_PROC_POOL = ThreadPoolExecutor(max_workers=2, thread_name_prefix="deckinstall-proc")
+_RELEVANT_ENV_KEYS = frozenset(key.rstrip(b"=") for key in _ENV_KEYS)
+
+
+def _scan_processes(
+    watches: set[tuple[str, ...]], names: set[str], proc_root: str, *, find_children: bool = False,
+) -> _ProcessSnapshot:
+    """Read each PID's data once, matching it to all watched folders and executable names."""
+    snapshot = _ProcessSnapshot({watch: set() for watch in watches}, {}, set())
+    encoded = {}
+    for watch in watches:
+        unix = [folder.encode() for folder in watch if folder and folder != "/"]
+        if unix:
+            encoded[watch] = (unix, [b"z:" + value.replace(b"/", b"\\").lower() for value in unix])
+    exe_names = {_exe_comm_bytes(name) for name in names if name}
+    ignored_roots = {b"", b"/", *(home.rstrip("/").encode() for home in _home_roots())}
+    own_pid = os.getpid() if proc_root == "/proc" else -1
     try:
-        entries = [e.name for e in os.scandir(proc_root) if e.name.isdigit()]
+        with os.scandir(proc_root) as listing:
+            pids = [entry.name for entry in listing if entry.name.isascii() and entry.name.isdigit()]
     except OSError:
-        return found
-    for name in entries:
+        return snapshot
+    for name in pids:
         pid = int(name)
-        if pid == me:
+        if pid == own_pid:
             continue
         base = f"{proc_root}/{name}"
-        raw_cmd = _read(f"{base}/cmdline")
-        raw_cmd_low = raw_cmd.lower()
-        if any(_cmd_has_path_prefix(raw_cmd, u) for u in unix) or any(
-            _cmd_has_path_prefix(raw_cmd_low, d) for d in dos
-        ):
-            found.add(pid)
+        comm = b""
+        zombie = False
+        if exe_names or find_children:
+            proc_stat = _read(f"{base}/stat")
+            start, end = proc_stat.find(b"("), proc_stat.rfind(b")")
+            if start >= 0 and end > start:
+                comm = proc_stat[start + 1:end]
+                fields = proc_stat[end + 2:].split(None, 4)
+                zombie = fields[:1] == [b"Z"]
+                if comm in exe_names:
+                    session = int(fields[3]) if len(fields) > 3 and fields[3].isdigit() else 0
+                    snapshot.states.setdefault(comm, []).append((pid, zombie, session))
+        if not encoded:
             continue
-        try:
-            cwd = os.readlink(f"{base}/cwd").encode()
-        except OSError:
-            cwd = b""
-        if (
-            cwd
-            and any(cwd == u or cwd.startswith(u + b"/") for u in unix)
-            and not _is_interactive_host_cwd_only(raw_cmd, unix)
-        ):
-            found.add(pid)
+        cmd = _read(f"{base}/cmdline")
+        if not cmd:
             continue
-        for var in _read(f"{base}/environ").split(b"\0"):
-            if var.startswith(_ENV_KEYS):  # WINEPREFIX and STEAM_COMPAT_DATA_PATH: both are checked
-                value = var.split(b"=", 1)[1].rstrip(b"/")
-                if not value or value in ignored_env_roots:
+        low = cmd.lower()
+        if find_children and comm and not zombie and comm.lower() not in _WINE_BACKGROUND_EXES:
+            if b".exe" in low and b"proton" not in low and b"wineserver" not in low:
+                snapshot.child_exes.add(pid)
+        cwd: bytes | None = None
+        prefixes: list[bytes] | None = None
+        for watch, (unix, dos) in encoded.items():
+            if any(_cmd_has_path_prefix(cmd, u) for u in unix) or any(_cmd_has_path_prefix(low, d) for d in dos):
+                snapshot.matches[watch].add(pid)
+                continue
+            if cwd is None:
+                try:
+                    cwd = os.fsencode(os.readlink(f"{base}/cwd"))
+                except OSError:
+                    cwd = b""
+            if cwd and any(cwd == u or cwd.startswith(u + b"/") for u in unix):
+                if not _is_interactive_host_cwd_only(cmd, unix):
+                    snapshot.matches[watch].add(pid)
                     continue
-                if any(value == u or value.startswith(u + b"/") or u.startswith(value + b"/") for u in unix):
-                    found.add(pid)
-                    break
-    return found
+            if prefixes is None:
+                prefixes = []
+                for field in _read(f"{base}/environ").split(b"\0"):
+                    key, _, raw = field.partition(b"=")
+                    prefix = raw.rstrip(b"/")
+                    if key in _RELEVANT_ENV_KEYS and prefix not in ignored_roots:
+                        prefixes.append(prefix)
+            if any(p == u or p.startswith(u + b"/") or u == p + b"/pfx" for p in prefixes for u in unix):
+                snapshot.matches[watch].add(pid)
+    return snapshot
+
+
+def find_game_pids(watch: tuple[str, ...], proc_root: str | None = None) -> set[int]:
+    """PIDs whose cmdline, cwd or Wine prefix points inside a watched folder."""
+    return _scan_processes({watch}, set(), proc_root or _PROC_ROOT).matches[watch] if watch else set()
 
 
 def _exe_comm_bytes(exe_name: str) -> bytes:
@@ -197,19 +255,30 @@ def _exe_comm_bytes(exe_name: str) -> bytes:
     return raw
 
 
-def exe_process_state(exe_name: str, proc_root: str = "/proc") -> tuple[bool, bool]:
+def exe_process_state(
+    exe_name: str,
+    proc_root: str | None = None,
+    *,
+    scope: set[int] | None = None,
+    session_id: int = 0,
+) -> tuple[bool, bool]:
     """(alive, zombie): processes named like the game's .exe (Wine sets comm to its first 15 bytes)."""
     comm = _exe_comm_bytes(exe_name)
     alive = zombie = False
     try:
-        entries = [e.name for e in os.scandir(proc_root) if e.name.isdigit()]
+        entries = [e.name for e in os.scandir(proc_root or _PROC_ROOT) if e.name.isdigit()]
     except OSError:
         return False, False
     for name in entries:
-        stat = _read(f"{proc_root}/{name}/stat")
+        stat = _read(f"{proc_root or _PROC_ROOT}/{name}/stat")
         start, end = stat.find(b"("), stat.rfind(b")")
         if start < 0 or end < 0 or stat[start + 1:end] != comm:
             continue
+        if scope is not None and int(name) not in scope:
+            # Exited processes lose cmdline and cwd. Their session still identifies our child.
+            fields = stat[end + 2:].split(None, 4)
+            if not session_id or len(fields) < 4 or fields[3] != str(session_id).encode():
+                continue
         if stat[end + 2:end + 3] == b"Z":
             zombie = True
         else:
@@ -217,47 +286,57 @@ def exe_process_state(exe_name: str, proc_root: str = "/proc") -> tuple[bool, bo
     return alive, zombie
 
 
-def exe_pids(exe_name: str, proc_root: str = "/proc") -> set[int]:
+def exe_pids(exe_name: str, proc_root: str | None = None) -> set[int]:
     """Live (not zombie) processes named like the game's .exe (Wine sets comm to its first 15 bytes)."""
     if not exe_name:
         return set()
     comm = _exe_comm_bytes(exe_name)
     found: set[int] = set()
     try:
-        entries = [e.name for e in os.scandir(proc_root) if e.name.isdigit()]
+        entries = [e.name for e in os.scandir(proc_root or _PROC_ROOT) if e.name.isdigit()]
     except OSError:
         return found
     for name in entries:
-        stat = _read(f"{proc_root}/{name}/stat")
+        stat = _read(f"{proc_root or _PROC_ROOT}/{name}/stat")
         start, end = stat.find(b"("), stat.rfind(b")")
         if start >= 0 and end >= 0 and stat[start + 1:end] == comm and stat[end + 2:end + 3] != b"Z":
             found.add(int(name))
     return found
 
 
+@lru_cache(maxsize=1)
+def _system_boot_time() -> int:
+    return _boot_time("/proc")
+
+
+def _boot_time(proc_root: str) -> int:
+    return next(int(line.split()[1]) for line in _read(f"{proc_root}/stat").splitlines()
+                if line.startswith(b"btime "))
+
+
 def process_start_epoch(pid: int, proc_root: str = "/proc") -> float | None:
     """When a process started (seconds since the epoch), from /proc/<pid>/stat and the boot time."""
-    stat = _read(f"{proc_root}/{pid}/stat")
-    end = stat.rfind(b")")
+    proc_stat = _read(f"{proc_root}/{pid}/stat")
+    end = proc_stat.rfind(b")")
     try:
-        ticks = int(stat[end + 2:].split()[19])
-        btime = next(int(line.split()[1]) for line in _read(f"{proc_root}/stat").splitlines()
-                     if line.startswith(b"btime "))
+        ticks = int(proc_stat[end + 2:].split()[19])
+        btime = _system_boot_time() if proc_root == "/proc" else _boot_time(proc_root)
         return btime + ticks / os.sysconf("SC_CLK_TCK")
     except (ValueError, IndexError, StopIteration, OSError):
         return None
 
 
-def stale_instance_pids(exe_name: str, watch: tuple[str, ...], proc_root: str = "/proc") -> set[int]:
+def stale_instance_pids(exe_name: str, watch: tuple[str, ...], proc_root: str | None = None) -> set[int]:
     """Processes of a game instance already running (its .exe alive inside the watched folders).
 
     Proton launches with "waitforexitandrun": a new launch waits, without any window, until the
     old instance of the same prefix exits. Empty when the game's .exe is not running.
     """
-    alive = exe_pids(exe_name, proc_root)
-    if not alive:
+    if not exe_name or not watch:
         return set()
-    game = find_game_pids(watch, proc_root)
+    snapshot = _scan_processes({watch}, {exe_name}, proc_root or _PROC_ROOT)
+    alive = snapshot.exe_pids(exe_name)
+    game = snapshot.matches[watch]
     return game if alive & game else set()
 
 
@@ -325,6 +404,9 @@ class PlayMonitor(QObject):
         self.scan = find_game_pids
         self.exe_state = exe_process_state
         self.exe_pids = exe_pids
+        self._proc_poll: Future[_ProcessSnapshot] | None = None
+        self._polled_runs: dict[str, _Run] = {}
+        self._proc_snapshot: _ProcessSnapshot | None = None
 
     def state(self, key: str) -> str:
         run = self._runs.get(key)
@@ -387,9 +469,12 @@ class PlayMonitor(QObject):
         proc.setStandardOutputFile(out, QProcess.OpenModeFlag.Append)
         proc.setStandardErrorFile(out, QProcess.OpenModeFlag.Append)
         proc.setUnixProcessParameters(QProcess.UnixProcessFlag.CreateNewSession)
+        old_exe_pids = self.exe_pids(exe_name)
+        if watch and old_exe_pids:
+            old_exe_pids &= self.scan(watch)
         self._runs[key] = _Run(
             name, LOADING, self.clock(), watch, log_path or log_file, proc, exe_name=exe_name,
-            old_exe_pids=self.exe_pids(exe_name),
+            old_exe_pids=old_exe_pids,
         )
         proc.errorOccurred.connect(lambda err, k=key, p=proc: self._on_error(k, p, err))
         proc.finished.connect(lambda code, status, k=key, p=proc: self._on_finished(k, p, code, status))
@@ -425,10 +510,14 @@ class PlayMonitor(QObject):
             except OSError:
                 pass
 
-    def kill_pids(self, pids: set[int], grace_ms: int = 3000) -> None:
+    def kill_pids(
+        self, pids: set[int], grace_ms: int = 3000, *, on_finished: Callable[[], None] | None = None,
+    ) -> None:
         """SIGTERM now, SIGKILL to whatever is left after grace_ms (guarding against PID reuse)."""
         epochs = {pid: process_start_epoch(pid) for pid in pids}
-        for pid in pids:
+        for pid, epoch in epochs.items():
+            if epoch is None:
+                continue
             try:
                 os.kill(pid, signal.SIGTERM)
             except OSError:
@@ -445,6 +534,8 @@ class PlayMonitor(QObject):
                     os.kill(pid, signal.SIGKILL)
                 except OSError:
                     pass
+            if on_finished is not None:
+                on_finished()
 
         QTimer.singleShot(grace_ms, self, _kill)
 
@@ -456,6 +547,10 @@ class PlayMonitor(QObject):
     def release(self) -> None:
         """Stop monitoring (the app is closing): running games keep running."""
         self._timer.stop()
+        if self._proc_poll is not None:
+            self._proc_poll.cancel()
+            self._proc_poll = None
+        self._polled_runs.clear()
         for run in self._runs.values():
             if run.proc is not None:
                 run.proc.blockSignals(True)
@@ -521,24 +616,38 @@ class PlayMonitor(QObject):
             run.exited_at = now  # quick exit 0: look for the real game process
             self._tick_run(key, run, now)
 
+    def _watch_pids(self, watch: tuple[str, ...]) -> set[int]:
+        if self._proc_snapshot is not None:
+            return self._proc_snapshot.matches.get(watch, set())
+        return self.scan(watch)
+
+    def _named_pids(self, name: str) -> set[int]:
+        if self._proc_snapshot is not None:
+            return self._proc_snapshot.exe_pids(name)
+        return self.exe_pids(name)
+
     def _started(self, run: _Run, now: float) -> bool:
         """Running: without a known .exe, our process alive RUNNING_AFTER_S; with one, a new .exe process."""
         if now - run.started < self.RUNNING_AFTER_S:
             return False
         if not run.exe_name:
             return True
-        return bool(self.exe_pids(run.exe_name) - run.old_exe_pids)
+        pids = self._named_pids(run.exe_name) - run.old_exe_pids
+        return bool(pids and (not run.watch or pids & self._watch_pids(run.watch)))
 
     def _has_live_child_exe(self, run: _Run, proc_root: str = "/proc") -> bool:
         """True if another live Windows .exe runs inside run.watch (bootstrapper handed off to real exe)."""
         if not run.watch:
             return False
-        for pid in self.scan(run.watch):
-            if pid in run.old_exe_pids:
-                continue
+        pids = self._watch_pids(run.watch) - run.old_exe_pids
+        if self._proc_snapshot is not None:
+            return bool(pids & self._proc_snapshot.child_exes)
+        for pid in pids:
             stat = _read(f"{proc_root}/{pid}/stat")
-            end = stat.rfind(b")")
-            if end < 0 or stat[end + 2 : end + 3] == b"Z":
+            start, end = stat.find(b"("), stat.rfind(b")")
+            if start < 0 or end < 0 or stat[end + 2 : end + 3] == b"Z":
+                continue
+            if stat[start + 1:end].lower() in _WINE_BACKGROUND_EXES:
                 continue
             cmd_low = _read(f"{proc_root}/{pid}/cmdline").replace(b"\0", b" ").lower()
             if b".exe" in cmd_low and b"proton" not in cmd_low and b"wineserver" not in cmd_low:
@@ -547,7 +656,15 @@ class PlayMonitor(QObject):
 
     def _check_hung(self, run: _Run, now: float) -> None:
         """The game .exe is a zombie and nothing alive has its name: Proton hung after the game died."""
-        alive, zombie = self.exe_state(run.exe_name)
+        if self._proc_snapshot is not None:
+            scope = self._watch_pids(run.watch) if run.watch else None
+            session = int(run.proc.processId()) if run.proc is not None else 0
+            alive, zombie = self._proc_snapshot.exe_state(run.exe_name, scope, session)
+        elif run.watch:
+            session = int(run.proc.processId()) if run.proc is not None else 0
+            alive, zombie = self.exe_state(run.exe_name, scope=self._watch_pids(run.watch), session_id=session)
+        else:
+            alive, zombie = self.exe_state(run.exe_name)
         if not zombie or alive or self._has_live_child_exe(run):
             run.zombie_since = None
             return
@@ -560,8 +677,34 @@ class PlayMonitor(QObject):
     def _tick(self) -> None:
         self.frame += 1
         now = self.clock()
-        for key, run in list(self._runs.items()):
-            self._tick_run(key, run, now)
+        runs = dict(self._runs)
+        if self.scan is not find_game_pids or self.exe_state is not exe_process_state or self.exe_pids is not exe_pids:
+            for key, run in runs.items():
+                self._tick_run(key, run, now)
+            return
+        if self._proc_poll is not None and self._proc_poll.done():
+            self._proc_snapshot = self._proc_poll.result()
+            self._proc_poll = None
+        try:
+            for key, run in runs.items():
+                needs_proc = not run.preparing and run.state != ERROR and (
+                    (run.proc is None and bool(run.watch)) or bool(run.exe_name)
+                )
+                if not needs_proc or (self._proc_snapshot is not None and self._polled_runs.get(key) is run):
+                    self._tick_run(key, run, now)
+                elif run.state == LOADING:
+                    self.changed.emit(key)
+        finally:
+            self._proc_snapshot = None
+        if self._proc_poll is None:
+            active = {key: run for key, run in self._runs.items() if not run.preparing and run.state != ERROR}
+            watches = {run.watch for run in active.values() if run.watch}
+            names = {run.exe_name for run in active.values() if run.exe_name}
+            if watches or names:
+                self._polled_runs = active
+                self._proc_poll = _PROC_POOL.submit(
+                    _scan_processes, watches, names, _PROC_ROOT, find_children=bool(names),
+                )
 
     def _tick_run(self, key: str, run: _Run, now: float) -> None:
         if run.state == ERROR:
@@ -578,7 +721,7 @@ class PlayMonitor(QObject):
                 run.state = RUNNING
                 self._changed(key)
             elif run.state == LOADING and run.exe_name and now - run.started >= self.LOADING_TIMEOUT_S:
-                old = run.old_exe_pids & self.exe_pids(run.exe_name)
+                old = run.old_exe_pids & self._named_pids(run.exe_name)
                 if old:  # Proton is waiting for the old instance: this launch never shows anything
                     self._fail(key, tr("play.blocked_by_old", pids=", ".join(map(str, sorted(old)))))
                     if run.proc is not None and run.proc.state() != QProcess.ProcessState.NotRunning:
@@ -594,7 +737,7 @@ class PlayMonitor(QObject):
             elif run.exe_name and not run.hung and not run.stopping:
                 self._check_hung(run, now)
             return
-        pids = self.scan(run.watch)
+        pids = self._watch_pids(run.watch)
         if pids:
             run.pids, run.misses = pids, 0
             if run.state == LOADING:

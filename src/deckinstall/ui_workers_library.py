@@ -6,7 +6,6 @@ import logging
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Literal
 
 from PySide6.QtCore import QThread, Signal
 
@@ -39,7 +38,6 @@ from .steam_paths import (
     find_proton_binary,
     find_steam_root,
     is_steam_running,
-    list_installed_protons,
     resolve_steam_paths,
 )
 from .steam_vdf import (
@@ -48,7 +46,6 @@ from .steam_vdf import (
     _strip_vdf_quotes,
     backup_all_saves,
     get_compat_tool_map,
-    get_shortcut_proton,
     load_shortcuts,
     remove_shortcut,
     restore_saves_backup,
@@ -56,6 +53,36 @@ from .steam_vdf import (
     start_steam,
 )
 from .ui_cards import _format_worker_error, _is_wine_game_running
+
+
+def close_steam_for_edit(
+    is_running: Callable[[], bool],
+    shutdown: Callable[[], bool],
+    status: Callable[[str], None] | None = None,
+) -> bool:
+    """Close Steam when running and report whether this operation closed it."""
+    if not is_running():
+        return False
+    if status is not None:
+        status(tr("add.closing_steam"))
+    if not shutdown():
+        raise RuntimeError(tr("add.close_steam_timeout"))
+    return True
+
+
+def restart_steam_after_edit(
+    start: Callable[[], bool], operation: str, status: Callable[[str], None] | None = None,
+) -> bool:
+    if status is not None:
+        status(tr("add.restarting_steam"))
+    try:
+        ok = start()
+    except Exception:
+        logging.exception("Failed restarting Steam after %s", operation)
+        ok = False
+    if not ok and status is not None:
+        status(tr("steam.restart_failed"))
+    return ok
 
 
 def compute_library_runner_labels(
@@ -266,7 +293,9 @@ class LaunchPrepWorker(QThread):
 
     def run(self) -> None:
         try:
-            wants_mangohud = "MANGOHUD=1" in str(getattr(self._obj, "launch_options", "") or "")
+            from .launch_presets import parse_presets
+
+            wants_mangohud = parse_presets(str(getattr(self._obj, "launch_options", "") or ""))["mangohud"]
             if wants_mangohud and not official_mangohud_installed() and not system_mangohud_installed():
                 try:  # the overlay always comes from the official build when no system MangoHud exists
                     ensure_mangohud()
@@ -364,63 +393,6 @@ class SteamRunningWorker(QThread):
         self.ready.emit(running)
 
 
-class ProtonPrepWorker(QThread):
-    """Inspect prefix compatibility and list available Proton tools."""
-
-    ready = Signal(bool, list, str)
-    failed = Signal(str)
-
-    def __init__(
-        self,
-        mode: Literal["standalone", "steam"],
-        prefix_dir: Path,
-        paths: SteamPaths | None = None,
-        appid_u32: int = 0,
-    ) -> None:
-        super().__init__()
-        self._mode = mode
-        self._prefix_dir = prefix_dir
-        self._paths = paths
-        self._appid_u32 = appid_u32
-
-    def run(self) -> None:
-        try:
-            self._prepare()
-        except Exception as exc:
-            self.failed.emit(_format_worker_error(exc))
-
-    def _prepare(self) -> None:
-        if is_win32_prefix(self._prefix_dir):
-            self.ready.emit(True, [], "")
-            return
-        if self._mode == "standalone":
-            tools: list[tuple[str, str]] = []
-            seen_ids: set[str] = set()
-            for ct in list_installed_compat_tools():
-                if ct.tool_id not in seen_ids:
-                    seen_ids.add(ct.tool_id)
-                    tools.append((ct.tool_id, ct.folder_name or ct.tool_id))
-            if self._paths is not None:
-                for tid, disp in list_installed_protons(self._paths.steam_root):
-                    if tid not in seen_ids:
-                        seen_ids.add(tid)
-                        tools.append((tid, disp))
-            self.ready.emit(False, tools, "")
-            return
-
-        protons = (
-            list_installed_protons(self._paths.steam_root)
-            if self._paths is not None
-            else []
-        )
-        current_id = (
-            get_shortcut_proton(self._paths.config_vdf, self._appid_u32)
-            if protons and self._paths is not None
-            else ""
-        )
-        self.ready.emit(False, protons, current_id)
-
-
 class BackupWorker(QThread):
     """Back up all game saves into a zip archive."""
 
@@ -475,28 +447,20 @@ class RemoveShortcutWorker(QThread):
         self.restart_if_was_running = True
 
     def run(self) -> None:
-        was_running = False
-        removed = False
-        err_msg: str | None = None
         try:
-            was_running = is_steam_running()
-            if was_running and not shutdown_steam():
-                raise RuntimeError(tr("add.close_steam_timeout"))
-            self.closed_steam = was_running
-            removed = remove_shortcut(self._paths, self._shortcut.appid_u32)
-        except Exception as exc:
-            err_msg = _format_worker_error(exc)
-        finally:
+            self.closed_steam = close_steam_for_edit(is_steam_running, shutdown_steam)
             try:
-                if was_running and not is_steam_running() and not start_steam():
+                removed = remove_shortcut(self._paths, self._shortcut.appid_u32)
+            finally:
+                try:
+                    if self.closed_steam and not is_steam_running():
+                        self.restart_failed = not restart_steam_after_edit(start_steam, type(self).__name__)
+                except Exception:
+                    logging.exception("Could not check Steam after removing the shortcut")
                     self.restart_failed = True
-            except Exception:
-                logging.exception("Failed restarting Steam after RemoveShortcutWorker")
-                self.restart_failed = True
-        if err_msg is not None:
-            self.failed.emit(err_msg)
-        else:
             self.done.emit(removed)
+        except Exception as exc:
+            self.failed.emit(_format_worker_error(exc))
 
 
 class DirStatsWorker(QThread):

@@ -84,6 +84,10 @@ class UninstallDialog(QDialog):
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
         self.btn_uninstall = buttons.addButton(tr("uninstall.btn_uninstall"), QDialogButtonBox.ButtonRole.AcceptRole)
         self.btn_uninstall.setObjectName("dangerBtn")
+        self.btn_uninstall.setAutoDefault(False)
+        cancel = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+        cancel.setDefault(True)
+        cancel.setFocus()
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         lay.addWidget(buttons)
@@ -95,6 +99,11 @@ class UninstallDialog(QDialog):
     def _refresh(self) -> None:
         for item in self.plan.items:
             if item.locked:
+                continue
+            if item.id == un.SAVES:
+                self.boxes[item.id].setEnabled(
+                    any(self.boxes[key].isChecked() for key in (un.PREFIX, un.GAME_FILES) if key in self.boxes)
+                )
                 continue
             parent = item.covered_by or item.requires
             if not parent or parent not in self.boxes:

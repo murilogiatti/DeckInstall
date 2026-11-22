@@ -93,11 +93,16 @@ def library_root_for(game_dir: Path, rel_game_dir: str) -> Path | None:
     rel = PurePosixPath(rel_game_dir.strip())
     if rel.is_absolute() or ".." in rel.parts or not rel.parts or rel.parts == (".",):
         return None
+    if len(rel.parts) >= len(game_dir.parts):
+        return None
     # Only the depth matters, so a game folder renamed by hand still finds its root.
     root = game_dir
     for _ in rel.parts:
-        root = root.parent
-    return root
+        parent = root.parent
+        if parent == root:
+            return None
+        root = parent
+    return root if root != root.parent else None
 
 
 def _read_json(manifest_path: Path) -> dict[str, Any] | None:

@@ -10,6 +10,8 @@ import shlex
 import shutil
 import struct
 import subprocess
+import tempfile
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,7 @@ from . import library as _lib
 from .extractor import check_disk_space
 from .fsutil import (
     atomic_write_bytes,
+    atomic_write_text,
     copy_or_move_dir_contents,
     is_within,
     move_dir_safely,
@@ -53,6 +56,7 @@ from .scanner import detect_steam_appid, detect_steam_emulator, gog_product_id
 from .steam_paths import (
     SteamPaths,
     dir_size_bytes,
+    find_proton_binary,
     find_steam_root,
     list_steam_users,
     resolve_proton_dir,
@@ -320,7 +324,11 @@ def _resolve_proton_path(proton_name: str) -> str:
         from .runtime_manager import list_ge_proton10_dirs, list_ge_proton11_dirs
 
         newest = list_ge_proton11_dirs() or list_ge_proton10_dirs()
-        return str(newest[0]) if newest else "GE-Proton"
+        if newest:
+            return str(newest[0])
+        steam_root = find_steam_root()
+        proton = find_proton_binary(steam_root) if steam_root is not None else None
+        return str(proton.parent) if proton is not None else "GE-Proton"
     from .runtime_manager import get_compat_tools_dir
 
     steam_root = find_steam_root() or (Path.home() / ".local" / "share" / "Steam")
@@ -388,7 +396,7 @@ def _parse_launch_tokens(
     launch_options: str,
     winedlloverrides: str = "",
 ) -> tuple[list[tuple[str, str]], list[str], list[str], str]:
-    """Parse Steam-style launch_options into (env_pairs, wrappers, game_args, effective_dll_overrides)."""
+    """Return environment values, wrappers, shell-formatted arguments and effective DLL overrides."""
     _validate_launch_options(launch_options)
     _validate_launch_options(winedlloverrides)
     try:
@@ -419,24 +427,32 @@ def _parse_launch_tokens(
     for tok in before:
         if _is_env_assignment(tok):
             k, v = tok.split("=", 1)
-            v_unquoted = _strip_vdf_quotes(v)
+            v_unquoted = _unquote_launch_token(v)
             if k == "WINEDLLOVERRIDES":
                 parsed_dll = v_unquoted
                 continue
             env_pairs.append((k, v_unquoted))
         else:
-            wrappers.append(_strip_vdf_quotes(tok))
+            wrappers.append(_unquote_launch_token(tok))
 
-    effective_dll = winedlloverrides.strip() or parsed_dll
-    game_args = [_strip_vdf_quotes(t) for t in after]
+    effective_dll = merge_dll_overrides(winedlloverrides, parsed_dll) if winedlloverrides.strip() else parsed_dll
+    game_args = [_quote_game_arg(t) for t in after]
     return env_pairs, wrappers, game_args, effective_dll
+
+
+def _unquote_launch_token(token: str) -> str:
+    try:
+        parts = shlex.split(token)
+    except ValueError:
+        return token
+    return parts[0] if len(parts) == 1 else token
 
 
 def _quote_game_arg(arg: str) -> str:
     """Quote a game argument unless it is a shell operator (excluding %command%)."""
     if arg in _SHELL_OPS and arg != "%command%":
         return arg
-    return shlex.quote(arg)
+    return shlex.quote(_unquote_launch_token(arg))
 
 
 def _store_of(game: StandaloneGame) -> str:
@@ -449,24 +465,21 @@ def _codename_of(game: StandaloneGame) -> str:
 
 def merge_dll_overrides(user: str, extra: str) -> str:
     """Add the extra WINEDLLOVERRIDES entries the user did not set already (user entries win)."""
-    from .steam_vdf import merge_winedlloverride
+    from .steam_vdf import _normalize_dll_name, merge_winedlloverride
 
-    def names(spec: str) -> set[str]:
-        out: set[str] = set()
-        for entry in spec.split(";"):
-            part = entry.split("=", 1)[0]
-            out.update(n.strip().lower().removesuffix(".dll") for n in part.split(",") if n.strip())
-        return out
-
-    taken = names(user)
+    taken = {
+        _normalize_dll_name(dll)
+        for entry in user.split(";")
+        for dll in entry.partition("=")[0].split(",")
+    }
     merged = user.strip()
     for entry in extra.split(";"):
-        if not entry.strip():
-            continue
-        dll, _, mode = entry.partition("=")
-        if dll.strip().lower() in taken:
-            continue
-        merged = merge_winedlloverride(merged, dll.strip(), mode.strip() or "n,b")
+        dlls, separator, mode = entry.partition("=")
+        for dll in dlls.split(","):
+            norm = _normalize_dll_name(dll)
+            if norm and norm not in taken:
+                merged = merge_winedlloverride(merged, norm, mode.strip() if separator else "n,b")
+                taken.add(norm)
     return merged
 
 
@@ -488,11 +501,7 @@ def _is_deckinstall_launcher(script: Path) -> bool:
     )
 
 
-def preserve_foreign_launch_script(script: Path) -> Path | None:
-    """Rename a launch.sh the game shipped itself (not ours) to launch.sh.orig; return the backup.
-
-    Symlinks and DeckInstall launchers are left alone (None).
-    """
+def _foreign_launch_backup_path(script: Path) -> Path | None:
     if script.is_symlink() or not script.is_file() or _is_deckinstall_launcher(script):
         return None
     backup = script.with_name(script.name + _LAUNCH_BACKUP_SUFFIX)
@@ -500,6 +509,14 @@ def preserve_foreign_launch_script(script: Path) -> Path | None:
     while backup.exists() or backup.is_symlink():
         backup = script.with_name(f"{script.name}{_LAUNCH_BACKUP_SUFFIX}.{idx}")
         idx += 1
+    return backup
+
+
+def preserve_foreign_launch_script(script: Path) -> Path | None:
+    """Keep a game-provided launch.sh as a sibling backup."""
+    backup = _foreign_launch_backup_path(script)
+    if backup is None:
+        return None
     os.rename(script, backup)
     logging.info("Kept the game's own %s as %s", script.name, backup.name)
     return backup
@@ -557,8 +574,10 @@ def _write_launch_script(
         "#!/usr/bin/env bash",
         LAUNCHER_MARKER,
         "set -euo pipefail",
-        f"cd {shlex.quote(str(exe_path.parent))}",
     ]
+    if log_dir is not None:
+        lines.extend(_log_lines(log_dir, game_name or exe_path.stem))
+    lines.append(f"cd {shlex.quote(str(exe_path.parent))}")
 
     if not native_linux:
         proton_path = _resolve_proton_path(proton_name)
@@ -601,12 +620,11 @@ def _write_launch_script(
     if not native_linux:
         cmd_parts.append(shlex.quote(str(UMU_RUN_PATH)))
     cmd_parts.append(shlex.quote(str(exe_path)))
-    cmd_parts.extend(_quote_game_arg(arg) for arg in game_args)
+    cmd_parts.extend(game_args)
     command = " ".join(cmd_parts)
     if log_dir is None:
         lines.append("exec " + command)
     else:
-        lines.extend(_log_lines(log_dir, game_name or exe_path.stem))
         lines.extend([
             "rc=0",
             f"{command} || rc=$?",
@@ -614,8 +632,7 @@ def _write_launch_script(
             'exit "$rc"',
         ])
 
-    _atomic_write_text(script_path, "\n".join(lines) + "\n")
-    script_path.chmod(0o755)
+    atomic_write_text(script_path, "\n".join(lines) + "\n", mode=0o755)
 
 
 LOG_KEEP = 5
@@ -829,9 +846,9 @@ def extract_pe_icon(exe_path: Path, out_ico: Path) -> Path | None:
             if len(opt_hdr) < opt_size:
                 return None
             magic = struct.unpack_from("<H", opt_hdr, 0)[0]
-            if magic == 0x10B and opt_size >= 112:
+            if magic == 0x10B and opt_size >= 120:
                 rsrc_rva, _ = struct.unpack_from("<II", opt_hdr, 96 + 2 * 8)
-            elif magic == 0x20B and opt_size >= 128:
+            elif magic == 0x20B and opt_size >= 136:
                 rsrc_rva, _ = struct.unpack_from("<II", opt_hdr, 112 + 2 * 8)
             else:
                 return None
@@ -1617,7 +1634,7 @@ def owned_shortcut_appids(game: StandaloneGame) -> set[int]:
     out: set[int] = set()
     source = game.meta.get("source") or {}
     candidates = [(game.meta.get("steam") or {}).get("shortcut_appid")]
-    if source.get("origin") == "steam":
+    if source.get("origin") == "steam" or source.get("kind") == "adopted":
         candidates.append(source.get("shortcut_appid"))
     for raw in candidates:
         try:
@@ -1666,6 +1683,7 @@ def match_owned_shortcuts(
         for path in paths:
             if path:
                 by_path.setdefault(Path(os.path.normpath(path)), []).append(g)
+                by_path.setdefault(Path(os.path.realpath(path)), []).append(g)
         account = (g.meta.get("steam") or {}).get("user_id")
         if not account or user_id is None or str(account) == user_id:
             for appid in owned_shortcut_appids(g):
@@ -1676,7 +1694,12 @@ def match_owned_shortcuts(
         if not exe.is_absolute():
             continue
         candidates = {
-            g.game_dir: g for g in [*by_path.get(exe, ()), *by_appid.get(entry.appid_u32, ())]
+            g.game_dir: g
+            for g in [
+                *by_path.get(exe, ()),
+                *by_path.get(Path(os.path.realpath(exe)), ()),
+                *by_appid.get(entry.appid_u32, ()),
+            ]
         }
         if len(candidates) == 1:
             owned[entry.appid_u32] = next(iter(candidates.values()))
@@ -1693,7 +1716,7 @@ def primary_owned_shortcuts(
         game = owned.get(entry.appid_u32)
         if game is None:
             continue
-        current = Path(os.path.normpath(_strip_vdf_quotes(entry.exe))) == game.exe_path
+        current = os.path.realpath(_strip_vdf_quotes(entry.exe)) == os.path.realpath(game.exe_path)
         if game.game_dir not in primary or (current and not priorities[game.game_dir]):
             primary[game.game_dir] = entry
             priorities[game.game_dir] = current
@@ -2018,11 +2041,11 @@ def shortcut_launch_options(shortcut: ShortcutEntry) -> tuple[str, str]:
     env_pairs, wrappers, game_args, dll_overrides = _parse_launch_tokens(shortcut.launch_options)
     clean_tokens: list[str] = []
     for k, v in env_pairs:
-        clean_tokens.append(f"{k}={shlex.quote(v)}" if any(c.isspace() for c in v) else f"{k}={v}")
-    clean_tokens.extend(wrappers)
+        clean_tokens.append(f"{k}={shlex.quote(v)}")
+    clean_tokens.extend(shlex.quote(wrapper) for wrapper in wrappers)
     if clean_tokens or game_args:
         clean_tokens.append("%command%")
-        clean_tokens.extend(_quote_game_arg(arg) for arg in game_args)
+        clean_tokens.extend(game_args)
     return " ".join(clean_tokens), dll_overrides
 
 
@@ -2044,16 +2067,20 @@ def _ensure_umu_pfx_link(prefix_dir: Path) -> None:
 def _adopt_steam_prefix(src_compat: Path, prefix_dir: Path) -> None:
     """Move a Steam compatdata folder into an empty game prefix, converting it to the umu layout."""
     inner = src_compat / "pfx"
-    if inner.is_dir() and not inner.is_symlink():
+    real_inner = inner.is_dir() and not inner.is_symlink()
+    top_items = [item for item in src_compat.iterdir() if item.name != "pfx"]
+    incoming = [*top_items, *(inner.iterdir() if real_inner else ())]
+    seen: set[str] = set()
+    for item in incoming:
+        target = prefix_dir / item.name
+        if item.name in seen or target.exists() or target.is_symlink():
+            raise FileExistsError(f"Cannot adopt Steam prefix because {target} already exists")
+        seen.add(item.name)
+    if real_inner:
         copy_or_move_dir_contents(inner, prefix_dir, move=True)
         inner.rmdir()
-    for item in list(src_compat.iterdir()):
-        if item.name == "pfx":
-            continue
-        target = prefix_dir / item.name
-        if target.exists() or target.is_symlink():
-            continue
-        shutil.move(str(item), str(target))
+    for item in top_items:
+        shutil.move(str(item), str(prefix_dir / item.name))
     remaining = list(src_compat.iterdir())
     if remaining:
         raise RuntimeError(f"Could not fully adopt {src_compat}: {[p.name for p in remaining]}")
@@ -2124,6 +2151,50 @@ def _unlink_steam_compatdata(game: StandaloneGame) -> None:
         logging.warning("Failed to remove Steam compatdata link %s: %s", link, exc)
 
 
+def _copy_import_prefix(source: Path, compat: Path, convert_link: bool) -> None:
+    """Commit the merged prefix after copying, while keeping the original recoverable."""
+    if source.is_symlink():
+        raise ValueError(f"Refusing to copy a symlinked source prefix: {source}")
+    if not compat.is_symlink() and source.resolve() == (compat / "pfx").resolve():
+        return
+    if compat.is_symlink():
+        if not convert_link or not symlink_points_to(compat, source):
+            raise ValueError(f"Refusing to replace a foreign prefix link: {compat}")
+    elif compat.exists() and not compat.is_dir():
+        raise ValueError(f"Steam compatdata is not a directory: {compat}")
+    compat.parent.mkdir(parents=True, exist_ok=True)
+    backup: Path | None = None
+    with tempfile.TemporaryDirectory(prefix=".deckinstall-import-", dir=compat.parent) as work:
+        staged = Path(work) / "compatdata"
+        if compat.is_dir() and not compat.is_symlink():
+            shutil.copytree(compat, staged, symlinks=True)
+        else:
+            staged.mkdir()
+        target = staged / "pfx"
+        if target.is_symlink():
+            raise ValueError(f"Refusing to merge into a symlinked Steam pfx: {compat / 'pfx'}")
+        copy_or_move_dir_contents(source, target, move=False)
+        if compat.exists() or compat.is_symlink():
+            backup = _compatdata_backup_path(compat)
+            os.replace(compat, backup)
+        try:
+            os.replace(staged, compat)
+        except BaseException:
+            if backup is not None:
+                try:
+                    os.replace(backup, compat)
+                except OSError as exc:
+                    raise RuntimeError(
+                        f"Could not restore Steam compatdata. Previous prefix retained at {backup}"
+                    ) from exc
+            raise
+    if backup is not None:
+        try:
+            remove_path_or_tree(backup)
+        except OSError:
+            logging.warning("Could not remove previous Steam prefix backup %s", backup, exc_info=True)
+
+
 def import_standalone_to_steam(
     paths: SteamPaths,
     game: StandaloneGame,
@@ -2133,17 +2204,18 @@ def import_standalone_to_steam(
     match_existing_name: bool = True,
 ) -> int:
     """Import a standalone game into Steam shortcuts.vdf and compatdata/<appid>/pfx."""
-    env_pairs, wrappers, _, _ = _parse_launch_tokens(game.launch_options, game.winedlloverrides)
+    env_pairs, wrappers, _, dll_overrides = _parse_launch_tokens(game.launch_options, game.winedlloverrides)
     env_map = dict(env_pairs)
 
     steam_launch = apply_launch_presets(
         game.launch_options,
         gamemode="gamemoderun" in wrappers,
-        mangohud=env_map.get("MANGOHUD") == "1",
+        mangohud=env_map.get("MANGOHUD") == "1" or "mangohud" in wrappers,
+        preserve_mangohud_config=True,
         wined3d=env_map.get("PROTON_USE_WINED3D") == "1",
         no_esync=env_map.get("PROTON_NO_ESYNC") == "1",
         no_fsync=env_map.get("PROTON_NO_FSYNC") == "1",
-        winedlloverrides=game.winedlloverrides,
+        winedlloverrides=dll_overrides,
         dlss_upgrade=env_map.get("PROTON_DLSS_UPGRADE") == "1",
         nvidia_nvapi=(
             env_map.get("PROTON_ENABLE_NVAPI") == "1"
@@ -2162,49 +2234,89 @@ def import_standalone_to_steam(
         steam_appid=game.steam_appid,
     )
 
-    appid_u32 = add_or_update_shortcut(
-        paths,
-        app_name=game.name,
-        exe_path=game.exe_path,
-        start_dir=game.exe_path.parent,
-        icon_path=resolved_icon,
-        launch_options=steam_launch or None,
-        enable_proton=not game.native_linux,
-        match_existing_name=match_existing_name,
-    )
+    manifest = game.game_dir / MANIFEST_V2
+    tracked = [paths.shortcuts_vdf, paths.config_vdf]
+    link_prefix = game.schema >= 2 and not game.native_linux and not remove_standalone_files
+    if link_prefix:
+        tracked.append(manifest)
+    with ExitStack() as locks, ExitStack() as rollback:
+        for anchor in sorted({paths.shortcuts_vdf, paths.config_vdf}):
+            locks.enter_context(_steam_transaction_lock(anchor))
+        for path in tracked:
+            if path.is_symlink() or (path.exists() and not path.is_file()):
+                raise ValueError(f"Unsafe Steam import file: {path}")
+            if path.is_file():
+                rollback.callback(atomic_write_bytes, path, path.read_bytes(), mode=path.stat().st_mode & 0o777)
+            else:
+                rollback.callback(path.unlink, missing_ok=True)
 
-    target_tool = compat_tool.strip() or game.proton_name.strip()
-    if target_tool and not game.native_linux:
-        set_shortcut_proton(paths.config_vdf, appid_u32, target_tool)
+        appid_u32 = add_or_update_shortcut(
+            paths,
+            app_name=game.name,
+            exe_path=game.exe_path,
+            start_dir=game.exe_path.parent,
+            icon_path=resolved_icon,
+            launch_options=steam_launch or None,
+            enable_proton=not game.native_linux,
+            match_existing_name=match_existing_name,
+            keep_matching_appid=True,
+        )
+        target_tool = compat_tool.strip() or game.proton_name.strip()
+        if target_tool and not game.native_linux:
+            set_shortcut_proton(paths.config_vdf, appid_u32, target_tool)
 
-    target_compat = paths.compatdata_dir / str(appid_u32)
-    target_pfx = target_compat / "pfx"
-    if game.schema >= 2 and not game.native_linux and not remove_standalone_files:
-        # One game, one prefix: Steam runs the same prefix the launcher uses.
-        backup = link_compatdata_to_prefix(target_compat, game.prefix_dir)
-        steam_meta: dict[str, Any] = {
-            "user_id": paths.user_id,
-            "shortcut_appid": appid_u32,
-            "compatdata_link": encode_path(target_compat, None),
-        }
-        if target_tool:
-            steam_meta["compat_tool"] = target_tool
-        if backup is not None:
-            steam_meta["compatdata_backup"] = encode_path(backup, None)
-        game.meta["steam"] = steam_meta
-        _write_manifest(game)
-    elif game.prefix_dir.is_dir() and not game.prefix_dir.is_symlink():
-        if target_compat.is_symlink():
-            # Converting a linked game to Steam-only: give Steam a real folder again.
-            target_compat.unlink()
-        copy_or_move_dir_contents(game.prefix_dir, target_pfx, move=remove_standalone_files)
-        if remove_standalone_files:
-            _safe_remove_prefix_dir(game.prefix_dir, game.game_dir)
+        target_compat = paths.compatdata_dir / str(appid_u32)
+        if not game.native_linux and game.prefix_dir.is_symlink():
+            raise ValueError(f"Refusing to import a symlinked source prefix: {game.prefix_dir}")
+        if link_prefix:
+            backup = None
+            linked_before = symlink_points_to(target_compat, game.prefix_dir)
+            if target_compat.is_symlink() and not linked_before:
+                raise ValueError(f"Steam compatdata points at another prefix: {target_compat}")
+            if target_compat.is_dir() and not target_compat.is_symlink():
+                backup = _compatdata_backup_path(target_compat)
+                os.replace(target_compat, backup)
+                rollback.callback(os.replace, backup, target_compat)
+            if not target_compat.is_symlink():
+                rollback.callback(target_compat.unlink, missing_ok=True)
+            pfx_link = game.prefix_dir / "pfx"
+            if not pfx_link.exists() and not pfx_link.is_symlink():
+                rollback.callback(pfx_link.unlink, missing_ok=True)
+            link_compatdata_to_prefix(target_compat, game.prefix_dir)
+            steam_meta: dict[str, Any] = {
+                "user_id": paths.user_id,
+                "shortcut_appid": appid_u32,
+                "compatdata_link": encode_path(target_compat, None),
+            }
+            if target_tool:
+                steam_meta["compat_tool"] = target_tool
+            if backup is not None:
+                steam_meta["compatdata_backup"] = encode_path(backup, None)
+            elif linked_before:
+                prior_steam = game.meta.get("steam") or {}
+                if prior_steam.get("shortcut_appid") == appid_u32 and prior_steam.get("compatdata_backup"):
+                    steam_meta["compatdata_backup"] = prior_steam["compatdata_backup"]
+            previous_meta = dict(game.meta)
+            rollback.callback(setattr, game, "meta", previous_meta)
+            game.meta["steam"] = steam_meta
+            _write_manifest(game)
+        elif not game.native_linux and game.prefix_dir.is_dir():
+            _copy_import_prefix(game.prefix_dir, target_compat, remove_standalone_files)
+
+        rollback.pop_all()
 
     if remove_standalone_files:
+        if (
+            not game.native_linux and not is_within(game.prefix_dir, target_compat)
+            and not _prefix_used_by_other_game(game.prefix_dir, game.game_dir)
+        ):
+            _safe_remove_prefix_dir(game.prefix_dir, game.game_dir)
         remove_standalone_game(game, delete_files=False, delete_cache=True)
 
-    sync_prefix_symlinks(paths)
+    try:
+        sync_prefix_symlinks(paths)
+    except OSError:
+        logging.warning("Could not refresh named prefix links after Steam import", exc_info=True)
     if game.steam_appid and paths.grid_dir:
         try:
             from .artwork import download_steam_artwork
@@ -2233,7 +2345,10 @@ def add_installed_game_to_steam(paths: SteamPaths, game_dir: Path, uid: str) -> 
         raise ValueError(f"Installed game is unavailable or changed: {game_dir}")
 
     tracked = (paths.shortcuts_vdf, paths.config_vdf, manifest_path)
-    with _steam_transaction_lock(paths.shortcuts_vdf), _steam_transaction_lock(paths.config_vdf):
+    anchors = sorted({paths.shortcuts_vdf, paths.config_vdf})
+    with ExitStack() as locks:
+        for anchor in anchors:
+            locks.enter_context(_steam_transaction_lock(anchor))
         if any(path.is_symlink() for path in tracked):
             raise ValueError("Refusing to replace a symlinked Steam file or game manifest")
         entries = load_shortcuts(paths.shortcuts_vdf, strict=True)

@@ -23,12 +23,12 @@ from pathlib import Path
 from typing import Any
 
 from . import library as _lib
+from . import save_sync
 from . import standalone as _sa
-from .adopt import SnapshotFn, _default_snapshot, _move_back, _move_tree
-from .fsutil import atomic_write_text, is_within, symlink_points_to
+from .adopt import SnapshotFn, _move_back, _move_tree
+from .fsutil import atomic_write_text, is_within, symlink_points_to, unique_dir
 from .library import Library, find_library_root
 from .manifest import decode_path, encode_path, find_manifest
-from .migrate import _unique_dir
 from .standalone import StandaloneGame
 from .steam_paths import dir_size_bytes
 
@@ -142,14 +142,23 @@ def plan_relocation(game: StandaloneGame, target: Library) -> RelocatePlan:
     if _sa._is_protected_dir(gd):
         blockers.append(B_PROTECTED)
 
-    plan = RelocatePlan(game, target, _unique_dir(target.games_dir / gd.name))
+    plan = RelocatePlan(game, target, unique_dir(target.games_dir / gd.name))
 
     # The prefix and the cache move only when they live in a library folder and the target can hold them.
+    internal_root = _lib.internal_library_root()
+    internal_prefixes = internal_root / _lib.PREFIXES
+    internal_caches = internal_root / _lib.CACHES
+
     prefix = game.prefix_dir
     if not game.native_linux and prefix.is_dir() and not is_within(prefix, gd):
         if _managed(prefix, _lib.PREFIXES, gd) and not is_within(prefix, target.prefixes_dir):
             if not target.unix_fs:
                 warnings.append(W_PREFIX_STAYS)
+                if not is_within(prefix, internal_prefixes):
+                    if _sa._prefix_used_by_other_game(prefix, gd):
+                        blockers.append(B_SHARED_PREFIX)
+                    else:
+                        plan.new_prefix_dir = internal_prefixes / game.uid
             elif _sa._prefix_used_by_other_game(prefix, gd):
                 blockers.append(B_SHARED_PREFIX)
             else:
@@ -157,13 +166,14 @@ def plan_relocation(game: StandaloneGame, target: Library) -> RelocatePlan:
     cache = game.cache_dir
     if (
         cache is not None
-        and target.unix_fs
         and cache.is_dir()
         and not cache.is_symlink()
         and _managed(cache, _lib.CACHES, gd)
-        and not is_within(cache, target.caches_dir)
     ):
-        plan.new_cache_dir = target.caches_dir / game.uid
+        if target.unix_fs and not is_within(cache, target.caches_dir):
+            plan.new_cache_dir = target.caches_dir / game.uid
+        elif not target.unix_fs and not is_within(cache, internal_caches):
+            plan.new_cache_dir = internal_caches / game.uid
     if (game.meta.get("steam") or {}).get("shortcut_appid"):
         warnings.append(W_STEAM_SHORTCUT)
 
@@ -174,19 +184,37 @@ def plan_relocation(game: StandaloneGame, target: Library) -> RelocatePlan:
         plan.cache_bytes = dir_size_bytes(cache)
 
     target_dev = _dev(target.root)
-    moves = [(gd, plan.game_bytes, plan.new_game_dir)]
+    pfx_dst_root = target.root if target.unix_fs else internal_root
+    moves = [(gd, plan.game_bytes, target.root)]
     if plan.new_prefix_dir is not None:
-        moves.append((prefix, plan.prefix_bytes, plan.new_prefix_dir))
+        moves.append((prefix, plan.prefix_bytes, pfx_dst_root))
     if plan.new_cache_dir is not None and cache is not None:
-        moves.append((cache, plan.cache_bytes, plan.new_cache_dir))
+        moves.append((cache, plan.cache_bytes, pfx_dst_root))
     plan.same_fs = _dev(gd) == target_dev and target_dev is not None
-    plan.cross_device_bytes = sum(size for src, size, _dst in moves if _dev(src) != target_dev or target_dev is None)
+    needed_by_dev: dict[int | Path, tuple[Path, int]] = {}
+    total_cross = 0
+    for src, size, dst_root in moves:
+        dst_dev = _dev(dst_root)
+        if _dev(src) != dst_dev or dst_dev is None:
+            total_cross += size
+            dev_key: int | Path = dst_dev if dst_dev is not None else dst_root
+            prev_root, prev_sz = needed_by_dev.get(dev_key, (dst_root, 0))
+            needed_by_dev[dev_key] = (prev_root, prev_sz + size)
+    plan.cross_device_bytes = total_cross
     try:
         plan.free_bytes = shutil.disk_usage(_existing(target.root)).free
     except OSError:
         plan.free_bytes = 0
-    if plan.cross_device_bytes and plan.free_bytes < int(plan.cross_device_bytes * _SPACE_MARGIN):
-        blockers.append(B_NO_SPACE)
+    for dst_root, needed in needed_by_dev.values():
+        if needed <= 0:
+            continue
+        try:
+            avail = shutil.disk_usage(_existing(dst_root)).free
+        except OSError:
+            avail = 0
+        if avail < int(needed * _SPACE_MARGIN):
+            blockers.append(B_NO_SPACE)
+            break
     plan.warnings, plan.blockers = warnings, blockers
     return plan
 
@@ -260,10 +288,22 @@ def relocate_game(
     if new_dir.exists() or new_dir.is_symlink():
         raise RelocateError(f"Target already exists: {new_dir}")
     say = progress or (lambda _step: None)
-    if plan.new_prefix_dir is not None and not game.native_linux and game.prefix_dir.is_dir():
+    if game.game_dir.is_dir():
         say("snapshot")
         try:
-            (snapshot_fn or _default_snapshot)(game.prefix_dir, game.name, "relocate", "relocate")
+            if snapshot_fn is not None:
+                snapshot_fn(game.prefix_dir, game.name, "relocate", "relocate")
+            else:
+                raw_aid = (game.meta.get("steam") or {}).get("shortcut_appid")
+                aid = raw_aid if isinstance(raw_aid, int) and not isinstance(raw_aid, bool) and raw_aid > 0 else None
+                save_sync.auto_snapshot(
+                    game.prefix_dir,
+                    game.name,
+                    "relocate",
+                    "relocate",
+                    game_dir=game.game_dir,
+                    steam_appid=game.steam_appid or aid,
+                )
         except Exception as exc:
             raise RelocateError(f"Save snapshot failed, nothing was changed: {exc}") from exc
     undo: list[tuple[str, Callable[[], None]]] = []
@@ -282,26 +322,44 @@ def relocate_game(
 
         say("game")
         target.games_dir.mkdir(parents=True, exist_ok=True)
-        _move_tree(old_dir, new_dir, target.root)
+        _move_tree(old_dir, new_dir)
         undo.append((f"move {new_dir} back", _move_back(old_dir, new_dir)))
+
+        pfx_dst_root = target.root if target.unix_fs else _lib.internal_library_root()
+        if not target.unix_fs and (plan.new_prefix_dir is not None or plan.new_cache_dir is not None):
+            _lib.ensure_library(pfx_dst_root, internal=True)
 
         new_prefix = game.prefix_dir
         if plan.new_prefix_dir is not None:
             say("prefix")
             plan.new_prefix_dir.parent.mkdir(parents=True, exist_ok=True)
-            _move_tree(game.prefix_dir, plan.new_prefix_dir, target.root)
+            _move_tree(game.prefix_dir, plan.new_prefix_dir)
             undo.append((f"move {plan.new_prefix_dir} back", _move_back(game.prefix_dir, plan.new_prefix_dir)))
             new_prefix = plan.new_prefix_dir
         new_cache = game.cache_dir
         if plan.new_cache_dir is not None and game.cache_dir is not None:
             say("cache")
             plan.new_cache_dir.parent.mkdir(parents=True, exist_ok=True)
-            _move_tree(game.cache_dir, plan.new_cache_dir, target.root)
+            _move_tree(game.cache_dir, plan.new_cache_dir)
             undo.append((f"move {plan.new_cache_dir} back", _move_back(game.cache_dir, plan.new_cache_dir)))
             new_cache = plan.new_cache_dir
 
+        try:
+            old_resolved = old_dir.resolve()
+        except OSError:
+            old_resolved = old_dir
+
         def rebase(p: Path) -> Path:
-            return new_dir / p.relative_to(old_dir) if is_within(p, old_dir) else p
+            if not is_within(p, old_dir):
+                return p
+            try:
+                return new_dir / p.relative_to(old_dir)
+            except ValueError:
+                pass
+            try:
+                return new_dir / p.resolve().relative_to(old_resolved)
+            except (OSError, ValueError):
+                return p
 
         meta: dict[str, Any] = dict(game.meta)
         source_meta = dict(meta.get("source") or {}) if isinstance(meta.get("source"), dict) else {}
@@ -313,7 +371,7 @@ def relocate_game(
         source_meta["previous_game_dirs"] = prev_dirs
         meta["source"] = source_meta
         if plan.new_prefix_dir is not None:
-            meta["prefix_location"] = "library"
+            meta["prefix_location"] = "internal" if not target.unix_fs else "library"
         elif W_PREFIX_STAYS in plan.warnings:
             meta["prefix_location"] = "internal"
         if meta.get("icons"):

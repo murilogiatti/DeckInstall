@@ -115,7 +115,7 @@ def is_repack_folder(folder: Path) -> bool:
     if any(m in low for m in _REPACK_MARKERS):
         return True
     bins = [n for n in names if _REPACK_BIN_RE.match(n)]
-    return len(bins) >= 1 and any(n.lower().startswith(("fg-", "setup-")) for n in bins)
+    return any(n.lower().startswith(("fg-", "setup-", "data")) for n in bins)
 
 
 def find_setup_exe(folder: Path) -> Path | None:
@@ -160,7 +160,7 @@ def find_setup_exe(folder: Path) -> Path | None:
 
 def _is_installer_name(path: Path) -> bool:
     stem = path.stem.lower()
-    return any(w in stem for w in _INSTALLER_WORDS) and not _skip_name(stem.replace("setup", "").replace("install", ""))
+    return any(w in stem for w in _INSTALLER_WORDS) and not _skip_name(stem)
 
 
 def _folder_has_executable(folder: Path) -> bool:
@@ -255,9 +255,13 @@ def classify_source(path: Path) -> SourceInfo:
         return SourceInfo(ARCHIVE, path, installer=path)
     suffix = path.suffix.lower()
     if suffix == ".sh":
+        if path.stem.lower() in {"start", "launch", "run"}:
+            return SourceInfo(EXE, path)
         return SourceInfo(NATIVE_SH, path, installer=path)
     if suffix == ".exe":
-        if is_repack_folder(path.parent) and path.name.lower().startswith("setup"):
+        if _skip_name(path.name):
+            return SourceInfo(UNKNOWN, path)
+        if _is_installer_name(path) and is_repack_folder(path.parent):
             return SourceInfo(REPACK, path.parent, installer=path)
         if is_gog_installer(path):
             return SourceInfo(GOG_SETUP, path, installer=path)

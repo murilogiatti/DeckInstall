@@ -184,7 +184,7 @@ def test_wizard_lists_plans_blocks_and_adopts_in_batch(
         _dispose(app, dlg)
 
 
-def test_guessed_folder_needs_confirmation_and_steam_removal_disabled(
+def test_guessed_folder_needs_confirmation_and_steam_removal_can_be_deferred(
     app: QApplication, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     c = _cand(tmp_path, ad.STEAM, "Guess", shortcut_appid=7, warnings=[ad.W_GAME_ROOT_GUESSED])
@@ -197,13 +197,15 @@ def test_guessed_folder_needs_confirmation_and_steam_removal_disabled(
         dlg.set_checked({c.key})
         dlg.btn_next.click()
         _wait(app, lambda: dlg.items[0].plan is not None)
-        assert not dlg.rb_steam_remove.isEnabled() and dlg.lbl_steam_note.text() == note
+        assert dlg.rb_steam_remove.isEnabled() and dlg.lbl_steam_note.text() == note
         assert dlg.chk_confirm_folder.isVisibleTo(dlg)
         assert tr("adopt.confirm_needed") in dlg.lbl_blockers.text()
         assert not dlg.btn_next.isEnabled()
         dlg.chk_confirm_folder.setChecked(True)
         assert dlg.btn_next.isEnabled()
         assert dlg.items[0].opts.remove_from_steam is False
+        dlg.rb_steam_remove.click()
+        assert dlg.items[0].opts.remove_from_steam is True
     finally:
         _dispose(app, dlg)
 

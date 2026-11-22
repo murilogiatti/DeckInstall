@@ -87,11 +87,14 @@ def test_build_steam_shortcut_payload_direct_and_launcher_cmd(tmp_path: Path) ->
     assert direct["launch_options"] == "MANGOHUD=1 %command%"
     assert direct["enable_proton"] is True
 
-    via_launcher = build_steam_shortcut_payload(
-        ext, launch_options="gamemoderun %command%", use_launcher_cmd=True
-    )
-    assert via_launcher["exe_path"] == Path("lutris")
+    with patch("deckinstall.external_actions.shutil.which", return_value="/usr/bin/lutris"):
+        via_launcher = build_steam_shortcut_payload(
+            ext, launch_options="gamemoderun %command%", use_launcher_cmd=True
+        )
+        without_presets = build_steam_shortcut_payload(ext, use_launcher_cmd=True)
+    assert via_launcher["exe_path"] == Path("/usr/bin/lutris")
     assert via_launcher["launch_options"] == "gamemoderun %command% lutris:rungameid/42"
+    assert without_presets["launch_options"] == "%command% lutris:rungameid/42"
     assert via_launcher["enable_proton"] is False
 
     linux_ext, _ = _make_external_game(tmp_path / "linux_case", runner="linux")

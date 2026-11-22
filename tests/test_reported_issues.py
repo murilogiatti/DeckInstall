@@ -588,11 +588,17 @@ class UiUxSimplificationTests(unittest.TestCase):
                     self.assertTrue(win.btn_shortcut_steam.isHidden())
 
                     win._set_extract_source(str(zip_file))
+                    for worker in list(win._active_workers):
+                        self.assertTrue(worker.wait(5000))
+                    app.processEvents()
                     self.assertEqual(win.extract_src.text(), str(zip_file))
                     self.assertEqual(win.add_name.text(), "CoolGame-v1")  # extraction uses the step 2 name
                     self.assertFalse(win.extract_details_box.isHidden())
 
                     win._set_extract_source(str(game_exe))
+                    for worker in list(win._active_workers):
+                        self.assertTrue(worker.wait(5000))
+                    app.processEvents()
                     self.assertEqual(win.add_name.text(), "CoolGame")
                     self.assertEqual(win.add_exe_combo.currentText(), str(game_exe))
                 finally:

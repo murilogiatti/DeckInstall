@@ -124,7 +124,8 @@ class MaintHealthWorker(QThread):
             except OSError:
                 pass
         for extra_pfx_root in (
-            Path.home() / "Games" / "Prefixes",
+            games_dir / "Prefixes",
+            games_dir / ".prefixes",
             Path.home() / "Prefixes",
         ):
             _add_prefix_root(extra_pfx_root)
@@ -154,12 +155,9 @@ class MaintHealthWorker(QThread):
             if any(res == existing or res.is_relative_to(existing) for existing in seen_rt_dirs):
                 continue
             seen_rt_dirs = [p for p in seen_rt_dirs if not p.is_relative_to(res)]
-            runtime_dirs = [
-                p for p in runtime_dirs
-                if not p.resolve().is_relative_to(res)
-            ]
+            runtime_dirs = [p for p in runtime_dirs if not p.is_relative_to(res)]
             seen_rt_dirs.append(res)
-            runtime_dirs.append(candidate)
+            runtime_dirs.append(res)
         runtimes_bytes = dir_size_bytes_many(runtime_dirs)
 
         self.ready.emit(

@@ -9,7 +9,6 @@ from PySide6.QtCore import QPoint, Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QButtonGroup,
-    QDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -28,6 +27,7 @@ from .cleanup import GROUP_ORDER, CleanupCandidate
 from .i18n import tr
 from .ui_cards import (
     FlowLayout,
+    _BusyGuardedDialog,
     _cleanup_candidate_auto_check,
     _dialog_guard,
     _dialog_parent,
@@ -194,7 +194,6 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     clean_layout.addLayout(footer)
     layout.addWidget(clean_card, 1)
 
-    refresh_maintenance_health(win)
     _populate_maint_list(win)
     return page
 
@@ -633,13 +632,15 @@ def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
     from .ui_workers import SteamOpWorker
     from .vdf_queue import QueuedVdfEdit
 
-    win.btn_uninstall_runtimes.setEnabled(False)
+    if win._steam_busy:
+        return
+    win._begin_busy()
     win.status_label.setText(tr("runtime.uninstall_loading"))
     loader = SteamOpWorker(lambda: list_runtimes(win.paths))
     win._track_worker(loader)
 
     def _show(res: object) -> None:
-        win.btn_uninstall_runtimes.setEnabled(True)
+        win._end_busy()
         win.status_label.setText(tr("status.ready"))
         items = [i for i in res if isinstance(i, RuntimeItem)] if isinstance(res, list) else []
         if win._closing_pending:
@@ -647,20 +648,11 @@ def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
         if not items:
             QMessageBox.information(_dialog_parent(win), __app_name__, tr("runtime.uninstall_none"))
             return
-        dlg = QDialog(_dialog_parent(win))
+        op_state = {"busy": False}
+        dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: op_state["busy"])
         dlg.setWindowTitle(tr("runtime.uninstall_title"))
         dlg.resize(760, 420)
         dlg_alive = _dialog_guard(dlg)
-        op_state = {"busy": False}
-        orig_close_event = dlg.closeEvent
-
-        def _close_event(event) -> None:
-            if op_state["busy"]:
-                event.ignore()
-                return
-            orig_close_event(event)
-
-        dlg.closeEvent = _close_event  # type: ignore[method-assign]
         lay = QVBoxLayout(dlg)
         hint = QLabel(tr("runtime.uninstall_hint"))
         hint.setWordWrap(True)
@@ -726,20 +718,27 @@ def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
                 b.setEnabled(False)
             win._begin_busy()
 
+            paths_at_start = win.paths
+            queued_now = win.should_queue_vdf_edits()
+
             def _uninstall() -> tuple[list[str], list[str], list[int]]:
                 if _is_wine_game_running():
                     raise RuntimeError(tr("runtime.uninstall_game_running"))
-                tool_names: set[str] = set()
+                to_remove = []
+                blocked = []
+                affected_by_name: dict[str, list[int]] = {}
                 for item in chosen:
-                    if item.kind != GE:
-                        continue
-                    tool_names.add(item.name)
-                    vdf_file = item.path / "compatibilitytool.vdf"
-                    if vdf_file.is_file():
-                        tool_names.add(_read_compat_tool_id(vdf_file, item.name))
-                affected = affected_steam_appids(win.paths, tool_names) if tool_names else []
-                removed_names, errs = uninstall(chosen)
-                return removed_names, errs, affected
+                    if item.kind == GE:
+                        tool_id = _read_compat_tool_id(item.path / "compatibilitytool.vdf", item.name)
+                        ids = affected_steam_appids(paths_at_start, {item.name, tool_id})
+                        if 0 in ids or (queued_now and ids):
+                            blocked.append(f"{item.name}: {tr('proton_mgr.remove_requires_review')}")
+                            continue
+                        affected_by_name[item.name] = ids
+                    to_remove.append(item)
+                removed_names, errs = uninstall(to_remove)
+                affected = sorted({appid for name in removed_names for appid in affected_by_name.get(name, ())})
+                return removed_names, blocked + errs, affected
 
             worker = SteamOpWorker(_uninstall)
             win._track_worker(worker)
@@ -761,7 +760,7 @@ def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
                     paths = win.paths
                     if not affected or paths is None or not removed or win._closing_pending:
                         return
-                    msg_parent = _dialog_parent(win)
+                    msg_parent = win
                     if win.should_queue_vdf_edits():
                         edit = QueuedVdfEdit(
                             f"bulk_migrate_compat::{','.join(map(str, affected))}",
@@ -830,6 +829,10 @@ def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
                         QMessageBox.information(_dialog_parent(win), __app_name__, msg)
                         _cleanup_steam_mappings()
                     return
+                for row in reversed(range(len(items))):
+                    if items[row].name in removed:
+                        tbl.removeRow(row)
+                        del items[row]
                 for b in (btn_all, btn_none, btn_remove, btn_close):
                     b.setEnabled(True)
                 QMessageBox.information(dlg, __app_name__, msg)
@@ -860,7 +863,7 @@ def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
         dlg.deleteLater()
 
     def _err(err: str) -> None:
-        win.btn_uninstall_runtimes.setEnabled(True)
+        win._end_busy()
         win.status_label.setText(tr("status.ready"))
         if not win._closing_pending:
             QMessageBox.critical(_dialog_parent(win), __app_name__, tr("runtime.error", err=err))

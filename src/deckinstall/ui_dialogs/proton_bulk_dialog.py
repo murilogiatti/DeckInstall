@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QComboBox,
-    QDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -43,7 +42,7 @@ from ..runtime_manager import (
     list_installed_compat_tools,
 )
 from ..standalone import list_standalone_games, match_owned_shortcuts, primary_owned_shortcuts
-from ..steam_paths import SteamPaths, find_proton_binary, find_steam_root, list_installed_protons
+from ..steam_paths import SteamPaths, find_steam_root, list_installed_protons, resolve_builtin_proton
 from ..steam_vdf import (
     _strip_vdf_quotes,
     bulk_migrate_compat_tool,
@@ -52,7 +51,7 @@ from ..steam_vdf import (
     orphan_shortcut_mappings,
     remove_orphan_shortcut_mappings,
 )
-from ..ui_cards import _dialog_guard, _dialog_parent, _format_worker_error
+from ..ui_cards import _BusyGuardedDialog, _dialog_guard, _dialog_parent, _format_worker_error
 from ..ui_workers import SteamOpWorker
 from ..vdf_queue import QueuedVdfEdit
 
@@ -107,9 +106,11 @@ def collect_rows(paths: SteamPaths | None) -> tuple[list[ProtonRow], list[int], 
         for g in games if not g.native_linux and g.game_dir not in primary
     ]
     for sc in shortcuts:
-        if not _strip_vdf_quotes(sc.exe).lower().endswith((".exe", ".bat")):
-            continue  # native Linux shortcuts do not run Proton
         game = owned.get(sc.appid_u32)
+        if game is not None and game.native_linux:
+            continue
+        if game is None and not _strip_vdf_quotes(sc.exe).lower().endswith((".exe", ".bat")):
+            continue
         if game is not None and sc.appid_u32 not in chosen_appids:
             continue
         tool = compat.get(sc.appid_u32, "")
@@ -133,9 +134,10 @@ def collect_target_options(
 ) -> tuple[list[tuple[str, str]], dict[str, str], bool]:
     """Return (combo_items, custom_folder_by_id, has_official_steam) with zero network access."""
     steam_root = paths.steam_root if paths is not None else find_steam_root()
-    official = list_installed_protons(steam_root) if steam_root is not None else []
+    installed = list_installed_protons(steam_root) if steam_root is not None else []
+    official = [(tid, label) for tid, label in installed if steam_root and resolve_builtin_proton(tid, steam_root)]
     custom = list_installed_compat_tools()
-    has_official = bool(official or (steam_root is not None and find_proton_binary(steam_root) is not None))
+    has_official = bool(official)
 
     options: list[tuple[str, str]] = []
     seen_ids: set[str] = set()
@@ -287,20 +289,11 @@ def _show(
     newest: str,
     target_info: tuple[list[tuple[str, str]], dict[str, str], bool],
 ) -> None:
-    dlg = QDialog(_dialog_parent(win))
+    busy_state = {"active": False}
+    dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: busy_state["active"])
     dlg.setWindowTitle(tr("proton_bulk.title"))
     dlg.resize(900, 580)
     dlg_alive = _dialog_guard(dlg)
-    busy_state = {"active": False}
-    orig_close_event = dlg.closeEvent
-
-    def _close_event(event) -> None:
-        if busy_state["active"]:
-            event.ignore()
-            return
-        orig_close_event(event)
-
-    dlg.closeEvent = _close_event  # type: ignore[method-assign]
     lay = QVBoxLayout(dlg)
     hint = QLabel(tr("proton_bulk.hint"))
     hint.setWordWrap(True)
@@ -651,29 +644,91 @@ def _show(
             _launch_apply(False)
 
     def _previous() -> None:
-        dirs = [r.game_dir for r in _checked() if r.game_dir is not None and r.has_previous]
-        if not dirs:
+        selection = {row.game_dir: row for row in _checked() if row.game_dir is not None and row.has_previous}
+        if not selection:
             QMessageBox.information(dlg, __app_name__, tr("proton_bulk.no_previous"))
             return
-        errors: list[str] = []
-        for d in dirs:
-            try:
-                use_previous_proton(d)
-            except (OSError, ValueError) as exc:
-                errors.append(f"{d.name}: {exc}")
-        _reload([tr("proton_games.changed", count=len(dirs) - len(errors)), *errors])
+        paths = win.paths
+        needs_steam_write = paths is not None and any(row.steam_tools for row in selection.values())
+        queued = win.should_queue_vdf_edits()
+        _busy(True)
+
+        def _go() -> None:
+            win._begin_busy()
+
+            def _job() -> tuple[int, list[str], dict[str, list[int]]]:
+                errors: list[str] = []
+                writes: dict[str, list[int]] = {}
+                changed = 0
+                for directory, row in selection.items():
+                    try:
+                        game = use_previous_proton(directory)
+                        changed += 1
+                        for appid, _ in row.steam_tools:
+                            writes.setdefault(game.proton_name, []).append(appid)
+                    except (OSError, ValueError) as exc:
+                        errors.append(f"{row.name}: {exc}")
+                pending = {}
+                for tool, ids in writes.items():
+                    if queued:
+                        pending[tool] = ids
+                    elif paths is not None:
+                        try:
+                            bulk_migrate_compat_tool(paths.config_vdf, ids, tool)
+                        except Exception as exc:
+                            errors.append(str(exc))
+                            pending[tool] = ids
+                return changed, errors, pending
+
+            worker = SteamOpWorker(_job, need_steam_closed=needs_steam_write and not queued)
+            win._track_worker(worker)
+
+            def _done(result: object) -> None:
+                win._end_busy()
+                assert isinstance(result, tuple)
+                changed, errors, pending = result
+                for tool, ids in pending.items():
+                    win.enqueue_vdf_edit(QueuedVdfEdit(
+                        f"bulk_migrate_compat:{tool}:{','.join(map(str, ids))}", "bulk_migrate_compat", 0,
+                        tr("proton_bulk.queue_label", tool=tool), {"appids": ids, "target_tool": tool},
+                    ), trigger_watch=queued)
+                _reload([tr("proton_games.changed", count=changed), *errors])
+
+            def _failed(err: str) -> None:
+                win._end_busy()
+                _reload([tr("proton.error", err=err)])
+
+            worker.finished_ok.connect(_done)
+            worker.failed.connect(_failed)
+            worker.start()
+
+        if needs_steam_write and not queued:
+            win._confirm_close_steam_async(_go, on_cancelled=lambda: _busy(False), parent=dlg, alive_fn=dlg_alive)
+        else:
+            _go()
 
     def _clean_orphans() -> None:
-        fresh = collect_rows(win.paths)[1]
-        if not fresh:
-            return
-        if (
-            QMessageBox.question(dlg, __app_name__, tr("proton_bulk.confirm_orphans", count=len(fresh)))
-            != QMessageBox.StandardButton.Yes
-        ):
+        paths = win.paths
+        if paths is None:
             return
         _busy(True)
-        _steam_write("remove", fresh, "", [])
+        worker = SteamOpWorker(lambda: orphan_shortcut_mappings(paths))
+        win._track_worker(worker)
+
+        def _ready(fresh: object) -> None:
+            if not dlg_alive() or win._closing_pending:
+                return
+            if isinstance(fresh, list) and fresh and (
+                QMessageBox.question(dlg, __app_name__, tr("proton_bulk.confirm_orphans", count=len(fresh)))
+                == QMessageBox.StandardButton.Yes
+            ):
+                _steam_write("remove", fresh, "", [])
+            else:
+                _busy(False)
+
+        worker.finished_ok.connect(_ready)
+        worker.failed.connect(lambda err: _finish_reload([tr("proton.error", err=err)]))
+        worker.start()
 
     def _versions() -> None:
         from .proton_dialogs import open_proton_manager_dialog

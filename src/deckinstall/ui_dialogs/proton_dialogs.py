@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-from pathlib import Path
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QComboBox,
-    QDialog,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -36,12 +35,19 @@ from ..standalone import list_standalone_games, resolve_standalone_proton_fallba
 from ..steam_paths import SteamPaths, list_installed_protons
 from ..steam_vdf import (
     CompatMappingEntry,
+    _steam_transaction_lock,
     bulk_migrate_compat_tool,
     list_compat_tool_usage,
 )
-from ..ui_cards import _dialog_parent, _format_worker_error, _SortableTableItem, format_size_bytes
+from ..ui_cards import (
+    _BusyGuardedDialog,
+    _dialog_parent,
+    _format_worker_error,
+    _is_wine_game_running,
+    _SortableTableItem,
+    format_size_bytes,
+)
 from ..ui_workers import SteamOpWorker
-from ..vdf_queue import QueuedVdfEdit
 
 if TYPE_CHECKING:
     from ..ui import MainWindow
@@ -70,25 +76,14 @@ def _manager_tool_usage(paths: SteamPaths | None) -> list[CompatMappingEntry]:
 
 def open_proton_manager_dialog(win: MainWindow) -> None:
     """Manage installed custom Proton tools and download/install new releases."""
-    dlg = QDialog(_dialog_parent(win))
+    busy_state = {"active": False}
+    dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: busy_state["active"])
     dlg.setWindowTitle(tr("proton_mgr.title"))
     dlg.resize(640, 580)
     lay = QVBoxLayout(dlg)
     dlg_alive = {"open": True}
-    busy_state = {"active": False}
-    orig_close_event = dlg.closeEvent
 
-    def _on_finished(_r: int) -> None:
-        dlg_alive["open"] = False
-
-    def _close_event(event) -> None:
-        if busy_state["active"]:
-            event.ignore()
-            return
-        orig_close_event(event)
-
-    dlg.closeEvent = _close_event  # type: ignore[method-assign]
-    dlg.finished.connect(_on_finished)
+    dlg.finished.connect(lambda _result: dlg_alive.__setitem__("open", False))
 
     lay.addWidget(QLabel(tr("proton_mgr.installed_label")))
     installed_list = QTableWidget(0, 3)
@@ -215,8 +210,9 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
         ) -> None:
             if not dlg_alive["open"] or win._closing_pending or r_id != inst_req["id"]:
                 return
-            btn_refresh_inst.setEnabled(True)
-            lbl_status.setText(tr("status.ready"))
+            if not busy_state["active"]:
+                btn_refresh_inst.setEnabled(True)
+                lbl_status.setText(tr("status.ready"))
             installed_list.setSortingEnabled(False)
             installed_list.clearSpans()
             installed_list.setRowCount(0)
@@ -255,8 +251,9 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
         def _on_inst_err(r_id: int, err: str) -> None:
             if not dlg_alive["open"] or win._closing_pending or r_id != inst_req["id"]:
                 return
-            btn_refresh_inst.setEnabled(True)
-            lbl_status.setText(tr("proton_mgr.error", err=err))
+            if not busy_state["active"]:
+                btn_refresh_inst.setEnabled(True)
+                lbl_status.setText(tr("proton_mgr.error", err=err))
 
         worker.ready.connect(_on_inst_ready)
         worker.failed.connect(_on_inst_err)
@@ -393,185 +390,131 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
 
     def _on_remove() -> None:
         data = _selected_table_data(installed_list)
-        if not (isinstance(data, tuple) and len(data) == 2):
+        if busy_state["active"] or not (isinstance(data, tuple) and len(data) == 2):
             return
-        tool, used_entries = data
+        tool, _ = data
         assert isinstance(tool, InstalledCompatTool)
-        # Refresh usage before removal: the list may predate a new game install.
-        active_standalone = [
-            entry for entry in _manager_tool_usage(win.paths)
-            if entry.source == "Standalone" and entry.tool_name in (tool.tool_id, tool.folder_name)
-        ]
-        if active_standalone:
-            QMessageBox.warning(
-                dlg, __app_name__,
-                tr("proton_mgr.standalone_in_use", name=tool.folder_name,
-                   games="\n".join(entry.name for entry in active_standalone)),
+        paths = win.paths
+        names = {tool.tool_id, tool.folder_name}
+        auto_snap = win._is_auto_snapshot_enabled()
+        _set_busy(True, tr("proton_mgr.loading_installed"))
+        win._begin_busy()
+
+        def _usage() -> list[CompatMappingEntry]:
+            return [entry for entry in _manager_tool_usage(paths) if entry.tool_name in names]
+
+        def _finish(text: str = "") -> None:
+            win._end_busy()
+            if dlg_alive["open"]:
+                progress.setRange(0, 100)
+                _set_busy(False, text or tr("status.ready"))
+
+        def _failed(err: str) -> None:
+            _finish(tr("proton_mgr.error", err=err))
+            if dlg_alive["open"] and not win._closing_pending:
+                QMessageBox.critical(dlg, __app_name__, tr("proton_mgr.error", err=err))
+
+        def _inspect() -> tuple[list[CompatMappingEntry], list[tuple[str, str]]]:
+            usage = _usage()
+            alternatives = (
+                [(tid, label) for tid, label in list_installed_protons(paths.steam_root) if tid not in names]
+                if paths is not None and any(u.source != "Standalone" and u.appid_u32 > 0 for u in usage)
+                else []
             )
-            return
-        if used_entries and win.paths is not None:
-            paths = win.paths
-            auto_snap_enabled = win._is_auto_snapshot_enabled()
+            return usage, alternatives
 
-            class _ListProtonsWorker(QThread):
-                ready = Signal(list)
-                failed = Signal(str)
+        def _start_removal(target: str, approved_ids: set[int]) -> None:
+            if not dlg_alive["open"] or win._closing_pending:
+                _finish()
+                return
+            queued = win.should_queue_vdf_edits()
+            progress.setRange(0, 0)
+            lbl_status.setText(tr("proton_mgr.removing", name=tool.folder_name))
 
-                def run(self) -> None:
-                    try:
-                        protons = [
-                            (tid, disp)
-                            for tid, disp in list_installed_protons(paths.steam_root)
-                            if tid not in (tool.tool_id, tool.folder_name)
-                        ]
-                        self.ready.emit(protons)
-                    except Exception as exc:
-                        self.failed.emit(_format_worker_error(exc))
-
-            def _on_protons_loaded(protons: list[tuple[str, str]]) -> None:
-                if not dlg_alive["open"] or win._closing_pending:
-                    return
-                if not protons:
-                    QMessageBox.warning(
-                        dlg,
-                        __app_name__,
-                        tr("proton_mgr.in_use_no_target", name=tool.folder_name, count=len(used_entries)),
-                    )
-                    return
-                labels = [disp for _, disp in protons]
-                choice, ok = QInputDialog.getItem(
-                    dlg,
-                    tr("proton_mgr.title"),
-                    tr("proton_mgr.in_use_migrate_prompt", name=tool.folder_name, count=len(used_entries)),
-                    labels,
-                    0,
-                    False,
-                )
-                if not ok or not choice:
-                    return
-                target_tool = protons[labels.index(choice)][0]
-                ids = [u.appid_u32 for u in used_entries]
-
-                def _proceed_migrate_and_remove() -> None:
-                    if not dlg_alive["open"] or win._closing_pending:
-                        return
-                    queued = win.should_queue_vdf_edits()
-                    win._begin_busy()
-                    progress.setRange(0, 0)
-                    _set_busy(True, tr("proton_mgr.migrating_removing", name=tool.folder_name))
-
-                    def _do_migrate_and_remove() -> None:
-                        for u in used_entries:
+            def _remove() -> None:
+                if _is_wine_game_running():
+                    raise RuntimeError(tr("cleanup.wine_running"))
+                lock = _steam_transaction_lock(paths.config_vdf) if paths is not None else nullcontext()
+                with lock:
+                    usage = _usage()
+                    if any(u.appid_u32 <= 0 or u.source == "Standalone" for u in usage):
+                        raise RuntimeError(tr("proton_mgr.remove_requires_review"))
+                    ids = {u.appid_u32 for u in usage}
+                    if ids and (queued or not target or not ids.issubset(approved_ids)):
+                        raise RuntimeError(tr("proton_mgr.remove_requires_review"))
+                    if paths is not None and ids:
+                        for u in usage:
                             win._auto_snapshot_if_enabled(
-                                paths.compatdata_dir / str(u.appid_u32) / "pfx",
-                                u.name or str(u.appid_u32),
-                                "proton-bulk-migrate",
-                                "proton",
-                                enabled=auto_snap_enabled,
+                                paths.compatdata_dir / str(u.appid_u32) / "pfx", u.name,
+                                "proton-bulk-migrate", "proton", enabled=auto_snap,
                             )
-                        if not queued:
-                            bulk_migrate_compat_tool(paths.config_vdf, ids, target_tool)
-                        remove_compat_tool(tool.path)
+                        bulk_migrate_compat_tool(paths.config_vdf, sorted(ids), target)
+                    remove_compat_tool(tool.path)
 
-                    worker = SteamOpWorker(_do_migrate_and_remove, need_steam_closed=not queued)
-                    win._track_worker(worker)
+            worker = SteamOpWorker(_remove, need_steam_closed=bool(approved_ids))
+            win._track_worker(worker)
 
-                    def _ok_mig(_res: object) -> None:
-                        win._end_busy()
-                        if queued:
-                            win.enqueue_vdf_edit(
-                                QueuedVdfEdit(
-                                    f"bulk_migrate_compat:{target_tool}:{','.join(map(str, ids))}",
-                                    "bulk_migrate_compat",
-                                    0,
-                                    tr("proton_bulk.queue_label", tool=target_tool),
-                                    {"appids": ids, "target_tool": target_tool},
-                                )
-                            )
-                        if not dlg_alive["open"]:
-                            return
-                        progress.setRange(0, 100)
-                        _set_busy(False, tr("proton_mgr.removed", name=tool.folder_name))
-                        _refresh_installed()
-                        win._refresh_maintenance_health()
-
-                    def _err_mig(err: str) -> None:
-                        win._end_busy()
-                        if not dlg_alive["open"]:
-                            return
-                        progress.setRange(0, 100)
-                        _set_busy(False, tr("proton_mgr.error", err=err))
-                        QMessageBox.critical(dlg, __app_name__, tr("proton_mgr.error", err=err))
-
-                    worker.finished_ok.connect(_ok_mig)
-                    worker.failed.connect(_err_mig)
-                    worker.start()
-
-                win._confirm_close_steam_async(
-                    _proceed_migrate_and_remove,
-                    parent=dlg,
-                    alive_fn=lambda: dlg_alive["open"],
-                )
-
-            def _on_protons_failed(err: str) -> None:
+            def _done(_result: object) -> None:
+                _finish(tr("proton_mgr.removed", name=tool.folder_name))
                 if dlg_alive["open"] and not win._closing_pending:
-                    QMessageBox.critical(dlg, __app_name__, tr("proton_mgr.error", err=err))
+                    _refresh_installed()
+                    win._refresh_maintenance_health()
+                    win._refresh_shortcuts()
 
-            protons_worker = _ListProtonsWorker()
-            win._track_worker(protons_worker)
-            protons_worker.ready.connect(_on_protons_loaded)
-            protons_worker.failed.connect(_on_protons_failed)
-            protons_worker.start()
-            return
+            worker.finished_ok.connect(_done)
+            worker.failed.connect(_failed)
+            worker.start()
 
-        if (
-            QMessageBox.question(
-                dlg,
-                __app_name__,
-                tr("proton_mgr.confirm_remove", name=tool.folder_name),
+        def _ready(result: object) -> None:
+            if not dlg_alive["open"] or win._closing_pending or not isinstance(result, tuple):
+                _finish()
+                return
+            usage, alternatives = result
+            standalone_users = [u.name for u in usage if u.source == "Standalone"]
+            if standalone_users:
+                _finish()
+                QMessageBox.warning(dlg, __app_name__, tr(
+                    "proton_mgr.standalone_in_use", name=tool.folder_name, games="\n".join(standalone_users),
+                ))
+                return
+            if any(u.appid_u32 <= 0 for u in usage) or (usage and win.should_queue_vdf_edits()):
+                _finish()
+                QMessageBox.warning(dlg, __app_name__, tr("proton_mgr.remove_requires_review"))
+                return
+            if not usage:
+                if QMessageBox.question(dlg, __app_name__, tr(
+                    "proton_mgr.confirm_remove", name=tool.folder_name,
+                )) == QMessageBox.StandardButton.Yes:
+                    _start_removal("", set())
+                else:
+                    _finish()
+                return
+            if not alternatives:
+                _finish()
+                QMessageBox.warning(dlg, __app_name__, tr(
+                    "proton_mgr.in_use_no_target", name=tool.folder_name, count=len(usage),
+                ))
+                return
+            labels = [label for _, label in alternatives]
+            choice, ok = QInputDialog.getItem(
+                dlg, tr("proton_mgr.title"),
+                tr("proton_mgr.in_use_migrate_prompt", name=tool.folder_name, count=len(usage)),
+                labels, 0, False,
             )
-            != QMessageBox.StandardButton.Yes
-        ):
-            return
-
-        class _RemoveCompatWorker(QThread):
-            done = Signal()
-            failed = Signal(str)
-
-            def __init__(self, target_path: Path) -> None:
-                super().__init__()
-                self._path = target_path
-
-            def run(self) -> None:
-                try:
-                    remove_compat_tool(self._path)
-                    self.done.emit()
-                except Exception as exc:
-                    self.failed.emit(_format_worker_error(exc))
-
-        progress.setRange(0, 0)
-        _set_busy(True, tr("proton_mgr.removing", name=tool.folder_name))
-        rm_worker = _RemoveCompatWorker(tool.path)
-        win._track_worker(rm_worker)
-
-        def _on_rm_done() -> None:
-            if not dlg_alive["open"] or win._closing_pending:
+            if not ok or not choice:
+                _finish()
                 return
-            progress.setRange(0, 100)
-            _set_busy(False, tr("proton_mgr.removed", name=tool.folder_name))
-            _refresh_installed()
-            win._refresh_maintenance_health()
+            target = alternatives[labels.index(choice)][0]
+            win._confirm_close_steam_async(
+                lambda: _start_removal(target, {u.appid_u32 for u in usage}),
+                on_cancelled=_finish, parent=dlg, alive_fn=lambda: dlg_alive["open"],
+            )
 
-        def _on_rm_err(err: str) -> None:
-            if not dlg_alive["open"] or win._closing_pending:
-                return
-            progress.setRange(0, 100)
-            _set_busy(False, tr("proton_mgr.error", err=err))
-            QMessageBox.critical(dlg, __app_name__, tr("proton_mgr.error", err=err))
-
-        rm_worker.done.connect(_on_rm_done)
-        rm_worker.failed.connect(_on_rm_err)
-        rm_worker.start()
+        preflight = SteamOpWorker(_inspect)
+        win._track_worker(preflight)
+        preflight.finished_ok.connect(_ready)
+        preflight.failed.connect(_failed)
+        preflight.start()
 
     btn_refresh_inst.clicked.connect(_refresh_installed)
     btn_fetch.clicked.connect(_on_fetch)

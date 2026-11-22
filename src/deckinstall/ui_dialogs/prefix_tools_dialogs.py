@@ -11,7 +11,6 @@ from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -45,7 +44,7 @@ from ..runtime_manager import (
     install_system_package,
     resolve_game_prefix,
 )
-from ..standalone import StandaloneGame, update_standalone_launch_options
+from ..standalone import StandaloneGame, list_standalone_games, update_standalone_launch_options
 from ..steam_vdf import (
     ShortcutEntry,
     merge_winedlloverride,
@@ -53,6 +52,7 @@ from ..steam_vdf import (
     update_shortcut_launch_options,
 )
 from ..ui_cards import (
+    _BusyGuardedDialog,
     _dialog_guard,
     _dialog_parent,
     _format_worker_error,
@@ -85,7 +85,7 @@ def run_exe_in_prefix_dialog(
     try:
         prefix_dir, proton_dir = resolve_game_prefix(kind, obj, win.paths)
     except Exception as exc:
-        QMessageBox.critical(win, __app_name__, str(exc))
+        QMessageBox.critical(_dialog_parent(win), __app_name__, str(exc))
         return
 
     if win._warn_if_win32_prefix(prefix_dir):
@@ -129,7 +129,7 @@ def run_exe_in_prefix_dialog(
         worker.start()
 
     _pick_file_async(
-        win,
+        _dialog_parent(win),
         tr("run_exe.pick_title"),
         start_dir,
         tr("run_exe.filter"),
@@ -154,7 +154,7 @@ def open_winetricks_dialog(
     try:
         prefix_dir, proton_dir = resolve_game_prefix(kind, obj, win.paths)
     except Exception as exc:
-        QMessageBox.critical(win, __app_name__, str(exc))
+        QMessageBox.critical(_dialog_parent(win), __app_name__, str(exc))
         return
 
     title_name = (
@@ -162,7 +162,8 @@ def open_winetricks_dialog(
         if isinstance(obj, ShortcutEntry)
         else str(getattr(obj, "name", "") or "")
     )
-    dlg = QDialog(_dialog_parent(win))
+    active_worker: dict[str, WinetricksWorker | None] = {"w": None}
+    dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: active_worker["w"] is not None)
     dlg.setWindowTitle(tr("winetricks.title", name=title_name))
     dlg.resize(560, 480)
     lay = QVBoxLayout(dlg)
@@ -173,14 +174,6 @@ def open_winetricks_dialog(
     lay.addWidget(lbl_prefix)
 
     dlg_alive = _dialog_guard(dlg)
-    active_worker: dict[str, WinetricksWorker | None] = {"w": None}
-
-    def _on_dlg_finished(_r: int) -> None:
-        w = active_worker["w"]
-        if w is not None and w.isRunning():
-            w.cancel()
-
-    dlg.finished.connect(_on_dlg_finished)
 
     warn_row = QWidget()
     warn_lay = QHBoxLayout(warn_row)
@@ -356,10 +349,12 @@ def open_winetricks_dialog(
     btn_install.clicked.connect(_on_run)
     btn_cancel.clicked.connect(_on_cancel)
     dlg.exec()
+    dlg.deleteLater()
 
 
 def open_optiscaler_dialog(
-    win: MainWindow, kind: str | None = None, obj: object | None = None
+    win: MainWindow, kind: str | None = None, obj: object | None = None, *,
+    on_saved: Callable[[str], None] | None = None,
 ) -> None:
     """Open OptiScaler install/configure/uninstall dialog for the selected game."""
     if kind is None or obj is None:
@@ -372,7 +367,9 @@ def open_optiscaler_dialog(
     if kind == "steam" and not win.paths:
         return
 
-    exe_path = _resolve_game_exe_path(kind, obj)
+    managed = win._managed_library_game(obj) if isinstance(obj, ShortcutEntry) else None
+    exe_path = managed.exe_path if managed is not None else _resolve_game_exe_path(kind, obj)
+    current_steam_opts = obj.launch_options if isinstance(obj, ShortcutEntry) else ""
     if exe_path is None or not str(exe_path).strip() or not exe_path.parent.is_dir():
         QMessageBox.warning(
             win,
@@ -386,7 +383,8 @@ def open_optiscaler_dialog(
         if isinstance(obj, ShortcutEntry)
         else str(getattr(obj, "name", "") or "")
     )
-    dlg = QDialog(_dialog_parent(win))
+    operation = {"busy": False, "refresh_id": 0}
+    dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: bool(operation["busy"]))
     dlg.setWindowTitle(tr("optiscaler.title", name=title_name))
     dlg.resize(520, 360)
     lay = QVBoxLayout(dlg)
@@ -472,7 +470,6 @@ def open_optiscaler_dialog(
     btn_row.addWidget(btn_close)
     lay.addLayout(btn_row)
 
-    operation = {"busy": False, "refresh_id": 0}
 
     def _on_state_refreshed(req_id: int, st_now: object, recommended: str = "") -> None:
         if (
@@ -564,7 +561,7 @@ def open_optiscaler_dialog(
 
             if isinstance(obj, ExternalLauncherGame):
                 return str(_parse_launch_preset_state(load_external_launch_presets(obj))["winedll"])
-        return str(_parse_launch_preset_state(str(getattr(obj, "launch_options", "") or ""))["winedll"])
+        return str(_parse_launch_preset_state(current_steam_opts)["winedll"])
 
     def _apply_winedll_to_opts(cur_opts: str, winedll: str, *, allow_dlss_upgrade: bool = False) -> str:
         extra: dict[str, Any] = {} if allow_dlss_upgrade else {"dlss_upgrade": False}
@@ -573,7 +570,11 @@ def open_optiscaler_dialog(
     def _apply_winedll_update(
         new_winedll: str,
         done_msg: str,
+        *,
+        previous_proxy: str = "",
+        new_proxy: str = "",
     ) -> None:
+        nonlocal current_steam_opts
         parent_win = dlg if dlg_alive() else win
         if kind == "standalone" and isinstance(obj, StandaloneGame):
             cur_opts = str(obj.launch_options or "")
@@ -589,6 +590,8 @@ def open_optiscaler_dialog(
                     QMessageBox.critical(parent_win, __app_name__, tr("optiscaler.error", err=str(exc)))
                 return
             obj.winedlloverrides = updated.winedlloverrides
+            if on_saved is not None:
+                on_saved(updated.launch_options)
             win._refresh_shortcuts()
             _set_busy(False)
             win.status_label.setText(done_msg)
@@ -612,6 +615,8 @@ def open_optiscaler_dialog(
                 if not win._closing_pending:
                     QMessageBox.critical(parent_win, __app_name__, tr("optiscaler.error", err=str(exc)))
                 return
+            if on_saved is not None:
+                on_saved(new_opts)
             _set_busy(False)
             win.status_label.setText(done_msg)
             if not win._closing_pending:
@@ -624,69 +629,83 @@ def open_optiscaler_dialog(
         paths = win.paths
         entry = obj
 
-        def _proceed_steam_winedll() -> None:
-            if win._closing_pending:
-                return
-            cur_opts = str(entry.launch_options or "")
-            new_opts = _apply_winedll_to_opts(cur_opts, new_winedll, allow_dlss_upgrade=True)
-            if win.should_queue_vdf_edits():
-                win.enqueue_vdf_edit(
-                    QueuedVdfEdit(
-                        edit_id=f"set_launch_options:{entry.appid_u32}",
-                        op="set_launch_options",
-                        appid_u32=entry.appid_u32,
-                        label=entry.app_name,
-                        payload={"launch_options": new_opts},
-                    )
-                )
-                _set_busy(False)
+        new_opts = _apply_winedll_to_opts(current_steam_opts, new_winedll, allow_dlss_upgrade=True)
+
+        def _queue_steam_winedll() -> None:
+            nonlocal current_steam_opts
+            win.enqueue_vdf_edit(
+                QueuedVdfEdit(
+                    f"set_launch_options:{entry.appid_u32}", "set_launch_options",
+                    entry.appid_u32, entry.app_name, {"launch_options": new_opts},
+                ),
+                trigger_watch=win.should_queue_vdf_edits(),
+            )
+            current_steam_opts = new_opts
+            if on_saved is not None:
+                on_saved(new_opts)
+            _set_busy(False)
+            if not win._closing_pending:
                 win.status_label.setText(tr("vdf_queue.enqueued", name=entry.app_name))
-                p_win = dlg if dlg_alive() else win
+
+        if managed is not None:
+            try:
+                current = next((g for g in list_standalone_games() if g.game_dir == managed.game_dir), managed)
+                dll = current.winedlloverrides
+                if previous_proxy and previous_proxy != new_proxy:
+                    dll = remove_winedlloverride(dll, previous_proxy)
+                if new_proxy:
+                    dll = merge_winedlloverride(dll, new_proxy, "n,b")
+                update_standalone_launch_options(
+                    current.game_dir, winedlloverrides=dll, launch_options=current.launch_options,
+                )
+            except Exception as exc:
+                _set_busy(False)
                 if not win._closing_pending:
-                    QMessageBox.information(p_win, __app_name__, tr("vdf_queue.enqueued", name=entry.app_name))
+                    QMessageBox.critical(parent_win, __app_name__, tr("optiscaler.error", err=str(exc)))
                 return
 
+        def _proceed_steam_winedll() -> None:
+            if win._closing_pending:
+                _queue_steam_winedll()
+                return
+
+            def _write() -> None:
+                if not update_shortcut_launch_options(paths, entry.appid_u32, new_opts):
+                    raise RuntimeError(tr("add.steam_missing"))
+
             win._begin_busy()
-            steam_worker = SteamOpWorker(
-                lambda: update_shortcut_launch_options(paths, entry.appid_u32, new_opts),
-                need_steam_closed=True,
-            )
+            steam_worker = SteamOpWorker(_write, need_steam_closed=True)
             win._track_worker(steam_worker)
             steam_worker.status.connect(win.status_label.setText)
 
             def _steam_ok(_res: object) -> None:
+                nonlocal current_steam_opts
                 win._end_busy()
                 win._refresh_shortcuts()
+                current_steam_opts = new_opts
+                if on_saved is not None:
+                    on_saved(new_opts)
                 _set_busy(False)
                 win.status_label.setText(done_msg)
-                p_win = dlg if dlg_alive() else win
                 if not win._closing_pending:
-                    QMessageBox.information(p_win, __app_name__, done_msg)
+                    QMessageBox.information(dlg if dlg_alive() else win, __app_name__, done_msg)
 
             def _steam_err(err: str) -> None:
                 win._end_busy()
-                _set_busy(False)
+                _queue_steam_winedll()
                 if not win._closing_pending:
-                    QMessageBox.critical(
-                        dlg if dlg_alive() else win,
-                        __app_name__,
-                        tr("optiscaler.error", err=err),
-                    )
+                    QMessageBox.critical(dlg if dlg_alive() else win, __app_name__, tr("optiscaler.error", err=err))
 
             steam_worker.finished_ok.connect(_steam_ok)
             steam_worker.failed.connect(_steam_err)
             steam_worker.start()
 
         if win.should_queue_vdf_edits():
-            _proceed_steam_winedll()
-            return
-
-        win._confirm_close_steam_async(
-            _proceed_steam_winedll,
-            on_cancelled=lambda: _set_busy(False),
-            parent=parent_win,
-            alive_fn=dlg_alive,
-        )
+            _queue_steam_winedll()
+        else:
+            win._confirm_close_steam_async(
+                _proceed_steam_winedll, on_cancelled=_queue_steam_winedll, parent=parent_win, alive_fn=dlg_alive,
+            )
 
     class _OptiScalerOpWorker(QThread):
         status = Signal(str)
@@ -753,6 +772,7 @@ def open_optiscaler_dialog(
                 progress_cb=cb,
                 prefix_dir=pfx_dir,
                 game_name=title_name,
+                auto_snapshot=auto_snap_enabled,
             )
             return state, prev_state
 
@@ -800,7 +820,8 @@ def open_optiscaler_dialog(
                 backend=state.backend,
                 version=state.version or "-",
             )
-            _apply_winedll_update(new_winedll, done_msg)
+            previous = prev_state.proxy_dll if isinstance(prev_state, OptiScalerState) else ""
+            _apply_winedll_update(new_winedll, done_msg, previous_proxy=previous, new_proxy=state.proxy_dll)
 
         def _on_err(err: str) -> None:
             win.status_label.setText(tr("status.ready"))
@@ -841,7 +862,9 @@ def open_optiscaler_dialog(
                 if state is not None and state.proxy_dll
                 else cur_winedll
             )
-            _apply_winedll_update(new_winedll, tr("optiscaler.remove_done"))
+            _apply_winedll_update(
+                new_winedll, tr("optiscaler.remove_done"), previous_proxy=state.proxy_dll if state is not None else "",
+            )
 
         def _on_err(err: str) -> None:
             win.status_label.setText(tr("status.ready"))
@@ -861,3 +884,4 @@ def open_optiscaler_dialog(
     btn_remove.clicked.connect(_on_remove)
     _refresh_state_ui()
     dlg.exec()
+    dlg.deleteLater()
