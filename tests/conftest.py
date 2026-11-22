@@ -14,6 +14,7 @@ if str(SRC) not in sys.path:
 
 from deckinstall import (  # noqa: E402
     external_actions,
+    i18n,
     library,
     play_monitor,
     runtime_manager,
@@ -95,10 +96,17 @@ def _isolated_libraries(tmp_path_factory: pytest.TempPathFactory, monkeypatch: p
     monkeypatch.setattr(steam_paths, "_PROC_ROOT", proc_root)
     monkeypatch.setattr(play_monitor, "_PROC_ROOT", str(proc_root))
     monkeypatch.setattr(ui_cards, "_PROC_ROOT", proc_root)
+    # The host locale (e.g. pt_BR) and a language set by an earlier test must not change messages.
+    for variable in ("LANGUAGE", "LC_ALL", "LC_MESSAGES"):
+        monkeypatch.delenv(variable, raising=False)
+    monkeypatch.setenv("LANG", "C.UTF-8")
+    previous_lang = i18n.get_language()
+    i18n.set_language(i18n.DEFAULT_LANG)
     # Cached Steam/Gaming Mode checks must not leak from one test to the next.
     steam_paths.invalidate_process_cache()
     yield
     steam_paths.invalidate_process_cache()
+    i18n.set_language(previous_lang)
 
 
 def pe_exe_bytes(machine: int = 0x8664, extra: bytes = b"") -> bytes:
