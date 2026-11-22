@@ -1,7 +1,7 @@
 DeckInstall - Plano de acao v3 (2026-11-17, atualizado 2026-11-19)
 ==========================================================
 
-STATUS: Fases 0 a 12 e revisoes de auditoria concluidas localmente. Versao atual: v0.23.0.
+STATUS: Fases 0 a 12 e revisoes de auditoria concluidas localmente. Versao atual: v0.23.0. PLANO v4 (universal, dois modos) no fim do arquivo.
 v0.23.0: Recuperacao de importacoes legadas para a Steam, protecoes em backups e
 sincronizacao, gravacao de VDF e filas mais seguras, reparo de runtimes, correcoes
 em dialogos Qt e melhorias nas varreduras de jogos, saves e processos.
@@ -352,3 +352,131 @@ PENDENCIAS CONHECIDAS (da revisao)
 - runtime_manager: falha do OptiScaler derruba o RuntimeUpdateWorker; consulta GitHub a cada chamada.
 - ui.py: botao "Remover existente" ativo durante outras operacoes; dialogo Configurar perde a selecao apos trocar Proton.
 - [FEITO] launcher_scan: slug do Lutris (agora vem do pga.db / nome do .yml sem o timestamp; usa rungameid).
+
+================================================================================
+PLANO v4 - DeckInstall universal (desktop Linux), dois modos (Autonomo e Steam)
+Iniciado 2026-11-22 na branch feat/universal-desktop (a partir de main @ 78c0079 = v0.23.0).
+Este plano SUBSTITUI os anteriores. Fases: R, 0..12 (ver prompt da missao).
+================================================================================
+
+FASE R - Reconciliacao (2026-11-22) - AGUARDANDO APROVACAO DO USUARIO
+Estado de partida (evidencia):
+- main = origin/main = 78c0079 "chore(release): prepare v0.23.0"; tag v0.23.0 publicada (release "Latest"
+  2026-11-22T23:24Z); CI do main e da tag verdes (runs 45082239877 / 45082239744). VERSION = 0.23.0.
+- O Codex terminou a release: nao ha trabalho em andamento nos arquivos de codigo. Unica sobra local:
+  AUDITORIA_V022_PLANO.txt (nao versionado; plano/relatorio da auditoria v0.22 -> fases A-G, ja commitadas).
+  Nao foi tocado nem commitado; decidir com o usuario (versionar, mover ou apagar).
+- 33,8 mil linhas em src/deckinstall (42 modulos), 72 arquivos de teste.
+
+Fatos da secao 2 do prompt, conferidos no codigo:
+ F1 CONFIRMADO. runtime_manager._SYSTEM_PACKAGE_MAP (l.2017) so cobre gamemoderun e winetricks;
+    install_system_package (l.2049) via pkexec; fix_bwrap_userns (l.2073) grava /etc/apparmor.d/bwrap com
+    "profile bwrap /usr/bin/bwrap" via pkexec. grep por os-release/ostree/rpm-ostree/steamos-readonly/
+    toolbox/distrobox em src = 0 ocorrencias.
+ F2 CONFIRMADO. extractor._select_extract_cmd (l.136): tar -> unrar -> unzip -> 7z; senao
+    RuntimeError("No extraction tool found"). ToolMissingError (l.1314) para innoextract.
+ F3 CONFIRMADO. get_compat_tools_dir (l.576) cai em $XDG_DATA_HOME/Steam/compatibilitytools.d sem Steam.
+    ensure_umu_run (l.1145) so o portatil em ~/.local/share/DeckInstall/runtime/umu.
+ F4 CONFIRMADO + detalhe: official_mangohud_installed (l.297) e system_mangohud_installed (l.335) existem;
+    RuntimeUpdateWorker._update_mangohud ja prefere o do sistema quando nao ha o oficial (PARCIAL da regra
+    SteamOS). Nao ha regra por variante (SteamOS / Steam Flatpak / Snap).
+ F5 CONFIRMADO. steam_paths.find_steam_root (l.92): 3 nativos + 2 Flatpak; Snap ausente; is_flatpak_steam
+    (l.112) so olha "com.valvesoftware.Steam" no caminho. So devolve UMA Steam.
+ F6 CONFIRMADO. standalone.link_compatdata_to_prefix (l.2099); launch.sh exporta WINEPREFIX, PROTONPATH,
+    GAMEID, STORE e chama umu-run (standalone.py ~l.563-670).
+ F7 CONFIRMADO. build-appimage.yml: validacao ubuntu-22.04 em 3.10/3.11/3.13; build Nuitka 22.04; smoke
+    em "$APPDIR/AppRun" (nao no .AppImage); release (softprops/action-gh-release) no mesmo job do build.
+ F8 CONFIRMADO. 16 ocorrencias "Steam Deck|SteamOS" em src/pyproject/main.py; pyproject description
+    "... for Steam Deck"; .desktop GenericName "Steam Deck Game Installer"; en.json about.body
+    "... for SteamOS & Linux"; launch.mangohud_level_label "(SteamOS)"; README e hero_banner.jpg.
+ F9 PARCIAL/DESATUALIZADO. A pendencia "app_updater confiar so em APPIMAGE e exigir APPDIR" ja foi feita
+    (app_updater.get_running_appimage l.110 exige APPIMAGE e APPDIR absolutos e montados; SHA-256 obrigatorio
+    - Fase E da auditoria v0.22). Continua aberta: consulta ao GitHub sem cache/ETag (_fetch_json l.847, sem
+    If-None-Match nem token). NAO TESTADO A MAO segue valido.
+
+Tabela item -> estado (FEITO / PARCIAL / A FAZER), com evidencia:
+Fase 0 - Infra de validacao
+  A FAZER  fixtures winfixture (fakegame.c, NSIS, MSI, zip)          nada em tests/fixtures
+  A FAZER  harness de residuo fsdiff + intentional_residue.txt        nada em tests/harness
+  PARCIAL  isolamento de HOME/XDG/proc nos testes                     tests/conftest.py (commit db7ebc8, fase G)
+  A FAZER  umu-run falso (L1), os-release fixtures, arvores da Steam   -
+  A FAZER  deckinstall --doctor (texto/JSON, probe real de userns)    grep "--doctor" = 0
+Fase 1 - Spikes S1..S13                                                A FAZER (nenhum registrado)
+Fase 2 - README/About/metadados
+  A FAZER  descricao universal (README, pyproject, .desktop+Keywords, about.body, rotulos)   F8
+  A FAZER  matriz modo x distro, livro-razao, "remover tudo", Quick Start por distro, FUSE
+  A FAZER  teste "versao do README == VERSION"                        grep em tests: nao existe
+  A FAZER  banner novo (pedir ao usuario)
+Fase 3 - CI
+  A FAZER  Python 3.12 na matriz; appimage-matrix rodando o ARQUIVO; containers Fedora/Arch;
+           jobs de modo; release em job separado com needs:          F7
+Fase 4 - AppImage definitivo
+  A FAZER  erro claro sem FUSE / --appimage-extract-and-run           grep libfuse = 0
+  PARCIAL  .desktop de jogo no menu existe; "Integrar o PROPRIO app ao menu" A FAZER
+  FEITO    atualizador confia so em APPIMAGE/APPDIR + SHA-256         app_updater.py l.110-140
+  A FAZER  assinatura verificada (so checksum hoje)
+  PARCIAL  env limpo ao reabrir a Steam (build_clean_relaunch_env, _PATH_ENV_KEYS inclui
+           LD_LIBRARY_PATH/QT_PLUGIN_PATH); falta garantir/testar no launch.sh e no Jogar (QProcess)
+  PARCIAL  Qt: configure_qt_environment (steam_paths l.490) trata gamescope/portal; Wayland-only
+           Ubuntu 26.04 nao testado (S-A2)
+Fase 5 - Modos e variantes da Steam
+  PARCIAL  os dois modos existem (launch.sh+umu / atalho Steam + compatdata link), mas sem LaunchMode
+           no manifesto nem padrao global (grep LaunchMode/launch_mode = 0)
+  A FAZER  tabela de variantes em dados (nativa/Flatpak/Snap/SteamOS); Snap ausente (F5)
+  A FAZER  varias Steams ao mesmo tempo (find_steam_root devolve uma)
+  A FAZER  flatpak override com confirmacao/registro; validacao de caminho no Snap
+  A FAZER  politica de MangoHud por variante (F4)
+  A FAZER  decisao S-B1 (symlink compatdata no Flatpak)
+  A FAZER  appinfo.vdf tolerante (grep = 0)
+  PARCIAL  adotar pasta solta existe (adopt.py "pasta solta"); falta como caminho de 1a classe no modo Steam
+  FEITO    artes oficiais ao criar atalho; colecoes A FAZER
+Fase 6 - Modo Autonomo por distro
+  PARCIAL  fix_bwrap_userns (perfil so /usr/bin/bwrap, via pkexec, sem livro-razao, sem probe) F1
+  A FAZER  deteccao de imutavel/container; nada de pkexec em imutavel
+Fase 7 - Resolvedor de dependencias
+  A FAZER  platform_env + registro declarativo                       F1
+  A FAZER  zip/tar pela stdlib (zipfile/tarfile ja sao usados para INSPECIONAR, nao para extrair) F2
+  A FAZER  7zz/innoextract empacotados (S7)
+  PARCIAL  winetricks/gamemode via pkexec existem; falta escada e "nunca pkexec em imutavel"
+  PARCIAL  GE-Proton reaproveita os instalados (_all_compat_tool_dirs); umu portatil upstream FEITO
+Fase 8 - Limpeza sem sujeira
+  FEITO    manifesto v2 registra o que foi criado; Desinstalar guiado (uninstall.py)
+  FEITO    retencao GE-Proton atual+anterior protegendo os em uso (prune_ge_proton keep=2, protected_tool_names)
+  PARCIAL  "Desinstalar runtimes" (runtime_uninstall.py); "Remover tudo do DeckInstall" A FAZER
+  A FAZER  harness de residuo no CI nos dois modos; troca de modo sem residuo
+  A FAZER  cache GitHub com ETag/token/retentativa (F9)
+  A FAZER  livro-razao system-changes.json (grep = 0)
+Fase 9 - Lancamento robusto
+  A FAZER  STEAM_COMPAT_LIBRARY_PATHS, PROTON_VERB, UMU_LOG/PROTON_LOG por jogo, UMU_RUNTIME_UPDATE=0,
+           systemd-inhibit, pre/pos-lancamento                    grep = 0 para todos
+  PARCIAL  run.log por jogo com 5 execucoes e codigo de saida (Fase 3.4); falta cabecalho com o comando exato
+  PARCIAL  GPU: preset "prime" (__NV_PRIME_RENDER_OFFLOAD) so NVIDIA; AMD/Intel hibrido (DRI_PRIME) A FAZER
+Fase 10 - Instalacao universal
+  FEITO    Inno (/DIR=) + innoextract GOG + repacks + prefixo de instalador isolado (Fase 2 e 11.5)
+  A FAZER  NSIS /S /D=, MSI msiexec, InstallShield, winecfg/regedit/taskmgr, versao do Windows,
+           aviso de anti-cheat (so ha filtro de exe "easyanticheat" no scanner)
+  PARCIAL  _CommonRedist/redist pulados na busca; instalar redist opcional A FAZER
+  FEITO    trocar o exe em 1 clique; perguntar quando confianca baixa A FAZER
+Fase 11 - Saves
+  FEITO    snapshot/restore com snapshot de seguranca, Ludusavi import/export, caminhos validados
+           (save_sync, ludusavi.py, test_saves_backup.py, test_home_saves_guard.py)
+  A FAZER  manifesto do Ludusavi para saves fora do prefixo (S13)
+  PARCIAL  "snapshot vazio nunca desloca os antigos": dedup por hash existe; caso vazio/ilegivel conferir
+  A FAZER  aviso ao restaurar estado mais antigo
+Fase 12 - Metadados e conforto
+  A FAZER  SteamGridDB, ProtonDB, tempo de jogo proprio, Ctrl+F, favoritos, "Copiar diagnostico"
+  FEITO    busca na biblioteca por filtro de origem (pilulas); busca por texto - conferir na Fase 12
+
+Riscos/observacoes da Fase R:
+- "MangoHud oficial por usuario" (decisao v0.21) conflita com a nova regra "SteamOS: nunca instalar copia
+  por usuario". Hoje o worker da Manutencao ja respeita o do sistema, mas o preset (ensure_mangohud no
+  primeiro uso) precisa ser conferido na Fase 5/7.
+- O ambiente de desenvolvimento e Ubuntu 26.04 (kernel 7.0) - util para S-A1/S-A2 localmente.
+
+Achado ao rodar a suite na maquina do usuario (LANG=pt_BR.UTF-8, Ubuntu 26.04.1):
+- 1 falha dependente de ordem: test_a37_restore_job... esperava a mensagem em ingles, mas um teste anterior
+  deixava o idioma ativo em pt_BR (no CI passa porque o locale e ingles). [FEITO] tests/conftest.py agora fixa
+  LANG=C.UTF-8, remove LANGUAGE/LC_ALL/LC_MESSAGES e reinicia i18n em "en" a cada teste.
+  Resultado: 713 passed (antes: 1 failed, 712 passed). ruff e mypy limpos.
+Sobras da Fase R: decidir o destino de AUDITORIA_V022_PLANO.txt.
+NAO TESTADO A MAO na Fase R: nada a testar (so leitura).
