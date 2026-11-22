@@ -9,8 +9,11 @@ from PySide6.QtCore import QThread, Signal
 
 from .cleanup import CleanupCandidate, delete_cleanup_candidates_checked, find_cleanup_candidates
 from .i18n import tr
+from .library import discover_libraries
 from .runtime_manager import (
     get_compat_tools_dir,
+    get_mangohud_dir,
+    get_optiscaler_dir,
     get_steamrt4_dir,
     get_umu_run_path,
     is_steamrt4_valid,
@@ -95,30 +98,68 @@ class MaintHealthWorker(QThread):
             mangohud_status = tr("maint.status_missing")
 
         prefix_dirs: list[Path] = []
-        if self._paths is not None and self._paths.compatdata_dir.is_dir():
-            prefix_dirs.append(self._paths.compatdata_dir)
+        seen_prefix_roots: set[Path] = set()
+
+        def _add_prefix_root(path: Path) -> None:
+            if not path.is_dir():
+                return
+            try:
+                resolved = path.resolve()
+            except OSError:
+                resolved = path
+            if resolved in seen_prefix_roots:
+                return
+            seen_prefix_roots.add(resolved)
+            prefix_dirs.append(path)
+
+        if self._paths is not None:
+            _add_prefix_root(self._paths.compatdata_dir)
         games_dir = Path.home() / "Games"
         if games_dir.is_dir():
             try:
                 for child in games_dir.iterdir():
                     if child.is_dir():
                         for sub_name in ("prefix", "pfx", "wineprefix"):
-                            sub = child / sub_name
-                            if sub.is_dir():
-                                prefix_dirs.append(sub)
+                            _add_prefix_root(child / sub_name)
             except OSError:
                 pass
         for extra_pfx_root in (
             Path.home() / "Games" / "Prefixes",
             Path.home() / "Prefixes",
         ):
-            if extra_pfx_root.is_dir():
-                prefix_dirs.append(extra_pfx_root)
+            _add_prefix_root(extra_pfx_root)
+        try:
+            for lib in discover_libraries():
+                _add_prefix_root(lib.prefixes_dir)
+        except OSError:
+            pass
         prefixes_bytes = dir_size_bytes_many(prefix_dirs)
 
-        runtime_dirs = [
-            p for p in (umu_path.parent, get_compat_tools_dir()) if p.is_dir()
-        ]
+        raw_runtime_dirs = (
+            umu_path.parent,
+            get_compat_tools_dir(),
+            get_steamrt4_dir(),
+            get_mangohud_dir(),
+            get_optiscaler_dir().parent,
+        )
+        runtime_dirs: list[Path] = []
+        seen_rt_dirs: list[Path] = []
+        for candidate in raw_runtime_dirs:
+            if not candidate.is_dir() or candidate.is_symlink():
+                continue
+            try:
+                res = candidate.resolve()
+            except OSError:
+                res = candidate
+            if any(res == existing or res.is_relative_to(existing) for existing in seen_rt_dirs):
+                continue
+            seen_rt_dirs = [p for p in seen_rt_dirs if not p.is_relative_to(res)]
+            runtime_dirs = [
+                p for p in runtime_dirs
+                if not p.resolve().is_relative_to(res)
+            ]
+            seen_rt_dirs.append(res)
+            runtime_dirs.append(candidate)
         runtimes_bytes = dir_size_bytes_many(runtime_dirs)
 
         self.ready.emit(

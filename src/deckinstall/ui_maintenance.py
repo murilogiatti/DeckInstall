@@ -626,9 +626,12 @@ def show_maint_context_menu(win: MainWindow, pos: QPoint) -> None:
 
 
 def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
-    """Check the runtimes to remove (one, some or all); sizes and GE-Proton users are shown."""
-    from .runtime_uninstall import GE, RuntimeItem, list_runtimes, uninstall
+    """Check the runtimes to remove (one, some or all); sizes and Proton users are shown."""
+    from .runtime_uninstall import GE, RuntimeItem, affected_steam_appids, list_runtimes, uninstall
+    from .steam_paths import _read_compat_tool_id
+    from .steam_vdf import bulk_migrate_compat_tool
     from .ui_workers import SteamOpWorker
+    from .vdf_queue import QueuedVdfEdit
 
     win.btn_uninstall_runtimes.setEnabled(False)
     win.status_label.setText(tr("runtime.uninstall_loading"))
@@ -723,10 +726,20 @@ def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
                 b.setEnabled(False)
             win._begin_busy()
 
-            def _uninstall() -> tuple[list[str], list[str]]:
+            def _uninstall() -> tuple[list[str], list[str], list[int]]:
                 if _is_wine_game_running():
                     raise RuntimeError(tr("runtime.uninstall_game_running"))
-                return uninstall(chosen)
+                tool_names: set[str] = set()
+                for item in chosen:
+                    if item.kind != GE:
+                        continue
+                    tool_names.add(item.name)
+                    vdf_file = item.path / "compatibilitytool.vdf"
+                    if vdf_file.is_file():
+                        tool_names.add(_read_compat_tool_id(vdf_file, item.name))
+                affected = affected_steam_appids(win.paths, tool_names) if tool_names else []
+                removed_names, errs = uninstall(chosen)
+                return removed_names, errs, affected
 
             worker = SteamOpWorker(_uninstall)
             win._track_worker(worker)
@@ -734,22 +747,92 @@ def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
             def _done(result: object) -> None:
                 op_state["busy"] = False
                 win._end_busy()
-                removed, errors = result if isinstance(result, tuple) else ([], [])
+                removed, errors, affected = (
+                    result if isinstance(result, tuple) and len(result) == 3 else ([], [], [])
+                )
                 msg = tr("runtime.uninstall_done", count=len(removed))
                 if errors:
                     msg += "\n\n" + "\n".join(errors)
                 win.status_label.setText(tr("runtime.uninstall_done", count=len(removed)))
                 refresh_maintenance_health(win)
                 win._refresh_shortcuts()
+
+                def _cleanup_steam_mappings() -> None:
+                    paths = win.paths
+                    if not affected or paths is None or not removed or win._closing_pending:
+                        return
+                    msg_parent = _dialog_parent(win)
+                    if win.should_queue_vdf_edits():
+                        edit = QueuedVdfEdit(
+                            f"bulk_migrate_compat::{','.join(map(str, affected))}",
+                            "bulk_migrate_compat",
+                            0,
+                            tr("proton_bulk.queue_label", tool=tr("proton.steam_default_label")),
+                            {"appids": affected, "target_tool": ""},
+                        )
+                        win.enqueue_vdf_edit(edit)
+                        QMessageBox.information(
+                            msg_parent, __app_name__, tr("runtime.uninstall_steam_queued", count=len(affected))
+                        )
+                        return
+                    if (
+                        QMessageBox.question(
+                            msg_parent,
+                            __app_name__,
+                            tr("runtime.uninstall_clean_steam", count=len(affected)),
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            QMessageBox.StandardButton.Yes,
+                        )
+                        != QMessageBox.StandardButton.Yes
+                    ):
+                        return
+
+                    def _go_clean() -> None:
+                        if win._closing_pending:
+                            return
+                        win._begin_busy()
+                        cleaner = SteamOpWorker(
+                            lambda: bulk_migrate_compat_tool(paths.config_vdf, affected, ""),
+                            need_steam_closed=True,
+                        )
+                        win._track_worker(cleaner)
+
+                        def _cleaned(cnt: object) -> None:
+                            win._end_busy()
+                            win._refresh_shortcuts()
+                            if not win._closing_pending:
+                                QMessageBox.information(
+                                    _dialog_parent(win),
+                                    __app_name__,
+                                    tr("runtime.uninstall_steam_cleaned", count=int(cnt or 0)),
+                                )
+
+                        def _clean_err(cerr: str) -> None:
+                            win._end_busy()
+                            if not win._closing_pending:
+                                QMessageBox.critical(_dialog_parent(win), __app_name__, tr("runtime.error", err=cerr))
+
+                        cleaner.finished_ok.connect(_cleaned)
+                        cleaner.failed.connect(_clean_err)
+                        cleaner.start()
+
+                    win._confirm_close_steam_async(
+                        _go_clean,
+                        parent=msg_parent,
+                        alive_fn=lambda: not win._closing_pending,
+                    )
+
                 if not dlg_alive():
                     if not win._closing_pending:
                         QMessageBox.information(_dialog_parent(win), __app_name__, msg)
+                        _cleanup_steam_mappings()
                     return
                 for b in (btn_all, btn_none, btn_remove, btn_close):
                     b.setEnabled(True)
                 QMessageBox.information(dlg, __app_name__, msg)
                 if not errors:
                     dlg.accept()
+                _cleanup_steam_mappings()
 
             def _fail(err: str) -> None:
                 op_state["busy"] = False

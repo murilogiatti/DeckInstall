@@ -309,8 +309,9 @@ def resolve_standalone_proton_fallback(game: StandaloneGame) -> tuple[Path | Non
     """Resolve game.proton_name or fall back to the newest installed GE-Proton11+/10 tool."""
     from .runtime_manager import list_ge_proton10_dirs, list_ge_proton11_dirs
 
-    if game.proton_name.strip():
-        resolved_str = _resolve_proton_path(game.proton_name)
+    pinned_name = game.proton_name.strip()
+    if pinned_name:
+        resolved_str = _resolve_proton_path(pinned_name)
         resolved_path = Path(resolved_str)
         if resolved_path.is_dir() and (resolved_path / "proton").is_file():
             return (resolved_path, None)
@@ -318,7 +319,7 @@ def resolve_standalone_proton_fallback(game: StandaloneGame) -> tuple[Path | Non
     candidates = list_ge_proton11_dirs() or list_ge_proton10_dirs()
     if candidates:
         fallback_dir = candidates[0]
-        return (fallback_dir, fallback_dir.name)
+        return (fallback_dir, fallback_dir.name if pinned_name else None)
     return (None, None)
 
 

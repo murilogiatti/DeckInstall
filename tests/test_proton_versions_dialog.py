@@ -73,7 +73,7 @@ def test_steam_shortcuts_owned_by_a_game_are_not_listed_twice(tmp_path: Path) ->
         ("Other", "shortcut", "proton_9"),
     ]
     assert rows[0].steam_tools == ((0x80000001, "proton_11"),) and not rows[0].newest
-    assert rows[0].game_dir is None
+    assert rows[0].game_dir == game.game_dir
     assert orphans == [0x80000099]
 
 

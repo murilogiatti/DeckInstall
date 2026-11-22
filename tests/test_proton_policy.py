@@ -23,6 +23,7 @@ def _proton(name: str) -> Path:
     tool = runtime_manager.get_compat_tools_dir() / name
     tool.mkdir(parents=True, exist_ok=True)
     (tool / "proton").write_text("#!/bin/sh\n", encoding="utf-8")
+    (tool / ".deckinstall-managed").write_text(f"{name}\n", encoding="utf-8")
     return tool
 
 

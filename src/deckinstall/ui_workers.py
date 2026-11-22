@@ -500,15 +500,20 @@ class RuntimeUpdateWorker(QThread):
             policy_msg = self._after_ge_update(previous_ge)
 
             opti_ver = ""
+            opti_err = ""
             if _has_optiscaler_dll(get_optiscaler_dir()):
                 old_opti_ver = str(_load_versions().get("optiscaler_installed_version") or "").strip()
-                ensure_optiscaler(
-                    check_update=True,
-                    progress_cb=lambda msg, _pct: self.status.emit(msg),
-                )
-                opti_ver = str(_load_versions().get("optiscaler_installed_version") or "").strip()
-                if opti_ver and opti_ver != old_opti_ver:
-                    any_updated = True
+                try:
+                    ensure_optiscaler(
+                        check_update=True,
+                        progress_cb=lambda msg, _pct: self.status.emit(msg),
+                    )
+                    opti_ver = str(_load_versions().get("optiscaler_installed_version") or "").strip()
+                    if opti_ver and opti_ver != old_opti_ver:
+                        any_updated = True
+                except Exception as exc:
+                    logging.warning("OptiScaler update failed: %s", exc)
+                    opti_err = tr("runtime.optiscaler_failed", err=str(exc))
 
             mh_msg = self._update_mangohud()
             if mh_msg.startswith("+"):
@@ -526,6 +531,8 @@ class RuntimeUpdateWorker(QThread):
             )
             if opti_ver:
                 msg = f"{msg} | OptiScaler {opti_ver}"
+            if opti_err:
+                msg = f"{msg} | {opti_err}"
             if mh_msg:
                 msg = f"{msg} | {mh_msg}"
             if policy_msg:
@@ -591,6 +598,7 @@ class StandaloneInstallWorker(QThread):
         game_dir: Path | None = None,
         single_exe_only: bool = False,
         library: Library | None = None,
+        prepare_standalone_runtime: bool = True,
     ) -> None:
         super().__init__()
         self.library = library
@@ -605,6 +613,7 @@ class StandaloneInstallWorker(QThread):
         self.winedlloverrides = winedlloverrides
         self.game_dir = game_dir
         self.single_exe_only = single_exe_only
+        self.prepare_standalone_runtime = prepare_standalone_runtime
 
     def run(self) -> None:
         try:
@@ -612,12 +621,13 @@ class StandaloneInstallWorker(QThread):
             if is_native:
                 proton_name = ""
             else:
-                self.status.emit(tr("add.preparing_runtime"))
-                ensure_umu_run(progress_cb=lambda msg, _pct: self.status.emit(msg))
-                # Best effort: GAMEID/STORE lookups (protonfixes) need the umu-database.
-                _rm.ensure_umu_database(timeout=15)
-                ge_dir = ensure_ge_proton11(progress_cb=lambda msg, _pct: self.status.emit(msg))
-                proton_name = ge_dir.name
+                if self.prepare_standalone_runtime:
+                    self.status.emit(tr("add.preparing_runtime"))
+                    ensure_umu_run(progress_cb=lambda msg, _pct: self.status.emit(msg))
+                    # Best effort: GAMEID/STORE lookups (protonfixes) need the umu-database.
+                    _rm.ensure_umu_database(timeout=15)
+                    ensure_ge_proton11(progress_cb=lambda msg, _pct: self.status.emit(msg))
+                proton_name = ""
 
             if self.game_dir is not None:
                 game_dir = self.game_dir
@@ -720,20 +730,28 @@ class RunExeInPrefixWorker(QThread):
         prefix_dir: Path,
         exe_path: Path,
         proton_dir: Path | None = None,
+        allow_download: bool = True,
     ) -> None:
         super().__init__()
         self.prefix_dir = prefix_dir
         self.exe_path = exe_path
         self.proton_dir = proton_dir
+        self.allow_download = allow_download
 
     def run(self) -> None:
         try:
             self.status.emit(tr("run_exe.running", exe=self.exe_path.name))
-            run_exe_in_prefix(
+            kwargs: dict[str, Any] = {"proton_path": self.proton_dir}
+            if not self.allow_download:
+                kwargs["allow_download"] = False
+            rc = run_exe_in_prefix(
                 self.exe_path,
                 self.prefix_dir,
-                proton_path=self.proton_dir,
+                **kwargs,
             )
+            if isinstance(rc, int) and rc != 0:
+                self.failed.emit(f"{self.exe_path.name} exited with code {rc}")
+                return
             self.finished_ok.emit()
         except Exception as exc:
             self.failed.emit(_format_worker_error(exc))

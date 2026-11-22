@@ -41,6 +41,7 @@ from ..optiscaler import (
 from ..runtime_manager import (
     WINETRICKS_PRESETS,
     get_system_package_install_cmd,
+    get_umu_run_path,
     install_system_package,
     resolve_game_prefix,
 )
@@ -95,6 +96,19 @@ def run_exe_in_prefix_dialog(
     def _on_picked(exe_path_str: str) -> None:
         if not exe_path_str or win._closing_pending:
             return
+        if (
+            not get_umu_run_path().is_file()
+            and (win.paths is not None or getattr(win, "_steam_root_found", False))
+        ):
+            ans = QMessageBox.question(
+                _dialog_parent(win),
+                __app_name__,
+                tr("run_exe.confirm_umu_steamos"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
         exe_path = Path(exe_path_str)
         worker = RunExeInPrefixWorker(prefix_dir, exe_path, proton_dir=proton_dir)
         win._track_worker(worker)

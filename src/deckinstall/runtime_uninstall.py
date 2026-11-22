@@ -7,7 +7,9 @@ GE-Proton that "Default" games use moves them to the newest one left.
 
 from __future__ import annotations
 
+import json
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,11 +25,29 @@ class RuntimeItem:
     name: str
     path: Path
     size_bytes: int
-    users: tuple[str, ...] = ()  # games that use it (GE-Proton only)
+    users: tuple[str, ...] = ()  # games that use it (custom Proton tools)
+
+
+def _orphan_mangohud_layer_bytes() -> int:
+    """Total size of user Vulkan implicit layers pointing into DeckInstall's MangoHud dir."""
+    mh_resolved = rm.get_mangohud_dir().resolve()
+    layer_dir = rm.get_user_vulkan_layer_dir()
+    total = 0
+    for json_name in ("MangoHud.x86_64.json", "MangoHud.x86.json", "MangoHud.json"):
+        layer = layer_dir / json_name
+        if not layer.is_file() or layer.is_symlink():
+            continue
+        try:
+            data = json.loads(layer.read_text(encoding="utf-8"))
+            if Path(str(data["layer"]["library_path"])).resolve().is_relative_to(mh_resolved):
+                total += layer.stat().st_size
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return total
 
 
 def _proton_users(paths: SteamPaths | None) -> dict[str, list[str]]:
-    """{Proton folder name: games using it} for DeckInstall games and Steam shortcuts."""
+    """{Proton folder/tool name: games using it} for DeckInstall games and Steam shortcuts."""
     from .proton_policy import effective_proton_name
     from .standalone import list_standalone_games
 
@@ -48,22 +68,69 @@ def _proton_users(paths: SteamPaths | None) -> dict[str, list[str]]:
     return users
 
 
+def affected_steam_appids(paths: SteamPaths | None, tool_names: Iterable[str]) -> list[int]:
+    """Return Steam AppIDs in config.vdf currently mapped to any tool name in tool_names."""
+    wanted = {name.strip() for name in tool_names if name and name.strip()}
+    if paths is None or not wanted:
+        return []
+    try:
+        from .steam_vdf import list_compat_tool_usage
+
+        seen: list[int] = []
+        for u in list_compat_tool_usage(paths):
+            if u.tool_name in wanted and u.appid_u32 not in seen:
+                seen.append(u.appid_u32)
+        return seen
+    except Exception:
+        logging.exception("Could not read Steam compat-tool mappings for runtime cleanup")
+        return []
+
+
 def list_runtimes(paths: SteamPaths | None = None) -> list[RuntimeItem]:
-    """What can be uninstalled now, with its size and (for GE-Proton) the games that use it."""
+    """What can be uninstalled now, with its size and (for custom Protons) the games using it."""
     items: list[RuntimeItem] = []
+    mh_dir = rm.get_mangohud_dir()
     fixed = (
         (UMU, "umu-run", rm.get_umu_dir()),
         (STEAMRT4, "Steam Runtime 4 (umu)", rm.get_steamrt4_dir()),
-        (MANGOHUD, "MangoHud", rm.get_mangohud_dir()),
         (OPTISCALER, "OptiScaler", rm.get_optiscaler_dir().parent),
     )
     for kind, name, path in fixed:
         if path.is_dir() and not path.is_symlink():
             items.append(RuntimeItem(kind, name, path, dir_size_bytes(path)))
+    mh_layer_bytes = _orphan_mangohud_layer_bytes()
+    if mh_dir.is_dir() and not mh_dir.is_symlink():
+        items.append(RuntimeItem(MANGOHUD, "MangoHud", mh_dir, dir_size_bytes(mh_dir) + mh_layer_bytes))
+    elif mh_layer_bytes > 0:
+        items.append(RuntimeItem(MANGOHUD, "MangoHud", rm.get_user_vulkan_layer_dir(), mh_layer_bytes))
+
     users = _proton_users(paths)
-    for path in rm.list_ge_proton_dirs(min_major=1):
-        if rm.is_managed_ge_proton(path):
-            items.append(RuntimeItem(GE, path.name, path, dir_size_bytes(path), tuple(users.get(path.name, ()))))
+    compat_dir = rm.get_compat_tools_dir()
+    managed_tools: list[Path] = []
+    if compat_dir.is_dir():
+        try:
+            for entry in compat_dir.iterdir():
+                if rm.is_managed_compat_tool(entry):
+                    managed_tools.append(entry)
+        except OSError:
+            managed_tools = []
+    ge_order = {p: idx for idx, p in enumerate(rm.list_ge_proton_dirs(min_major=1))}
+    managed_tools.sort(key=lambda p: (0 if p in ge_order else 1, ge_order.get(p, 0), p.name.lower()))
+    for path in managed_tools:
+        tool_users = list(users.get(path.name, ()))
+        vdf_file = path / "compatibilitytool.vdf"
+        if vdf_file.is_file():
+            try:
+                from .steam_paths import _read_compat_tool_id
+
+                tid = _read_compat_tool_id(vdf_file, path.name)
+                if tid != path.name:
+                    for u_name in users.get(tid, ()):
+                        if u_name not in tool_users:
+                            tool_users.append(u_name)
+            except OSError:
+                pass
+        items.append(RuntimeItem(GE, path.name, path, dir_size_bytes(path), tuple(tool_users)))
     return items
 
 
@@ -84,7 +151,7 @@ def uninstall(items: list[RuntimeItem]) -> tuple[list[str], list[str]]:
                 changed = rm.uninstall_mangohud()
             elif item.kind == OPTISCALER:
                 changed = rm.uninstall_optiscaler_package()
-            elif item.kind == GE and rm.is_managed_ge_proton(item.path):
+            elif item.kind == GE and rm.is_managed_compat_tool(item.path):
                 changed = rm._remove_runtime_dir(item.path)
             else:
                 raise ValueError(f"Runtime is not managed by DeckInstall: {item.path}")
@@ -94,6 +161,6 @@ def uninstall(items: list[RuntimeItem]) -> tuple[list[str], list[str]]:
             errors.append(f"{item.name}: {exc}")
     newest_after = newest_ge_proton()
     if newest_before is not None and (newest_after is None or newest_after.name != newest_before.name):
-        # "Default" games pointed at the removed newest version: rewrite them to the newest left.
+        # "Default" games pointed at the removed newest version: rewrite them to match what remains.
         retarget_default_games("")
     return removed, errors

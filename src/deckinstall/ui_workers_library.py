@@ -26,6 +26,7 @@ from .runtime_manager import (
     list_ge_proton11_dirs,
     list_installed_compat_tools,
     official_mangohud_installed,
+    system_mangohud_installed,
 )
 from .standalone import (
     StandaloneGame,
@@ -266,8 +267,8 @@ class LaunchPrepWorker(QThread):
     def run(self) -> None:
         try:
             wants_mangohud = "MANGOHUD=1" in str(getattr(self._obj, "launch_options", "") or "")
-            if wants_mangohud and not official_mangohud_installed():
-                try:  # the overlay always comes from the official build (distro ones may lack NVIDIA)
+            if wants_mangohud and not official_mangohud_installed() and not system_mangohud_installed():
+                try:  # the overlay always comes from the official build when no system MangoHud exists
                     ensure_mangohud()
                 except Exception as exc:
                     logging.warning("Could not get the official MangoHud: %s", exc)

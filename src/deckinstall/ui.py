@@ -95,7 +95,10 @@ from .proton_policy import DEFAULT_PROTON_ID, set_game_proton
 from .runtime_manager import (
     detect_gpu_profile,
     fix_bwrap_userns,
+    get_umu_run_path,
     is_win32_prefix,
+    list_ge_proton10_dirs,
+    list_ge_proton11_dirs,
 )
 from .save_sync import auto_snapshot
 from .scanner import (
@@ -712,7 +715,7 @@ class MainWindow(QMainWindow):
             btn.style().unpolish(btn)
             btn.style().polish(btn)
             btn.update()
-        self.btn_bulk_proton.setVisible(has_steam)
+        self.btn_bulk_proton.setVisible(True)
         if hasattr(self, "btn_maint_revalidate"):
             self.btn_maint_revalidate.setEnabled(has_steam)
         self._update_steam_status_style()
@@ -1496,7 +1499,7 @@ class MainWindow(QMainWindow):
 
         def _preflight_failed(err: str) -> None:
             logging.warning("Runtime preflight failed: %s", err)
-            _on_preflight(False)
+            _on_preflight(True)
 
         preflight.failed.connect(_preflight_failed)
         preflight.start()
@@ -2308,6 +2311,25 @@ class MainWindow(QMainWindow):
             inside_games_dir = False
 
         def _start_install(final_keep_in_place: bool, final_single_exe_only: bool) -> None:
+            steam_only = (steam_target is not None) and not create_menu and not create_desktop
+            if (
+                not steam_only
+                and not is_native_linux_exe(exe_path)
+                and (self.paths is not None or self._steam_root_found)
+                and (
+                    not get_umu_run_path().is_file()
+                    or not (list_ge_proton11_dirs() or list_ge_proton10_dirs())
+                )
+            ):
+                ans = QMessageBox.question(
+                    _dialog_parent(self),
+                    __app_name__,
+                    tr("add.confirm_runtime_steamos"),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    _optional_install_default(True),
+                )
+                if ans != QMessageBox.StandardButton.Yes:
+                    return
             self._begin_busy()
             worker = StandaloneInstallWorker(
                 app_name=app_name,
@@ -2321,6 +2343,7 @@ class MainWindow(QMainWindow):
                 game_dir=game_dir,
                 single_exe_only=final_single_exe_only,
                 library=target_library,
+                prepare_standalone_runtime=not steam_only,
             )
             self._track_worker(worker)
             worker.status.connect(self.status_label.setText)

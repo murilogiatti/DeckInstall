@@ -1042,9 +1042,12 @@ def list_compat_tool_usage(paths: SteamPaths) -> list[CompatMappingEntry]:
 
 
 def bulk_migrate_compat_tool(config_vdf: Path, appids: list[int], target_tool: str) -> int:
-    """Migrate multiple AppIDs in CompatToolMapping to target_tool in one atomic write."""
-    if not appids or not target_tool.strip():
+    """Migrate multiple AppIDs in CompatToolMapping to target_tool ("" removes them) atomically."""
+    cleaned = target_tool.strip()
+    if not appids:
         return 0
+    if not cleaned:
+        return remove_compat_tools(config_vdf, appids)
     with _steam_transaction_lock(config_vdf):
         if not config_vdf.is_file():
             return 0

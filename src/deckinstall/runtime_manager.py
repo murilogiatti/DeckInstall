@@ -288,22 +288,59 @@ def official_mangohud_installed() -> bool:
     return True
 
 
+_MANGOHUD_LIB_DIRS = ("lib", "lib64", "lib32", "lib/x86_64-linux-gnu", "lib/i386-linux-gnu")
+
+
+def _resolve_system_layer_lib(raw_path: str) -> Path | None:
+    """Resolve an implicit Vulkan layer library_path (including $LIB tokens) to an existing file."""
+    cleaned = raw_path.strip()
+    if not cleaned:
+        return None
+    if "$LIB" in cleaned:
+        for lib_sub in _MANGOHUD_LIB_DIRS:
+            candidate = Path(cleaned.replace("$LIB", lib_sub))
+            try:
+                if candidate.is_absolute() and candidate.is_file():
+                    return candidate
+            except OSError:
+                continue
+        return None
+    candidate = Path(cleaned)
+    try:
+        return candidate if candidate.is_absolute() and candidate.is_file() else None
+    except OSError:
+        return None
+
+
 def system_mangohud_installed() -> bool:
     """Recognize a native installation from its Vulkan manifests and libraries."""
     data_dirs = os.environ.get("XDG_DATA_DIRS") or "/usr/local/share:/usr/share"
     for base in map(Path, data_dirs.split(os.pathsep)):
-        if not base.is_absolute() or base.is_relative_to(Path.home()):
-            continue
+        try:
+            if not base.is_absolute() or base.is_relative_to(Path.home()):
+                continue
+        except ValueError:
+            pass
         layers = base / "vulkan" / "implicit_layer.d"
         try:
             libraries = [
-                Path(json.loads((layers / name).read_text(encoding="utf-8"))["layer"]["library_path"])
+                _resolve_system_layer_lib(
+                    str(json.loads((layers / name).read_text(encoding="utf-8"))["layer"]["library_path"])
+                )
                 for name, _ in _MANGOHUD_LAYERS
             ]
         except (OSError, ValueError, KeyError, TypeError):
-            continue
-        if all(lib.is_absolute() and lib.is_file() for lib in libraries):
+            libraries = []
+        if libraries and all(lib is not None for lib in libraries):
             return True
+        single_layer = layers / "MangoHud.json"
+        if single_layer.is_file():
+            try:
+                raw_lib = str(json.loads(single_layer.read_text(encoding="utf-8"))["layer"]["library_path"])
+            except (OSError, ValueError, KeyError, TypeError):
+                raw_lib = ""
+            if _resolve_system_layer_lib(raw_lib) is not None:
+                return True
     return False
 
 
@@ -393,13 +430,16 @@ def mangohud_versions() -> tuple[str, str]:
 def uninstall_mangohud() -> bool:
     """Remove DeckInstall's official MangoHud and its user layers (a layer pointing elsewhere is kept)."""
     mh_dir = get_mangohud_dir()
+    mh_resolved = mh_dir.resolve()
     removed = False
+    layer_names = (*[json_name for json_name, _lib in _MANGOHUD_LAYERS], "MangoHud.json")
     with _MANGOHUD_LOCK:
-        for json_name, _lib in _MANGOHUD_LAYERS:
-            layer = get_user_vulkan_layer_dir() / json_name
+        layer_dir = get_user_vulkan_layer_dir()
+        for json_name in layer_names:
+            layer = layer_dir / json_name
             try:
                 data = json.loads(layer.read_text(encoding="utf-8"))
-                ours = Path(str(data["layer"]["library_path"])).is_relative_to(mh_dir)
+                ours = Path(str(data["layer"]["library_path"])).resolve().is_relative_to(mh_resolved)
             except (OSError, ValueError, KeyError, TypeError):
                 ours = False
             if ours:
@@ -589,16 +629,24 @@ def list_ge_proton_dirs(
     return [entry for _, entry in found]
 
 
+def is_managed_compat_tool(path: Path) -> bool:
+    """True for any compatibility tool directory recorded as installed by this app."""
+    marker = path / _GE_MANAGED_MARKER
+    try:
+        return (
+            path.is_dir()
+            and not path.is_symlink()
+            and path.parent.resolve() == get_compat_tools_dir().resolve()
+            and not marker.is_symlink()
+            and marker.is_file()
+        )
+    except OSError:
+        return False
+
+
 def is_managed_ge_proton(path: Path) -> bool:
     """True for a GE-Proton directory recorded as installed by this app."""
-    marker = path / _GE_MANAGED_MARKER
-    return (
-        path.parent.resolve() == get_compat_tools_dir().resolve()
-        and not path.is_symlink()
-        and _parse_ge_proton_version(path.name, min_major=1) is not None
-        and not marker.is_symlink()
-        and marker.is_file()
-    )
+    return is_managed_compat_tool(path) and _parse_ge_proton_version(path.name, min_major=1) is not None
 
 
 def list_ge_proton11_dirs() -> list[Path]:
@@ -745,16 +793,16 @@ def _sanitize_asset_name(name: str) -> str:
 
 
 def _fetch_json(url: str, timeout: int = 20) -> Any:
-    resp = _request_github_with_validated_redirects(
+    with _request_github_with_validated_redirects(
         url,
         headers={
             "User-Agent": USER_AGENT,
             "Accept": "application/vnd.github+json",
         },
         timeout=timeout,
-    )
-    resp.raise_for_status()
-    return resp.json()
+    ) as resp:
+        resp.raise_for_status()
+        return resp.json()
 
 
 def _download_file(
@@ -1371,22 +1419,46 @@ def repair_ge_proton(
     if proton_dir.name in ("", ".", ".."):
         raise ValueError(f"Unsafe GE-Proton directory name: {proton_dir!r}")
 
-    _emit_progress(progress_cb, f"Removing broken GE-Proton directory {proton_dir.name}...", 0)
+    _emit_progress(progress_cb, f"Replacing broken GE-Proton directory {proton_dir.name}...", 0)
+    backup_dir: Path | None = None
     if proton_dir.is_symlink():
         proton_dir.unlink()
     elif proton_dir.exists():
-        shutil.rmtree(proton_dir)
+        expected_compat_dir.mkdir(parents=True, exist_ok=True)
+        tmp_bk = Path(
+            tempfile.mkdtemp(prefix=f".{proton_dir.name}_repair_", dir=str(compat_parent))
+        )
+        tmp_bk.rmdir()
+        os.replace(proton_dir, tmp_bk)
+        backup_dir = tmp_bk
 
-    tag = proton_dir.name
-    if _parse_ge_proton_version(tag, min_major=1) is not None:
-        try:
-            releases = fetch_available_proton_releases("ge-proton", limit=50)
-            for rel in releases:
-                if rel.tag_name == tag:
-                    return install_compat_tool(rel, progress_cb=progress_cb)
-        except Exception:
-            pass
-    return ensure_ge_proton11(force_update=True, progress_cb=progress_cb)
+    def _restore_backup() -> None:
+        if backup_dir is not None and backup_dir.exists() and not proton_dir.exists():
+            try:
+                os.replace(backup_dir, proton_dir)
+            except OSError:
+                pass
+
+    installed: Path | None = None
+    try:
+        tag = proton_dir.name
+        if _parse_ge_proton_version(tag, min_major=1) is not None:
+            try:
+                releases = fetch_available_proton_releases("ge-proton", limit=50)
+                for rel in releases:
+                    if rel.tag_name == tag:
+                        installed = install_compat_tool(rel, progress_cb=progress_cb)
+                        break
+            except Exception:
+                pass
+        if installed is None:
+            installed = ensure_ge_proton11(force_update=True, progress_cb=progress_cb)
+    except Exception:
+        _restore_backup()
+        raise
+    if backup_dir is not None and backup_dir.exists():
+        shutil.rmtree(backup_dir, ignore_errors=True)
+    return installed
 
 
 def ensure_ge_proton11(
@@ -1757,8 +1829,7 @@ def install_compat_tool(
         target_dir = compat_dir / folder_name
         if ".." in folder_name or target_dir.resolve().parent != compat_dir.resolve():
             raise RuntimeError(f"Unsafe compatibility tool target directory: {target_dir}")
-        if _parse_ge_proton_version(folder_name, min_major=1) is not None:
-            atomic_write_text(extracted_root / _GE_MANAGED_MARKER, f"{folder_name}\n")
+        atomic_write_text(extracted_root / _GE_MANAGED_MARKER, f"{folder_name}\n")
         backup_dir: Path | None = None
         try:
             if target_dir.exists() or target_dir.is_symlink():
@@ -2313,18 +2384,32 @@ def run_exe_in_prefix(
     proton_path: Path | None = None,
     game_id: str = "umu-default",
     wait: bool = True,
+    allow_download: bool = True,
 ) -> int:
     """Run an arbitrary Windows executable inside an existing Wine prefix via umu-run."""
     resolved_proton = proton_path
     if resolved_proton is None:
         candidates = list_ge_proton11_dirs() or list_ge_proton10_dirs()
-        if not candidates:
-            raise RuntimeError(
-                "No GE-Proton11+ or GE-Proton10 installation found. Install GE-Proton first."
-            )
-        resolved_proton = candidates[0]
+        if candidates:
+            resolved_proton = candidates[0]
+        else:
+            from .steam_paths import find_proton_binary, find_steam_root
 
-    umu_run = ensure_umu_run()
+            steam_root = find_steam_root()
+            steam_proton = find_proton_binary(steam_root) if steam_root is not None else None
+            if steam_proton is not None:
+                resolved_proton = steam_proton.parent
+            else:
+                raise RuntimeError(
+                    "No GE-Proton11+/10 or official Steam Proton installation found. Install Proton first."
+                )
+
+    if allow_download:
+        umu_run = ensure_umu_run()
+    else:
+        umu_run = get_umu_run_path()
+        if not umu_run.is_file():
+            raise RuntimeError("umu-run is not installed.")
     prefix_dir.mkdir(parents=True, exist_ok=True)
     env = build_umu_env(prefix_dir, resolved_proton, game_id=game_id)
     cmd = [str(umu_run), str(exe_path)]

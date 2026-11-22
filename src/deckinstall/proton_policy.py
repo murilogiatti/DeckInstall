@@ -78,7 +78,8 @@ def _apply(game: StandaloneGame, tool_name: str, *, before: str) -> StandaloneGa
 def set_game_proton(game_dir: Path, tool_name: str) -> StandaloneGame:
     """Pin a game to tool_name, or put it back on "Default (newest)" with an empty name."""
     game = _load(game_dir)
-    return _apply(game, tool_name, before=effective_proton_name(game))
+    cleaned = "" if tool_name.strip() == DEFAULT_PROTON_ID else tool_name.strip()
+    return _apply(game, cleaned, before=effective_proton_name(game))
 
 
 def use_previous_proton(game_dir: Path) -> StandaloneGame:
@@ -106,15 +107,13 @@ def set_games_proton(game_dirs: Iterable[Path], tool_name: str) -> tuple[int, li
 
 
 def retarget_default_games(previous_name: str, games: Iterable[StandaloneGame] | None = None) -> int:
-    """After a GE-Proton update, rewrite the launchers of every "Default" game to the newest version."""
+    """After a GE-Proton change, rewrite the launchers of every "Default" game to match."""
     newest = newest_ge_proton()
-    if newest is None:
-        return 0
     moved = 0
     for game in games if games is not None else list_standalone_games():
         if not is_default(game):
             continue
-        if previous_name and previous_name != newest.name:
+        if previous_name and (newest is None or previous_name != newest.name):
             game.meta["proton_previous"] = previous_name
         game.meta["proton_mode"] = DEFAULT
         try:
@@ -122,7 +121,12 @@ def retarget_default_games(previous_name: str, games: Iterable[StandaloneGame] |
             _write_manifest(game)
             moved += 1
         except OSError as exc:
-            logging.warning("Could not move %s to %s: %s", game.name, newest.name, exc)
+            logging.warning(
+                "Could not move %s to %s: %s",
+                game.name,
+                newest.name if newest is not None else "default",
+                exc,
+            )
     return moved
 
 
@@ -148,7 +152,12 @@ def prune_ge_proton(keep: int = 2, protected: Iterable[str] = ()) -> list[Path]:
     managed = _rm.get_compat_tools_dir()
     removed: list[Path] = []
     for index, tool_dir in enumerate(_rm.list_ge_proton_dirs(min_major=10)):
-        if index < keep or tool_dir.name in keep_names or tool_dir.parent != managed:
+        if (
+            index < keep
+            or tool_dir.name in keep_names
+            or tool_dir.parent != managed
+            or not _rm.is_managed_ge_proton(tool_dir)
+        ):
             continue
         try:
             _rm.remove_compat_tool(tool_dir)
