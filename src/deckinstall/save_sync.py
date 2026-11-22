@@ -9,6 +9,7 @@ import os
 import re
 import stat
 import tempfile
+import threading
 import time
 import zipfile
 from dataclasses import dataclass
@@ -197,22 +198,81 @@ def _collect_prefix_state_entries(
     return entries
 
 
+@dataclass(frozen=True)
+class _LudusaviManifestIndex:
+    """Data-oriented flat lookup tables for the cached Ludusavi manifest."""
+
+    key: tuple[Path, int, int, int]
+    entries: dict[str, dict[str, object]]
+    by_appid: dict[str, dict[str, object]]
+    by_norm_name: dict[str, dict[str, object]]
+
+
+_LUDUSAVI_CACHE_LOCK = threading.Lock()
+_LUDUSAVI_CACHE: _LudusaviManifestIndex | None = None
+
+
+def _build_ludusavi_index(
+    cache_key: tuple[Path, int, int, int], raw: dict[object, object]
+) -> _LudusaviManifestIndex:
+    entries: dict[str, dict[str, object]] = {}
+    by_appid: dict[str, dict[str, object]] = {}
+    by_norm_name: dict[str, dict[str, object]] = {}
+    for k, v in raw.items():
+        if not isinstance(v, dict):
+            continue
+        name = str(k)
+        entries[name] = v
+        steam_info = v.get("steam")
+        if isinstance(steam_info, dict):
+            sid = str(steam_info.get("id", "")).strip()
+            if sid and sid not in by_appid:
+                by_appid[sid] = v
+        nk = _norm_key(name)
+        if nk and nk not in by_norm_name:
+            by_norm_name[nk] = v
+    return _LudusaviManifestIndex(
+        key=cache_key,
+        entries=entries,
+        by_appid=by_appid,
+        by_norm_name=by_norm_name,
+    )
+
+
+def _get_ludusavi_index(manifest_path: Path | None = None) -> _LudusaviManifestIndex | None:
+    global _LUDUSAVI_CACHE
+    target = manifest_path if manifest_path is not None else DEFAULT_LUDUSAVI_MANIFEST_PATH
+    if not target.is_file() or target.is_symlink():
+        return None
+    try:
+        resolved = target.resolve()
+        st = target.stat()
+    except OSError:
+        return None
+    if st.st_size > _LUDUSAVI_MANIFEST_MAX_BYTES:
+        return None
+    cache_key = (resolved, st.st_ino, st.st_mtime_ns, st.st_size)
+    with _LUDUSAVI_CACHE_LOCK:
+        if _LUDUSAVI_CACHE is not None and _LUDUSAVI_CACHE.key == cache_key:
+            return _LUDUSAVI_CACHE
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    index = _build_ludusavi_index(cache_key, raw)
+    with _LUDUSAVI_CACHE_LOCK:
+        _LUDUSAVI_CACHE = index
+    return index
+
+
 def load_ludusavi_manifest(
     manifest_path: Path | None = None,
 ) -> dict[str, dict[str, object]]:
     """Load a Ludusavi JSON manifest mapping game names to save/registry definitions."""
-    target = manifest_path if manifest_path is not None else DEFAULT_LUDUSAVI_MANIFEST_PATH
-    if not target.is_file() or target.is_symlink():
-        return {}
-    try:
-        if target.stat().st_size > _LUDUSAVI_MANIFEST_MAX_BYTES:
-            return {}
-        raw = json.loads(target.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-    return {str(k): v for k, v in raw.items() if isinstance(v, dict)}
+    idx = _get_ludusavi_index(manifest_path)
+    return dict(idx.entries) if idx is not None else {}
 
 
 def find_manifest_game_entry(
@@ -221,23 +281,35 @@ def find_manifest_game_entry(
     manifest: dict[str, dict[str, object]] | None = None,
 ) -> dict[str, object] | None:
     """Find a Ludusavi manifest entry by Steam AppID, exact name, or normalized name."""
-    loaded = manifest if manifest is not None else load_ludusavi_manifest()
-    if not loaded:
+    if manifest is None:
+        idx = _get_ludusavi_index()
+        if idx is None or not idx.entries:
+            return None
+        if steam_appid is not None:
+            hit = idx.by_appid.get(str(steam_appid))
+            if hit is not None:
+                return hit
+        if game_name in idx.entries:
+            return idx.entries[game_name]
+        target_key = _norm_key(game_name)
+        return idx.by_norm_name.get(target_key) if target_key else None
+
+    if not manifest:
         return None
 
     if steam_appid is not None:
         target_id = str(steam_appid)
-        for entry in loaded.values():
+        for entry in manifest.values():
             steam_info = entry.get("steam")
             if isinstance(steam_info, dict) and str(steam_info.get("id", "")).strip() == target_id:
                 return entry
 
-    if game_name in loaded:
-        return loaded[game_name]
+    if game_name in manifest:
+        return manifest[game_name]
 
     target_key = _norm_key(game_name)
     if target_key:
-        for key, entry in loaded.items():
+        for key, entry in manifest.items():
             if _norm_key(key) == target_key:
                 return entry
     return None
@@ -659,6 +731,7 @@ _HOME_BLOCKED_ROOTS = (
     (".local", "share", "flatpak"), (".local", "share", "kservices5"), (".local", "share", "kservices6"),
     (".local", "share", "kio"), (".local", "share", "plasma"), (".local", "share", "dolphin"),
     (".local", "share", "kwin"), (".local", "share", "trash"),
+    (".local", "share", "vulkan"), (".local", "share", "deckinstall"), (".config", "deckinstall"),
 )
 _HOME_BLOCKED_NAMES = frozenset({
     ".bashrc", ".profile", ".bash_profile", ".bash_login", ".bash_logout", ".zshrc", ".zprofile",
@@ -1732,6 +1805,10 @@ def _restore_saves_archive(
         if len(infolist) > _RESTORE_MAX_ENTRIES:
             raise RuntimeError(
                 f"Sync archive exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})"
+            )
+        if sum(max(0, info.file_size) for info in infolist) > _RESTORE_MAX_TOTAL_BYTES:
+            raise RuntimeError(
+                f"Sync archive exceeds maximum uncompressed size ({_RESTORE_MAX_TOTAL_BYTES})"
             )
         for info in infolist:
             if info.is_dir():

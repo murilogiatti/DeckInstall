@@ -7,12 +7,14 @@ import logging
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import tarfile
 import tempfile
 import time
 import zipfile
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
@@ -818,20 +820,39 @@ def extract_archive(
                 start_new_session=True,
             )
             pct = 10
+            tail_lines: deque[str] = deque(maxlen=8)
 
             def _handle_line(line: str) -> None:
                 nonlocal pct
+                clean = line.strip()
+                if clean:
+                    tail_lines.append(clean[:140])
                 m = re.search(r"(\d{1,3})%", line)
                 if m:
                     pct = min(95, max(pct, int(m.group(1))))
                 elif pct < 90:
                     pct = min(90, pct + 1)
                 if on_progress:
-                    on_progress(pct, line.strip()[:120] or f"Extracting {archive.name}...")
+                    on_progress(pct, clean[:120] or f"Extracting {archive.name}...")
 
-            rc = _drain_stream_lines(proc, cancel_flag, _handle_line, "Extraction cancelled by user.")
+            try:
+                rc = _drain_stream_lines(proc, cancel_flag, _handle_line, "Extraction cancelled by user.")
+            finally:
+                if proc.poll() is None and isinstance(getattr(proc, "pid", None), int):
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                        proc.wait(timeout=2)
+                    except (OSError, subprocess.TimeoutExpired):
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=2)
+                        except (OSError, subprocess.TimeoutExpired):
+                            pass
+                if proc.stdout is not None and hasattr(proc.stdout, "close"):
+                    proc.stdout.close()
             if rc != 0:
-                raise RuntimeError(f"Failed to extract {archive.name} (code {rc}).")
+                detail = f": {' | '.join(tail_lines)}" if tail_lines else ""
+                raise RuntimeError(f"Failed to extract {archive.name} (code {rc}){detail}.")
 
         if on_progress:
             on_progress(96, "Organizing files...")
@@ -1216,7 +1237,21 @@ def run_windows_installer(
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-        rc = _drain_stream_lines(proc, cancel_flag, _handle_inst_line, "Installer cancelled by user.")
+        try:
+            rc = _drain_stream_lines(proc, cancel_flag, _handle_inst_line, "Installer cancelled by user.")
+        finally:
+            if proc.poll() is None and isinstance(getattr(proc, "pid", None), int):
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    proc.wait(timeout=2)
+                except (OSError, subprocess.TimeoutExpired):
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+            if proc.stdout is not None and hasattr(proc.stdout, "close"):
+                proc.stdout.close()
         leaked = unsafe_prefix_drives(inst_pfx)
         if leaked:
             logging.warning("Installer prefix drives reached / or home after the run: %s", ", ".join(leaked))

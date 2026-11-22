@@ -28,18 +28,20 @@ def parse_presets(opts: str) -> dict[str, Any]:
     mh_level = 0
     mh_position = ""
     mh_fps_limit = 0
-    for tok in tokens_now:
+    for tok in tokens_list:
         if tok.startswith("MANGOHUD_CONFIG="):
             val = tok.split("=", 1)[1]
-            if "horizontal" in val and ("hud_compact" in val or "position=top-center" in val):
+            parts = [part.strip() for part in val.split(",") if part.strip()]
+            parts_set = set(parts)
+            if "horizontal" in parts_set and ("hud_compact" in parts_set or "position=top-center" in parts_set):
                 mh_level = 2
             else:
-                for lv in MANGOHUD_LEVELS:
-                    if f"preset={lv}" in val:
-                        mh_level = lv
-                        break
-            for part in val.split(","):
-                part_s = part.strip()
+                for part_s in parts:
+                    for lv in MANGOHUD_LEVELS:
+                        if part_s == f"preset={lv}":
+                            mh_level = lv
+                            break
+            for part_s in parts:
                 if part_s.startswith("position="):
                     mh_position = part_s.split("=", 1)[1].strip()
                 elif part_s.startswith("fps_limit="):

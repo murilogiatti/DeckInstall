@@ -179,8 +179,12 @@ def check_app_update(timeout: float = 10.0) -> AppUpdateInfo:
     }
     api_url = _validate_github_url(GITHUB_RELEASES_API)
     response = _request_github_with_validated_redirects(api_url, headers=headers, timeout=timeout)
-    response.raise_for_status()
-    data = response.json()
+    try:
+        response.raise_for_status()
+        data = response.json()
+    finally:
+        if hasattr(response, "close"):
+            response.close()
 
     tag_name = str(data.get("tag_name") or "").strip()
     latest_version = tag_name.lstrip("vV")

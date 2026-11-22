@@ -94,9 +94,15 @@ def _mangohud_gpus(drm_root: str = "/sys/class/drm") -> list[str]:
         return []
     out: list[str] = []
     for node in nodes:
-        driver = os.path.basename(os.path.realpath(f"{drm_root}/{node}/device/driver"))
-        if driver in _MANGOHUD_DRIVERS:
-            out.append(os.path.basename(os.path.realpath(f"{drm_root}/{node}/device")))
+        try:
+            driver_link = f"{drm_root}/{node}/device/driver"
+            if not os.path.exists(driver_link):
+                continue
+            driver = os.path.basename(os.path.realpath(driver_link))
+            if driver in _MANGOHUD_DRIVERS:
+                out.append(os.path.basename(os.path.realpath(f"{drm_root}/{node}/device")))
+        except OSError:
+            continue
     return out
 
 

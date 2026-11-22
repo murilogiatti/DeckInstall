@@ -13,7 +13,9 @@ Kinds:
 
 from __future__ import annotations
 
+import os
 import re
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -162,13 +164,65 @@ def _is_installer_name(path: Path) -> bool:
 
 
 def _folder_has_executable(folder: Path) -> bool:
+    queue: deque[tuple[Path, int]] = deque([(folder, 0)])
     scanned = 0
-    for p in folder.rglob("*"):
-        scanned += 1
-        if scanned > _SCAN_LIMIT:
-            break
-        if p.is_file() and not p.is_symlink() and (p.suffix.lower() == ".exe" or p.suffix.lower() == ".x86_64"):
-            return True
+    while queue and scanned < _SCAN_LIMIT:
+        cur, depth = queue.popleft()
+        try:
+            with os.scandir(cur) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for entry in entries:
+            scanned += 1
+            if scanned > _SCAN_LIMIT:
+                break
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    if depth < 6 and not entry.name.startswith(".") and not _skip_part(entry.name):
+                        queue.append((Path(entry.path), depth + 1))
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                low = entry.name.lower()
+                if low.endswith((".exe", ".x86_64")):
+                    return True
+                if depth <= 2 and (entry.stat(follow_symlinks=False).st_mode & 0o111) and _is_elf(Path(entry.path)):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _has_other_game_exe(folder: Path, setup: Path) -> bool:
+    queue: deque[Path] = deque([folder])
+    scanned = 0
+    while queue and scanned < _SCAN_LIMIT:
+        cur = queue.popleft()
+        try:
+            with os.scandir(cur) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for entry in entries:
+            scanned += 1
+            if scanned > _SCAN_LIMIT:
+                break
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    if not entry.name.startswith(".") and not _skip_part(entry.name):
+                        queue.append(Path(entry.path))
+                    continue
+                if entry.is_file(follow_symlinks=False) and entry.name.lower().endswith(".exe"):
+                    p = Path(entry.path)
+                    if p != setup and not _skip_name(entry.name):
+                        return True
+            except OSError:
+                continue
     return False
 
 
@@ -189,10 +243,7 @@ def classify_source(path: Path) -> SourceInfo:
             return SourceInfo(GOG_SETUP, path, installer=top_setups[0])
         if _folder_has_executable(path):
             setup = find_setup_exe(path)
-            only_setup = setup is not None and setup.parent == path and not any(
-                p.suffix.lower() == ".exe" and p != setup and not _skip_name(p.name)
-                for p in path.rglob("*.exe")
-            )
+            only_setup = setup is not None and setup.parent == path and not _has_other_game_exe(path, setup)
             if only_setup and setup is not None:
                 return SourceInfo(INSTALLER, path, installer=setup)
             return SourceInfo(READY_FOLDER, path)

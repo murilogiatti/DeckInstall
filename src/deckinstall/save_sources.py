@@ -64,6 +64,8 @@ def steam_save_sources(paths: SteamPaths) -> list[ExternalSaves]:
     seen: set[int] = set()
     for sa in _steam_libraries(paths.steam_root):
         for acf in sorted(sa.glob("appmanifest_*.acf")):
+            if acf.is_symlink():
+                continue
             stem = acf.stem.removeprefix("appmanifest_")
             if not (stem.isascii() and stem.isdigit()):
                 continue
