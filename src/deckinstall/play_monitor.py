@@ -436,10 +436,11 @@ class PlayMonitor(QObject):
 
         def _kill() -> None:
             for pid, orig_epoch in epochs.items():
-                if orig_epoch is not None:
-                    cur_epoch = process_start_epoch(pid)
-                    if cur_epoch is None or cur_epoch != orig_epoch:
-                        continue
+                if orig_epoch is None:
+                    continue
+                cur_epoch = process_start_epoch(pid)
+                if cur_epoch is None or cur_epoch != orig_epoch:
+                    continue
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except OSError:

@@ -1139,6 +1139,7 @@ _FORBIDDEN_ROOT_NAMES = {
     ".config",
     ".var",
     ".local",
+    "deckinstall",
     "heroic",
     "lutris",
     "prefixes",
@@ -1286,11 +1287,16 @@ def _looks_like_multi_game_container(directory: Path) -> bool:
 def infer_game_root_from_exe(exe_path: Path) -> Path:
     """Infer the top-level game folder from an executable path."""
     home = Path.home()
+    home_resolved = home.resolve()
     known_containers = {
         p.resolve()
         for p in (
             home,
             home / "Games",
+            home / "DeckInstall",
+            home / "DeckInstall" / "Games",
+            home / "DeckInstall" / "Prefixes",
+            home / "DeckInstall" / "Caches",
             home / "Downloads",
             home / "Syncthing",
             home / "Desktop",
@@ -1303,7 +1309,9 @@ def infer_game_root_from_exe(exe_path: Path) -> Path:
             Path("/tmp"),
             Path("/var/tmp"),
             Path("/mnt"),
+            Path("/var/mnt"),
             Path("/media"),
+            Path("/run/media"),
         )
     }
     resolved = exe_path.resolve()
@@ -1312,35 +1320,92 @@ def infer_game_root_from_exe(exe_path: Path) -> Path:
             f"O executável está dentro de um prefixo Wine (drive_c): {resolved}. "
             "Mova o jogo para uma pasta própria antes de migrar."
         )
-    # Detect real mount roots under /run/media (supports both /run/media/<disk> and /run/media/<user>/<disk>).
-    media_mount: Path | None = None
-    if resolved.parts[:3] == ("/", "run", "media"):
-        for parent in resolved.parents:
-            if parent.parts[:3] == ("/", "run", "media") and len(parent.parts) >= 4 and os.path.ismount(parent):
-                media_mount = parent
-                known_containers.add(media_mount)
-                if (media_mount / "Games").is_dir():
-                    known_containers.add((media_mount / "Games").resolve())
-                break
-    def _is_unmounted_media_container(p: Path) -> bool:
-        return media_mount is None and p.parts[:3] == ("/", "run", "media") and len(p.parts) <= 5
+    tmp_containers = {Path("/tmp").resolve(), Path("/var/tmp").resolve()}
 
-    if resolved.parent in known_containers or _looks_like_multi_game_container(resolved.parent):
+    # Detect real mount roots or DeckInstall library roots anywhere above the executable.
+    real_mount: Path | None = None
+    media_prefixes = (
+        ("/", "run", "media"),
+        ("/", "media"),
+        ("/", "mnt"),
+        ("/", "var", "mnt"),
+    )
+    for parent in resolved.parents:
+        if (
+            parent == Path("/")
+            or parent in tmp_containers
+            or parent == home_resolved
+            or parent in home_resolved.parents
+        ):
+            continue
+        try:
+            is_mount = os.path.ismount(parent)
+            has_lib = (parent / "library.json").is_file()
+        except OSError:
+            is_mount = False
+            has_lib = False
+        if is_mount or has_lib:
+            if is_mount and real_mount is None and any(parent.parts[: len(pfx)] == pfx for pfx in media_prefixes):
+                real_mount = parent
+            for extra in (
+                parent,
+                parent / "Games",
+                parent / "DeckInstall",
+                parent / "DeckInstall" / "Games",
+                parent / "DeckInstall" / "Prefixes",
+                parent / "DeckInstall" / "Caches",
+            ):
+                try:
+                    known_containers.add(extra.resolve() if extra.exists() or extra.is_symlink() else extra)
+                except OSError:
+                    known_containers.add(extra)
+            if real_mount is not None and has_lib:
+                break
+
+    def _is_media_mount_container(p: Path) -> bool:
+        if p == Path("/") or p in tmp_containers or p == home_resolved or p in home_resolved.parents:
+            return False
+        try:
+            if os.path.ismount(p) or (p / "library.json").is_file():
+                return True
+        except OSError:
+            pass
+        in_media_tree = (
+            p.parts[:3] == ("/", "run", "media")
+            or p.parts[:2] == ("/", "media")
+            or p.parts[:2] == ("/", "mnt")
+            or p.parts[:3] == ("/", "var", "mnt")
+        )
+        if real_mount is not None:
+            return in_media_tree and (p == real_mount or p in real_mount.parents)
+        return (
+            (p.parts[:3] == ("/", "run", "media") and len(p.parts) <= 5)
+            or (p.parts[:2] == ("/", "media") and len(p.parts) <= 4)
+            or (p.parts[:2] == ("/", "mnt") and len(p.parts) <= 3)
+            or (p.parts[:3] == ("/", "var", "mnt") and len(p.parts) <= 4)
+        )
+
+    def _is_container(p: Path) -> bool:
+        if p in known_containers or _is_media_mount_container(p):
+            return True
+        if p.name.lower() in ("games", "deckinstall", "prefixes", "caches") and _is_media_mount_container(p.parent):
+            return True
+        return (
+            p.name.lower() == "games"
+            and p.parent.name.lower() == "deckinstall"
+            and _is_media_mount_container(p.parent.parent)
+        )
+
+    if _is_container(resolved.parent) or _looks_like_multi_game_container(resolved.parent):
         raise ValueError(
             f"O executável está solto diretamente em {resolved.parent}; "
             "coloque-o dentro de uma subpasta própria antes de migrar."
         )
-    if _is_unmounted_media_container(resolved.parent):
-        raise ValueError(
-            f"O executável está solto diretamente na raiz da mídia removível ({resolved.parent}); "
-            "coloque-o dentro de uma subpasta própria antes de migrar."
-        )
-    tmp_containers = {Path("/tmp").resolve(), Path("/var/tmp").resolve()}
     candidate = resolved.parent
     for parent in resolved.parents:
         if parent == parent.parent:
             continue
-        if parent in known_containers:
+        if _is_container(parent):
             break
         if parent.parent in tmp_containers:
             rel_parts = resolved.relative_to(parent).parts
@@ -1354,30 +1419,21 @@ def infer_game_root_from_exe(exe_path: Path) -> Path:
             ):
                 candidate = candidate.parent
             break
-        if parent.parent in known_containers or _looks_like_multi_game_container(parent.parent):
-            candidate = parent
-            break
-        if (
-            len(parent.parts) >= 5
-            and parent.parts[:3] == ("/", "run", "media")
-            and parent.parent.name == "Games"
-        ):
+        if _is_container(parent.parent) or _looks_like_multi_game_container(parent.parent):
             candidate = parent
             break
     else:
         while (
             candidate.name.lower() in _SUBDIR_NAMES
             and candidate.parent != candidate
-            and candidate.parent not in known_containers
+            and not _is_container(candidate.parent)
             and not _looks_like_multi_game_container(candidate.parent)
-            and not _is_unmounted_media_container(candidate.parent)
         ):
             candidate = candidate.parent
     if (
         candidate.name.lower() in _FORBIDDEN_ROOT_NAMES
-        or candidate in known_containers
+        or _is_container(candidate)
         or _looks_like_multi_game_container(candidate)
-        or _is_unmounted_media_container(candidate)
     ):
         raise ValueError(f"Raiz inferida inválida ou protegida para migração: {candidate}")
     return candidate
@@ -2148,9 +2204,13 @@ def _active_compat_tools(config_vdf: Path, active_appids: set[int]) -> set[str]:
     return used
 
 
-def _all_user_shortcuts(paths: SteamPaths) -> tuple[list[ShortcutEntry], list[ShortcutEntry]]:
+def _all_user_shortcuts(
+    paths: SteamPaths,
+    *,
+    strict: bool = False,
+) -> tuple[list[ShortcutEntry], list[ShortcutEntry]]:
     """Return (current_user_entries, deduplicated_all_user_entries) for Steam shortcuts."""
-    current_entries = load_shortcuts(paths.shortcuts_vdf)
+    current_entries = load_shortcuts(paths.shortcuts_vdf, strict=strict)
     all_users = list_steam_users(paths.steam_root)
     all_user_entries: list[ShortcutEntry] = list(current_entries)
     if all_users:
@@ -2160,7 +2220,7 @@ def _all_user_shortcuts(paths: SteamPaths) -> tuple[list[ShortcutEntry], list[Sh
         }
         for uid in all_users:
             sv = paths.steam_root / "userdata" / uid / "config" / "shortcuts.vdf"
-            for e in load_shortcuts(sv):
+            for e in load_shortcuts(sv, strict=strict):
                 key = (e.appid_u32, e.exe, e.start_dir, e.icon, e.launch_options)
                 if key not in seen_entry_keys:
                     all_user_entries.append(e)

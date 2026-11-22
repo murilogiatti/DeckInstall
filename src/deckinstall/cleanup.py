@@ -12,7 +12,7 @@ import re
 import shlex
 import shutil
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from functools import cached_property
@@ -115,7 +115,7 @@ def collect_active_proton_tools(
     games_dir: Path | None = None,
 ) -> set[str]:
     """Return compatibility tool names in use by Steam games/shortcuts and standalone games."""
-    from .standalone import list_standalone_games
+    from .standalone import get_legacy_games_dir, list_standalone_games
 
     tools: set[str] = set()
     if paths is not None:
@@ -123,7 +123,23 @@ def collect_active_proton_tools(
         active_shortcuts = {e.appid_u32 for e in all_user_entries}
         installed_steam = _installed_steam_appids(paths.steam_root)
         tools.update(_active_compat_tools(paths.config_vdf, active_shortcuts | installed_steam))
-    for game in list_standalone_games(games_dir):
+    if games_dir is None:
+        games = list_standalone_games(None)
+    else:
+        try:
+            is_legacy = games_dir.resolve() == get_legacy_games_dir().resolve()
+        except OSError:
+            is_legacy = games_dir == get_legacy_games_dir()
+        if is_legacy:
+            seen_dirs: set[Path] = set()
+            games = []
+            for game in [*list_standalone_games(games_dir), *list_standalone_games(None)]:
+                if game.game_dir not in seen_dirs:
+                    seen_dirs.add(game.game_dir)
+                    games.append(game)
+        else:
+            games = list_standalone_games(games_dir)
+    for game in games:
         if game.proton_name:
             tools.add(game.proton_name)
         prev = str(game.meta.get("proton_previous") or "").strip()
@@ -179,8 +195,22 @@ def _newest_ge_proton11_paths(compat_tools: Path) -> set[Path]:
     return preserved
 
 
-def _is_orphan_desktop_file(desktop_path: Path) -> bool:
-    """Return True if a deckinstall-*.desktop file points to a missing Exec= or Path=."""
+def _path_under_norm_roots(raw_path: str, norm_roots: list[str]) -> bool:
+    """Return True if raw_path lexically lies inside any unmounted library root."""
+    if not raw_path or not norm_roots:
+        return False
+    norm = os.path.normpath(os.path.expanduser(raw_path))
+    for root in norm_roots:
+        if norm == root or norm.startswith(root.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def _is_orphan_desktop_file(
+    desktop_path: Path,
+    absent_library_roots: Iterable[Path] = (),
+) -> bool:
+    """Return True if a deckinstall-*.desktop file points to a missing Exec= or Path= (unless on an absent library)."""
     try:
         text = desktop_path.read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -201,6 +231,11 @@ def _is_orphan_desktop_file(desktop_path: Path) -> bool:
         tokens = [exec_val.strip('"')]
     if not tokens:
         return True
+    norm_roots = [os.path.normpath(str(r)) for r in absent_library_roots]
+    if _path_under_norm_roots(tokens[0], norm_roots) or (
+        path_val and _path_under_norm_roots(path_val, norm_roots)
+    ):
+        return False
     if not Path(tokens[0]).exists():
         return True
     if path_val and not Path(path_val).exists():
@@ -259,8 +294,13 @@ class _ScanContext:
         self.paths = paths
         self.current_entries: list[ShortcutEntry] = []
         self.all_user_entries: list[ShortcutEntry] = []
+        self.shortcuts_readable = True
         if paths is not None:
-            self.current_entries, self.all_user_entries = _all_user_shortcuts(paths)
+            try:
+                self.current_entries, self.all_user_entries = _all_user_shortcuts(paths, strict=True)
+            except (OSError, ValueError):
+                self.shortcuts_readable = False
+                self.current_entries, self.all_user_entries = _all_user_shortcuts(paths, strict=False)
 
         self.by_norm_key: dict[str, ShortcutEntry] = {}
         self.by_steam_appid: dict[str, ShortcutEntry] = {}
@@ -278,6 +318,7 @@ class _ScanContext:
         self.installed_steam = _installed_steam_appids(paths.steam_root) if paths is not None else set()
 
         home = home_dir or Path.home()
+        self._custom_home = home_dir is not None
         self.home = home
         self.data_home = (
             (home / ".local" / "share")
@@ -379,7 +420,15 @@ class _ScanContext:
 
     @cached_property
     def active_tools(self) -> set[str]:
-        return collect_active_proton_tools(self.paths, games_dir=self.games_dir)
+        tools = collect_active_proton_tools(
+            self.paths,
+            games_dir=self.games_dir if self._custom_home else None,
+        )
+        if self._custom_home:
+            v2_games = self.home / "DeckInstall" / "Games"
+            if v2_games.is_dir():
+                tools.update(collect_active_proton_tools(None, games_dir=v2_games))
+        return tools
 
     @cached_property
     def sniper_in_use(self) -> bool:
@@ -662,7 +711,7 @@ def _find_prefix_caches(ctx: _ScanContext) -> Iterator[_Found]:
 def _find_orphan_compatdata(ctx: _ScanContext) -> Iterator[_Found]:
     """compatdata/<appid> of games no longer installed nor referenced by any shortcut."""
     paths = ctx.paths
-    if paths is None:
+    if paths is None or not ctx.shortcuts_readable:
         return
     for child in _compatdata_children(ctx):
         if _is_active_appid_dir(ctx, child) is not False:
@@ -699,7 +748,7 @@ def _find_orphan_compatdata(ctx: _ScanContext) -> Iterator[_Found]:
 
 
 def _find_orphan_shadercache(ctx: _ScanContext) -> Iterator[_Found]:
-    if ctx.paths is None:
+    if ctx.paths is None or not ctx.shortcuts_readable:
         return
     shadercache_dir = ctx.paths.steam_root / "steamapps" / "shadercache"
     if not shadercache_dir.is_dir():
@@ -732,12 +781,18 @@ def _find_orphan_desktop_files(ctx: _ScanContext) -> Iterator[_Found]:
     apps_dir = ctx.data_home / "applications"
     if not apps_dir.is_dir() or apps_dir.is_symlink():
         return
+    try:
+        from .library import discover_libraries
+
+        absent_roots = [lib.root for lib in discover_libraries() if not lib.available]
+    except Exception:
+        absent_roots = []
     for child in apps_dir.iterdir():
         if child.is_symlink() or not child.is_file():
             continue
         if not (child.name.startswith("deckinstall-") and child.name.endswith(".desktop")):
             continue
-        if _is_orphan_desktop_file(child):
+        if _is_orphan_desktop_file(child, absent_library_roots=absent_roots):
             try:
                 sz = child.stat().st_size
             except OSError:

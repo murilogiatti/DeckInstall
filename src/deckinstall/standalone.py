@@ -257,13 +257,19 @@ def _get_protected_dirs() -> set[Path]:
         home / "Public",
         home / "Templates",
         home / "Games",
+        home / "DeckInstall",
+        home / "DeckInstall" / "Games",
+        home / "DeckInstall" / "Prefixes",
+        home / "DeckInstall" / "Caches",
         get_games_dir(),
         home / "Syncthing",
         Path("/"),
         Path("/tmp"),
         Path("/var/tmp"),
         Path("/mnt"),
+        Path("/var/mnt"),
         Path("/media"),
+        Path("/run/media"),
     )
     protected: set[Path] = set()
     for candidate in candidates:
@@ -275,17 +281,34 @@ def _get_protected_dirs() -> set[Path]:
 
 
 def _is_protected_dir(path: Path) -> bool:
-    """Return True if path is a protected directory or a Syncthing folder root."""
+    """Return True if path is a protected directory, library root, mountpoint, or Syncthing root."""
     try:
         resolved = path.resolve()
     except OSError:
         resolved = path
     if resolved in _get_protected_dirs():
         return True
+    if resolved.parent in (Path("/mnt"), Path("/var/mnt"), Path("/media")):
+        return True
     try:
-        return (resolved / ".stfolder").exists()
+        if (resolved / ".stfolder").exists() or (resolved / "library.json").is_file():
+            return True
     except OSError:
         return False
+    try:
+        home_resolved = Path.home().resolve()
+        tmp_resolved = {Path("/tmp").resolve(), Path("/var/tmp").resolve()}
+        if (
+            resolved != Path("/")
+            and resolved != home_resolved
+            and resolved not in home_resolved.parents
+            and resolved not in tmp_resolved
+            and os.path.ismount(resolved)
+        ):
+            return True
+    except OSError:
+        pass
+    return False
 
 
 def _resolve_proton_path(proton_name: str) -> str:

@@ -395,6 +395,17 @@ def _expand_manifest_template(
     return results
 
 
+def _manifest_registry_paths(entry: dict[str, object]) -> list[str]:
+    """Return applicable Windows registry paths declared in a Ludusavi manifest entry."""
+    reg_paths: list[str] = []
+    reg_spec = entry.get("registry")
+    if isinstance(reg_spec, dict):
+        for raw_reg, spec in reg_spec.items():
+            if _manifest_entry_applies(spec) and str(raw_reg).strip():
+                reg_paths.append(str(raw_reg).strip())
+    return reg_paths
+
+
 def _resolve_manifest_save_paths(
     prefix_dir: Path,
     entry: dict[str, object],
@@ -404,20 +415,25 @@ def _resolve_manifest_save_paths(
     file_entries: list[tuple[str, Path, Path]] = []
     seen_files: set[tuple[str, str]] = set()
 
-    drive_c = _resolve_drive_c_target(prefix_dir)
-    users_dir = _prefix_users_dir(prefix_dir)
-    user_dirs: list[Path] = []
-    if users_dir is not None:
-        try:
-            user_dirs = [
-                d
-                for d in users_dir.iterdir()
-                if not d.is_symlink()
-                and d.is_dir()
-                and d.name.lower() not in {"default", "default user", "all users"}
-            ]
-        except OSError:
-            user_dirs = []
+    root = _unwrap_prefix_root(prefix_dir)
+    if root.is_symlink():
+        drive_c = root / "drive_c"
+        user_dirs: list[Path] = []
+    else:
+        drive_c = _resolve_drive_c_target(root)
+        users_dir = _prefix_users_dir(root)
+        user_dirs = []
+        if users_dir is not None:
+            try:
+                user_dirs = [
+                    d
+                    for d in users_dir.iterdir()
+                    if not d.is_symlink()
+                    and d.is_dir()
+                    and d.name.lower() not in {"default", "default user", "all users"}
+                ]
+            except OSError:
+                user_dirs = []
 
     files_spec = entry.get("files")
     if isinstance(files_spec, dict):
@@ -427,7 +443,7 @@ def _resolve_manifest_save_paths(
             for section, section_root, target_pat in _expand_manifest_template(
                 str(raw_tpl), user_dirs, drive_c, game_dir
             ):
-                if not section_root.is_dir() or section_root.is_symlink():
+                if section_root.is_symlink() or not section_root.is_dir():
                     continue
                 try:
                     section_root_resolved = section_root.resolve()
@@ -473,12 +489,7 @@ def _resolve_manifest_save_paths(
                                     seen_files.add(key)
                                     file_entries.append((section, src_file, rel))
 
-    reg_paths: list[str] = []
-    reg_spec = entry.get("registry")
-    if isinstance(reg_spec, dict):
-        for raw_reg, spec in reg_spec.items():
-            if _manifest_entry_applies(spec) and str(raw_reg).strip():
-                reg_paths.append(str(raw_reg).strip())
+    reg_paths = _manifest_registry_paths(entry)
 
     file_entries.sort(key=lambda item: (item[0], item[2].as_posix()))
     return file_entries, reg_paths
@@ -1443,7 +1454,7 @@ def _extract_manifest_reg_bytes(
     entry = find_manifest_game_entry(game_name, steam_appid=steam_appid)
     if entry is None:
         return None
-    _, reg_paths = _resolve_manifest_save_paths(prefix_dir, entry)
+    reg_paths = _manifest_registry_paths(entry)
     if not reg_paths:
         return None
     return _extract_registry_saves(prefix_dir, reg_paths)

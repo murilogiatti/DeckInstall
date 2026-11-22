@@ -2784,12 +2784,13 @@ class MainWindow(QMainWindow):
         """Gaming Mode cannot close Steam: Steam edits wait in the saved queue instead of applying now."""
         return self.paths is not None and is_gamescope_session()
 
-    def enqueue_vdf_edit(self, edit: QueuedVdfEdit) -> None:
+    def enqueue_vdf_edit(self, edit: QueuedVdfEdit, *, trigger_watch: bool = True) -> None:
         """Enqueue a VDF edit; it is applied once Steam is closed."""
         self._vdf_queue.enqueue(edit)
         self._vdf_auto_paused = False
         self._update_vdf_queue_banner()
-        self._vdf_watch_tick()
+        if trigger_watch:
+            self._vdf_watch_tick()
 
     def _on_vdf_queue_paths_ready(self) -> None:
         """Steam was (re)detected: pick up edits saved earlier (e.g. in Gaming Mode) and apply if Steam is closed."""
@@ -3402,7 +3403,6 @@ class MainWindow(QMainWindow):
         for w in (
             self.btn_add_steam,
             self.btn_shortcut_steam,
-            self.btn_bulk_proton,
             self.act_import_steam,
             self.act_ext_to_steam,
         ):
@@ -3440,6 +3440,7 @@ class MainWindow(QMainWindow):
             self.btn_save_refresh,
             self.btn_adopt_games,
             self.btn_bulk_optiscaler,
+            self.btn_bulk_proton,
             self.btn_maint_scan,
             self.btn_maint_clean_safe,
             self.btn_maint_delete_selected,
@@ -3882,7 +3883,8 @@ class MainWindow(QMainWindow):
                                     r.shortcut_appid,
                                     r.game.name,
                                     {},
-                                )
+                                ),
+                                trigger_watch=False,
                             )
                         elif (
                             r.shortcut_needs_repoint
@@ -3907,13 +3909,32 @@ class MainWindow(QMainWindow):
                                             "user_id": paths.user_id,
                                             "steam_root": str(paths.steam_root),
                                         },
-                                    )
+                                    ),
+                                    trigger_watch=False,
                                 )
                     selected = [result.game for result in results if result.add_to_steam]
-                    if selected:
+                    if selected and self._vdf_queue.pending_count() == 0:
                         self._add_installed_shortcuts_to_steam(paths, selected)
-                    elif self._vdf_queue.pending_count() > 0 and not self.should_queue_vdf_edits():
-                        self._confirm_close_steam_async(lambda: self._apply_vdf_queue())
+                    else:
+                        if selected:
+                            for game in selected:
+                                self.enqueue_vdf_edit(
+                                    QueuedVdfEdit(
+                                        f"add_installed_game:{paths.user_id}:{game.uid}",
+                                        "add_installed_game",
+                                        0,
+                                        game.name,
+                                        {
+                                            "game_dir": str(game.game_dir),
+                                            "uid": game.uid,
+                                            "user_id": paths.user_id,
+                                            "steam_root": str(paths.steam_root),
+                                        },
+                                    ),
+                                    trigger_watch=False,
+                                )
+                        if self._vdf_queue.pending_count() > 0 and not self.should_queue_vdf_edits():
+                            self._apply_vdf_queue()
 
         self._check_steam_running_async(_open)
 

@@ -921,6 +921,8 @@ def plan_adoption(
             exe_dst = exe
             _add(blockers, B_EXE_OUTSIDE_GAME_DIR)
 
+    if c.steam_compat_dir is not None and c.steam_compat_dir.is_symlink():
+        _add(warnings, W_SYMLINK_PREFIX)
     src_prefix = c.prefix_dir
     prefix_layout = ""
     if native:
@@ -1259,13 +1261,28 @@ def adopt(
         if c.shortcut_appid is not None and paths is not None:
             progress(STEP_STEAM)
             if not opts.remove_from_steam:
-                if (
+                compat = paths.compatdata_dir / str(c.shortcut_appid)
+                compat_points_elsewhere = False
+                if compat.is_symlink() and compat.exists():
+                    try:
+                        compat_points_elsewhere = compat.resolve() != game.prefix_dir.resolve()
+                    except OSError:
+                        compat_points_elsewhere = True
+                can_link_compat = (
                     opts.link_steam_compatdata
-                    and plan.prefix_action in ("move", "copy_saves", "new")
+                    and opts.move_prefix
+                    and plan.prefix_action in ("move", "new")
                     and not c.prefix_shared
                     and not plan.native_linux
-                ):
-                    compat = paths.compatdata_dir / str(c.shortcut_appid)
+                    and not compat_points_elsewhere
+                    and not (
+                        plan.prefix_action == "new"
+                        and compat.is_dir()
+                        and not compat.is_symlink()
+                        and _has_drive_c(compat)
+                    )
+                )
+                if can_link_compat:
                     pfx_link = game.prefix_dir / "pfx"
                     had_pfx = pfx_link.exists() or pfx_link.is_symlink()
                     backup = link_compatdata_to_prefix(compat, game.prefix_dir)

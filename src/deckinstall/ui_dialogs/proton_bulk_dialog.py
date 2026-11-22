@@ -148,7 +148,7 @@ def collect_target_options(
             if tid and tid not in seen_ids:
                 options.append((tid, label))
                 seen_ids.add(tid)
-    elif newest_name:
+    if newest_name and DEFAULT_PROTON_ID not in seen_ids:
         options.append((DEFAULT_PROTON_ID, f"{tr('proton.default_label')} ({newest_name})"))
         seen_ids.add(DEFAULT_PROTON_ID)
 
@@ -506,7 +506,14 @@ def _show(
         loader.failed.connect(_fail)
         loader.start()
 
-    def _steam_write(job_name: str, appids: list[int], tool: str, lines: list[str]) -> None:
+    def _steam_write(
+        job_name: str,
+        appids: list[int],
+        tool: str,
+        lines: list[str],
+        *,
+        skip_confirm: bool = False,
+    ) -> None:
         """Steam shortcuts: one write with Steam closed, or the queue in Gaming Mode."""
         paths = win.paths
         if not appids or paths is None:
@@ -561,18 +568,32 @@ def _show(
             worker.failed.connect(_err)
             worker.start()
 
-        win._confirm_close_steam_async(
-            _go,
-            on_cancelled=lambda: _reload([*lines, tr("proton_bulk.steam_skipped")]),
-            parent=dlg,
-            alive_fn=dlg_alive,
-        )
+        if skip_confirm:
+            _go()
+        else:
+            win._confirm_close_steam_async(
+                _go,
+                on_cancelled=lambda: _reload([*lines, tr("proton_bulk.steam_skipped")]),
+                parent=dlg,
+                alive_fn=dlg_alive,
+            )
 
     def _update(selection: list[ProtonRow]) -> None:
         if not selection:
             QMessageBox.information(dlg, __app_name__, tr("proton_bulk.none_selected"))
             return
         target_id = str(cmb_target.currentData() or STEAM_DEFAULT_PROTON_ID)
+        custom_map = state_ctx["custom_map"]
+        assert isinstance(custom_map, dict)
+        dirs = [
+            r.game_dir
+            for r in selection
+            if r.game_dir is not None and not (target_id == STEAM_DEFAULT_PROTON_ID and not r.steam_tools)
+        ]
+        appids = list(dict.fromkeys(appid for r in selection for appid, _ in r.steam_tools))
+        if not dirs and not appids:
+            QMessageBox.information(dlg, __app_name__, tr("proton_bulk.none_selected"))
+            return
         download_ge = target_id == DOWNLOAD_NEWEST_GE_ID
         has_official = bool(
             state_ctx["has_official_steam"] or win.paths is not None or win._steam_root_found
@@ -588,42 +609,46 @@ def _show(
             if ans != QMessageBox.StandardButton.Yes:
                 return
 
-        custom_map = state_ctx["custom_map"]
-        assert isinstance(custom_map, dict)
-        dirs = [
-            r.game_dir
-            for r in selection
-            if r.game_dir is not None and not (target_id == STEAM_DEFAULT_PROTON_ID and not r.steam_tools)
-        ]
-        appids = list(dict.fromkeys(appid for r in selection for appid, _ in r.steam_tools))
         standalone_tool = (
             ""
             if target_id in (STEAM_DEFAULT_PROTON_ID, DEFAULT_PROTON_ID, DOWNLOAD_NEWEST_GE_ID)
             else custom_map.get(target_id, target_id)
         )
 
-        _busy(True)
-        worker = _ApplyWorker(dirs, target_id, standalone_tool, download_ge)
-        win._track_worker(worker)
-        worker.status.connect(_set_status)
-
-        def _done(resolved: str, changed: int, errors: list[str]) -> None:
-            _set_status(tr("status.ready"))
-            if not dlg_alive():
-                _busy(False)
+        def _launch_apply(confirmed_steam: bool) -> None:
+            if not dlg_alive() or win._closing_pending:
                 return
-            label_name = resolved if resolved != STEAM_DEFAULT_PROTON_ID else tr("proton.steam_default_label")
-            steam_tool = "" if target_id == STEAM_DEFAULT_PROTON_ID else resolved
-            lines = [tr("proton_bulk.games_updated", count=changed, name=label_name)] if dirs else []
-            _steam_write("migrate", appids, steam_tool, lines + errors)
+            _busy(True)
+            worker = _ApplyWorker(dirs, target_id, standalone_tool, download_ge)
+            win._track_worker(worker)
+            worker.status.connect(_set_status)
 
-        def _fail(err: str) -> None:
-            _set_status(tr("status.ready"))
-            _reload([tr("proton.error", err=err)])
+            def _done(resolved: str, changed: int, errors: list[str]) -> None:
+                _set_status(tr("status.ready"))
+                if not dlg_alive():
+                    _busy(False)
+                    return
+                label_name = resolved if resolved != STEAM_DEFAULT_PROTON_ID else tr("proton.steam_default_label")
+                steam_tool = "" if target_id == STEAM_DEFAULT_PROTON_ID else resolved
+                lines = [tr("proton_bulk.games_updated", count=changed, name=label_name)] if dirs else []
+                _steam_write("migrate", appids, steam_tool, lines + errors, skip_confirm=confirmed_steam)
 
-        worker.done.connect(_done)
-        worker.failed.connect(_fail)
-        worker.start()
+            def _fail(err: str) -> None:
+                _set_status(tr("status.ready"))
+                _reload([tr("proton.error", err=err)])
+
+            worker.done.connect(_done)
+            worker.failed.connect(_fail)
+            worker.start()
+
+        if appids and win.paths is not None and not win.should_queue_vdf_edits():
+            win._confirm_close_steam_async(
+                lambda: _launch_apply(True),
+                parent=dlg,
+                alive_fn=dlg_alive,
+            )
+        else:
+            _launch_apply(False)
 
     def _previous() -> None:
         dirs = [r.game_dir for r in _checked() if r.game_dir is not None and r.has_previous]
