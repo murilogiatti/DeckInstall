@@ -4,7 +4,7 @@
 
 Non-Steam game installer, Proton prefix migrator, save validator, and official Steam artwork manager for **Steam Deck / SteamOS** (KDE Plasma + Qt6).
 
-**Current version:** `0.21.0`
+**Current version:** `0.22.0`
 
 ## Features
 - **Library Hub & Smart Initial View**: The **Library** is the home page, with large **Install game**, **Backup & sync** and **Maintenance** buttons on top; each opens its page with a **← Library** button to go back; there is no sidebar: Steam status, *Find Steam again*, theme, language and *About* live in **Maintenance**. The app always opens on the Library, with a 4-column sortable Non-Steam Library (`Name`, `Source`, `Proton / Runner` with `[OptiScaler]` badge, `Executable`), instant source filter pills (`All`, `Steam`, `Standalone`, `External`), and a compact 2-tab **Configure Game** dialog with inline Proton switching. The **Play** button works like Steam's: *Loading…* while the game starts, *Stop* while it runs (two games can run together) and an error with the last lines of the log when it fails to start or closes right away; closing DeckInstall never closes a running game. The **Graphics** and **Engine** columns are read from the game files without running anything: DirectX 8-12, Vulkan, OpenGL, DirectDraw and Glide from the import tables, loaded DLL names and per-backend modules (Unreal RHIs, CryEngine, Source 1/2, OGRE), and Unity, Unreal 1-5 (Win64, WinGDK/Game Pass, Test and Linux builds, modular builds), Godot, GameMaker, RPG Maker XP to MZ, Ren'Py, Source 2, RE Engine, Frostbite, Creation/Gamebryo, id Tech, Decima and other engines, with versions where the files carry them.
@@ -27,10 +27,10 @@ Non-Steam game installer, Proton prefix migrator, save validator, and official S
 Download `DeckInstall-<version>-x86_64.AppImage` from [GitHub Releases](https://github.com/murilogiatti/DeckInstall/releases):
 
 ```bash
-chmod +x DeckInstall-0.21.0-x86_64.AppImage
-./DeckInstall-0.21.0-x86_64.AppImage --version
-QT_QPA_PLATFORM=offscreen ./DeckInstall-0.21.0-x86_64.AppImage --smoke-test
-./DeckInstall-0.21.0-x86_64.AppImage
+chmod +x DeckInstall-0.22.0-x86_64.AppImage
+./DeckInstall-0.22.0-x86_64.AppImage --version
+QT_QPA_PLATFORM=offscreen ./DeckInstall-0.22.0-x86_64.AppImage --smoke-test
+./DeckInstall-0.22.0-x86_64.AppImage
 ```
 
 ## Translating DeckInstall
@@ -55,7 +55,7 @@ mypy src
 ```
 
 ## Build AppImage (GitHub Actions)
-Push a semantic tag matching `VERSION` (e.g. `v0.21.0`) to automatically run the complete test suite on Python 3.10, 3.11, and 3.13, check lint and types, compile a standalone binary with Nuitka, smoke-test the packaged `AppDir`, build `DeckInstall-<version>-x86_64.AppImage`, and attach it plus `SHA256SUMS` to the GitHub Release. Pushes and pull requests only run the tests (in parallel), lint and types; a test AppImage can be built from **Actions > Run workflow**.
+Push a semantic tag matching `VERSION` (e.g. `v0.22.0`) to automatically run the complete test suite on Python 3.10, 3.11, and 3.13, check lint and types, compile a standalone binary with Nuitka, smoke-test the packaged `AppDir`, build `DeckInstall-<version>-x86_64.AppImage`, and attach it plus `SHA256SUMS` to the GitHub Release. Pushes and pull requests only run the tests (in parallel), lint and types; a test AppImage can be built from **Actions > Run workflow**.
 
 ## License
 Distributed under the [MIT License](LICENSE).
