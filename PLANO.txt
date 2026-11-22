@@ -1,7 +1,10 @@
 DeckInstall - Plano de acao v3 (2026-11-17, atualizado 2026-11-19)
 ==========================================================
 
-STATUS: Fases 0 a 12 + auditoria completa (fases 1-5) concluidas. Ultima release: v0.22.0 (2026-11-22).
+STATUS: Fases 0 a 12 e revisoes de auditoria concluidas localmente. Versao atual: v0.23.0.
+v0.23.0: Recuperacao de importacoes legadas para a Steam, protecoes em backups e
+sincronizacao, gravacao de VDF e filas mais seguras, reparo de runtimes, correcoes
+em dialogos Qt e melhorias nas varreduras de jogos, saves e processos.
 v0.22.0: Auditoria completa — Adotar jogos sem duplicar (mescla Steam+externo, atualiza atalho Steam preservando AppID/artes/prefixo sem split-brain), Proton em massa respeitando o Proton oficial da Steam no SteamOS (sem baixar GE-Proton/umu/runtime sem confirmacao explicita e disponivel tambem em modo autonomo), Desinstalar runtimes listando e removendo todos os runtimes gerenciados (umu-run, Steam Runtime, GE-Proton, OptiScaler, MangoHud), correcoes de VDF/concorrencia/Gamescope/Qt UAF/processos travados, cache DOD no Ludusavi e melhorias em scanners/presets/updater/tema.
 v0.21.0: Fase 12 + Biblioteca sem barra lateral, botao Jogar dinamico, MangoHud oficial por usuario (todas as GPUs
 com nome), oferta do save guardado ao instalar, tamanhos > 2 GiB nos sinais do Qt, colunas Graficos/Motor cobrindo
