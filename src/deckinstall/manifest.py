@@ -25,6 +25,8 @@ MANIFEST_V2 = ".deckinstall.json"
 MANIFEST_V1 = ".deckinstall_standalone.json"
 MANIFEST_NAMES = (MANIFEST_V2, MANIFEST_V1)
 SCHEMA_VERSION = 2
+# How the game runs: "steam" (Steam runs it) or "standalone" (umu-run). Absent in older manifests.
+RUN_MODES = ("steam", "standalone")
 _MAX_MANIFEST_BYTES = 1024 * 1024
 
 
@@ -218,6 +220,7 @@ def _v2_fields(raw: dict[str, Any], game_dir: Path) -> dict[str, Any]:
             "proton_mode": _str(proton.get("mode")) or "pinned",
             **({"proton_previous": _str(proton.get("previous"))} if _str(proton.get("previous")) else {}),
             **({"emulator": _str(runtime.get("emulator"))} if _str(runtime.get("emulator")) else {}),
+            **({"mode": _str(runtime.get("mode"))} if _str(runtime.get("mode")) in RUN_MODES else {}),
             "prefix_location": _str(prefix.get("location")) or "library",
             "icons": _paths(created.get("icons"), root),
             "steam": _section(created, "steam"),
@@ -289,6 +292,7 @@ def build_manifest_v2(fields: dict[str, Any], library_root: Path | None) -> dict
             "winedlloverrides": str(fields.get("winedlloverrides") or ""),
             "launch_options": str(fields.get("launch_options") or ""),
             **({"emulator": str(meta["emulator"])} if meta.get("emulator") else {}),
+            **({"mode": str(meta["mode"])} if meta.get("mode") in RUN_MODES else {}),
         },
         "prefix": {
             "path": enc(fields["prefix_dir"]),

@@ -172,10 +172,8 @@
   "add.steam_shortcuts_confirm_restart": "Close and reopen Steam to create the shortcuts now? Choose No to queue them.",
   "add.steam_shortcuts_confirm_close": "Close Steam to create the shortcuts now? Choose No to queue them.",
   "add.done_standalone": "'{name}' installed in standalone mode ({path}).",
-  "library.btn_import_steam": "Add to Steam (Gamescope)",
   "library.tag_standalone": "[Standalone]",
   "library.filter_standalone": "Standalone",
-  "library.import_done": "'{name}' added to Steam (ID {appid}).",
   "status.steam_needs_login": "Steam installed — log in once to initialize",
   "sidebar.redetect_steam": "Re-detect Steam",
   "install.btn_continue_add": "Continue to Install",
@@ -934,5 +932,12 @@
   "runtimes.note_standalone_only": "Only for Standalone games; Steam-mode games use Steam's.",
   "maint.runtimes_moved": "Proton, umu-run, MangoHud and OptiScaler are managed in the Runtimes tab.",
   "add.confirm_standalone_runtime": "Standalone mode needs umu-run and GE-Proton (about 500 MB), which are not installed yet.\n\nDownload them now?",
-  "mode.note_steam_shortcut_standalone": "In Standalone mode the game opens from the Library, the menu or the desktop, so it is not added to Steam."
+  "mode.note_steam_shortcut_standalone": "In Standalone mode the game opens from the Library, the menu or the desktop, so it is not added to Steam.",
+  "mode.btn_switch_steam": "Run with Steam…",
+  "mode.btn_switch_standalone": "Run standalone…",
+  "mode.switch_confirm_steam": "Run '{name}' with Steam from now on?\n\nDeckInstall adds the Steam shortcut (it uses the game's own prefix, so saves stay) and removes the app menu and desktop launchers. MangoHud is left out: Steam has its own performance overlay. Steam will be closed for the change.",
+  "mode.switch_confirm_standalone": "Run '{name}' standalone from now on?\n\nDeckInstall removes the game's Steam shortcut and creates the app menu launcher. Game files, prefix and saves stay. If umu-run and GE-Proton (about 500 MB) are not installed yet, they are downloaded first. Steam will be closed for the change.",
+  "mode.switch_gaming_mode": "Switch the mode in Desktop Mode: Steam has to be closed for the change.",
+  "mode.switched": "'{name}' now runs with: {mode}.",
+  "mode.switch_failed": "Could not switch the mode: {err}"
 }

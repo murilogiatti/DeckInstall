@@ -2271,8 +2271,7 @@ def import_standalone_to_steam(
     steam_launch = apply_launch_presets(
         game.launch_options,
         gamemode="gamemoderun" in wrappers,
-        mangohud=env_map.get("MANGOHUD") == "1" or "mangohud" in wrappers,
-        preserve_mangohud_config=True,
+        mangohud=False,  # Steam mode uses Steam's own performance overlay
         wined3d=env_map.get("PROTON_USE_WINED3D") == "1",
         no_esync=env_map.get("PROTON_NO_ESYNC") == "1",
         no_fsync=env_map.get("PROTON_NO_FSYNC") == "1",
@@ -2360,6 +2359,7 @@ def import_standalone_to_steam(
             previous_meta = dict(game.meta)
             rollback.callback(setattr, game, "meta", previous_meta)
             game.meta["steam"] = steam_meta
+            game.meta["mode"] = "steam"
             _write_manifest(game)
         elif not game.native_linux and game.prefix_dir.is_dir():
             _copy_import_prefix(game.prefix_dir, target_compat, remove_standalone_files)

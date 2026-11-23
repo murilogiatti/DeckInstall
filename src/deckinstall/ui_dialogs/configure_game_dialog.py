@@ -33,7 +33,7 @@ from .. import __app_name__
 from ..external_actions import load_external_launch_presets
 from ..i18n import tr
 from ..launcher_scan import ExternalLauncherGame
-from ..modes import STEAM, feature_note
+from ..modes import STANDALONE, STEAM, feature_note
 from ..proton_policy import (
     DEFAULT_PROTON_ID,
     newest_ge_proton,
@@ -290,6 +290,24 @@ def _launcher_checkboxes(win: MainWindow, dlg: QDialog, game: StandaloneGame, st
     return box
 
 
+def _mode_switch_row(win: MainWindow, dlg: QDialog, game: StandaloneGame, label: QLabel, is_steam: bool) -> QWidget:
+    """The game's mode and one button that moves it to the other mode (greyed out, with the
+    reason, when this system does not offer that mode)."""
+    target = STANDALONE if is_steam else STEAM
+    box = QWidget()
+    lay = QHBoxLayout(box)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.addWidget(label)
+    btn = QPushButton(tr("mode.btn_switch_standalone") if is_steam else tr("mode.btn_switch_steam"))
+    blocked = win.mode_env.mode_note(target)
+    btn.setEnabled(not blocked and not win._steam_busy)
+    btn.setToolTip(blocked or (tr("mode.desc_standalone") if is_steam else tr("mode.desc_steam")))
+    btn.clicked.connect(lambda: win._switch_game_mode(game, target, on_done=dlg.accept))
+    lay.addWidget(btn)
+    lay.addStretch()
+    return box
+
+
 def open_configure_game_dialog(win: MainWindow) -> None:
     """Open a streamlined 2-tab configuration dialog for the selected game."""
     sel = win._selected_library_item()
@@ -394,7 +412,10 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     if is_steam or is_standalone:
         lbl_mode = QLabel(tr("mode.steam") if is_steam else tr("mode.standalone"))
         lbl_mode.setToolTip(tr("mode.desc_steam") if is_steam else tr("mode.desc_standalone"))
-        game_form.addRow(tr("mode.label"), lbl_mode)
+        if sa_obj is None:
+            game_form.addRow(tr("mode.label"), lbl_mode)
+        else:
+            game_form.addRow(tr("mode.label"), _mode_switch_row(win, dlg, sa_obj, lbl_mode, is_steam))
 
     initial_opts_text = (
         load_external_launch_presets(obj)
@@ -600,7 +621,6 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     visible_org_actions = [
         action
         for action in (
-            win.act_import_steam,
             win.act_ext_to_steam,
             win.act_ext_import_saves,
         )

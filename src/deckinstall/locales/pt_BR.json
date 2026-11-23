@@ -172,10 +172,8 @@
   "add.steam_shortcuts_confirm_restart": "Fechar e reabrir a Steam para criar os atalhos agora? Se escolher Não, eles ficarão na fila.",
   "add.steam_shortcuts_confirm_close": "Fechar a Steam para criar os atalhos agora? Se escolher Não, eles ficarão na fila.",
   "add.done_standalone": "'{name}' instalado em modo autônomo ({path}).",
-  "library.btn_import_steam": "Adicionar à Steam (Gamescope)",
   "library.tag_standalone": "[Autônomo]",
   "library.filter_standalone": "Autônomo",
-  "library.import_done": "'{name}' adicionado à Steam (ID {appid}).",
   "status.steam_needs_login": "Steam instalada. Entre na sua conta uma vez para ela terminar de preparar.",
   "sidebar.redetect_steam": "Procurar a Steam de novo",
   "install.btn_continue_add": "Continuar para a instalação",
@@ -934,5 +932,12 @@
   "runtimes.note_standalone_only": "Só para jogos no modo Autônomo; jogos no modo Steam usam o da Steam.",
   "maint.runtimes_moved": "Proton, umu-run, MangoHud e OptiScaler ficam na aba Runtimes.",
   "add.confirm_standalone_runtime": "O modo Autônomo precisa do umu-run e do GE-Proton (cerca de 500 MB), que ainda não estão instalados.\n\nBaixar agora?",
-  "mode.note_steam_shortcut_standalone": "No modo Autônomo o jogo abre pela Biblioteca, pelo menu ou pela área de trabalho, então não é adicionado à Steam."
+  "mode.note_steam_shortcut_standalone": "No modo Autônomo o jogo abre pela Biblioteca, pelo menu ou pela área de trabalho, então não é adicionado à Steam.",
+  "mode.btn_switch_steam": "Rodar pela Steam…",
+  "mode.btn_switch_standalone": "Rodar autônomo…",
+  "mode.switch_confirm_steam": "Rodar '{name}' pela Steam a partir de agora?\n\nO DeckInstall adiciona o atalho na Steam (usando o prefixo do próprio jogo, então os saves continuam) e remove os atalhos do menu e da área de trabalho. O MangoHud fica de fora: a Steam tem medidor de desempenho próprio. A Steam será fechada para a troca.",
+  "mode.switch_confirm_standalone": "Rodar '{name}' no modo autônomo a partir de agora?\n\nO DeckInstall remove o atalho do jogo na Steam e cria o atalho no menu de aplicativos. Arquivos, prefixo e saves continuam. Se o umu-run e o GE-Proton (cerca de 500 MB) ainda não estiverem instalados, eles são baixados antes. A Steam será fechada para a troca.",
+  "mode.switch_gaming_mode": "Troque o modo no Modo Desktop: a Steam precisa estar fechada para a troca.",
+  "mode.switched": "'{name}' agora roda com: {mode}.",
+  "mode.switch_failed": "Não foi possível trocar o modo: {err}"
 }

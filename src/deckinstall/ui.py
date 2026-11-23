@@ -93,6 +93,7 @@ from .migrate import (
     migrate_legacy_games,
     plan_migration,
 )
+from .mode_switch import switch_to_standalone, switch_to_steam
 from .modes import STANDALONE, STEAM, ModeEnv, feature_note, is_steamos
 from .play_monitor import ERROR, LOADING, RUNNING, PlayMonitor, process_start_epoch, stale_instance_pids, watch_paths
 from .runtime_manager import (
@@ -115,11 +116,9 @@ from .scanner import (
 )
 from .standalone import (
     StandaloneGame,
-    add_installed_game_to_steam,
     find_existing_installs,
     game_log_dir,
     get_games_dir,
-    import_standalone_to_steam,
     list_standalone_games,
     match_owned_shortcuts,
     planned_game_dir,
@@ -1329,8 +1328,6 @@ class MainWindow(QMainWindow):
         self.btn_play_game.clicked.connect(self._play_selected_game)
 
 
-        self.act_import_steam = QAction(tr("library.btn_import_steam"), self)
-        self.act_import_steam.triggered.connect(self._import_selected_to_steam)
         self.act_ext_to_steam = QAction(tr("library.btn_ext_to_steam"), self)
         self.act_ext_to_steam.triggered.connect(self._external_add_to_steam)
         self.act_ext_import_saves = QAction(tr("library.btn_ext_import_saves"), self)
@@ -2833,7 +2830,6 @@ class MainWindow(QMainWindow):
         self.btn_move_game.setEnabled(managed is not None and not self._steam_busy)
 
         # Hide mutually exclusive per-game actions instead of merely disabling them
-        self.act_import_steam.setVisible(is_standalone)
         self.act_ext_to_steam.setVisible(is_external)
         self.act_ext_import_saves.setVisible(is_external)
         ext_prefix = getattr(sel[1], "prefix_dir", None) if is_external and sel is not None else None
@@ -2843,7 +2839,6 @@ class MainWindow(QMainWindow):
             and Path(ext_prefix).is_dir()
         )
 
-        self.act_import_steam.setEnabled(is_standalone and can_write_vdf)
         self.act_ext_to_steam.setEnabled(is_external and can_write_vdf)
         self.act_ext_import_saves.setEnabled(idle and has_ext_prefix)
         self.btn_remove_game.setEnabled((is_steam and can_write_vdf) or (idle and is_standalone))
@@ -3579,7 +3574,6 @@ class MainWindow(QMainWindow):
 
     def _set_vdf_write_enabled(self, enabled: bool) -> None:
         for w in (
-            self.act_import_steam,
             self.act_ext_to_steam,
         ):
             w.setEnabled(enabled)
@@ -4022,67 +4016,87 @@ class MainWindow(QMainWindow):
         )
         self._confirm_close_steam_async(_apply, on_cancelled=_queue, prompt=confirm)
 
-    def _import_selected_to_steam(self) -> None:
-        sel = self._selected_library_item()
-        if not sel or sel[0] != "standalone" or not self.paths:
+    def _switch_game_mode(
+        self, game: StandaloneGame, target: str, on_done: Callable[[], None] | None = None,
+    ) -> None:
+        """Move a managed game to Steam or Standalone mode, leaving nothing of the old mode behind."""
+        parent = _dialog_parent(self)
+        if self._steam_busy:
             return
-        game = sel[1]
-        assert isinstance(game, StandaloneGame)
-        if not game.native_linux and self._warn_if_win32_prefix(game.prefix_dir):
+        blocked = self.mode_env.mode_note(target)
+        if blocked:
+            QMessageBox.warning(parent, __app_name__, blocked)
+            return
+        if self.paths is not None and self._vdf_corrupt:
+            QMessageBox.critical(
+                parent, __app_name__, self.vdf_error_banner.text() or tr("library.vdf_error", err="shortcuts.vdf"),
+            )
+            return
+        if self.should_queue_vdf_edits():
+            QMessageBox.warning(parent, __app_name__, tr("mode.switch_gaming_mode"))
+            return
+        if _is_wine_game_running() or self._play.state(self._play_key("standalone", game)) in (LOADING, RUNNING):
+            QMessageBox.warning(parent, __app_name__, tr("cleanup.wine_running"))
+            return
+        if target == STEAM and not game.native_linux and self._warn_if_win32_prefix(game.prefix_dir):
+            return
+        question = (
+            tr("mode.switch_confirm_steam", name=game.name)
+            if target == STEAM
+            else tr("mode.switch_confirm_standalone", name=game.name)
+        )
+        if QMessageBox.question(parent, __app_name__, question) != QMessageBox.StandardButton.Yes:
             return
         paths = self.paths
 
-        def _proceed_import() -> None:
+        def _proceed() -> None:
             if self._closing_pending:
                 return
-            self._begin_busy()
-            def import_game() -> int:
-                if game.schema >= 2 and game.uid:
-                    return add_installed_game_to_steam(paths, game.game_dir, game.uid)
-                return import_standalone_to_steam(paths, game)
+            if target == STEAM:
+                assert paths is not None
+                worker = SteamOpWorker(lambda: switch_to_steam(paths, game), need_steam_closed=True)
+            else:
+                needs_runtime = not game.native_linux and (
+                    not get_umu_run_path().is_file() or not list_ge_proton11_dirs()
+                )
 
-            worker = SteamOpWorker(import_game, need_steam_closed=True)
+                def _to_standalone() -> object:
+                    if needs_runtime:  # first, so a failed download changes nothing
+                        from . import runtime_manager as rm
+
+                        say = worker.status.emit
+                        say(tr("add.preparing_runtime"))
+                        rm.ensure_umu_run(progress_cb=lambda msg, _pct: say(msg))
+                        rm.ensure_umu_database(timeout=15)
+                        rm.ensure_ge_proton11(progress_cb=lambda msg, _pct: say(msg))
+                    return switch_to_standalone(paths, game)
+
+                worker = SteamOpWorker(_to_standalone, need_steam_closed=paths is not None)
+            self._begin_busy()
             self._track_worker(worker)
             worker.status.connect(self.status_label.setText)
 
-            def _ok(res: object) -> None:
+            def _ok(_res: object) -> None:
                 self._end_busy()
                 self._refresh_shortcuts()
-                msg = tr("library.import_done", name=game.name, appid=res)
-                self.status_label.setText(msg)
-                if not self._closing_pending:
-                    QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+                mode_name = tr("mode.steam") if target == STEAM else tr("mode.standalone")
+                self.status_label.setText(tr("mode.switched", name=game.name, mode=mode_name))
+                if on_done is not None and not self._closing_pending:
+                    on_done()
 
             def _err(err: str) -> None:
                 self._end_busy()
                 if not self._closing_pending:
-                    QMessageBox.critical(_dialog_parent(self), __app_name__, err)
+                    QMessageBox.critical(parent, __app_name__, tr("mode.switch_failed", err=err))
 
             worker.finished_ok.connect(_ok)
             worker.failed.connect(_err)
             worker.start()
 
-        if self.should_queue_vdf_edits():
-            self.enqueue_vdf_edit(
-                QueuedVdfEdit(
-                    f"add_installed_game:{paths.user_id}:{game.uid}",
-                    "add_installed_game",
-                    0,
-                    game.name,
-                    {
-                        "game_dir": str(game.game_dir),
-                        "uid": game.uid,
-                        "user_id": paths.user_id,
-                        "steam_root": str(paths.steam_root),
-                    },
-                )
-            )
-            msg = tr("vdf_queue.enqueued", name=game.name)
-            self.status_label.setText(msg)
-            if not self._closing_pending:
-                QMessageBox.information(_dialog_parent(self), __app_name__, msg)
-            return
-        self._confirm_close_steam_async(_proceed_import)
+        if paths is None:
+            _proceed()
+        else:
+            self._confirm_close_steam_async(_proceed)
 
     def _find_matching_installed(self) -> tuple[StandaloneGame | None, ShortcutEntry | None]:
         """Match the current Add-tab game/exe against existing Standalone games and Steam shortcuts."""

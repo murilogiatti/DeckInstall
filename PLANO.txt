@@ -555,3 +555,20 @@ Regra unica: src/deckinstall/modes.py (ModeEnv, feature_note, mode_of_kind, is_s
 NAO TESTADO A MAO: tudo acima so por testes automaticos e capturas offscreen (Ubuntu 26.04). SteamOS real, Steam
   real com o fluxo novo de instalacao no modo Steam, e Adotar no SteamOS nao foram exercitados.
 Sobras: campo "mode" no manifesto e troca de modo sem residuo (Fase 5); dividir ui.py (4,3 mil linhas).
+
+TROCA DE MODO POR JOGO (Fase 5, pedido do usuario em 2026-11-23)
+[FEITO] Manifesto: campo runtime.mode ("steam" | "standalone"), gravado pela troca e ao ligar o prefixo a Steam.
+  A Biblioteca continua decidindo o modo pelo atalho da Steam (vale tambem para jogo Linux nativo e manifesto antigo).
+[FEITO] mode_switch.py: switch_to_steam (adiciona o atalho com compatdata ligado ao prefixo do jogo, remove os
+  atalhos de menu/area de trabalho, grava mode=steam) e switch_to_standalone (remove os atalhos do jogo na Steam e
+  o link do compatdata, devolve o prefixo da Steam que o link tinha substituido, limpa created.steam, cria o atalho
+  no menu, grava mode=standalone). Arquivos, prefixo e saves nunca sao tocados. Exige manifesto v2.
+[FEITO] Configurar jogo: linha "Rodar com" com o modo atual e um botao "Rodar pela Steam..." / "Rodar autonomo...".
+  Acinzentado com o motivo quando o sistema nao oferece o outro modo (SteamOS: so Steam; sem Steam: so Autonomo).
+  Pede confirmacao dizendo o que muda; fecha a Steam para gravar o VDF (com reabertura); no Modo Jogo recusa e pede
+  o Modo Desktop. Para o Autonomo baixa umu-run + GE-Proton antes, se faltarem (falha no download nao muda nada).
+[FEITO] Atalho da Steam nunca leva MangoHud (import_standalone_to_steam: mangohud=False); as opcoes do modo
+  Autonomo ficam guardadas no manifesto e voltam ao trocar de volta.
+[FEITO] Saiu "Adicionar a Steam (Gamescope)" (act_import_steam/_import_selected_to_steam): fazia metade da troca e
+  deixava os atalhos de menu/area de trabalho. A troca no Configurar substitui.
+NAO TESTADO A MAO: troca com a Steam real aberta/fechada, jogo adotado da Steam voltando ao Autonomo, SteamOS.

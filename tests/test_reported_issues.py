@@ -504,7 +504,6 @@ class LibraryColumnsFilterAndLogsTests(unittest.TestCase):
                     )
                     win.shortcuts_list.setCurrentCell(adopted_row, 0)
                     self.assertEqual(win._selected_library_item(), ("steam", owned_sc))
-                    self.assertFalse(win.act_import_steam.isVisible())
                     self.assertEqual(win._managed_library_game(owned_sc), sa)
                     win._on_library_source_filter_changed("standalone")
                     self.assertTrue(all(win.shortcuts_list.isRowHidden(r) for r in range(3)))
