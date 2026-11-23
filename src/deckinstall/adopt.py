@@ -309,7 +309,26 @@ def _drive_c_game_root(exe: Path, drive_c: Path) -> Path | None:
         if parts[1].lower() in _SYSTEM_DIRS:
             return None
         return drive_c / parts[0] / parts[1]
+    if (
+        len(parts) >= 6
+        and parts[0].lower() == "users"
+        and parts[2].lower() == "appdata"
+        and parts[3].lower() == "local"
+    ):
+        from .extractor import _APPDATA_SKIP_DIRS
+
+        if parts[4].lower() == "programs" and len(parts) >= 7:
+            if parts[5].lower() in _SYSTEM_DIRS | _APPDATA_SKIP_DIRS:
+                return None
+            return drive_c / parts[0] / parts[1] / parts[2] / parts[3] / parts[4] / parts[5]
+        if parts[4].lower() not in _SYSTEM_DIRS | _APPDATA_SKIP_DIRS:
+            return drive_c / parts[0] / parts[1] / parts[2] / parts[3] / parts[4]
+        return None
     if len(parts) >= 2 and parts[0].lower() not in parents | {"windows", "users", "programdata"}:
+        from .extractor import _APPDATA_SKIP_DIRS
+
+        if parts[0].lower() in _SYSTEM_DIRS | _APPDATA_SKIP_DIRS:
+            return None
         return drive_c / parts[0]
     return None
 

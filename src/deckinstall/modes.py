@@ -42,9 +42,23 @@ def _os_release_fields(path: Path | None = None) -> dict[str, str]:
     return fields
 
 
+_IMMUTABLE_DISTRO_IDS = frozenset({"steamos", "bazzite", "chimeraos"})
+
+
 def is_steamos(path: Path | None = None) -> bool:
     """True on Valve's SteamOS (ID=steamos), not on other gaming distros such as Bazzite."""
     return _os_release_fields(path).get("ID", "").lower() == "steamos"
+
+
+def is_immutable_os(
+    os_release_path: Path | None = None,
+    ostree_marker: Path | None = None,
+) -> bool:
+    """True on immutable gaming OSes (SteamOS, Bazzite/ostree, ChimeraOS) where pacman/dnf cannot mutate /usr."""
+    if _os_release_fields(os_release_path).get("ID", "").lower() in _IMMUTABLE_DISTRO_IDS:
+        return True
+    marker = ostree_marker if ostree_marker is not None else Path("/run/ostree-booted")
+    return marker.exists()
 
 
 @dataclass(frozen=True)

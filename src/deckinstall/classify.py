@@ -1,7 +1,7 @@
 """Classify what the user picked so the install flow takes the right path.
 
 Kinds:
-  archive      .zip/.rar/.7z/.tar.* (also split parts)  -> extract
+  archive      .zip/.rar/.7z/.tar.* (also split parts)  -> not installable: extract it first
   gog_setup    GOG offline installer (Inno Setup)       -> innoextract, fallback: run setup
   repack       folder with fg-*.bin / unarc.dll / ISDone.dll / setup-*.bin -> run its setup.exe
   installer    other Windows setup/installer .exe       -> run it
@@ -30,9 +30,10 @@ READY_FOLDER = "ready_folder"
 EXE = "exe"
 UNKNOWN = "unknown"
 
-INSTALL_KINDS = frozenset({ARCHIVE, GOG_SETUP, REPACK, INSTALLER, NATIVE_SH})
+INSTALL_KINDS = frozenset({GOG_SETUP, REPACK, INSTALLER, NATIVE_SH})
 
 _REPACK_MARKERS = ("unarc.dll", "isdone.dll", "isskin.dll", "cls-srep.dll")
+_INSTALLSHIELD_MARKERS = ("data1.cab", "data1.hdr", "setup.inx", "issetup.dll", "_isres.dll")
 _REPACK_BIN_RE = re.compile(r"^(fg-\d+|setup-\d+|data-?\d+|.*-\d+)\.bin$", re.IGNORECASE)
 _GOG_NAME_RE = re.compile(r"^setup_.+\.exe$", re.IGNORECASE)
 _INSTALLER_WORDS = ("setup", "install")
@@ -44,10 +45,12 @@ _SKIP_PARTS = frozenset({
 })
 _SKIP_NAME_WORDS = (
     "redist", "vcredist", "directx", "dxsetup", "dotnet", "physx", "unins", "uninst", "dlc", "patch",
-    "update", "quicksfv", "md5", "verify",
+    "update", "quicksfv", "md5", "verify", "autorun", "crashpad", "crashreport", "crashhandler",
+    "bugreport", "notificationhelper", "bootstrapper",
 )
 _SCAN_LIMIT = 4000
 _HEAD_BYTES = 8 * 1024 * 1024
+_STUB_BYTES = 512 * 1024
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,33 @@ def is_inno_setup(path: Path) -> bool:
     """True when an .exe is an Inno Setup installer (the format GOG uses)."""
     head = _read_head(path)
     return head[:2] == b"MZ" and (b"Inno Setup" in head or b"InnoSetupLdrWindow" in head)
+
+
+def is_nsis_installer(path: Path) -> bool:
+    """True when an .exe is a Nullsoft Scriptable Install System (NSIS) installer."""
+    head = _read_head(path, _STUB_BYTES)  # the NSIS stub sits at the start; a game exe may merely mention it
+    return head[:2] == b"MZ" and (
+        b"NullsoftInst" in head or b"Nullsoft.NSIS" in head or b"Nullsoft Install System" in head
+    )
+
+
+def is_installshield_installer(path: Path) -> bool:
+    """True when an .exe's own stub (not just a string somewhere in it) is an InstallShield launcher."""
+    head = _read_head(path, _STUB_BYTES)
+    return head[:2] == b"MZ" and b"InstallShield" in head and (
+        b"ISSetup" in head or b"Setup Launcher" in head or b"InstallShield Wizard" in head
+    )
+
+
+def is_installshield_folder(folder: Path) -> bool:
+    """True for InstallShield discs/folders: setup.exe next to data1.cab / setup.inx / ISSetup.dll."""
+    try:
+        names = [p.name for p in folder.iterdir() if p.is_file() and not p.is_symlink()]
+    except OSError:
+        return False
+    low = {n.lower() for n in names}
+    has_setup = any(n.endswith(".exe") and any(w in n for w in _INSTALLER_WORDS) for n in low)
+    return has_setup and any(m in low for m in _INSTALLSHIELD_MARKERS)
 
 
 def is_gog_installer(path: Path) -> bool:
@@ -141,7 +171,12 @@ def find_setup_exe(folder: Path) -> Path | None:
                     stack.append((entry, depth + 1))
                 continue
             name = entry.name.lower()
-            if not name.endswith(".exe") or _skip_name(name):
+            if _skip_name(name):
+                continue
+            if name.endswith(".msi"):
+                candidates.append((depth, 3, name, entry))
+                continue
+            if not name.endswith(".exe"):
                 continue
             if name == "setup.exe":
                 rank = 0
@@ -189,7 +224,9 @@ def _folder_has_executable(folder: Path) -> bool:
                 low = entry.name.lower()
                 if low.endswith((".exe", ".x86_64")):
                     return True
-                if depth <= 2 and (entry.stat(follow_symlinks=False).st_mode & 0o111) and _is_elf(Path(entry.path)):
+                if depth <= 2 and (entry.stat(follow_symlinks=False).st_mode & 0o111) and (
+                    low in {"start.sh", "launch.sh", "run.sh"} or _is_elf(Path(entry.path))
+                ):
                     return True
             except OSError:
                 continue
@@ -217,10 +254,18 @@ def _has_other_game_exe(folder: Path, setup: Path) -> bool:
                     if not entry.name.startswith(".") and not _skip_part(entry.name):
                         queue.append(Path(entry.path))
                     continue
-                if entry.is_file(follow_symlinks=False) and entry.name.lower().endswith(".exe"):
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                low = entry.name.lower()
+                if low.endswith(".exe"):
                     p = Path(entry.path)
                     if p != setup and not _skip_name(entry.name):
                         return True
+                elif low.endswith(".x86_64") or (
+                    (entry.stat(follow_symlinks=False).st_mode & 0o111)
+                    and (low in {"start.sh", "launch.sh", "run.sh"} or _is_elf(Path(entry.path)))
+                ):
+                    return True
             except OSError:
                 continue
     return False
@@ -235,6 +280,10 @@ def classify_source(path: Path) -> SourceInfo:
             setup = find_setup_exe(path)
             if setup is not None:
                 return SourceInfo(REPACK, path, installer=setup)
+        if is_installshield_folder(path):
+            setup = find_setup_exe(path)
+            if setup is not None and not _has_other_game_exe(path, setup):
+                return SourceInfo(INSTALLER, path, installer=setup)
         top_setups = [
             p for p in sorted(path.glob("*.exe"))
             if p.is_file() and not p.is_symlink() and _GOG_NAME_RE.match(p.name) and is_gog_installer(p)
@@ -243,10 +292,23 @@ def classify_source(path: Path) -> SourceInfo:
             return SourceInfo(GOG_SETUP, path, installer=top_setups[0])
         if _folder_has_executable(path):
             setup = find_setup_exe(path)
+            if setup is None or setup.suffix.lower() == ".msi":
+                top_installers = [
+                    p for p in sorted(path.glob("*.exe"))
+                    if p.is_file()
+                    and not p.is_symlink()
+                    and not _skip_name(p.name)
+                    and (is_inno_setup(p) or is_nsis_installer(p) or is_installshield_installer(p))
+                ]
+                if len(top_installers) == 1:
+                    setup = top_installers[0]
             only_setup = setup is not None and setup.parent == path and not _has_other_game_exe(path, setup)
             if only_setup and setup is not None:
                 return SourceInfo(INSTALLER, path, installer=setup)
             return SourceInfo(READY_FOLDER, path)
+        setup = find_setup_exe(path)
+        if setup is not None:
+            return SourceInfo(INSTALLER, path, installer=setup)
         return SourceInfo(UNKNOWN, path)
 
     if not path.is_file():
@@ -258,6 +320,10 @@ def classify_source(path: Path) -> SourceInfo:
         if path.stem.lower() in {"start", "launch", "run"}:
             return SourceInfo(EXE, path)
         return SourceInfo(NATIVE_SH, path, installer=path)
+    if suffix == ".msi":
+        if _skip_name(path.name):
+            return SourceInfo(UNKNOWN, path)
+        return SourceInfo(INSTALLER, path, installer=path)
     if suffix == ".exe":
         if _skip_name(path.name):
             return SourceInfo(UNKNOWN, path)
@@ -265,7 +331,12 @@ def classify_source(path: Path) -> SourceInfo:
             return SourceInfo(REPACK, path.parent, installer=path)
         if is_gog_installer(path):
             return SourceInfo(GOG_SETUP, path, installer=path)
-        if _is_installer_name(path) or is_inno_setup(path):
+        if (
+            _is_installer_name(path)
+            or is_inno_setup(path)
+            or is_nsis_installer(path)
+            or is_installshield_installer(path)
+        ):
             return SourceInfo(INSTALLER, path, installer=path)
         return SourceInfo(EXE, path)
     if _is_elf(path):

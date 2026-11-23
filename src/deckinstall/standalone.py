@@ -321,9 +321,13 @@ def _resolve_proton_path(proton_name: str) -> str:
     if not name:
         # "Default (newest)": bake the newest installed GE-Proton into the launcher; updating
         # GE-Proton rewrites these launchers (proton_policy.retarget_default_games).
-        from .runtime_manager import list_ge_proton10_dirs, list_ge_proton11_dirs
+        from .runtime_manager import (
+            list_cachyos_proton_dirs,
+            list_ge_proton10_dirs,
+            list_ge_proton11_dirs,
+        )
 
-        newest = list_ge_proton11_dirs() or list_ge_proton10_dirs()
+        newest = list_ge_proton11_dirs() or list_cachyos_proton_dirs() or list_ge_proton10_dirs()
         if newest:
             return str(newest[0])
         steam_root = find_steam_root()
@@ -337,8 +341,12 @@ def _resolve_proton_path(proton_name: str) -> str:
 
 
 def resolve_standalone_proton_fallback(game: StandaloneGame) -> tuple[Path | None, str | None]:
-    """Resolve game.proton_name or fall back to the newest installed GE-Proton11+/10 tool."""
-    from .runtime_manager import list_ge_proton10_dirs, list_ge_proton11_dirs
+    """Resolve game.proton_name or fall back to the newest installed GE-Proton11+/10 or CachyOS Proton."""
+    from .runtime_manager import (
+        list_cachyos_proton_dirs,
+        list_ge_proton10_dirs,
+        list_ge_proton11_dirs,
+    )
 
     pinned_name = game.proton_name.strip()
     if pinned_name:
@@ -347,7 +355,7 @@ def resolve_standalone_proton_fallback(game: StandaloneGame) -> tuple[Path | Non
         if resolved_path.is_dir() and (resolved_path / "proton").is_file():
             return (resolved_path, None)
 
-    candidates = list_ge_proton11_dirs() or list_ge_proton10_dirs()
+    candidates = list_ge_proton11_dirs() or list_cachyos_proton_dirs() or list_ge_proton10_dirs()
     if candidates:
         fallback_dir = candidates[0]
         return (fallback_dir, fallback_dir.name if pinned_name else None)
@@ -618,7 +626,10 @@ def _write_launch_script(
 
     cmd_parts = [shlex.quote(w) for w in wrappers]
     if not native_linux:
-        cmd_parts.append(shlex.quote(str(UMU_RUN_PATH)))
+        from .runtime_manager import find_system_umu_run
+
+        umu_bin = find_system_umu_run() or UMU_RUN_PATH
+        cmd_parts.append(shlex.quote(str(umu_bin)))
     cmd_parts.append(shlex.quote(str(exe_path)))
     cmd_parts.extend(game_args)
     command = " ".join(cmd_parts)

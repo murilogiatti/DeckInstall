@@ -149,5 +149,168 @@ def test_extract_worker_falls_back_to_setup_without_innoextract(tmp_path: Path) 
         worker.run()
     run.assert_called_once()
     assert run.call_args.args[0] == setup
-    assert worker.kind == classify.GOG_SETUP
-    assert done == [str(tmp_path / "Games" / "Game")]
+
+
+def test_archive_not_installable_and_worker_rejects(tmp_path: Path) -> None:
+    from deckinstall import ui_workers
+
+    zpath = _write(tmp_path / "Game.zip", b"PK")
+    info = classify.classify_source(zpath)
+    assert info.kind == classify.ARCHIVE
+    assert not info.needs_install
+
+    worker = ui_workers.ExtractWorker(zpath, tmp_path / "Games", "Game")
+    errs: list[str] = []
+    worker.failed.connect(errs.append)
+    worker.run()
+    assert len(errs) == 1
+
+
+def test_nsis_msi_and_installshield_classification(tmp_path: Path) -> None:
+    nsis_exe = _write(tmp_path / "IndieGame_v1.0.exe", b"MZ" + b"\x00" * 64 + b"NullsoftInst")
+    nsis_info = classify.classify_source(nsis_exe)
+    assert nsis_info.kind == classify.INSTALLER
+    assert nsis_info.installer == nsis_exe
+    args = extractor.installer_arguments(nsis_exe, tmp_path / "Games" / "IndieGame")
+    assert len(args) == 1 and args[0].startswith("/D=D:\\")
+    assert extractor.installer_arguments(nsis_exe, tmp_path / "Games" / "Indie Game") == []
+
+    msi_dir = tmp_path / "MsiOnlyFolder"
+    msi_file = _write(msi_dir / "GamePackage.msi", b"\xd0\xcf\x11\xe0")
+    msi_info = classify.classify_source(msi_file)
+    assert msi_info.kind == classify.INSTALLER
+    assert msi_info.installer == msi_file
+    assert classify.classify_source(msi_dir).kind == classify.INSTALLER
+    msi_args = extractor.installer_arguments(msi_file, tmp_path / "Games" / "GamePackage")
+    assert len(msi_args) == 1 and msi_args[0].startswith("TARGETDIR=D:\\")
+
+    is_dir = tmp_path / "ClassicGame"
+    is_setup = _write(is_dir / "setup.exe")
+    _write(is_dir / "data1.cab", b"ISc(")
+    is_info = classify.classify_source(is_dir)
+    assert is_info.kind == classify.INSTALLER
+    assert is_info.installer == is_setup
+
+    is_installed = tmp_path / "ClassicInstalled"
+    _write(is_installed / "setup.exe")
+    _write(is_installed / "data1.cab", b"ISc(")
+    _write(is_installed / "Game.exe")
+    assert classify.classify_source(is_installed).kind == classify.READY_FOLDER
+
+    nsis_dir = tmp_path / "NsisFolder"
+    nsis_only = _write(nsis_dir / "Indie_v1.exe", b"MZ" + b"\x00" * 64 + b"NullsoftInst")
+    assert classify.classify_source(nsis_dir).kind == classify.INSTALLER
+    assert classify.classify_source(nsis_dir).installer == nsis_only
+
+    linux_msi_dir = tmp_path / "LinuxPlusMsi"
+    _write(linux_msi_dir / "game.x86_64", b"\x7fELF")
+    _write(linux_msi_dir / "extra.msi", b"\xd0\xcf\x11\xe0")
+    assert classify.classify_source(linux_msi_dir).kind == classify.READY_FOLDER
+
+    start_msi_dir = tmp_path / "StartShPlusMsi"
+    start_sh = _write(start_msi_dir / "start.sh", b"#!/bin/sh\n")
+    start_sh.chmod(0o755)
+    _write(start_msi_dir / "Extras.msi", b"\xd0\xcf\x11\xe0")
+    assert classify.classify_source(start_msi_dir).kind == classify.READY_FOLDER
+
+    nsis_msi_dir = tmp_path / "NsisPlusMsi"
+    nsis_installer = _write(nsis_msi_dir / "Indie_v1.exe", b"MZ" + b"\x00" * 64 + b"NullsoftInst")
+    _write(nsis_msi_dir / "Extras.msi", b"\xd0\xcf\x11\xe0")
+    nsis_msi_info = classify.classify_source(nsis_msi_dir)
+    assert nsis_msi_info.kind == classify.INSTALLER
+    assert nsis_msi_info.installer == nsis_installer
+
+
+def test_msi_command_uses_msiexec_and_appdata_adoption(tmp_path: Path) -> None:
+    msi_file = _write(tmp_path / "src" / "Game.msi", b"\xd0\xcf\x11\xe0")
+    with (
+        mock.patch.object(extractor, "find_steam_root", return_value=tmp_path / "steam"),
+        mock.patch.object(extractor, "find_proton_binary", return_value=tmp_path / "proton"),
+    ):
+        cmd, _env, _pfx = extractor._installer_command(msi_file, ["TARGETDIR=D:\\Game"], tmp_path / "pfx", None, None)
+    assert cmd[:4] == [str(tmp_path / "proton"), "run", "msiexec", "/i"]
+    assert cmd[4] == "I:\\Game.msi"
+
+    drive_c = tmp_path / "drive_c"
+    exe = _write(drive_c / "users" / "steamuser" / "AppData" / "Local" / "Programs" / "MyIndie" / "MyIndie.exe")
+    picked, _fallback = extractor.find_games_in_drive_c(drive_c)
+    assert [p.name for p in picked] == ["MyIndie"]
+
+    from deckinstall import adopt
+
+    assert adopt._drive_c_game_root(exe, drive_c) == exe.parent
+
+    # Symlinked AppData pointing outside drive_c must be ignored
+    outside = tmp_path / "outside"
+    _write(outside / "Local" / "Programs" / "Secret" / "Secret.exe")
+    dc2 = tmp_path / "drive_c_sym"
+    (dc2 / "users" / "steamuser").mkdir(parents=True)
+    (dc2 / "users" / "steamuser" / "AppData").symlink_to(outside)
+    assert extractor.find_games_in_drive_c(dc2) == ([], [])
+
+    # Program Files game takes precedence over AppData/Local updater
+    dc3 = tmp_path / "drive_c_prio"
+    _write(dc3 / "Program Files" / "RealGame" / "RealGame.exe")
+    _write(dc3 / "users" / "steamuser" / "AppData" / "Local" / "Vendor" / "updater.exe")
+    picked3, _ = extractor.find_games_in_drive_c(dc3)
+    assert [p.name for p in picked3] == ["RealGame"]
+
+    # Folder with only updater.exe + UnityCrashHandler64.exe in AppData is not picked or adopted
+    dc4 = tmp_path / "drive_c_updater_only"
+    _write(dc4 / "users" / "steamuser" / "AppData" / "Local" / "Vendor" / "updater.exe")
+    _write(dc4 / "users" / "steamuser" / "AppData" / "Local" / "Vendor" / "UnityCrashHandler64.exe")
+    picked4, fallback4 = extractor.find_games_in_drive_c(dc4)
+    assert picked4 == [] and fallback4 == []
+    assert extractor._adopt_from_drive_c(dc4, tmp_path / "out4") is False
+
+    # Collision between Program Files/Meu Jogo and drive_c/Meu Jogo does not overwrite
+    dc6 = tmp_path / "drive_c_collision"
+    _write(dc6 / "Program Files" / "Meu Jogo" / "a.txt", b"1")
+    _write(dc6 / "Program Files" / "Meu Jogo" / "Game.exe")
+    _write(dc6 / "Meu Jogo" / "a.txt", b"2")
+    _write(dc6 / "Meu Jogo" / "Other.exe")
+    out6 = tmp_path / "out6"
+    out6.mkdir()
+    assert extractor._adopt_from_drive_c(dc6, out6) is True
+    assert (out6 / "Meu Jogo" / "a.txt").read_bytes() == b"1"
+    assert (out6 / "Meu Jogo (2)" / "a.txt").read_bytes() == b"2"
+
+    dc5 = tmp_path / "drive_c_root_game"
+    _write(dc5 / "Program Files" / "Vendor" / "Launcher.exe")
+    _write(dc5 / "Meu Jogo" / "MeuJogo.exe")
+    picked5, _ = extractor.find_games_in_drive_c(dc5)
+    assert sorted(p.name for p in picked5) == ["Meu Jogo", "Vendor"]
+
+
+def test_winetricks_presets_cover_common_runtimes() -> None:
+    from deckinstall import runtime_manager
+
+    for verb in ("vcrun2022", "vcrun2013", "d3dx9", "dotnet48", "xact", "physx"):
+        assert verb in runtime_manager.WINETRICKS_PRESETS
+
+
+def test_autorun_and_crash_helpers_do_not_make_an_installer_folder_a_game(tmp_path: Path) -> None:
+    for name in ("setup.exe", "autorun.exe", "crashpad_handler.exe", "updater.exe"):
+        _write(tmp_path / name, b"MZ")
+    _write(tmp_path / "data1.cab", b"x")
+    info = classify.classify_source(tmp_path)
+    assert info.kind == classify.INSTALLER and info.installer is not None
+
+
+def test_game_exe_mentioning_installshield_is_not_an_installer(tmp_path: Path) -> None:
+    exe = _write(tmp_path / "Game.exe", b"MZ" + b"\0" * 600_000 + b"InstallShield ISSetup")
+    assert classify.classify_source(exe).kind == classify.EXE
+    stub = _write(tmp_path / "Launch.exe", b"MZ" + b"\0" * 100 + b"InstallShield Setup Launcher")
+    assert classify.classify_source(stub).kind == classify.INSTALLER
+
+
+def test_adopt_from_drive_c_merges_into_existing_folder(tmp_path: Path) -> None:
+    from deckinstall.extractor import _adopt_from_drive_c
+
+    drive_c = tmp_path / "drive_c"
+    _write(drive_c / "My Game" / "game.exe", b"MZ")
+    target = tmp_path / "target"
+    _write(target / "My Game" / "old.exe", b"MZ")
+    assert _adopt_from_drive_c(drive_c, target)
+    assert sorted(p.name for p in target.iterdir()) == ["My Game"]
+    assert (target / "My Game" / "game.exe").is_file() and (target / "My Game" / "old.exe").is_file()

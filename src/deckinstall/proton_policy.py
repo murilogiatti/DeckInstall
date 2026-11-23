@@ -9,6 +9,8 @@ Only the current and the previous GE-Proton are kept, unless a game is pinned to
 from __future__ import annotations
 
 import logging
+import re
+import shlex
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -30,8 +32,12 @@ DEFAULT_PROTON_ID = "__default__"
 
 
 def newest_ge_proton() -> Path | None:
-    """Return the newest installed GE-Proton (11+, then 10), or None."""
-    found = _rm.list_ge_proton11_dirs() or _rm.list_ge_proton10_dirs()
+    """Return the newest installed GE-Proton (11+), CachyOS Proton, or GE-Proton10, or None."""
+    found = (
+        _rm.list_ge_proton11_dirs()
+        or _rm.list_cachyos_proton_dirs()
+        or _rm.list_ge_proton10_dirs()
+    )
     return found[0] if found else None
 
 
@@ -127,6 +133,36 @@ def retarget_default_games(previous_name: str, games: Iterable[StandaloneGame] |
                 newest.name if newest is not None else "default",
                 exc,
             )
+    return moved
+
+
+def retarget_stale_default_games(games: Iterable[StandaloneGame] | None = None) -> int:
+    """Rewrite "Default" launchers whose baked PROTONPATH no longer exists (e.g. a system package upgrade)."""
+    newest = newest_ge_proton()
+    if newest is None:
+        return 0
+    moved = 0
+    for game in games if games is not None else list_standalone_games():
+        if not is_default(game):
+            continue
+        try:
+            text = game.launch_script.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        match = re.search(r"^export PROTONPATH=(.+)$", text, re.MULTILINE)
+        if match is None:
+            continue
+        try:
+            baked = shlex.split(match.group(1))[0]
+        except (ValueError, IndexError):
+            continue
+        if baked == str(newest) or Path(baked).is_dir():
+            continue
+        try:
+            refresh_integration_files(game)
+            moved += 1
+        except OSError as exc:
+            logging.warning("Could not retarget %s: %s", game.name, exc)
     return moved
 
 

@@ -41,6 +41,7 @@ from ..optiscaler import (
 )
 from ..runtime_manager import (
     WINETRICKS_PRESETS,
+    find_system_umu_run,
     get_system_package_install_cmd,
     get_umu_run_path,
     install_system_package,
@@ -100,6 +101,7 @@ def run_exe_in_prefix_dialog(
             return
         if (
             not get_umu_run_path().is_file()
+            and find_system_umu_run() is None
             and (win.paths is not None or getattr(win, "_steam_root_found", False))
         ):
             ans = QMessageBox.question(

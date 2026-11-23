@@ -100,9 +100,13 @@ def _runtime_temp_prefix(component: str) -> str:
 
 WINETRICKS_PRESETS: dict[str, str] = {
     "vcrun2022": "Visual C++ 2015-2022 Redistributable",
+    "vcrun2013": "Visual C++ 2013 Redistributable (msvcr120)",
     "d3dcompiler_47": "Direct3D Shader Compiler (d3dcompiler_47)",
-    "corefonts": "Microsoft Core Fonts (Arial, Times, etc.)",
     "d3dx9": "DirectX 9 Runtime (d3dx9)",
+    "dotnet48": ".NET Framework 4.8 (dotnet48)",
+    "xact": "XAudio / XACT Runtime (xact)",
+    "physx": "NVIDIA PhysX Runtime (physx)",
+    "corefonts": "Microsoft Core Fonts (Arial, Times, etc.)",
 }
 
 ProgressCallback = Callable[[str, int], None]
@@ -603,6 +607,13 @@ def _all_compat_tool_dirs(steam_root: Path | None = None) -> list[Path]:
     dirs: list[Path] = [get_compat_tools_dir()]
     if root is not None:
         dirs.extend(_iter_compat_tool_dirs(root))
+    else:
+        for sys_dir in (
+            Path("/usr/share/steam/compatibilitytools.d"),
+            Path("/usr/local/share/steam/compatibilitytools.d"),
+        ):
+            if sys_dir.is_dir():
+                dirs.append(sys_dir)
     dirs.extend(_iter_extra_compat_tool_dirs())
     return dirs
 
@@ -810,6 +821,45 @@ def superseded_managed_compat_tools() -> list[Path]:
 def list_ge_proton11_dirs() -> list[Path]:
     """List installed GE-Proton11+ directories sorted newest first."""
     return list_ge_proton_dirs(min_major=11)
+
+
+def list_cachyos_proton_dirs() -> list[Path]:
+    """List installed Proton-CachyOS directories (system or user compatibilitytools.d) sorted newest first."""
+    candidate_dirs = _all_compat_tool_dirs()
+    seen_dirs: set[Path] = set()
+    seen_entries: set[Path] = set()
+    found: list[tuple[tuple[int, ...], str, Path]] = []
+    for compat_dir in candidate_dirs:
+        if not compat_dir.is_dir():
+            continue
+        try:
+            resolved_dir = compat_dir.resolve()
+        except OSError:
+            resolved_dir = compat_dir
+        if resolved_dir in seen_dirs:
+            continue
+        seen_dirs.add(resolved_dir)
+        try:
+            entries = list(compat_dir.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            low = entry.name.lower()
+            if not (low.startswith("proton-cachyos") or low.startswith("cachyos-proton")):
+                continue
+            try:
+                if not entry.is_dir() or not (entry / "proton").is_file():
+                    continue
+                resolved_entry = entry.resolve()
+            except OSError:
+                continue
+            if resolved_entry in seen_entries:
+                continue
+            seen_entries.add(resolved_entry)
+            nums = tuple(int(n) for n in re.findall(r"\d+", entry.name))
+            found.append((nums, low, entry))
+    found.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [entry for _, _, entry in found]
 
 
 def list_ge_proton10_dirs() -> list[Path]:
@@ -1240,12 +1290,30 @@ def _verify_release_asset_integrity(
     )
 
 
+def find_system_umu_run() -> Path | None:
+    """Return a system-installed umu-run binary outside DeckInstall's managed runtime dir, or None."""
+    found = shutil.which("umu-run")
+    if not found:
+        return None
+    candidate = Path(found)
+    try:
+        if candidate.resolve().is_relative_to(get_umu_dir().resolve()):
+            return None
+    except OSError:
+        pass
+    return candidate if candidate.is_file() else None
+
+
 @_serialize_runtime("umu")
 def ensure_umu_run(
     force_update: bool = False,
     progress_cb: ProgressCallback | None = None,
 ) -> Path:
-    """Ensure portable umu-run is installed and executable, downloading if needed."""
+    """Ensure portable umu-run is installed and executable, preferring system umu-run when present."""
+    if not force_update:
+        sys_umu = find_system_umu_run()
+        if sys_umu is not None:
+            return sys_umu
     umu_run = get_umu_run_path()
     if umu_run.is_file() and not force_update:
         if not os.access(umu_run, os.X_OK):
@@ -1609,6 +1677,10 @@ def ensure_ge_proton11(
             return repair_ge_proton(managed, progress_cb=progress_cb)
         logging.warning("GE-Proton integrity check failed; preserving manually installed copies.")
 
+    if not force_update:
+        cachy_dirs = list_cachyos_proton_dirs()
+        if cachy_dirs:
+            return cachy_dirs[0]
 
     _emit_progress(progress_cb, "Checking latest GE-Proton11+ release...", 0)
     release = _fetch_latest_ge_proton11_release()
@@ -1966,6 +2038,21 @@ def install_compat_tool(
     return target_dir
 
 
+_SYSTEM_COMPAT_TOOL_DIRS = (
+    Path("/usr/share/steam/compatibilitytools.d"),
+    Path("/usr/local/share/steam/compatibilitytools.d"),
+)
+
+
+def is_system_compat_tool(tool_path: Path) -> bool:
+    """True when tool_path lives inside a system-wide compatibilitytools.d directory."""
+    try:
+        parent_res = tool_path.parent.resolve()
+        return parent_res in {d.resolve() for d in _SYSTEM_COMPAT_TOOL_DIRS if d.exists()}
+    except OSError:
+        return False
+
+
 @_serialize_runtime("compat-tools")
 def remove_compat_tool(tool_path: Path, *, managed_only: bool = False) -> None:
     """Safely remove a custom compatibility tool directory from compatibilitytools.d."""
@@ -1973,6 +2060,8 @@ def remove_compat_tool(tool_path: Path, *, managed_only: bool = False) -> None:
         raise ValueError(f"Refusing to remove symlink: {tool_path}")
     if not tool_path.exists() or not tool_path.is_dir():
         raise FileNotFoundError(f"Compatibility tool directory not found: {tool_path}")
+    if is_system_compat_tool(tool_path):
+        raise ValueError(f"Refusing to remove system-managed compatibility tool: {tool_path}")
     parent = tool_path.parent
     if parent.resolve() not in {path.resolve() for path in _all_compat_tool_dirs()}:
         raise ValueError(
@@ -1993,9 +2082,17 @@ def check_runtime_updates(force: bool = False) -> dict[str, Any]:
     now = time.time()
     last_check = float(versions.get("last_check", 0) or 0)
     umu_path = get_umu_run_path()
-    installed_umu = versions.get("umu_installed_version") if umu_path.is_file() else None
+    sys_umu = find_system_umu_run()
+    # Same precedence as every launcher: the system umu-run wins over the managed copy.
+    use_managed_umu = sys_umu is None and umu_path.is_file()
+    installed_umu = (
+        versions.get("umu_installed_version")
+        if use_managed_umu
+        else (f"system ({sys_umu.name})" if sys_umu is not None else None)
+    )
     ge_dirs = list_ge_proton11_dirs()
-    installed_ge = ge_dirs[0].name if ge_dirs else None
+    cachy_dirs = [] if ge_dirs else list_cachyos_proton_dirs()
+    installed_ge = ge_dirs[0].name if ge_dirs else (cachy_dirs[0].name if cachy_dirs else None)
 
     if not force and last_check > 0 and (now - last_check) < UPDATE_CACHE_TTL_SECONDS:
         latest_umu = versions.get("umu_latest_version")
@@ -2006,14 +2103,14 @@ def check_runtime_updates(force: bool = False) -> dict[str, Any]:
             "umu": {
                 "installed": installed_umu,
                 "latest": latest_umu,
-                "update_available": bool(latest_umu and installed_umu != latest_umu),
-                "installed_path": str(umu_path) if umu_path.is_file() else None,
+                "update_available": bool(use_managed_umu and latest_umu and installed_umu != latest_umu),
+                "installed_path": str(sys_umu) if sys_umu else (str(umu_path) if umu_path.is_file() else None),
             },
             "ge_proton": {
                 "installed": installed_ge,
                 "latest": latest_ge,
-                "update_available": bool(latest_ge and installed_ge != latest_ge),
-                "installed_path": str(ge_dirs[0]) if ge_dirs else None,
+                "update_available": bool(ge_dirs and latest_ge and installed_ge != latest_ge),
+                "installed_path": str(ge_dirs[0]) if ge_dirs else (str(cachy_dirs[0]) if cachy_dirs else None),
             },
         }
 
@@ -2037,14 +2134,14 @@ def check_runtime_updates(force: bool = False) -> dict[str, Any]:
         "umu": {
             "installed": installed_umu,
             "latest": latest_umu,
-            "update_available": bool(latest_umu and installed_umu != latest_umu),
-            "installed_path": str(umu_path) if umu_path.is_file() else None,
+            "update_available": bool(use_managed_umu and latest_umu and installed_umu != latest_umu),
+            "installed_path": str(sys_umu) if sys_umu else (str(umu_path) if umu_path.is_file() else None),
         },
         "ge_proton": {
             "installed": installed_ge,
             "latest": latest_ge,
-            "update_available": bool(latest_ge and installed_ge != latest_ge),
-            "installed_path": str(ge_dirs[0]) if ge_dirs else None,
+            "update_available": bool(ge_dirs and latest_ge and installed_ge != latest_ge),
+            "installed_path": str(ge_dirs[0]) if ge_dirs else (str(cachy_dirs[0]) if cachy_dirs else None),
         },
     }
 
@@ -2131,11 +2228,21 @@ _SYSTEM_PACKAGE_MAP: dict[str, dict[str, list[str]]] = {
         "pacman": ["winetricks"],
         "zypper": ["winetricks"],
     },
+    "innoextract": {
+        "apt-get": ["innoextract"],
+        "dnf": ["innoextract"],
+        "pacman": ["innoextract"],
+        "zypper": ["innoextract"],
+    },
 }
 
 
 def get_system_package_install_cmd(bin_name: str) -> list[str] | None:
-    """Return an OS package-manager install command for bin_name, or None if unsupported."""
+    """Return an OS package-manager install command for bin_name, or None on immutable OSes/unsupported."""
+    from .modes import is_immutable_os
+
+    if is_immutable_os():
+        return None
     pkg_map = _SYSTEM_PACKAGE_MAP.get(bin_name)
     if not pkg_map:
         return None
@@ -2375,7 +2482,7 @@ def resolve_game_prefix(
         if proton_name:
             proton_dir = _resolve_proton_name_in_compat_dirs(proton_name)
         if proton_dir is None:
-            ge_dirs = list_ge_proton11_dirs()
+            ge_dirs = list_ge_proton11_dirs() or list_cachyos_proton_dirs() or list_ge_proton10_dirs()
             if ge_dirs:
                 proton_dir = ge_dirs[0]
         return (prefix_dir, proton_dir)
@@ -2521,7 +2628,7 @@ def run_exe_in_prefix(
     """Run an arbitrary Windows executable inside an existing Wine prefix via umu-run."""
     resolved_proton = proton_path
     if resolved_proton is None:
-        candidates = list_ge_proton11_dirs() or list_ge_proton10_dirs()
+        candidates = list_ge_proton11_dirs() or list_cachyos_proton_dirs() or list_ge_proton10_dirs()
         if candidates:
             resolved_proton = candidates[0]
         else:
@@ -2539,7 +2646,7 @@ def run_exe_in_prefix(
     if allow_download:
         umu_run = ensure_umu_run()
     else:
-        umu_run = get_umu_run_path()
+        umu_run = find_system_umu_run() or get_umu_run_path()
         if not umu_run.is_file():
             raise RuntimeError("umu-run is not installed.")
     prefix_dir.mkdir(parents=True, exist_ok=True)

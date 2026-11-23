@@ -24,7 +24,6 @@ from .artwork import (
 from .extractor import (
     ToolMissingError,
     UnarcError,
-    extract_archive,
     extract_gog_installer,
     install_native_sh,
     run_windows_installer,
@@ -64,7 +63,7 @@ from .ui_workers_library import close_steam_for_edit, restart_steam_after_edit
 
 
 class ExtractWorker(QThread):
-    """Background worker for archive extraction or Proton setup.exe execution."""
+    """Background worker that runs installers (setup.exe, .msi, GOG, repacks, Linux .sh) in an isolated prefix."""
 
     progress = Signal(int, str)
     finished_ok = Signal(str)
@@ -121,13 +120,7 @@ class ExtractWorker(QThread):
                         index += 1
             on_progress = lambda p, msg: self.progress.emit(p, msg)  # noqa: E731
             if info.kind == classify.ARCHIVE:
-                out = extract_archive(
-                    self.source,
-                    self.dest_root,
-                    self.folder_name,
-                    on_progress=on_progress,
-                    cancel_flag=self._is_cancelled,
-                )
+                raise RuntimeError(tr("install.archive_extract_first"))
             elif info.kind == classify.GOG_SETUP and info.installer is not None:
                 try:
                     out = extract_gog_installer(

@@ -192,7 +192,7 @@ def _pick_dir_async(
 
 
 class DropZoneFrame(QFrame):
-    """Drag-and-drop card for archive or setup.exe selection."""
+    """Drag-and-drop card for setup.exe, .msi or game folder selection."""
 
     file_dropped = Signal(str)
 

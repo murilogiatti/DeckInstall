@@ -297,6 +297,8 @@ def _iter_compat_tool_dirs(steam_root: Path) -> list[Path]:
             / "Steam"
             / "compatibilitytools.d"
         ),
+        Path("/usr/share/steam/compatibilitytools.d"),
+        Path("/usr/local/share/steam/compatibilitytools.d"),
     ]
     out: list[Path] = []
     visited: set[Path] = set()

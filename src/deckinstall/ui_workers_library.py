@@ -22,6 +22,7 @@ from .runtime_manager import (
     ensure_mangohud,
     get_umu_run_path,
     is_win32_prefix,
+    list_ge_proton10_dirs,
     list_ge_proton11_dirs,
     list_installed_compat_tools,
     official_mangohud_installed,
@@ -386,12 +387,14 @@ class LaunchPrepWorker(QThread):
                 if obj.runner == "linux":
                     self.ready.emit("ok", "", [str(obj.exe_path)], obj.game_dir, None)
                     return
-                umu_run = get_umu_run_path()
+                from .runtime_manager import find_system_umu_run, list_cachyos_proton_dirs
+
+                umu_run = find_system_umu_run() or get_umu_run_path()
                 if not umu_run.is_file():
                     self.ready.emit("warn", tr("play.umu_missing"), [], None, None)
                     return
                 proton_dir: Path | None = None
-                ge_dirs = list_ge_proton11_dirs()
+                ge_dirs = list_ge_proton11_dirs() or list_cachyos_proton_dirs() or list_ge_proton10_dirs()
                 if ge_dirs:
                     proton_dir = ge_dirs[0]
                 else:

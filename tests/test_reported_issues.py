@@ -599,13 +599,26 @@ class UiUxSimplificationTests(unittest.TestCase):
                     self.assertTrue(win.btn_mode_standalone.isChecked())
                     self.assertTrue(win.btn_mode_steam.toolTip())
 
-                    win._set_extract_source(str(zip_file))
+                    setup_file = root / "CoolGameSetup" / "setup.exe"
+                    setup_file.parent.mkdir(parents=True, exist_ok=True)
+                    setup_file.write_bytes(b"MZ")
+
+                    win._set_extract_source(str(setup_file))
                     for worker in list(win._active_workers):
                         self.assertTrue(worker.wait(5000))
                     app.processEvents()
-                    self.assertEqual(win.extract_src.text(), str(zip_file))
-                    self.assertEqual(win.add_name.text(), "CoolGame-v1")  # extraction uses the step 2 name
+                    self.assertEqual(win.extract_src.text(), str(setup_file))
+                    self.assertEqual(win.add_name.text(), "CoolGameSetup")
                     self.assertFalse(win.extract_details_box.isHidden())
+
+                    with mock.patch("PySide6.QtWidgets.QMessageBox.information") as info_box:
+                        win._set_extract_source(str(zip_file))
+                        for worker in list(win._active_workers):
+                            self.assertTrue(worker.wait(5000))
+                        app.processEvents()
+                    info_box.assert_called_once()
+                    self.assertEqual(win.extract_src.text(), "")
+                    self.assertTrue(win.extract_details_box.isHidden())
 
                     win._set_extract_source(str(game_exe))
                     for worker in list(win._active_workers):

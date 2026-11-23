@@ -22,6 +22,7 @@ IGNORED_EXE_PATTERNS = (
     "vcredist",
     "vc_redist",
     "dxsetup",
+    "dxwebsetup",
     "ueprereq",
     "ue4prereq",
     "dotnet",
@@ -31,6 +32,9 @@ IGNORED_EXE_PATTERNS = (
     "redist",
     "easyanticheat",
     "battleye",
+    "quicksfv",
+    "notificationhelper",
+    "bugreport",
 )
 
 UTILITY_EXE_PATTERNS = (
@@ -46,6 +50,7 @@ UTILITY_EXE_PATTERNS = (
     "cefprocess",
     "webview",
     "helper",
+    "bootstrapper",
 )
 
 SCENE_TAG_RE = re.compile(

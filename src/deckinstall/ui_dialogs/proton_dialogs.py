@@ -159,13 +159,21 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
     footer.addWidget(btn_close)
     lay.addLayout(footer)
 
+    def _can_remove_selected() -> bool:
+        if busy_state["active"]:
+            return False
+        sel = _selected_table_data(installed_list)
+        if not isinstance(sel, tuple):
+            return False
+        from ..runtime_manager import is_system_compat_tool
+
+        return not is_system_compat_tool(sel[0].path)
+
     def _set_busy(busy: bool, text: str = "") -> None:
         busy_state["active"] = busy
         for w in (btn_refresh_inst, btn_fetch, family_combo, installed_list, releases_list, btn_close):
             w.setEnabled(not busy)
-        btn_remove_inst.setEnabled(
-            (not busy) and isinstance(_selected_table_data(installed_list), tuple)
-        )
+        btn_remove_inst.setEnabled(_can_remove_selected())
         btn_install.setEnabled(
             (not busy) and isinstance(_selected_table_data(releases_list), ProtonRelease)
         )
@@ -260,9 +268,7 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
         worker.start()
 
     installed_list.currentCellChanged.connect(
-        lambda *_args: btn_remove_inst.setEnabled(
-            not busy_state["active"] and isinstance(_selected_table_data(installed_list), tuple)
-        )
+        lambda *_args: btn_remove_inst.setEnabled(_can_remove_selected())
     )
     releases_list.currentCellChanged.connect(
         lambda *_args: btn_install.setEnabled(
@@ -440,6 +446,10 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
             lbl_status.setText(tr("proton_mgr.removing", name=tool.folder_name))
 
             def _remove() -> None:
+                from ..runtime_manager import is_system_compat_tool
+
+                if is_system_compat_tool(tool.path):
+                    raise ValueError(f"Refusing to remove system-managed compatibility tool: {tool.path}")
                 if _is_wine_game_running():
                     raise RuntimeError(tr("cleanup.wine_running"))
                 lock = _steam_transaction_lock(paths.config_vdf) if paths is not None else nullcontext()

@@ -19,6 +19,7 @@ from .runtime_manager import (
     get_steamrt4_dir,
     get_umu_run_path,
     is_steamrt4_valid,
+    list_ge_proton10_dirs,
     list_ge_proton11_dirs,
 )
 from .steam_paths import SteamPaths, dir_size_bytes_many, find_proton_binary, find_steam_root
@@ -70,14 +71,16 @@ class MaintHealthWorker(QThread):
             else tr("maint.status_missing")
         )
 
-        umu_path = get_umu_run_path()
+        from .runtime_manager import find_system_umu_run, list_cachyos_proton_dirs
+
+        umu_path = find_system_umu_run() or get_umu_run_path()
         umu_status = (
             f"{tr('maint.status_ok')} ({umu_path})"
             if umu_path.is_file()
             else missing_status
         )
 
-        ge_dirs = list_ge_proton11_dirs()
+        ge_dirs = list_ge_proton11_dirs() or list_cachyos_proton_dirs() or list_ge_proton10_dirs()
         proton_status = (
             f"{len(ge_dirs)} ({ge_dirs[0].name})" if ge_dirs else missing_status
         )
@@ -139,8 +142,10 @@ class MaintHealthWorker(QThread):
             pass
         prefixes_bytes = dir_size_bytes_many(prefix_dirs)
 
+        from .runtime_manager import get_umu_dir
+
         raw_runtime_dirs = (
-            umu_path.parent,
+            get_umu_dir(),
             get_compat_tools_dir(),
             get_steamrt4_dir(),
             get_mangohud_dir(),

@@ -889,10 +889,18 @@ _NON_GAME_EXE_PREFIXES = (
     "ueprereq",
     "prereq",
     "crashreport",
+    "crashpad",
     "crash",
+    "unitycrashhandler",
+    "crs-",
     "redist",
     "setup",
-)
+    "updater",
+    "bootstrapper",
+    "autorun",
+    "bugreport",
+    "notificationhelper",
+)  # keep in step with classify._SKIP_NAME_WORDS and scanner.IGNORED_EXE_PATTERNS
 
 
 def _is_non_game_helper_exe(path: Path) -> bool:
@@ -948,16 +956,24 @@ def to_wine_path(path: Path, drives: dict[str, Path]) -> str:
 
 
 def installer_arguments(installer_exe: Path, target_dir: Path) -> list[str]:
-    """Command-line switches for the installer: Inno Setup gets /DIR= on the D: drive.
+    """Command-line switches for the installer: Inno Setup (/DIR=), NSIS (/D=), and MSI (TARGETDIR=).
 
     Not used for repacks: FitGirl/DODI unpackers (ISDone/unarc) fail with "Unable to write
     data to disk" (-11) when the folder comes from /DIR=, but work when picked in the installer.
     """
-    from .classify import is_inno_setup
+    from .classify import is_inno_setup, is_nsis_installer
 
-    if not is_inno_setup(installer_exe):
-        return []
-    return [f"/DIR={to_wine_path(target_dir, installer_drives(installer_exe, target_dir))}"]
+    drives = installer_drives(installer_exe, target_dir)
+    if installer_exe.suffix.lower() == ".msi":
+        return [f"TARGETDIR={to_wine_path(target_dir, drives)}"]
+    if is_inno_setup(installer_exe):
+        return [f"/DIR={to_wine_path(target_dir, drives)}"]
+    if is_nsis_installer(installer_exe):
+        wine_target = to_wine_path(target_dir, drives)
+        # Wine quotes argv entries containing spaces, which breaks NSIS /D= parsing;
+        # when target_dir has spaces, let NSIS use drive_c and _adopt_from_drive_c() will move it.
+        return [] if " " in wine_target else [f"/D={wine_target}"]
+    return []
 
 
 def _exposes_home(path: Path, home: Path) -> bool:
@@ -1050,6 +1066,12 @@ def _installer_command(
     cancel_flag: Callable[[], bool] | None,
 ) -> tuple[list[str], dict[str, str], Path]:
     """Return (command, env, wine prefix): Steam Proton, else umu-run + GE-Proton, else system wine."""
+    is_msi = installer_exe.suffix.lower() == ".msi"
+    run_target = (
+        ["msiexec", "/i", f"{INSTALLER_SOURCE_DRIVE.rstrip(':').upper()}:\\{installer_exe.name}"]
+        if is_msi
+        else [str(installer_exe)]
+    )
     steam_root = find_steam_root()
     proton = find_proton_binary(steam_root) if steam_root is not None else None
     if steam_root is not None and proton is not None:
@@ -1058,7 +1080,7 @@ def _installer_command(
         env["STEAM_COMPAT_DATA_PATH"] = str(tmp_pfx)
         if on_log:
             on_log(f"Starting {installer_exe.name} via Proton.")
-        return [str(proton), "run", str(installer_exe), *args], env, tmp_pfx / "pfx"
+        return [str(proton), "run", *run_target, *args], env, tmp_pfx / "pfx"
     if cancel_flag and cancel_flag():
         raise RuntimeError("Installer cancelled by user.")
     try:
@@ -1068,7 +1090,7 @@ def _installer_command(
         env = runtime_manager.build_umu_env(tmp_pfx, resolved_proton)
         if on_log:
             on_log(f"Starting {installer_exe.name} via umu-run.")
-        return [str(umu_run), str(installer_exe), *args], env, tmp_pfx
+        return [str(umu_run), *run_target, *args], env, tmp_pfx
     except Exception as exc:
         wine = shutil.which("wine")
         if wine is None:
@@ -1078,24 +1100,56 @@ def _installer_command(
         env["WINEPREFIX"] = str(tmp_pfx)
         if on_log:
             on_log(f"umu-run is unavailable ({exc}); starting {installer_exe.name} with the system wine.")
-        return [wine, str(installer_exe), *args], env, tmp_pfx
+        return [wine, *run_target, *args], env, tmp_pfx
 
 
 DRIVE_C_GAME_PARENTS = ("Games", "GOG Games", "Program Files", "Program Files (x86)")
+_APPDATA_SKIP_DIRS = frozenset(
+    {
+        "microsoft",
+        "temp",
+        "windows",
+        "wine",
+        "squirreltemp",
+        "packages",
+        "connecteddevicesplatform",
+        "crashdumps",
+        "d3dscache",
+        "publishers",
+        "programs",
+    }
+)
 
 
-def find_games_in_drive_c(drive_c: Path) -> tuple[list[Path], list[Path]]:
-    """Return (game folders, helper-only folders) found under drive_c's Games/Program Files dirs.
+def _drive_c_search_bases(drive_c: Path) -> tuple[list[Path], list[Path]]:
+    primary = [drive_c / sub for sub in DRIVE_C_GAME_PARENTS]
+    appdata: list[Path] = []
+    users_dir = drive_c / "users"
+    if users_dir.is_dir() and not users_dir.is_symlink():
+        try:
+            for user_dir in sorted(users_dir.iterdir(), key=lambda p: p.name):
+                if user_dir.is_symlink() or not user_dir.is_dir():
+                    continue
+                app_data = user_dir / "AppData"
+                if app_data.is_symlink() or not app_data.is_dir():
+                    continue
+                local_app = app_data / "Local"
+                if local_app.is_dir() and not local_app.is_symlink():
+                    appdata.append(local_app)
+                    progs = local_app / "Programs"
+                    if progs.is_dir() and not progs.is_symlink():
+                        appdata.append(progs)
+        except OSError:
+            pass
+    return primary, appdata
 
-    Windows system folders and symlinks are skipped; a folder counts as a game when it holds
-    an .exe that is not a known helper (redist, crash handler, ...).
-    """
+
+def _scan_drive_c_bases(
+    bases: list[Path], skip: set[str] | frozenset[str] = frozenset()
+) -> tuple[list[Path], list[Path]]:
     picked: list[Path] = []
     fallback: list[Path] = []
-    if drive_c.is_symlink() or not drive_c.is_dir():
-        return picked, fallback
-    for sub in DRIVE_C_GAME_PARENTS:
-        base = drive_c / sub
+    for base in bases:
         if not base.is_dir() or base.is_symlink():
             continue
         try:
@@ -1103,7 +1157,14 @@ def find_games_in_drive_c(drive_c: Path) -> tuple[list[Path], list[Path]]:
         except OSError:
             continue
         for cand in children:
-            if cand.is_symlink() or not cand.is_dir() or cand.name.lower() in _SYSTEM_DIRS:
+            low_name = cand.name.lower()
+            if (
+                cand.is_symlink()
+                or not cand.is_dir()
+                or low_name in _SYSTEM_DIRS
+                or low_name in _APPDATA_SKIP_DIRS
+                or low_name in skip
+            ):
                 continue
             new_exes = [p for p in _collect_regular_files(cand) if p.suffix.lower() == ".exe"]
             if not new_exes:
@@ -1115,16 +1176,57 @@ def find_games_in_drive_c(drive_c: Path) -> tuple[list[Path], list[Path]]:
     return picked, fallback
 
 
+def find_games_in_drive_c(drive_c: Path) -> tuple[list[Path], list[Path]]:
+    """Return (game folders, helper-only folders) found under drive_c's Games/Program Files/AppData dirs.
+
+    Windows system folders and symlinks are skipped; a folder counts as a game when it holds
+    an .exe that is not a known helper (redist, crash handler, ...). AppData/Local is only used
+    when standard Program Files/Games/root folders contain no game.
+    """
+    if drive_c.is_symlink() or not drive_c.is_dir():
+        return [], []
+    primary, appdata = _drive_c_search_bases(drive_c)
+    picked, fallback = _scan_drive_c_bases(primary)
+    # Also check custom folders created directly at drive_c/<Game> (e.g. NSIS with spaces).
+    reserved = {p.lower() for p in DRIVE_C_GAME_PARENTS} | {"windows", "users", "programdata"} | _SYSTEM_DIRS
+    root_picked, root_fallback = _scan_drive_c_bases([drive_c], skip=reserved)
+    picked.extend(root_picked)
+    fallback.extend(root_fallback)
+    if picked:
+        return picked, fallback
+    app_picked, _app_fallback = _scan_drive_c_bases(appdata)
+    return app_picked, fallback
+
+
 def _adopt_from_drive_c(drive_c: Path, target_dir: Path) -> bool:
     """Move a game the installer put inside the prefix (ignoring /DIR=) into target_dir."""
     picked, fallback = find_games_in_drive_c(drive_c)
+    try:
+        drive_c_resolved = drive_c.resolve()
+    except OSError:
+        return False
+    adopted = False
+    placed: set[Path] = set()
     for cand in picked or fallback:
+        try:
+            if not cand.resolve().is_relative_to(drive_c_resolved):
+                continue
+        except OSError:
+            continue
         dest = target_dir / cand.name
+        if dest in placed:
+            # Two different folders from this install share a name: never overwrite the first one.
+            idx = 2
+            while (target_dir / f"{cand.name} ({idx})").exists():
+                idx += 1
+            dest = target_dir / f"{cand.name} ({idx})"
         if dest.exists() or dest.is_symlink():
-            copy_dir_no_symlinks(cand, dest)
+            copy_dir_no_symlinks(cand, dest)  # merge into the folder that was already there
         else:
             move_dir_safely(cand, dest)
-    return bool(picked or fallback)
+        placed.add(dest)
+        adopted = True
+    return adopted
 
 
 def _installed_elsewhere_roots(target_dir: Path) -> list[Path]:

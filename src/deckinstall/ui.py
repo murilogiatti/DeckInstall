@@ -1426,6 +1426,8 @@ class MainWindow(QMainWindow):
 
     def _on_system_scheme_changed(self, *_args: object) -> None:
         """Follow the system light/dark switch live, but only while the theme is set to Auto."""
+        if self._closed:
+            return  # a closed window must not keep restyling the whole application
         if str(self.theme_combo.currentData() or "auto") == "auto":
             apply_theme(self.app, "auto")
 
@@ -1747,8 +1749,16 @@ class MainWindow(QMainWindow):
             if not isinstance(result, tuple):
                 return
             info, is_dir, game = result
+            if info.kind == classify.ARCHIVE:
+                self.extract_src.clear()
+                self.extract_details_box.setVisible(False)
+                self.btn_use_extracted.setEnabled(False)
+                msg = tr("install.archive_extract_first")
+                self.status_label.setText(msg)
+                QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+                return
             if info.needs_install and info.installer is not None:
-                self.extract_src.setText(str(path if info.kind == classify.ARCHIVE else info.installer))
+                self.extract_src.setText(str(info.installer))
                 self.add_name.setText(classify.suggest_install_name(info))
                 self.extract_details_box.setVisible(True)
                 self.status_label.setText(self._detected_kind_text(info))
@@ -1764,7 +1774,6 @@ class MainWindow(QMainWindow):
 
     def _detected_kind_text(self, info: classify.SourceInfo) -> str:
         texts = {
-            classify.ARCHIVE: tr("install.detected_archive"),
             classify.GOG_SETUP: tr("install.detected_gog"),
             classify.REPACK: tr("install.detected_repack", name=info.installer.name if info.installer else ""),
             classify.INSTALLER: tr("install.detected_installer"),
@@ -1866,22 +1875,7 @@ class MainWindow(QMainWindow):
         self._refresh_games()
         if self._closing_pending or self._closed:
             return
-        if source_kind == classify.ARCHIVE:
-            def _ready(result: object) -> None:
-                if (
-                    isinstance(result, classify.SourceInfo)
-                    and result.kind in (classify.REPACK, classify.GOG_SETUP, classify.INSTALLER)
-                    and result.installer is not None
-                ):
-                    self.extract_src.setText(str(result.installer))
-                    msg = tr("install.archive_has_installer", name=result.installer.name)
-                    self.extract_log.append(msg)
-                    self.status_label.setText(msg)
-                elif self.isVisible():
-                    self._send_extracted_to_add_tab()
-
-            self._probe_install_source(lambda: classify.classify_source(Path(out_dir)), _ready)
-        elif self.isVisible():
+        if self.isVisible():
             self._send_extracted_to_add_tab()
 
     def _on_extract_failed(self, err: str) -> None:
@@ -2405,15 +2399,16 @@ class MainWindow(QMainWindow):
             inside_games_dir = False
 
         def _start_install(final_keep_in_place: bool, final_single_exe_only: bool) -> None:
+            from .runtime_manager import find_system_umu_run, list_cachyos_proton_dirs
+
             steam_only = mode == STEAM  # Steam runs it: no umu-run / GE-Proton download
+            has_umu = find_system_umu_run() is not None or get_umu_run_path().is_file()
+            has_proton = bool(list_ge_proton11_dirs() or list_cachyos_proton_dirs())
             if (
                 not steam_only
                 and not is_native_linux_exe(exe_path)
                 and (self.paths is not None or self._steam_root_found)
-                and (
-                    not get_umu_run_path().is_file()
-                    or not list_ge_proton11_dirs()
-                )
+                and (not has_umu or not has_proton)
             ):
                 # Standalone chosen while Steam exists: say what it downloads before doing it.
                 ans = QMessageBox.question(
@@ -2665,6 +2660,12 @@ class MainWindow(QMainWindow):
 
     def _maybe_prompt_migration(self, standalone_games: list[StandaloneGame]) -> None:
         """Offer once per session to move v1 games (~/Games) into the internal library."""
+        try:
+            from .proton_policy import retarget_stale_default_games
+
+            retarget_stale_default_games(standalone_games)
+        except Exception:
+            logging.exception("Could not refresh launchers with a missing Proton")
         if self._migration_prompted or self._closing_pending:
             return
         if not any(g.schema < 2 for g in standalone_games):
@@ -4199,8 +4200,11 @@ class MainWindow(QMainWindow):
                 assert paths is not None
                 worker = SteamOpWorker(lambda: switch_to_steam(paths, game), need_steam_closed=True)
             else:
+                from .runtime_manager import find_system_umu_run, list_cachyos_proton_dirs
+
                 needs_runtime = not game.native_linux and (
-                    not get_umu_run_path().is_file() or not list_ge_proton11_dirs()
+                    (find_system_umu_run() is None and not get_umu_run_path().is_file())
+                    or not (list_ge_proton11_dirs() or list_cachyos_proton_dirs())
                 )
 
                 def _to_standalone() -> object:
