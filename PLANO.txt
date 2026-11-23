@@ -480,3 +480,27 @@ Achado ao rodar a suite na maquina do usuario (LANG=pt_BR.UTF-8, Ubuntu 26.04.1)
   Resultado: 713 passed (antes: 1 failed, 712 passed). ruff e mypy limpos.
 Sobras da Fase R: decidir o destino de AUDITORIA_V022_PLANO.txt.
 NAO TESTADO A MAO na Fase R: nada a testar (so leitura).
+
+PEDIDOS DIRETOS DO USUARIO (2026-11-22, durante o portao da Fase R)
+1. [FEITO] Kiborg instalado 2x ("KIBORG (2)") sem aviso. Causa (evidencia em ~/DeckInstall/Games):
+   - A migracao da v0.21 (~/Games -> biblioteca) levou so a pasta do projeto Unreal
+     (origin ~/Games/KIBORG/Kiborg; exe Binaries/Win64/Kiborg-Win64-Shipping.exe). Kiborg.exe, Engine/, ArtBook,
+     OST, _Redist e o desinstalador ficaram em ~/Games/KIBORG (a raiz Unreal so foi corrigida depois, Fase 11.6).
+   - Hoje (v0.23.0) a busca da aba Instalar achou essa sobra como jogo novo; install_standalone_game nao
+     tinha NENHUMA checagem de duplicata e criou "(2)" em silencio; o aviso de mover mostrava ".../KIBORG".
+   - Correcao (e61b2dd): standalone.find_existing_installs (mesma pasta/origem, AppID ou nome) + pergunta
+     "Instalar outra copia" (padrao Cancelar); planned_game_dir mostra o destino real. tests/test_duplicate_install.py.
+   - NAO FEITO: juntar as duas metades do Kiborg do usuario (mexe em dados; aguarda aceite). Atalho Steam
+     direto (_add_selected_to_steam) ainda nao checa duplicata.
+2. [FEITO] OptiScaler oferecido sem necessidade (af24273). Medido nos 11 jogos do usuario: todos apareciam
+   "FSR,XeSS" por causa das DLLs do PROPRIO OptiScaler (libxess, amd_fidelityfx_*). Agora: arquivos do
+   OptiScaler ignorados; plugins Unreal (DLSS/Streamline/FSR/XeSS) ate 8 niveis; API sem DX11/12/Vulkan
+   descarta; sem upscaler = incompativel ("no_upscaler"). Resultado real: 4 com upscaler nativo (KIBORG,
+   Returnal, Star Wars Galactic Racer, Stellar Blade), 7 sem (Bzzzt, Cleared Hot, Disco Elysium, NoMercy,
+   Takeover 2, Rogue Prince, KIBORG (2)). 6 desses 7 ja tem OptiScaler instalado (inutil). Em lote: so marca
+   compativeis; incompativel com OptiScaler fica marcavel so para remover. Por jogo: pergunta antes (padrao Nao).
+   Limite: upscaler embutido no exe sem DLL nem pasta de plugin (ex.: FSR compilado em Unity) nao e detectado.
+3. [FEITO] Abas no topo (1655822): Biblioteca | Instalar jogo | Backup e sincronizacao | Manutencao; sem
+   botoes de hub nem "<- Biblioteca". NAO TESTADO A MAO: so captura offscreen e testes.
+4. [A FAZER - aguarda desenho aprovado] Gerenciadores separados por componente (Proton, umu/runtime,
+   MangoHud, OptiScaler, ferramentas). Encaixa nas Fases 5/7 (politica por variante e resolvedor).
