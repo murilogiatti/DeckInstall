@@ -490,8 +490,17 @@ PEDIDOS DIRETOS DO USUARIO (2026-11-22, durante o portao da Fase R)
      tinha NENHUMA checagem de duplicata e criou "(2)" em silencio; o aviso de mover mostrava ".../KIBORG".
    - Correcao (e61b2dd): standalone.find_existing_installs (mesma pasta/origem, AppID ou nome) + pergunta
      "Instalar outra copia" (padrao Cancelar); planned_game_dir mostra o destino real. tests/test_duplicate_install.py.
-   - NAO FEITO: juntar as duas metades do Kiborg do usuario (mexe em dados; aguarda aceite). Atalho Steam
-     direto (_add_selected_to_steam) ainda nao checa duplicata.
+   - [FEITO 2026-11-22, com aceite] Merge das duas metades: Engine/, Kiborg.exe, ArtBook, OST, _Redist e
+     desinstalador foram para ~/DeckInstall/Games/KIBORG (raiz Unreal); o jogo original (uid 02e35468, prefixo,
+     GE-Proton11-12, OptiScaler) agora tem game.dir=Games/KIBORG e exe Kiborg/Binaries/Win64/...; launch.sh,
+     .desktop da area de trabalho e indice da biblioteca reescritos pelas funcoes do app. O "(2)" (uid 8b693ab4,
+     nunca jogado; saves iguais aos do original, copia restaurada na instalacao) saiu pelo execute_uninstall
+     (snapshot remove-game antes). Backup: ~/Backups/DeckInstall/kiborg-merge-20261122 (manifestos, launch.sh,
+     .desktop e o prefixo do (2) em tar.gz). Script: scratchpad merge_kiborg.py (nao versionado).
+     NAO TESTADO A MAO: abrir o jogo depois do merge.
+   - Atalho Steam direto (_add_selected_to_steam) ainda nao checa duplicata.
+   - Achado lateral: indice ~/DeckInstall/Games/.deckinstall-library tem uma entrada "SharedGame" apontando
+     para um jogo que nao existe (provavel vazamento de teste antigo, antes do isolamento do conftest).
 2. [FEITO] OptiScaler oferecido sem necessidade (af24273). Medido nos 11 jogos do usuario: todos apareciam
    "FSR,XeSS" por causa das DLLs do PROPRIO OptiScaler (libxess, amd_fidelityfx_*). Agora: arquivos do
    OptiScaler ignorados; plugins Unreal (DLSS/Streamline/FSR/XeSS) ate 8 niveis; API sem DX11/12/Vulkan
@@ -504,3 +513,12 @@ PEDIDOS DIRETOS DO USUARIO (2026-11-22, durante o portao da Fase R)
    botoes de hub nem "<- Biblioteca". NAO TESTADO A MAO: so captura offscreen e testes.
 4. [A FAZER - aguarda desenho aprovado] Gerenciadores separados por componente (Proton, umu/runtime,
    MangoHud, OptiScaler, ferramentas). Encaixa nas Fases 5/7 (politica por variante e resolvedor).
+
+DECISAO DO USUARIO (2026-11-22) - MangoHud so no modo Autonomo
+- Com a Steam instalada (qualquer distro) o medidor de desempenho e o nativo da Steam; no SteamOS, o overlay
+  do gamescope. O DeckInstall NAO instala nem oferece MangoHud para jogos no modo Steam.
+- MangoHud fica so para o modo Autonomo (umu-run); politica de origem (sistema -> oficial por usuario) vale
+  apenas ali. Substitui as excecoes (a) e (b) da secao 0 do prompt para o modo Steam.
+- A FAZER (Fases 5/7): ui_workers_library (Jogar) chama ensure_mangohud tambem para atalhos Steam com
+  MANGOHUD no launch options; presets de atalho Steam ainda oferecem MangoHud; Manutencao atualiza o oficial
+  mesmo com Steam. Esconder/ignorar MangoHud quando o jogo esta no modo Steam.
