@@ -1755,6 +1755,67 @@ def repaired_shortcut_start_dir(entry: ShortcutEntry, game: StandaloneGame) -> P
     return game.exe_path.parent
 
 
+def _comparable_name(name: str) -> str:
+    return "".join(ch for ch in name.casefold() if ch.isalnum())
+
+
+def _overlaps(a: Path, b: Path, *, a_may_contain: bool) -> bool:
+    """True when a is inside b, or (a_may_contain) b is inside a."""
+    try:
+        ra, rb = a.resolve(), b.resolve()
+    except (OSError, RuntimeError):
+        return False
+    return ra == rb or ra.is_relative_to(rb) or (a_may_contain and rb.is_relative_to(ra))
+
+
+def find_existing_installs(
+    game_name: str,
+    steam_appid: int | None,
+    source_dir: Path,
+    games: list[StandaloneGame],
+    *,
+    container: bool = False,
+) -> list[tuple[StandaloneGame, str]]:
+    """Installed games the new install would duplicate, each with a reason.
+
+    Reasons: "folder" (the source is, holds or sits inside an installed game or the folder it came
+    from), "appid" (same Steam AppID) and "name" (same name, ignoring case and punctuation).
+    container: source_dir is a shared folder such as ~/Downloads, so holding a game is no match.
+    """
+    wanted = _comparable_name(game_name)
+    found: list[tuple[StandaloneGame, str]] = []
+    for game in games:
+        source = game.meta.get("source") or {}
+        known_dirs = [game.game_dir]
+        for raw in (source.get("origin"), source.get("original_game_dir")):
+            if isinstance(raw, str) and raw.startswith("/"):
+                known_dirs.append(Path(raw))
+        if any(_overlaps(source_dir, d, a_may_contain=not container) for d in known_dirs):
+            found.append((game, "folder"))
+        elif steam_appid and game.steam_appid == steam_appid:
+            found.append((game, "appid"))
+        elif wanted and _comparable_name(game.name) == wanted:
+            found.append((game, "name"))
+    return found
+
+
+def planned_game_dir(games_dir: Path, game_name: str, source_dir: Path) -> Path:
+    """Folder install_standalone_game will move a game into (same "(2)" rule)."""
+    safe = sanitize_dir_name(game_name.strip() or source_dir.name)
+    target = games_dir / safe
+    try:
+        if target.is_dir() and not target.is_symlink() and not any(target.iterdir()):
+            return target
+        if not target.exists() or target.resolve() == source_dir.resolve():
+            return target
+    except OSError:
+        return target
+    idx = 2
+    while (games_dir / f"{safe} ({idx})").exists():
+        idx += 1
+    return games_dir / f"{safe} ({idx})"
+
+
 def list_standalone_games(games_dir: Path | None = None) -> list[StandaloneGame]:
     """Load games from games_dir, or by default from every library plus the legacy ~/Games."""
     if games_dir is not None:

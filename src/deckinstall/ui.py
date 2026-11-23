@@ -112,11 +112,13 @@ from .scanner import (
 from .standalone import (
     StandaloneGame,
     add_installed_game_to_steam,
+    find_existing_installs,
     game_log_dir,
     get_games_dir,
     import_standalone_to_steam,
     list_standalone_games,
     match_owned_shortcuts,
+    planned_game_dir,
     primary_owned_shortcuts,
     repaired_shortcut_start_dir,
     shortcut_game_dir,
@@ -2328,6 +2330,29 @@ class MainWindow(QMainWindow):
         self._begin_busy()
         self._confirm_close_steam_async(_proceed_add, on_cancelled=self._end_busy)
 
+    def _confirm_not_duplicate(
+        self, app_name: str, steam_appid: int | None, game_dir: Path, container: bool
+    ) -> bool:
+        """Ask before installing a game that already looks installed. True = go on."""
+        matches = find_existing_installs(
+            app_name, steam_appid, game_dir, self._standalone_games, container=container
+        )
+        if not matches:
+            return True
+        lines = "\n".join(
+            tr(f"add.duplicate_reason_{reason}", name=game.name, path=str(game.game_dir))
+            for game, reason in matches
+        )
+        box = QMessageBox(_dialog_parent(self))
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle(__app_name__)
+        box.setText(tr("add.duplicate_found", name=app_name, matches=lines))
+        btn_copy = box.addButton(tr("add.duplicate_btn_copy"), QMessageBox.ButtonRole.AcceptRole)
+        btn_cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(btn_cancel)
+        box.exec()
+        return box.clickedButton() is btn_copy
+
     def _add_selected_standalone(self) -> None:
         validated = self._validate_add_inputs()
         if validated is None:
@@ -2355,6 +2380,9 @@ class MainWindow(QMainWindow):
             inferred_container = True
             if not keep_in_place:
                 single_exe_only = True
+
+        if not self._confirm_not_duplicate(app_name, steam_appid, game_dir, inferred_container):
+            return
 
         lib_ok, target_library = self._selected_library()
         if not lib_ok:
@@ -2451,7 +2479,7 @@ class MainWindow(QMainWindow):
                     "add.confirm_move_folder",
                     games_dir=str(games_dir),
                     src=str(game_dir),
-                    dst=str(games_dir / app_name),
+                    dst=str(planned_game_dir(games_dir, app_name, game_dir)),
                     count=item_count,
                     size=format_size_bytes(total_bytes),
                 )

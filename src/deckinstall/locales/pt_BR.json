@@ -897,5 +897,10 @@
   "runtime.uninstall_steam_cleaned": "{count} configuração(ões) de Proton removida(s) dos atalhos da Steam.",
   "run_exe.confirm_umu_steamos": "O Proton oficial da Steam está instalado, então executar um arquivo fora da Steam precisa baixar o umu-run (~15 MB).\n\nBaixar o umu-run agora?",
   "add.confirm_runtime_steamos": "O Proton oficial da Steam já está instalado.\n\nCriar atalhos no Menu ou Área de Trabalho fora da Steam precisa baixar o umu-run e o GE-Proton (~500 MB) para o modo Autônomo.\n\nBaixar agora?",
-  "table.size": "Tamanho"
+  "table.size": "Tamanho",
+  "add.duplicate_found": "'{name}' parece já estar instalado:\n\n{matches}\n\nInstalar de novo cria uma segunda cópia, com prefixo e saves próprios. Para corrigir ou mover o jogo instalado, cancele e use Configurar ou Desinstalar na Biblioteca.",
+  "add.duplicate_reason_folder": "• {name} ({path}): esta pasta é esse jogo, contém esse jogo ou é de onde ele veio",
+  "add.duplicate_reason_appid": "• {name} ({path}): mesmo AppID da Steam",
+  "add.duplicate_reason_name": "• {name} ({path}): mesmo nome",
+  "add.duplicate_btn_copy": "Instalar outra cópia"
 }

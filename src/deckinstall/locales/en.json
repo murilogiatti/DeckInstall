@@ -897,5 +897,10 @@
   "runtime.uninstall_steam_cleaned": "Cleaned {count} Steam shortcut Proton mapping(s).",
   "run_exe.confirm_umu_steamos": "Steam's official Proton is installed, so running an executable outside Steam requires downloading umu-run (~15 MB).\n\nDownload umu-run now?",
   "add.confirm_runtime_steamos": "Steam's official Proton is already installed.\n\nCreating Menu or Desktop shortcuts outside Steam requires downloading umu-run and GE-Proton (~500 MB) for Standalone mode.\n\nDownload them now?",
-  "table.size": "Size"
+  "table.size": "Size",
+  "add.duplicate_found": "'{name}' already looks installed:\n\n{matches}\n\nInstalling again creates a second copy with its own prefix and saves. To fix or move the installed game, cancel and use Configure or Uninstall in the Library.",
+  "add.duplicate_reason_folder": "• {name} ({path}): this folder is, holds or came from that game",
+  "add.duplicate_reason_appid": "• {name} ({path}): same Steam AppID",
+  "add.duplicate_reason_name": "• {name} ({path}): same name",
+  "add.duplicate_btn_copy": "Install another copy"
 }
