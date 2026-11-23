@@ -1217,6 +1217,11 @@ def ensure_umu_run(
     return umu_run
 
 
+def optiscaler_downloaded() -> bool:
+    """True when DeckInstall's OptiScaler package is on disk (games use copies of it)."""
+    return _has_optiscaler_dll(get_optiscaler_dir())
+
+
 def _has_optiscaler_dll(directory: Path) -> bool:
     if not directory.is_dir():
         return False

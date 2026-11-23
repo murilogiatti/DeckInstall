@@ -166,7 +166,6 @@ QPushButton#FilterPill:checked {
     background-color: #1d6fa5;
     border-color: $primary_border;
     color: #ffffff;
-    font-weight: 600;
 }
 QLineEdit:disabled, QComboBox:disabled {
     background-color: $input_disabled_bg;

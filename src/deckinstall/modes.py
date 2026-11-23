@@ -26,7 +26,6 @@ _OS_RELEASE = Path("/etc/os-release")
 _FEATURE_MODE: dict[str, tuple[str, Callable[[], str]]] = {
     "mangohud": (STANDALONE, lambda: tr("mode.note_mangohud_steam")),
     "app_shortcuts": (STANDALONE, lambda: tr("mode.note_shortcuts_steam")),
-    "standalone_runtimes": (STANDALONE, lambda: tr("mode.note_runtimes_steam")),
 }
 
 
@@ -54,12 +53,6 @@ class ModeEnv:
 
     steamos: bool
     steam: bool
-
-    @property
-    def modes(self) -> tuple[str, ...]:
-        if self.steamos:
-            return (STEAM,)
-        return (STEAM, STANDALONE) if self.steam else (STANDALONE,)
 
     @property
     def default_mode(self) -> str:

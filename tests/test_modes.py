@@ -33,13 +33,13 @@ def test_missing_os_release_is_not_steamos(tmp_path: Path) -> None:
 
 def test_modes_offered_per_system() -> None:
     steamos = ModeEnv(steamos=True, steam=True)
-    assert steamos.modes == (STEAM,) and steamos.default_mode == STEAM
+    assert steamos.default_mode == STEAM and steamos.mode_note(STEAM) == ""
     assert steamos.mode_note(STANDALONE) == tr("mode.note_standalone_steamos")
     desktop = ModeEnv(steamos=False, steam=True)
-    assert desktop.modes == (STEAM, STANDALONE) and desktop.default_mode == STEAM
+    assert desktop.default_mode == STEAM
     assert desktop.mode_note(STANDALONE) == "" and desktop.mode_note(STEAM) == ""
     no_steam = ModeEnv(steamos=False, steam=False)
-    assert no_steam.modes == (STANDALONE,) and no_steam.default_mode == STANDALONE
+    assert no_steam.default_mode == STANDALONE and no_steam.mode_note(STANDALONE) == ""
     assert no_steam.mode_note(STEAM) == tr("mode.note_steam_missing")
 
 
@@ -47,7 +47,6 @@ def test_features_belong_to_one_mode() -> None:
     assert feature_note("mangohud", STEAM) == tr("mode.note_mangohud_steam")
     assert feature_note("mangohud", STANDALONE) == ""
     assert feature_note("app_shortcuts", STEAM) == tr("mode.note_shortcuts_steam")
-    assert feature_note("standalone_runtimes", STEAM) == tr("mode.note_runtimes_steam")
     assert feature_note("gamemode", STEAM) == "" and feature_note("gamemode", STANDALONE) == ""
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 
@@ -160,9 +161,31 @@ class MaintHealthWorker(QThread):
             runtime_dirs.append(res)
         runtimes_bytes = dir_size_bytes_many(runtime_dirs)
 
+        from .extractor import _find_7z_bin
+        from .runtime_manager import _has_optiscaler_dll
+        from .steam_paths import list_installed_protons
+
+        if _has_optiscaler_dll(get_optiscaler_dir()):
+            opti_ver = str(_load_versions().get("optiscaler_installed_version") or "")
+            optiscaler_status = f"{tr('maint.status_ok')} ({opti_ver})" if opti_ver else tr("maint.status_ok")
+        else:
+            optiscaler_status = tr("runtimes.status_not_downloaded")
+        steam_protons = [
+            label for tool_id, label in (list_installed_protons(steam_root) if steam_root is not None else [])
+            if not tool_id.lower().startswith("ge-proton")
+        ]
+        tools = {
+            name: shutil.which(name) is not None
+            for name in ("winetricks", "gamemoderun", "innoextract", "unrar", "unzip")
+        }
+        tools["7z"] = _find_7z_bin() is not None
+
         self.ready.emit(
             self._req_id,
             {
+                "optiscaler_status": optiscaler_status,
+                "steam_protons": steam_protons,
+                "tools": tools,
                 "umu_status": umu_status,
                 "proton_status": proton_status,
                 "rt4_status": rt4_status,

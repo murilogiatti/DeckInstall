@@ -1,4 +1,4 @@
-"""Fase 8.3/8.5: bulk actions live in the Library ("In bulk"); art and single-migrate actions are gone."""
+"""Bulk Proton/OptiScaler live in their Runtimes cards; the Library keeps the legacy migration."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from deckinstall import ui  # noqa: E402
 from deckinstall.i18n import tr  # noqa: E402
 
 
-def test_bulk_buttons_in_library_not_in_maintenance() -> None:
+def test_bulk_buttons_live_with_their_component() -> None:
     app = QApplication.instance() or QApplication([])
     with (
         mock.patch.object(ui.MainWindow, "_refresh_games"),
@@ -27,17 +27,16 @@ def test_bulk_buttons_in_library_not_in_maintenance() -> None:
     ):
         win = ui.MainWindow(app)
     try:
-        library_page = win.stack.widget(1)
-        maintenance_page = win.stack.widget(3)
-        lib_labels = [b.text() for b in library_page.findChildren(QPushButton)]
-        maint_labels = [b.text() for b in maintenance_page.findChildren(QPushButton)]
-        for key in (
-            "library.btn_bulk_optiscaler",
-            "library.btn_bulk_proton",
-            "maint.btn_migrate_legacy",
-        ):
-            assert lib_labels.count(tr(key)) == 1, key
-            assert tr(key) not in maint_labels, key
+        pages = {idx: win.stack.widget(idx) for idx in (ui.PAGE_LIBRARY, ui.PAGE_MAINT, ui.PAGE_RUNTIMES)}
+        labels = {idx: [b.text() for b in page.findChildren(QPushButton)] for idx, page in pages.items()}
+        expected = {
+            "library.btn_bulk_optiscaler": ui.PAGE_RUNTIMES,
+            "library.btn_bulk_proton": ui.PAGE_RUNTIMES,
+            "maint.btn_migrate_legacy": ui.PAGE_LIBRARY,
+        }
+        for key, home in expected.items():
+            for idx, page_labels in labels.items():  # exactly one place, the one of its purpose
+                assert page_labels.count(tr(key)) == (1 if idx == home else 0), (key, idx)
         assert not hasattr(win, "btn_maint_protons")
         assert not hasattr(win, "btn_maint_game_protons")
         for gone in ("act_art", "act_revert_art", "act_migrate", "chk_batch_vdf", "act_bulk_migrate", "maint_batch_card"):

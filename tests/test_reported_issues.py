@@ -203,7 +203,7 @@ class UniqueLibraryActionTests(unittest.TestCase):
                 self.assertEqual(win.btn_remove_game.text(), tr("library.btn_uninstall"))
                 self.assertIsNone(win.btn_remove_game.menu())
                 self.assertIsNone(win.btn_save_sync.menu())
-                self.assertEqual(win.stack.count(), 4)
+                self.assertEqual(win.stack.count(), 5)
                 self.assertFalse(hasattr(win, "_nav_buttons"))  # no sidebar
                 self.assertEqual(win.findChildren(QWidget, "Sidebar"), [])
                 self.assertEqual(win.stack.currentIndex(), ui.PAGE_LIBRARY)
@@ -212,7 +212,7 @@ class UniqueLibraryActionTests(unittest.TestCase):
                 # Tabs on top replace the hub buttons and the "back" buttons.
                 self.assertEqual(
                     [win.nav_tabs.tabText(i) for i in range(win.nav_tabs.count())],
-                    [tr("nav.library"), tr("nav.install"), tr("nav.saves"), tr("nav.maintenance")],
+                    [tr("nav.library"), tr("nav.install"), tr("nav.runtimes"), tr("nav.saves"), tr("nav.maintenance")],
                 )
                 self.assertEqual(win.nav_tabs.currentIndex(), 0)
                 for tab, page in enumerate(ui.NAV_PAGES):
@@ -578,7 +578,9 @@ class UiUxSimplificationTests(unittest.TestCase):
                     self.assertFalse(hasattr(win, "chk_verify_md5"))
                     self.assertTrue(win.extract_details_box.isHidden())
                     self.assertTrue(win.stack.widget(0).isAncestorOf(win.add_name))
-                    self.assertTrue(win.stack.widget(3).isAncestorOf(win.btn_update_runtimes))
+                    self.assertTrue(win.stack.widget(ui.PAGE_RUNTIMES).isAncestorOf(win.btn_update_runtimes))
+                    self.assertTrue(win.stack.widget(ui.PAGE_RUNTIMES).isAncestorOf(win.btn_bulk_proton))
+                    self.assertTrue(win.stack.widget(ui.PAGE_RUNTIMES).isAncestorOf(win.btn_bulk_optiscaler))
                     self.assertTrue(win.stack.widget(3).isAncestorOf(win.btn_app_update))
 
                     for always_visible in (win.chk_keep_in_place, win.add_library_combo, win.btn_add_launch_adv,

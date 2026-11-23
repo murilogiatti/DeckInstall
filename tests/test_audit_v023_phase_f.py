@@ -68,21 +68,35 @@ def test_library_search_stays_applied_after_sorting() -> None:
 
 def test_runtime_update_unlocks_and_refreshes_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
     win = Mock(_steam_busy=False, _closing_pending=False)
-    preflight = Mock()
     updater = Mock()
-    monkeypatch.setattr(ui, "RuntimePreflightWorker", Mock(return_value=preflight))
-    monkeypatch.setattr(ui, "RuntimeUpdateWorker", Mock(return_value=updater))
+    worker_cls = Mock(return_value=updater)
+    monkeypatch.setattr(ui, "RuntimeUpdateWorker", worker_cls)
     monkeypatch.setattr(ui, "_dialog_parent", lambda parent: parent)
     monkeypatch.setattr(ui, "QMessageBox", Mock())
 
-    ui.MainWindow._update_runtimes(win)
+    ui.MainWindow._update_runtimes(win, ("mangohud",))  # one Runtimes card updates only its component
+    assert worker_cls.call_args.args[1] == ("mangohud",)
     win._begin_busy.assert_called_once()
-    preflight.ready.connect.call_args.args[0](False)
     win._end_busy.assert_not_called()
     updater.finished_ok.connect.call_args.args[0]("Updated", "")
     win._end_busy.assert_called_once()
     win._refresh_maintenance_health.assert_called_once()
     win._refresh_shortcuts.assert_called_once()
+
+
+def test_update_all_skips_what_steamos_does_not_use(monkeypatch: pytest.MonkeyPatch) -> None:
+    from deckinstall.modes import ModeEnv
+
+    monkeypatch.setattr(ui, "get_umu_run_path", lambda: Path("/nonexistent/umu-run"))
+    monkeypatch.setattr(ui, "list_ge_proton11_dirs", lambda: [Path("/x/GE-Proton11-1")])
+    monkeypatch.setattr(ui, "official_mangohud_installed", lambda: True)
+    monkeypatch.setattr(ui, "optiscaler_downloaded", lambda: True)
+    win = Mock(mode_env=ModeEnv(steamos=True, steam=True))
+    assert ui.MainWindow._runtime_components_for_update_all(win) == ("optiscaler",)
+    win = Mock(mode_env=ModeEnv(steamos=False, steam=True))
+    assert ui.MainWindow._runtime_components_for_update_all(win) == ("ge_proton", "mangohud", "optiscaler")
+    win = Mock(mode_env=ModeEnv(steamos=False, steam=False))
+    assert ui.MainWindow._runtime_components_for_update_all(win)[:2] == ("umu", "ge_proton")
 
 
 def test_managed_windows_shortcut_pointing_to_launch_script_is_listed(

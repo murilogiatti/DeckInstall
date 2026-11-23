@@ -522,3 +522,36 @@ DECISAO DO USUARIO (2026-11-22) - MangoHud so no modo Autonomo
 - A FAZER (Fases 5/7): ui_workers_library (Jogar) chama ensure_mangohud tambem para atalhos Steam com
   MANGOHUD no launch options; presets de atalho Steam ainda oferecem MangoHud; Manutencao atualiza o oficial
   mesmo com Steam. Esconder/ignorar MangoHud quando o jogo esta no modo Steam.
+
+REVISAO DOS FLUXOS POR MODO (pedido do usuario 2026-11-22) - Fase 5 parcial adiantada
+Regra unica: src/deckinstall/modes.py (ModeEnv, feature_note, mode_of_kind, is_steamos via /etc/os-release ID=steamos).
+- SteamOS: so modo Steam. Steam encontrada: Steam (padrao) ou Autonomo. Sem Steam: so Autonomo.
+- Um modo por jogo: modo Steam = atalho so na Steam (Proton/runtime/medidor da Steam; nada baixado; sem atalho de
+  menu/area de trabalho). Autonomo = launch.sh + umu-run + GE-Proton, atalhos de menu/area de trabalho, nunca Steam.
+  Modo de um jogo da biblioteca = linha da Biblioteca (atalho Steam -> Steam; senao Autonomo). Ainda NAO gravado
+  no manifesto como campo proprio (A FAZER na Fase 5) e trocar de modo continua manual (A FAZER, sem residuo).
+[FEITO] Instalar: "Rodar com" (Steam | Autonomo) + um botao Instalar; atalho Steam marcado e travado no modo Steam;
+  menu/area de trabalho acinzentados com o motivo no modo Steam; Steam acinzentado no Autonomo. Ate o usuario
+  escolher, segue o padrao do sistema (a Steam e detectada depois que a janela abre). Saiu o caminho
+  "Adicionar a Steam" sem registrar o jogo (AddToSteamWorker): todo jogo instalado tem manifesto e desinstala limpo.
+  Download de umu/GE-Proton so no Autonomo, com pergunta clara.
+[FEITO] Presets agrupados (Desempenho, Placa de video, Compatibilidade do Proton e do Wine, Avancado); MangoHud
+  acinzentado no modo Steam com o motivo (e retirado das opcoes de um jogo no modo Steam ao salvar).
+[FEITO] Jogar: MangoHud so e baixado para jogo no modo Autonomo.
+[FEITO] Adotar jogos: Steam ligado/adicionado desliga menu/area de trabalho com o motivo; SteamOS sempre Steam.
+[FEITO] Configurar jogo: mostra o modo; no modo Steam os atalhos de menu/area de trabalho so podem ser removidos.
+[FEITO] Aba Runtimes (ui_runtimes.py): cartoes Proton (Proton da Steam + GE-Proton, Proton em lote, baixar GE,
+  remover), umu-run + Steam Runtime, MangoHud, OptiScaler (OptiScaler em lote, atualizar, remover), Ferramentas do
+  sistema (so leitura). No SteamOS GE-Proton/umu/MangoHud acinzentados com o motivo; com Steam, nota "so para jogos
+  no modo Autonomo". "Atualizar tudo em uso" so mexe no que ja esta instalado. RuntimeUpdateWorker por componente;
+  "Remover..." de cada cartao lista so aquele componente. Saiu o RuntimePreflightWorker (pergunta "opcional").
+  Proton/OptiScaler em lote sairam da Biblioteca; runtimes sairam da Manutencao (fica app, disco e limpeza).
+[FEITO] Limpeza de codigo sem uso: AddToSteamWorker, RuntimePreflightWorker, _optional_install_default,
+  cleanup.collect_active_proton_tools, save_sync._read_sync_base e load_ludusavi_manifest (o indice continua via
+  find_manifest_game_entry), steam_vdf.adopt_installer_prefix (o prefixo do instalador ja e descartado),
+  save_sync_dialog.ludusavi_backup_for, AdoptCandidate.saves_hints (calculado e nunca lido: I/O a toa),
+  estilos HubBtn/BackBtn/SteamInfoBanner e 20 chaves de traducao. Checado com vulture (venv temporario), checagem de
+  chaves sem uso e de seletores QSS orfaos.
+NAO TESTADO A MAO: tudo acima so por testes automaticos e capturas offscreen (Ubuntu 26.04). SteamOS real, Steam
+  real com o fluxo novo de instalacao no modo Steam, e Adotar no SteamOS nao foram exercitados.
+Sobras: campo "mode" no manifesto e troca de modo sem residuo (Fase 5); dividir ui.py (4,3 mil linhas).

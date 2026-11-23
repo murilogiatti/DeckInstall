@@ -21,12 +21,3 @@ def test_english_needs_no_translator() -> None:
     app = QApplication.instance() or QApplication([])
     assert isinstance(app, QApplication)
     assert _install_qt_translator(app, "en") is False
-
-
-def test_optional_install_default_button() -> None:
-    from PySide6.QtWidgets import QMessageBox
-
-    from deckinstall.ui import _optional_install_default
-
-    assert _optional_install_default(True) == QMessageBox.StandardButton.No
-    assert _optional_install_default(False) == QMessageBox.StandardButton.Yes

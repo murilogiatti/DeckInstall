@@ -501,35 +501,6 @@ class DirStatsWorker(QThread):
         self.ready.emit(count, size_b)
 
 
-class RuntimePreflightWorker(QThread):
-    """Check whether SteamOS optional runtime confirmation is needed."""
-
-    ready = Signal(bool)
-    failed = Signal(str)
-
-    def __init__(
-        self,
-        *,
-        find_steam_root_fn: Callable[[], Path | None] | None = None,
-    ) -> None:
-        super().__init__()
-        self._find_steam_root = find_steam_root_fn or find_steam_root
-
-    def run(self) -> None:
-        try:
-            steam_root = self._find_steam_root()
-            has_steam_proton = (
-                steam_root is not None and find_proton_binary(steam_root) is not None
-            )
-            needs_confirm = has_steam_proton and (
-                not get_umu_run_path().is_file() or not list_ge_proton11_dirs()
-            )
-        except Exception as exc:
-            self.failed.emit(_format_worker_error(exc))
-            return
-        self.ready.emit(needs_confirm)
-
-
 class ExtImportSavesWorker(QThread):
     """Import saves from an external launcher prefix into a Steam or Standalone prefix."""
 

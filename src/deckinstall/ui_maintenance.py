@@ -37,6 +37,7 @@ from .ui_cards import (
     _SortableTableItem,
     format_size_bytes,
 )
+from .ui_runtimes import show_runtime_health
 from .ui_workers_maint import (
     MaintBackupWorker,
     MaintDeleteWorker,
@@ -84,32 +85,17 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     health_layout.addLayout(health_top)
 
     win.lbl_maint_app = QLabel()
-    win.lbl_maint_umu = QLabel()
-    win.lbl_maint_proton = QLabel()
-    win.lbl_maint_steamrt4 = QLabel()
-    win.lbl_maint_mangohud = QLabel()
     win.lbl_maint_disk = QLabel()
-    for lbl in (
-        win.lbl_maint_app,
-        win.lbl_maint_umu,
-        win.lbl_maint_proton,
-        win.lbl_maint_steamrt4,
-        win.lbl_maint_mangohud,
-        win.lbl_maint_disk,
-    ):
+    for lbl in (win.lbl_maint_app, win.lbl_maint_disk):
         lbl.setWordWrap(True)
         health_layout.addWidget(lbl)
+    hint = QLabel(tr("maint.runtimes_moved"))
+    hint.setObjectName("MutedText")
+    hint.setWordWrap(True)
+    health_layout.addWidget(hint)
     health_actions = FlowLayout(spacing=8)
-    win.btn_update_runtimes = QPushButton(tr("runtime.btn_update"))
-    win.btn_update_runtimes.setToolTip(tr("runtime.tooltip"))
-    win.btn_update_runtimes.clicked.connect(win._update_runtimes)
-    win.btn_uninstall_runtimes = QPushButton(tr("runtime.btn_uninstall"))
-    win.btn_uninstall_runtimes.setToolTip(tr("runtime.uninstall_tip"))
-    win.btn_uninstall_runtimes.clicked.connect(lambda: open_uninstall_runtimes_dialog(win))
     win.btn_app_update = QPushButton(tr("app_update.btn"))
     win.btn_app_update.clicked.connect(win._check_and_update_app)
-    health_actions.addWidget(win.btn_update_runtimes)
-    health_actions.addWidget(win.btn_uninstall_runtimes)
     health_actions.addWidget(win.btn_app_update)
     health_layout.addLayout(health_actions)
     layout.addWidget(health_card)
@@ -226,6 +212,7 @@ def refresh_maintenance_health(win: MainWindow) -> None:
             tr("maint.health_steamrt4", status=data["rt4_status"])
         )
         win.lbl_maint_mangohud.setText(tr("maint.health_mangohud", status=data.get("mangohud_status", "-")))
+        show_runtime_health(win, data)
         win.lbl_maint_disk.setText(
             tr(
                 "maint.health_disk",
@@ -624,8 +611,11 @@ def show_maint_context_menu(win: MainWindow, pos: QPoint) -> None:
         worker.start()
 
 
-def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
-    """Check the runtimes to remove (one, some or all); sizes and Proton users are shown."""
+def open_uninstall_runtimes_dialog(win: MainWindow, kinds: set[str] | None = None) -> None:
+    """Check the runtimes to remove (one, some or all); sizes and Proton users are shown.
+
+    kinds: only list these runtime kinds (a Runtimes card's "Remove"); None lists everything.
+    """
     from .runtime_uninstall import GE, RuntimeItem, affected_steam_appids, list_runtimes, uninstall
     from .steam_paths import _read_compat_tool_id
     from .steam_vdf import bulk_migrate_compat_tool
@@ -643,6 +633,8 @@ def open_uninstall_runtimes_dialog(win: MainWindow) -> None:
         win._end_busy()
         win.status_label.setText(tr("status.ready"))
         items = [i for i in res if isinstance(i, RuntimeItem)] if isinstance(res, list) else []
+        if kinds is not None:
+            items = [i for i in items if i.kind in kinds]
         if win._closing_pending:
             return
         if not items:

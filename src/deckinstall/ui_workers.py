@@ -33,7 +33,6 @@ from .extractor import (
 from .i18n import tr
 from .library import Library
 from .runtime_manager import (
-    _has_optiscaler_dll,
     _load_versions,
     check_runtime_updates,
     check_ubuntu_bwrap_userns,
@@ -41,7 +40,6 @@ from .runtime_manager import (
     ensure_mangohud,
     ensure_optiscaler,
     ensure_umu_run,
-    get_optiscaler_dir,
     mangohud_versions,
     run_exe_in_prefix,
     run_winetricks_verbs,
@@ -300,16 +298,23 @@ class ScanWorker(QThread):
 
 
 
+RUNTIME_COMPONENTS = ("umu", "ge_proton", "mangohud", "optiscaler")
+
+
 class RuntimeUpdateWorker(QThread):
-    """Background worker to check and update umu-run, GE-Proton11+, OptiScaler and the official MangoHud."""
+    """Install or update the Standalone-mode runtimes, one component or several.
+
+    components: any of RUNTIME_COMPONENTS (default: all). "umu" also refreshes the umu-database.
+    """
 
     status = Signal(str)
     finished_ok = Signal(str, str)
     failed = Signal(str)
 
-    def __init__(self, paths: SteamPaths | None = None) -> None:
+    def __init__(self, paths: SteamPaths | None = None, components: tuple[str, ...] | None = None) -> None:
         super().__init__()
         self.paths = paths
+        self.components = tuple(components) if components else RUNTIME_COMPONENTS
 
     def _after_ge_update(self, previous: str) -> str:
         """Move "Default" games to the new GE-Proton and keep only the current + previous versions."""
@@ -334,8 +339,8 @@ class RuntimeUpdateWorker(QThread):
         return msg
 
     def _update_mangohud(self) -> str:
-        """Official MangoHud: installed when missing (as on SteamOS, it is always there), updated when
-        GitHub has a newer one. "+" in front when something changed; a failure never stops the rest."""
+        """Official MangoHud: installed when missing (unless the system has one), updated when GitHub
+        has a newer one. "+" in front when something changed; a failure never stops the rest."""
         try:
             if not _rm.official_mangohud_installed() and _rm.system_mangohud_installed():
                 return tr("maint.mangohud_system")
@@ -348,82 +353,68 @@ class RuntimeUpdateWorker(QThread):
             logging.warning("MangoHud update failed: %s", exc)
             return tr("runtime.mangohud_failed", err=str(exc))
 
+    def _update_umu(self, info: dict[str, Any]) -> str:
+        """umu-run (portable, upstream) and the umu-database; "+" when it changed."""
+        umu_info = info.get("umu", {})
+        changed = bool(umu_info.get("update_available")) or not umu_info.get("installed")
+        if changed or not umu_info.get("installed_path"):
+            umu_path = ensure_umu_run(
+                force_update=bool(umu_info.get("update_available")),
+                progress_cb=lambda msg, _pct: self.status.emit(msg),
+            )
+        else:
+            umu_path = Path(str(umu_info["installed_path"]))
+        self.status.emit(tr("runtime.umu_db_updating"))
+        if _rm.ensure_umu_database(force_update=True) is None:
+            logging.warning("umu-database.csv could not be downloaded")
+        return ("+" if changed else "") + f"umu-run ({umu_path.name})"
+
+    def _update_ge(self, info: dict[str, Any]) -> str:
+        """Newest GE-Proton, then move "Default" games to it and prune old versions."""
+        from .proton_policy import newest_ge_proton
+
+        before = newest_ge_proton()
+        ge_info = info.get("ge_proton", {})
+        changed = bool(ge_info.get("update_available")) or not ge_info.get("installed")
+        if changed or not ge_info.get("installed_path"):
+            ge_path = ensure_ge_proton11(
+                force_update=bool(ge_info.get("update_available")),
+                progress_cb=lambda msg, _pct: self.status.emit(msg),
+            )
+        else:
+            ge_path = Path(str(ge_info["installed_path"]))
+        text = ("+" if changed else "") + ge_path.name
+        policy_msg = self._after_ge_update(before.name if before is not None else "")
+        return f"{text} | {policy_msg}" if policy_msg else text
+
+    def _update_optiscaler(self) -> str:
+        old = str(_load_versions().get("optiscaler_installed_version") or "").strip()
+        try:
+            ensure_optiscaler(check_update=True, progress_cb=lambda msg, _pct: self.status.emit(msg))
+        except Exception as exc:
+            logging.warning("OptiScaler update failed: %s", exc)
+            return tr("runtime.optiscaler_failed", err=str(exc))
+        new = str(_load_versions().get("optiscaler_installed_version") or "").strip()
+        return ("+" if new and new != old else "") + f"OptiScaler {new or '-'}"
+
     def run(self) -> None:
         try:
             self.status.emit(tr("runtime.checking"))
-            from .proton_policy import newest_ge_proton
-
-            before = newest_ge_proton()
-            previous_ge = before.name if before is not None else ""
-            info = check_runtime_updates(force=True)
-            umu_info = info.get("umu", {})
-            ge_info = info.get("ge_proton", {})
-            umu_needs_update = bool(umu_info.get("update_available")) or not umu_info.get("installed")
-            ge_needs_update = bool(ge_info.get("update_available")) or not ge_info.get("installed")
-            any_updated = umu_needs_update or ge_needs_update
-
-            if umu_needs_update:
-                umu_path = ensure_umu_run(
-                    force_update=bool(umu_info.get("update_available")),
-                    progress_cb=lambda msg, _pct: self.status.emit(msg),
-                )
-            else:
-                umu_path = Path(str(umu_info["installed_path"])) if umu_info.get("installed_path") else ensure_umu_run(
-                    force_update=False,
-                    progress_cb=lambda msg, _pct: self.status.emit(msg),
-                )
-
-            if ge_needs_update:
-                ge_path = ensure_ge_proton11(
-                    force_update=bool(ge_info.get("update_available")),
-                    progress_cb=lambda msg, _pct: self.status.emit(msg),
-                )
-            else:
-                ge_path = Path(str(ge_info["installed_path"])) if ge_info.get("installed_path") else ensure_ge_proton11(
-                    force_update=False,
-                    progress_cb=lambda msg, _pct: self.status.emit(msg),
-                )
-
-            policy_msg = self._after_ge_update(previous_ge)
-
-            opti_ver = ""
-            opti_err = ""
-            if _has_optiscaler_dll(get_optiscaler_dir()):
-                old_opti_ver = str(_load_versions().get("optiscaler_installed_version") or "").strip()
-                try:
-                    ensure_optiscaler(
-                        check_update=True,
-                        progress_cb=lambda msg, _pct: self.status.emit(msg),
-                    )
-                    opti_ver = str(_load_versions().get("optiscaler_installed_version") or "").strip()
-                    if opti_ver and opti_ver != old_opti_ver:
-                        any_updated = True
-                except Exception as exc:
-                    logging.warning("OptiScaler update failed: %s", exc)
-                    opti_err = tr("runtime.optiscaler_failed", err=str(exc))
-
-            mh_msg = self._update_mangohud()
-            if mh_msg.startswith("+"):
-                any_updated = True
-                mh_msg = mh_msg[1:]
-
-            self.status.emit(tr("runtime.umu_db_updating"))
-            if _rm.ensure_umu_database(force_update=True) is None:
-                logging.warning("umu-database.csv could not be downloaded")
-            bwrap_warn = check_ubuntu_bwrap_userns() or ""
-            msg = (
-                tr("runtime.updated", umu=umu_path.name, proton=ge_path.name)
-                if any_updated
-                else tr("runtime.up_to_date", umu=umu_path.name, proton=ge_path.name)
-            )
-            if opti_ver:
-                msg = f"{msg} | OptiScaler {opti_ver}"
-            if opti_err:
-                msg = f"{msg} | {opti_err}"
-            if mh_msg:
-                msg = f"{msg} | {mh_msg}"
-            if policy_msg:
-                msg = f"{msg} | {policy_msg}"
+            comps = self.components
+            info = check_runtime_updates(force=True) if ("umu" in comps or "ge_proton" in comps) else {}
+            parts: list[str] = []
+            if "umu" in comps:
+                parts.append(self._update_umu(info))
+            if "ge_proton" in comps:
+                parts.append(self._update_ge(info))
+            if "optiscaler" in comps:
+                parts.append(self._update_optiscaler())
+            if "mangohud" in comps:
+                parts.append(self._update_mangohud())
+            any_updated = any(p.startswith("+") for p in parts)
+            listed = " | ".join(p.lstrip("+") for p in parts if p)
+            bwrap_warn = (check_ubuntu_bwrap_userns() or "") if "umu" in comps else ""
+            msg = tr("runtime.updated", items=listed) if any_updated else tr("runtime.up_to_date", items=listed)
             self.finished_ok.emit(msg, bwrap_warn)
         except Exception as exc:
             self.failed.emit(_format_worker_error(exc))
@@ -651,7 +642,6 @@ from .ui_workers_library import (  # noqa: E402, F401
     LaunchPrepWorker,
     RemoveShortcutWorker,
     RestoreWorker,
-    RuntimePreflightWorker,
     ShortcutsRefreshWorker,
     SteamDetectWorker,
     SteamRunningWorker,

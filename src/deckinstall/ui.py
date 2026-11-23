@@ -101,6 +101,8 @@ from .runtime_manager import (
     get_umu_run_path,
     is_win32_prefix,
     list_ge_proton11_dirs,
+    official_mangohud_installed,
+    optiscaler_downloaded,
 )
 from .save_sync import auto_snapshot
 from .scanner import (
@@ -192,6 +194,7 @@ from .ui_maintenance import (
     build_maintenance_page,
     refresh_maintenance_health,
 )
+from .ui_runtimes import apply_runtimes_mode, build_runtimes_page
 from .ui_workers import (  # noqa: F401
     AppUpdateCheckWorker,
     AppUpdateDownloadWorker,
@@ -204,7 +207,6 @@ from .ui_workers import (  # noqa: F401
     PreviewWorker,
     RemoveShortcutWorker,
     RestoreWorker,
-    RuntimePreflightWorker,
     RuntimeUpdateWorker,
     ScanWorker,
     ShortcutsRefreshWorker,
@@ -276,9 +278,9 @@ def _setting_int(settings: QSettings, key: str, default: int = 0) -> int:
     return default
 
 
-PAGE_INSTALL, PAGE_LIBRARY, PAGE_SAVES, PAGE_MAINT = range(4)
+PAGE_INSTALL, PAGE_LIBRARY, PAGE_SAVES, PAGE_MAINT, PAGE_RUNTIMES = range(5)
 # Order of the tabs on top of the window (Library first); each maps to a page of the stack.
-NAV_PAGES = (PAGE_LIBRARY, PAGE_INSTALL, PAGE_SAVES, PAGE_MAINT)
+NAV_PAGES = (PAGE_LIBRARY, PAGE_INSTALL, PAGE_RUNTIMES, PAGE_SAVES, PAGE_MAINT)
 
 
 class MainWindow(QMainWindow):
@@ -307,6 +309,18 @@ class MainWindow(QMainWindow):
     btn_update_runtimes: QPushButton
     btn_uninstall_runtimes: QPushButton
     btn_app_update: QPushButton
+    # Runtimes tab (ui_runtimes.py)
+    btn_rt_refresh: QPushButton
+    btn_rt_ge_update: QPushButton
+    btn_rt_umu_update: QPushButton
+    btn_rt_mangohud_update: QPushButton
+    btn_rt_optiscaler_update: QPushButton
+    lbl_rt_steam_proton: QLabel
+    lbl_rt_optiscaler: QLabel
+    lbl_rt_tools: QLabel
+    lbl_rt_proton_note: QLabel
+    lbl_rt_umu_note: QLabel
+    lbl_rt_mangohud_note: QLabel
     # Backup/Sync page (ui_dialogs/save_sync_dialog.py)
     saves_list: QTableWidget
     lbl_saves_empty: QLabel
@@ -549,7 +563,7 @@ class MainWindow(QMainWindow):
         self.nav_tabs.setObjectName("NavTabs")
         self.nav_tabs.setExpanding(False)
         self.nav_tabs.setDrawBase(False)
-        for label in (tr("nav.library"), tr("nav.install"), tr("nav.saves"), tr("nav.maintenance")):
+        for label in (tr("nav.library"), tr("nav.install"), tr("nav.runtimes"), tr("nav.saves"), tr("nav.maintenance")):
             self.nav_tabs.addTab(label)
         right_layout.addWidget(self.nav_tabs)
 
@@ -557,7 +571,9 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(_wrap_scroll(self._build_extract_page()))  # PAGE_INSTALL
         self.stack.addWidget(_wrap_scroll(self._build_library_page()))  # PAGE_LIBRARY
         self.stack.addWidget(_wrap_scroll(self._build_saves_page()))  # PAGE_SAVES
+        runtimes_page = _wrap_scroll(build_runtimes_page(self))  # its labels are filled by the health check
         self.stack.addWidget(_wrap_scroll(self._build_maintenance_page()))  # PAGE_MAINT
+        self.stack.addWidget(runtimes_page)  # PAGE_RUNTIMES
         self.stack.setCurrentIndex(PAGE_LIBRARY)  # always open on the Library (no jump after the scan)
         self.nav_tabs.setCurrentIndex(NAV_PAGES.index(PAGE_LIBRARY))
         self.nav_tabs.currentChanged.connect(lambda tab: self.stack.setCurrentIndex(NAV_PAGES[tab]))
@@ -634,7 +650,7 @@ class MainWindow(QMainWindow):
         """Refresh Saves list or Maintenance metrics when their page opens."""
         if idx == PAGE_SAVES:
             self._refresh_saves_list()
-        elif idx == PAGE_MAINT:
+        elif idx in (PAGE_MAINT, PAGE_RUNTIMES):
             refresh_maintenance_health(self)
 
     def _format_steam_status_text(self) -> str:
@@ -703,6 +719,7 @@ class MainWindow(QMainWindow):
         """Adapt Add/Extract/Library/Maintenance controls for Steam vs Standalone-only mode."""
         has_steam = self.paths is not None
         self._apply_install_mode_ui(follow_default=True)
+        apply_runtimes_mode(self)
         if hasattr(self, "btn_maint_revalidate"):
             self.btn_maint_revalidate.setEnabled(has_steam)
         self._update_steam_status_style()
@@ -900,6 +917,32 @@ class MainWindow(QMainWindow):
         self.chk_keep_in_place.setChecked(False)
         form.addRow("", self.chk_keep_in_place)
 
+        # Who runs the game: Steam (Steam mode) or DeckInstall itself (Standalone mode).
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(8)
+        self.btn_mode_steam = shortcut_target_button(tr("mode.steam"))
+        self.btn_mode_standalone = shortcut_target_button(tr("mode.standalone"))
+        self._install_mode_group = QButtonGroup(self)
+        self._install_mode_group.setExclusive(True)
+        for button in (self.btn_mode_steam, self.btn_mode_standalone):
+            self._install_mode_group.addButton(button)
+            mode_row.addWidget(button)
+            button.toggled.connect(lambda _checked: self._apply_install_mode_ui())
+            button.clicked.connect(self._on_install_mode_clicked)
+        self._install_mode_chosen = False  # until the user picks one, follow the system's default
+        self._standalone_launchers: tuple[bool, ...] = (True, False)  # menu, desktop
+        mode_row.addStretch()
+        self.lbl_mode_note = QLabel()
+        self.lbl_mode_note.setObjectName("MutedText")
+        self.lbl_mode_note.setWordWrap(True)
+        mode_box = QWidget()
+        mode_col = QVBoxLayout(mode_box)
+        mode_col.setContentsMargins(0, 0, 0, 0)
+        mode_col.setSpacing(4)
+        mode_col.addLayout(mode_row)
+        mode_col.addWidget(self.lbl_mode_note)
+        form.addRow(tr("mode.label"), mode_box)
+
         self._add_launch_options = ""
         self._add_winedlloverrides = ""
         # One presets dialog for everything; the form only shows what is on.
@@ -914,35 +957,25 @@ class MainWindow(QMainWindow):
         launch_row.addWidget(self.lbl_add_presets, 1)
         form.addRow(tr("add.presets_label"), launch_row)
 
-        # Who runs the game: Steam (Steam mode) or DeckInstall itself (Standalone mode).
-        mode_row = FlowLayout(spacing=8)
-        self.btn_mode_steam = shortcut_target_button(tr("mode.steam"))
-        self.btn_mode_standalone = shortcut_target_button(tr("mode.standalone"))
-        self._install_mode_group = QButtonGroup(self)
-        self._install_mode_group.setExclusive(True)
-        for button in (self.btn_mode_steam, self.btn_mode_standalone):
-            self._install_mode_group.addButton(button)
-            mode_row.addWidget(button)
-            button.toggled.connect(lambda _checked: self._apply_install_mode_ui())
-            button.clicked.connect(self._on_install_mode_clicked)
-        self._install_mode_chosen = False  # until the user picks one, follow the system's default
-        form.addRow(tr("mode.label"), mode_row)
-        self.lbl_mode_note = QLabel()
-        self.lbl_mode_note.setObjectName("MutedText")
-        self.lbl_mode_note.setWordWrap(True)
-        form.addRow("", self.lbl_mode_note)
-
         # Standalone mode: where to find the game besides the Library.
         targets_row = FlowLayout(spacing=8)
         self.btn_shortcut_menu = shortcut_target_button(tr("add.shortcut_menu"), selected=True)
         self.btn_shortcut_desktop = shortcut_target_button(tr("add.shortcut_desktop"))
-        for button in (self.btn_shortcut_menu, self.btn_shortcut_desktop):
+        # Shows where a Steam-mode game goes; follows the mode, never clicked on its own.
+        self.btn_shortcut_steam = shortcut_target_button(tr("add.shortcut_steam"))
+        self.btn_shortcut_steam.setEnabled(False)
+        for button in (self.btn_shortcut_steam, self.btn_shortcut_menu, self.btn_shortcut_desktop):
             targets_row.addWidget(button)
-        form.addRow(tr("add.shortcuts_label"), targets_row)
         self.lbl_shortcuts_note = QLabel()
         self.lbl_shortcuts_note.setObjectName("MutedText")
         self.lbl_shortcuts_note.setWordWrap(True)
-        form.addRow("", self.lbl_shortcuts_note)
+        targets_box = QWidget()
+        targets_col = QVBoxLayout(targets_box)
+        targets_col.setContentsMargins(0, 0, 0, 0)
+        targets_col.setSpacing(4)
+        targets_col.addLayout(targets_row)
+        targets_col.addWidget(self.lbl_shortcuts_note)
+        form.addRow(tr("add.shortcuts_label"), targets_box)
         # Steam mode: Steam closes to write the shortcut.
         self.chk_restart = QCheckBox(tr("add.reopen_steam"))
         self.chk_restart.setChecked(True)
@@ -1115,9 +1148,19 @@ class MainWindow(QMainWindow):
         lines = [tr("mode.desc_steam") if mode == STEAM else tr("mode.desc_standalone")]
         lines += [env.mode_note(m) for m in (STEAM, STANDALONE) if env.mode_note(m)]
         self.lbl_mode_note.setText("\n".join(lines))
-        shortcuts_note = feature_note("app_shortcuts", mode)
-        for button in (self.btn_shortcut_menu, self.btn_shortcut_desktop):
-            button.setEnabled(not shortcuts_note)
+        shortcuts_note = feature_note("app_shortcuts", mode) or tr("mode.note_steam_shortcut_standalone")
+        launchers = (self.btn_shortcut_menu, self.btn_shortcut_desktop)
+        if mode == STEAM and self.btn_shortcut_menu.isEnabled():
+            # Leaving Standalone: remember its launcher choice and show them off (Steam mode has none).
+            self._standalone_launchers = tuple(b.isChecked() for b in launchers)
+            for button in launchers:
+                button.setChecked(False)
+        elif mode == STANDALONE and not self.btn_shortcut_menu.isEnabled():
+            for button, was_on in zip(launchers, self._standalone_launchers, strict=True):
+                button.setChecked(was_on)
+        for button in launchers:
+            button.setEnabled(mode == STANDALONE)
+        self.btn_shortcut_steam.setChecked(mode == STEAM)  # always disabled: the mode decides it
         self.lbl_shortcuts_note.setText(shortcuts_note)
         self.lbl_shortcuts_note.setVisible(bool(shortcuts_note))
         self.chk_restart.setEnabled(mode == STEAM)
@@ -1333,11 +1376,7 @@ class MainWindow(QMainWindow):
         batch_lbl.setObjectName("MutedText")
         lib_layout.addWidget(batch_lbl)
         batch_flow = FlowLayout(spacing=8)
-        for batch_btn in (
-            self.btn_bulk_optiscaler,
-            self.btn_bulk_proton,
-            self.btn_migrate_legacy,
-        ):
+        for batch_btn in (self.btn_migrate_legacy,):
             batch_flow.addWidget(batch_btn)
         lib_layout.addLayout(batch_flow)
         my_lib_layout.addWidget(lib_card, 1)
@@ -1464,67 +1503,56 @@ class MainWindow(QMainWindow):
                 on_error=_on_fix_err,
             )
 
-    def _update_runtimes(self) -> None:
+    def _runtime_components_for_update_all(self) -> tuple[str, ...]:
+        """What "Update all" touches: what is already installed, plus umu-run and GE-Proton when only
+        Standalone mode exists. Never what the system does not use (SteamOS)."""
+        env = self.mode_env
+        wanted: list[str] = []
+        if get_umu_run_path().is_file() or not env.steam:
+            wanted.append("umu")
+        if list_ge_proton11_dirs() or not env.steam:
+            wanted.append("ge_proton")
+        if official_mangohud_installed():
+            wanted.append("mangohud")
+        if optiscaler_downloaded():
+            wanted.append("optiscaler")
+        return tuple(c for c in wanted if not env.component_note(c))
+
+    def _update_runtimes(self, components: tuple[str, ...] | None = None) -> None:
+        """Install/update one runtime component (a Runtimes card) or everything in use ("Update all")."""
         if self._steam_busy:
+            return
+        comps = components if components is not None else self._runtime_components_for_update_all()
+        if not comps:
+            QMessageBox.information(_dialog_parent(self), __app_name__, tr("runtimes.nothing_to_update"))
             return
         self._begin_busy()
         self.status_label.setText(tr("runtime.checking"))
+        worker = RuntimeUpdateWorker(self.paths, comps)
+        self._track_worker(worker)
+        worker.status.connect(self.status_label.setText)
 
-        def _on_preflight(needs_confirm: bool) -> None:
+        def _ok(msg: str, bwrap_warn: str) -> None:
+            self._end_busy()
+            self.status_label.setText(msg)
             if self._closing_pending:
-                self._end_busy()
                 return
-            if needs_confirm:
-                # Steam already installed -> installing the extras is optional: "No" is the default.
-                steam_ok = self.paths is not None or self._steam_root_found
-                ans = QMessageBox.question(
-                    _dialog_parent(self),
-                    __app_name__,
-                    tr("runtime.confirm_optional_steamos"),
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    _optional_install_default(steam_ok),
-                )
-                if ans != QMessageBox.StandardButton.Yes:
-                    self._end_busy()
-                    self.status_label.setText(tr("status.ready"))
-                    return
+            self._refresh_maintenance_health()
+            self._refresh_shortcuts()
+            if bwrap_warn:
+                self._show_bwrap_warning_dialog(bwrap_warn)
+            QMessageBox.information(_dialog_parent(self), __app_name__, msg)
 
-            worker = RuntimeUpdateWorker(self.paths)
-            self._track_worker(worker)
-            worker.status.connect(self.status_label.setText)
+        def _err(err: str) -> None:
+            self._end_busy()
+            msg = tr("runtime.error", err=err)
+            self.status_label.setText(msg)
+            if not self._closing_pending:
+                QMessageBox.critical(_dialog_parent(self), __app_name__, msg)
 
-            def _ok(msg: str, bwrap_warn: str) -> None:
-                self._end_busy()
-                self.status_label.setText(msg)
-                if self._closing_pending:
-                    return
-                self._refresh_maintenance_health()
-                self._refresh_shortcuts()
-                if bwrap_warn:
-                    self._show_bwrap_warning_dialog(bwrap_warn)
-                QMessageBox.information(_dialog_parent(self), __app_name__, msg)
-
-            def _err(err: str) -> None:
-                self._end_busy()
-                msg = tr("runtime.error", err=err)
-                self.status_label.setText(msg)
-                if not self._closing_pending:
-                    QMessageBox.critical(_dialog_parent(self), __app_name__, msg)
-
-            worker.finished_ok.connect(_ok)
-            worker.failed.connect(_err)
-            worker.start()
-
-        preflight = RuntimePreflightWorker(find_steam_root_fn=find_steam_root)
-        self._track_worker(preflight)
-        preflight.ready.connect(_on_preflight)
-
-        def _preflight_failed(err: str) -> None:
-            logging.warning("Runtime preflight failed: %s", err)
-            _on_preflight(True)
-
-        preflight.failed.connect(_preflight_failed)
-        preflight.start()
+        worker.finished_ok.connect(_ok)
+        worker.failed.connect(_err)
+        worker.start()
 
     def _check_and_update_app(self) -> None:
         if self._steam_busy:
@@ -2340,7 +2368,7 @@ class MainWindow(QMainWindow):
             inside_games_dir = False
 
         def _start_install(final_keep_in_place: bool, final_single_exe_only: bool) -> None:
-            steam_only = (steam_target is not None) and not create_menu and not create_desktop
+            steam_only = mode == STEAM  # Steam runs it: no umu-run / GE-Proton download
             if (
                 not steam_only
                 and not is_native_linux_exe(exe_path)
@@ -2350,12 +2378,13 @@ class MainWindow(QMainWindow):
                     or not list_ge_proton11_dirs()
                 )
             ):
+                # Standalone chosen while Steam exists: say what it downloads before doing it.
                 ans = QMessageBox.question(
                     _dialog_parent(self),
                     __app_name__,
-                    tr("add.confirm_runtime_steamos"),
+                    tr("add.confirm_standalone_runtime"),
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    _optional_install_default(True),
+                    QMessageBox.StandardButton.Yes,
                 )
                 if ans != QMessageBox.StandardButton.Yes:
                     return
@@ -4288,11 +4317,6 @@ class MainWindow(QMainWindow):
         if ans != QMessageBox.StandardButton.Yes:
             return
         self._remove_steam_shortcut_async(entry)
-
-
-def _optional_install_default(steam_installed: bool) -> QMessageBox.StandardButton:
-    """Default answer for "install the extra runtimes?": optional when Steam exists, so No."""
-    return QMessageBox.StandardButton.No if steam_installed else QMessageBox.StandardButton.Yes
 
 
 _qt_translators: list[QTranslator] = []
