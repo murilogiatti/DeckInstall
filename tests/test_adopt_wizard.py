@@ -277,8 +277,7 @@ def test_main_window_has_one_adopt_entry(app: QApplication, tmp_path: Path) -> N
             ):
                 win.paths = mock.Mock()
                 win._update_steam_mode_ui()
-                assert not win.btn_shortcut_steam.isHidden() and win.btn_shortcut_steam.isCheckable()
-                assert not win.btn_shortcut_steam.isChecked()
+                assert win.btn_mode_steam.isEnabled() and win.btn_mode_steam.isChecked()  # Steam is the default
                 win._vdf_corrupt = False
                 win._open_adopt_wizard()
             assert seen["writable"] is False and seen["note"] == tr("adopt.steam_running_note")

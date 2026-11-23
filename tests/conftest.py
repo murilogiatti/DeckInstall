@@ -16,6 +16,7 @@ from deckinstall import (  # noqa: E402
     external_actions,
     i18n,
     library,
+    modes,
     play_monitor,
     runtime_manager,
     save_sources,
@@ -91,6 +92,8 @@ def _isolated_libraries(tmp_path_factory: pytest.TempPathFactory, monkeypatch: p
         "XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP", "XDG_SESSION_TYPE", "DESKTOP_SESSION",
     ):
         monkeypatch.delenv(variable, raising=False)
+    # The host's /etc/os-release (SteamOS or not) must not change which modes the app offers.
+    monkeypatch.setattr(modes, "_OS_RELEASE", base / "os-release")
     proc_root = base / "proc"
     proc_root.mkdir()
     monkeypatch.setattr(steam_paths, "_PROC_ROOT", proc_root)

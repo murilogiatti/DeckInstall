@@ -145,9 +145,9 @@ class InstallButtonTests(unittest.TestCase):
             win = ui.MainWindow(app)
             try:
                 win.chk_keep_in_place.setChecked(True)
-                self.assertEqual(win.btn_add_standalone.text(), tr("install.btn_add_standalone_in_place"))
+                self.assertEqual(win.btn_install.text(), tr("install.btn_install_in_place"))
                 win.chk_keep_in_place.setChecked(False)
-                self.assertEqual(win.btn_add_standalone.text(), tr("install.btn_add_standalone"))
+                self.assertEqual(win.btn_install.text(), tr("install.btn_install"))
             finally:
                 for worker in list(win._active_workers):
                     worker.wait(5000)
@@ -588,7 +588,10 @@ class UiUxSimplificationTests(unittest.TestCase):
                     self.assertTrue(win.btn_shortcut_menu.isCheckable())
                     self.assertTrue(win.btn_shortcut_menu.isChecked())
                     self.assertTrue(win.btn_shortcut_desktop.isCheckable())
-                    self.assertTrue(win.btn_shortcut_steam.isHidden())
+                    # No Steam: only Standalone mode, and the Steam mode button says why.
+                    self.assertFalse(win.btn_mode_steam.isEnabled())
+                    self.assertTrue(win.btn_mode_standalone.isChecked())
+                    self.assertTrue(win.btn_mode_steam.toolTip())
 
                     win._set_extract_source(str(zip_file))
                     for worker in list(win._active_workers):

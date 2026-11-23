@@ -1444,7 +1444,7 @@ class CoreTests(unittest.TestCase):
             self.assertIn("GITHUB_REF_NAME", wf_text)
             self.assertIn("format('v{0}', steps.meta.outputs.version)", wf_text)
             try:
-                from PySide6.QtWidgets import QApplication
+                from PySide6.QtWidgets import QApplication, QMessageBox
             except ImportError:
                 pass
             else:
@@ -1474,7 +1474,10 @@ class CoreTests(unittest.TestCase):
                         app.processEvents()
                         self.assertTrue(win._vdf_corrupt)
                         self.assertFalse(win.vdf_error_banner.isHidden())
-                        self.assertFalse(win.btn_add_steam.isEnabled())
+                        with mock.patch.object(QMessageBox, "critical") as crit:
+                            win.btn_mode_steam.setChecked(True)
+                            win._install_selected()  # Steam mode refuses while shortcuts.vdf is unreadable
+                        crit.assert_called_once()
                         self.assertTrue(win.btn_reload.isEnabled())
                         win.steam_search_input.setText("0")
                         win._search_steam_art()

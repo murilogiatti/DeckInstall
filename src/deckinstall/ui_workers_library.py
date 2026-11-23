@@ -294,8 +294,13 @@ class LaunchPrepWorker(QThread):
     def run(self) -> None:
         try:
             from .launch_presets import parse_presets
+            from .modes import STANDALONE, mode_of_kind
 
-            wants_mangohud = parse_presets(str(getattr(self._obj, "launch_options", "") or ""))["mangohud"]
+            # Only Standalone games use MangoHud; Steam runs its own performance overlay.
+            wants_mangohud = (
+                mode_of_kind(self._kind) == STANDALONE
+                and parse_presets(str(getattr(self._obj, "launch_options", "") or ""))["mangohud"]
+            )
             if wants_mangohud and not official_mangohud_installed() and not system_mangohud_installed():
                 try:  # the overlay always comes from the official build when no system MangoHud exists
                     ensure_mangohud()

@@ -196,10 +196,6 @@ QLabel#UnavailableBanner {
     color: $warning_fg; background-color: $warning_bg; border: 1px solid $warning_fg;
     border-radius: 6px; padding: 8px;
 }
-QLabel#SteamInfoBanner {
-    color: $info_fg; background-color: $info_bg; border: 1px solid $info_fg;
-    border-radius: 6px; padding: 8px;
-}
 QFrame#VdfQueueBanner {
     background-color: $info_bg; border: 1px solid $info_fg; border-radius: 6px; padding: 6px;
 }

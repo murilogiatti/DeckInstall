@@ -93,6 +93,7 @@ from .migrate import (
     migrate_legacy_games,
     plan_migration,
 )
+from .modes import STANDALONE, STEAM, ModeEnv, feature_note, is_steamos
 from .play_monitor import ERROR, LOADING, RUNNING, PlayMonitor, process_start_epoch, stale_instance_pids, watch_paths
 from .runtime_manager import (
     detect_gpu_profile,
@@ -192,7 +193,6 @@ from .ui_maintenance import (
     refresh_maintenance_health,
 )
 from .ui_workers import (  # noqa: F401
-    AddToSteamWorker,
     AppUpdateCheckWorker,
     AppUpdateDownloadWorker,
     BackupWorker,
@@ -335,6 +335,7 @@ class MainWindow(QMainWindow):
         _install_qt_translator(app, set_language(str(self.settings.value("language", "auto"))))
         self.paths: SteamPaths | None = None
         self._steam_root_found = False
+        self._steamos = is_steamos()
         self._gpu_profile_cache: object | None = None
         self._detected_games: list[DetectedGame] = []
         self._standalone_games: list[StandaloneGame] = []
@@ -371,7 +372,6 @@ class MainWindow(QMainWindow):
         self._shortcuts_req_id = 0
         self._steam_detect_req_id = 0
         self._extract_worker: ExtractWorker | None = None
-        self._add_worker: AddToSteamWorker | None = None
         self._scan_worker: ScanWorker | None = None
         self._play = PlayMonitor(self)
         self._play.changed.connect(self._on_play_changed)
@@ -397,7 +397,6 @@ class MainWindow(QMainWindow):
             self._active_workers.discard(worker)
             for attr in (
                 "_extract_worker",
-                "_add_worker",
                 "_scan_worker",
             ):
                 if getattr(self, attr, None) is worker:
@@ -703,21 +702,7 @@ class MainWindow(QMainWindow):
     def _update_steam_mode_ui(self) -> None:
         """Adapt Add/Extract/Library/Maintenance controls for Steam vs Standalone-only mode."""
         has_steam = self.paths is not None
-        self.add_no_steam_banner.setVisible(not has_steam)
-        self.btn_add_steam.setVisible(has_steam)
-        self.btn_shortcut_steam.setVisible(has_steam)
-        if not has_steam:
-            self.btn_shortcut_steam.setChecked(False)
-        self.lbl_steam_opts_group.setVisible(has_steam)
-        self.chk_proton.setVisible(has_steam)
-        self.chk_restart.setVisible(has_steam)
-        self.btn_add_steam.setObjectName("primaryBtn" if has_steam else "")
-        self.btn_add_standalone.setObjectName("" if has_steam else "primaryBtn")
-        for btn in (self.btn_add_steam, self.btn_add_standalone):
-            btn.style().unpolish(btn)
-            btn.style().polish(btn)
-            btn.update()
-        self.btn_bulk_proton.setVisible(True)
+        self._apply_install_mode_ui(follow_default=True)
         if hasattr(self, "btn_maint_revalidate"):
             self.btn_maint_revalidate.setEnabled(has_steam)
         self._update_steam_status_style()
@@ -810,12 +795,6 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(12)
-
-        self.add_no_steam_banner = QLabel(tr("add.no_steam_banner"))
-        self.add_no_steam_banner.setWordWrap(True)
-        self.add_no_steam_banner.setObjectName("SteamInfoBanner")
-        self.add_no_steam_banner.setVisible(False)
-        layout.addWidget(self.add_no_steam_banner)
 
         list_card, list_layout = _make_card()
         scan_row = QHBoxLayout()
@@ -935,22 +914,36 @@ class MainWindow(QMainWindow):
         launch_row.addWidget(self.lbl_add_presets, 1)
         form.addRow(tr("add.presets_label"), launch_row)
 
+        # Who runs the game: Steam (Steam mode) or DeckInstall itself (Standalone mode).
+        mode_row = FlowLayout(spacing=8)
+        self.btn_mode_steam = shortcut_target_button(tr("mode.steam"))
+        self.btn_mode_standalone = shortcut_target_button(tr("mode.standalone"))
+        self._install_mode_group = QButtonGroup(self)
+        self._install_mode_group.setExclusive(True)
+        for button in (self.btn_mode_steam, self.btn_mode_standalone):
+            self._install_mode_group.addButton(button)
+            mode_row.addWidget(button)
+            button.toggled.connect(lambda _checked: self._apply_install_mode_ui())
+            button.clicked.connect(self._on_install_mode_clicked)
+        self._install_mode_chosen = False  # until the user picks one, follow the system's default
+        form.addRow(tr("mode.label"), mode_row)
+        self.lbl_mode_note = QLabel()
+        self.lbl_mode_note.setObjectName("MutedText")
+        self.lbl_mode_note.setWordWrap(True)
+        form.addRow("", self.lbl_mode_note)
+
+        # Standalone mode: where to find the game besides the Library.
         targets_row = FlowLayout(spacing=8)
         self.btn_shortcut_menu = shortcut_target_button(tr("add.shortcut_menu"), selected=True)
         self.btn_shortcut_desktop = shortcut_target_button(tr("add.shortcut_desktop"))
-        self.btn_shortcut_steam = shortcut_target_button(tr("add.shortcut_steam"))
-        self.btn_shortcut_steam.setVisible(self.paths is not None)
-        for button in (self.btn_shortcut_menu, self.btn_shortcut_desktop, self.btn_shortcut_steam):
+        for button in (self.btn_shortcut_menu, self.btn_shortcut_desktop):
             targets_row.addWidget(button)
         form.addRow(tr("add.shortcuts_label"), targets_row)
-
-        self.lbl_steam_opts_group = QLabel(tr("add.group_steam_opts"))
-        self.lbl_steam_opts_group.setObjectName("MutedText")
-        self.lbl_steam_opts_group.setStyleSheet("font-weight: 700; margin-top: 4px;")
-        form.addRow(self.lbl_steam_opts_group)
-        self.chk_proton = QCheckBox(tr("install.enable_proton"))
-        self.chk_proton.setChecked(True)
-        form.addRow("", self.chk_proton)
+        self.lbl_shortcuts_note = QLabel()
+        self.lbl_shortcuts_note.setObjectName("MutedText")
+        self.lbl_shortcuts_note.setWordWrap(True)
+        form.addRow("", self.lbl_shortcuts_note)
+        # Steam mode: Steam closes to write the shortcut.
         self.chk_restart = QCheckBox(tr("add.reopen_steam"))
         self.chk_restart.setChecked(True)
         self.chk_restart.setToolTip(tr("add.reopen_steam_tooltip"))
@@ -975,16 +968,12 @@ class MainWindow(QMainWindow):
         list_layout.addWidget(cfg_split)
 
         actions_row = FlowLayout(spacing=8)
-        self.btn_add_steam = QPushButton(tr("install.btn_add_steam"))
-        self.btn_add_steam.setObjectName("primaryBtn")
-        self.btn_add_steam.clicked.connect(self._add_selected_to_steam)
-        actions_row.addWidget(self.btn_add_steam)
-
-        self.btn_add_standalone = QPushButton(tr("install.btn_add_standalone"))
-        self.btn_add_standalone.clicked.connect(self._add_selected_standalone)
-        actions_row.addWidget(self.btn_add_standalone)
-        self.chk_keep_in_place.toggled.connect(self._update_standalone_install_label)
-        self._update_standalone_install_label()
+        self.btn_install = QPushButton(tr("install.btn_install"))
+        self.btn_install.setObjectName("primaryBtn")
+        self.btn_install.clicked.connect(self._install_selected)
+        actions_row.addWidget(self.btn_install)
+        self.chk_keep_in_place.toggled.connect(self._update_install_label)
+        self._update_install_label()
 
         self.btn_remove_existing = QPushButton(tr("add.btn_remove_existing"))
         self.btn_remove_existing.setObjectName("dangerBtn")
@@ -994,6 +983,7 @@ class MainWindow(QMainWindow):
         list_layout.addLayout(actions_row)
         layout.addWidget(list_card)
         self._reset_add_launch_options()
+        self._apply_install_mode_ui(follow_default=True)
 
         layout.addStretch(1)
         return page
@@ -1086,13 +1076,58 @@ class MainWindow(QMainWindow):
             )
         return True, lib
 
-    def _update_standalone_install_label(self) -> None:
-        text = (
-            tr("install.btn_add_standalone_in_place")
-            if self.chk_keep_in_place.isChecked()
-            else tr("install.btn_add_standalone")
+    def _update_install_label(self) -> None:
+        self.btn_install.setText(
+            tr("install.btn_install_in_place") if self.chk_keep_in_place.isChecked() else tr("install.btn_install")
         )
-        self.btn_add_standalone.setText(text)
+
+    @property
+    def mode_env(self) -> ModeEnv:
+        """Which modes this system offers (SteamOS: Steam only; no Steam: Standalone only)."""
+        return ModeEnv(steamos=self._steamos, steam=self.paths is not None)
+
+    def _on_install_mode_clicked(self) -> None:
+        self._install_mode_chosen = True
+
+    def _selected_install_mode(self) -> str:
+        return STEAM if self.btn_mode_steam.isChecked() else STANDALONE
+
+    def _apply_install_mode_ui(self, follow_default: bool = False) -> None:
+        """Enable only what the chosen mode uses and say why the rest is off.
+
+        follow_default: Steam detection changed; pick the system's default mode unless the user chose one.
+        """
+        env = self.mode_env
+        for button, mode in ((self.btn_mode_steam, STEAM), (self.btn_mode_standalone, STANDALONE)):
+            note = env.mode_note(mode)
+            button.setEnabled(not note)
+            button.setToolTip(note)
+        checked = self._install_mode_group.checkedButton()
+        default_btn = self.btn_mode_steam if env.default_mode == STEAM else self.btn_mode_standalone
+        if (
+            checked is None
+            or not checked.isEnabled()
+            or (follow_default and not self._install_mode_chosen and checked is not default_btn)
+        ):
+            default_btn.setChecked(True)
+            return  # toggled() calls back with the new mode
+        mode = self._selected_install_mode()
+        lines = [tr("mode.desc_steam") if mode == STEAM else tr("mode.desc_standalone")]
+        lines += [env.mode_note(m) for m in (STEAM, STANDALONE) if env.mode_note(m)]
+        self.lbl_mode_note.setText("\n".join(lines))
+        shortcuts_note = feature_note("app_shortcuts", mode)
+        for button in (self.btn_shortcut_menu, self.btn_shortcut_desktop):
+            button.setEnabled(not shortcuts_note)
+        self.lbl_shortcuts_note.setText(shortcuts_note)
+        self.lbl_shortcuts_note.setVisible(bool(shortcuts_note))
+        self.chk_restart.setEnabled(mode == STEAM)
+        self.chk_restart.setVisible(mode == STEAM)
+        if feature_note("mangohud", mode) and active_flags(self._add_launch_options).count("mangohud"):
+            try:  # Steam mode: Steam's own performance overlay replaces MangoHud
+                self._add_launch_options = apply_presets(self._add_launch_options, mangohud=False)
+            except ValueError:
+                pass
+        self._update_add_presets_summary()
 
     def _switch_library_subview(self, idx: int) -> None:
         """Switch to unified Install / Add Game view (Tab 0) and focus game name."""
@@ -2020,6 +2055,7 @@ class MainWindow(QMainWindow):
             initial_winedll=cur_winedll,
             game_obj=None,
             is_native_linux=self._is_add_exe_native(),
+            mode=self._selected_install_mode(),
         )
         if res is None:
             return
@@ -2102,21 +2138,8 @@ class MainWindow(QMainWindow):
                 self._auto_art_timer.start()
         self._update_remove_existing_state()
 
-    def _on_exe_changed(self, text: str) -> None:
-        """Update Proton default and Remove button visibility when the executable changes."""
-        cleaned = text.strip()
-        is_elf = False
-        if cleaned:
-            exe_path = Path(cleaned)
-            is_elf = exe_path.is_file() and is_native_linux_exe(exe_path)
-        was_disabled = not self.chk_proton.isEnabled()
-        if is_elf:
-            self.chk_proton.setChecked(False)
-            self.chk_proton.setEnabled(False)
-        else:
-            self.chk_proton.setEnabled(True)
-            if was_disabled:
-                self.chk_proton.setChecked(True)
+    def _on_exe_changed(self, _text: str) -> None:
+        """Re-check the "Remove existing" button after the executable changes."""
         self._match_install_timer.start()
 
     def _display_preview_pixmap(self, pix: QPixmap) -> None:
@@ -2235,84 +2258,6 @@ class MainWindow(QMainWindow):
                     steam_appid = candidate
         return steam_appid
 
-    def _add_selected_to_steam(self) -> None:
-        if self._steam_busy:
-            return
-        if not self.paths:
-            QMessageBox.critical(_dialog_parent(self), __app_name__, tr("add.steam_missing"))
-            return
-        if self._vdf_corrupt:
-            QMessageBox.critical(
-                _dialog_parent(self),
-                __app_name__,
-                self.vdf_error_banner.text() or tr("library.vdf_error", err="shortcuts.vdf"),
-            )
-            return
-        validated = self._validate_add_inputs()
-        if validated is None:
-            return
-        app_name, exe_path = validated
-        paths = self.paths
-
-        def _proceed_add() -> None:
-            if self._closing_pending or self.paths != paths:
-                self._end_busy()
-                return
-            steam_appid = self._resolve_selected_steam_appid()
-            launch_opts, winedll = self._resolve_add_launch_options()
-            self._save_last_launch_prefs(launch_opts, winedll)
-
-            self._add_worker = AddToSteamWorker(
-                paths=paths,
-                app_name=app_name,
-                exe_path=exe_path,
-                steam_appid=steam_appid,
-                enable_proton=self.chk_proton.isChecked(),
-                restart_steam=self.chk_restart.isChecked(),
-                launch_options=launch_opts,
-                winedlloverrides=winedll,
-            )
-            self._track_worker(self._add_worker)
-            self._add_worker.status.connect(self.status_label.setText)
-            self._add_worker.finished_ok.connect(self._on_add_done)
-            self._add_worker.failed.connect(self._on_add_failed)
-            self._add_worker.start()
-
-        if self.should_queue_vdf_edits():
-            launch_opts, winedll = self._resolve_add_launch_options()
-            self._save_last_launch_prefs(launch_opts, winedll)
-            is_native = self._is_add_exe_native()
-            try:
-                effective_launch = (
-                    apply_presets(launch_opts, winedlloverrides=winedll, native_linux=is_native)
-                    if winedll.strip() and not is_native
-                    else launch_opts
-                )
-            except ValueError:
-                effective_launch = launch_opts
-            self.enqueue_vdf_edit(
-                QueuedVdfEdit(
-                    f"add_or_update_shortcut:{app_name}:{exe_path}",
-                    "add_or_update_shortcut",
-                    0,
-                    app_name,
-                    {
-                        "app_name": app_name,
-                        "exe_path": str(exe_path),
-                        "start_dir": str(exe_path.parent),
-                        "launch_options": effective_launch,
-                        "enable_proton": self.chk_proton.isChecked() and not is_native,
-                    },
-                )
-            )
-            msg = tr("vdf_queue.enqueued", name=app_name)
-            self.status_label.setText(msg)
-            if not self._closing_pending:
-                QMessageBox.information(_dialog_parent(self), __app_name__, msg)
-            return
-        self._begin_busy()
-        self._confirm_close_steam_async(_proceed_add, on_cancelled=self._end_busy)
-
     def _confirm_not_duplicate(
         self, app_name: str, steam_appid: int | None, game_dir: Path, container: bool
     ) -> bool:
@@ -2338,18 +2283,33 @@ class MainWindow(QMainWindow):
         box.exec()
         return box.clickedButton() is btn_copy
 
-    def _add_selected_standalone(self) -> None:
+    def _install_selected(self) -> None:
+        """Install the selected game into the library in the chosen mode.
+
+        Steam mode: the game gets a Steam shortcut (Steam's Proton, no umu/GE-Proton download, no menu or
+        desktop launcher). Standalone mode: launch.sh + umu-run, plus the menu/desktop launchers picked.
+        """
+        if self._steam_busy:
+            return
+        mode = self._selected_install_mode()
+        if mode == STEAM:
+            if self.paths is None:
+                QMessageBox.critical(_dialog_parent(self), __app_name__, tr("add.steam_missing"))
+                return
+            if self._vdf_corrupt:
+                QMessageBox.critical(
+                    _dialog_parent(self),
+                    __app_name__,
+                    self.vdf_error_banner.text() or tr("library.vdf_error", err="shortcuts.vdf"),
+                )
+                return
         validated = self._validate_add_inputs()
         if validated is None:
             return
-        create_menu = self.btn_shortcut_menu.isChecked()
-        create_desktop = self.btn_shortcut_desktop.isChecked()
-        steam_selected = self.btn_shortcut_steam.isEnabled() and self.btn_shortcut_steam.isChecked()
-        steam_target = self.paths if steam_selected else None
+        create_menu = mode == STANDALONE and self.btn_shortcut_menu.isChecked()
+        create_desktop = mode == STANDALONE and self.btn_shortcut_desktop.isChecked()
+        steam_target = self.paths if mode == STEAM else None
         restart_steam = self.chk_restart.isChecked()
-        if not (create_menu or create_desktop or steam_target is not None):
-            QMessageBox.warning(_dialog_parent(self), __app_name__, tr("add.no_shortcut_selected"))
-            return
         app_name, exe_path = validated
         steam_appid = self._resolve_selected_steam_appid()
         launch_opts, winedll = self._resolve_add_launch_options()
@@ -2494,20 +2454,6 @@ class MainWindow(QMainWindow):
 
         stats_worker.ready.connect(_on_stats_ready)
         stats_worker.start()
-
-    def _on_add_done(self, msg: str) -> None:
-        self._end_busy()
-        self.status_label.setText(msg)
-        self._refresh_shortcuts()
-        if not self._closing_pending:
-            QMessageBox.information(_dialog_parent(self), __app_name__, msg)
-
-    def _on_add_failed(self, err: str, partial_written: bool = False) -> None:
-        self._end_busy()
-        if partial_written:
-            self._refresh_shortcuts()
-        if not self._closing_pending:
-            QMessageBox.critical(_dialog_parent(self), __app_name__, err)
 
     def _apply_shortcuts_data(
         self,
@@ -3604,8 +3550,6 @@ class MainWindow(QMainWindow):
 
     def _set_vdf_write_enabled(self, enabled: bool) -> None:
         for w in (
-            self.btn_add_steam,
-            self.btn_shortcut_steam,
             self.act_import_steam,
             self.act_ext_to_steam,
         ):
@@ -3630,7 +3574,7 @@ class MainWindow(QMainWindow):
         for w in (
             self.btn_redetect_steam,
             self.btn_reload,
-            self.btn_add_standalone,
+            self.btn_install,
             self.shortcuts_list,
             self.btn_play_game,
             self.btn_configure_game,
@@ -3741,6 +3685,7 @@ class MainWindow(QMainWindow):
         game_obj: object | None = None,
         is_native_linux: bool = False,
         parent: QWidget | None = None,
+        mode: str | None = None,
     ) -> tuple[str, str] | None:
         return open_launch_presets_dialog(
             self,
@@ -3751,6 +3696,7 @@ class MainWindow(QMainWindow):
             game_obj=game_obj,
             is_native_linux=is_native_linux,
             parent=parent,
+            mode=mode,
         )
 
     def _edit_launch_options_presets(

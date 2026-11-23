@@ -25,6 +25,7 @@ from deckinstall.launcher_scan import ExternalLauncherGame  # noqa: E402
 from deckinstall.steam_paths import SteamPaths  # noqa: E402
 from deckinstall.steam_vdf import ShortcutEntry  # noqa: E402
 from deckinstall.ui_dialogs import configure_game_dialog, optiscaler_bulk_dialog, save_sync_dialog  # noqa: E402
+from deckinstall.vdf_queue import QueuedVdfEdit  # noqa: E402
 
 PE = b"MZ" + b"\x00" * 58 + (64).to_bytes(4, "little") + b"PE\x00\x00" + b"\x64\x86" + b"\x00" * 40
 
@@ -111,23 +112,17 @@ def test_delete_external_no_crash_and_managed_steam_passes_entry(tmp_path: Path)
         win.close()
 
 
-def test_native_elf_validates_and_rechecks_proton_when_switching_back(tmp_path: Path) -> None:
+def test_native_elf_validates(tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     win = _make_window(tmp_path, app)
     try:
         elf = tmp_path / "game_linux"
         elf.write_bytes(b"\x7fELF" + b"\x00" * 60)
         elf.chmod(0o755)
-        exe = tmp_path / "game.exe"
-        exe.write_bytes(PE)
 
         win.add_name.setText("Native Game")
         win.add_exe_combo.setEditText(str(elf))
-        assert not win.chk_proton.isEnabled() and not win.chk_proton.isChecked()
         assert win._validate_add_inputs() == ("Native Game", elf)
-
-        win.add_exe_combo.setEditText(str(exe))
-        assert win.chk_proton.isEnabled() and win.chk_proton.isChecked()
     finally:
         _drain(win, app)
         win.close()
@@ -239,7 +234,12 @@ def test_gaming_mode_queues_edits_and_stops_watch_timer(tmp_path: Path) -> None:
         with mock.patch.object(ui, "is_gamescope_session", return_value=True), mock.patch.object(QMessageBox, "information"):
             win.add_name.setText("Queued Game")
             win.add_exe_combo.setEditText(str(exe))
-            win._add_selected_to_steam()
+            win.enqueue_vdf_edit(
+                QueuedVdfEdit(
+                    "add_installed_game:x", "add_installed_game", 0, "Queued Game",
+                    {"game_dir": str(exe.parent), "uid": "x", "user_id": "0", "steam_root": str(tmp_path)},
+                )
+            )
             sc = ShortcutEntry("0", 3000007777, "Queued Game", f'"{exe}"', f'"{exe.parent}"', "", "")
             win._remove_steam_shortcut_async(sc)
             assert not win._vdf_watch_timer.isActive()

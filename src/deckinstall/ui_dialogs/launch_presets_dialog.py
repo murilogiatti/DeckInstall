@@ -30,6 +30,7 @@ from ..external_actions import load_external_launch_presets, save_external_launc
 from ..i18n import tr
 from ..launch_presets import apply_presets
 from ..launcher_scan import ExternalLauncherGame
+from ..modes import feature_note, mode_of_kind
 from ..optiscaler import inspect_optiscaler_state
 from ..runtime_manager import (
     ensure_mangohud,
@@ -68,11 +69,15 @@ def open_launch_presets_dialog(
     game_obj: object | None = None,
     is_native_linux: bool = False,
     parent: QWidget | None = None,
+    mode: str | None = None,
 ) -> tuple[str, str] | None:
     """Open launch options presets dialog and return (launch_opts, winedll) or None.
 
     parent: the dialog that asked (e.g. Configure game), so the child stays above it under gamescope/Wayland.
+    mode: Steam or Standalone (default: from kind). Options a mode does not use are shown greyed out
+    with the reason (MangoHud in Steam mode: Steam has its own performance overlay).
     """
+    mangohud_note = feature_note("mangohud", mode or mode_of_kind(kind))
     is_native_linux = bool(
         is_native_linux or (game_obj is not None and _is_native_linux_game(kind, game_obj))
     )
@@ -97,6 +102,12 @@ def open_launch_presets_dialog(
     lay = QVBoxLayout(body)
     lay.setContentsMargins(0, 0, 4, 0)
 
+    def _section(text: str) -> None:
+        lbl = QLabel(text)
+        lbl.setObjectName("SectionTitle")
+        lbl.setContentsMargins(0, 8, 0, 2)
+        lay.addWidget(lbl)
+
     def _muted_hint(text: str) -> QLabel:
         lbl = QLabel(text)
         lbl.setObjectName("MutedText")
@@ -107,7 +118,8 @@ def open_launch_presets_dialog(
     chk_gm = QCheckBox(tr("launch.gamemode"))
     chk_gm.setChecked(bool(st["gamemode"]))
     chk_mh = QCheckBox(tr("launch.mangohud"))
-    chk_mh.setChecked(bool(st["mangohud"]))
+    chk_mh.setChecked(bool(st["mangohud"]) and not mangohud_note)
+    chk_mh.setEnabled(not mangohud_note)
 
     mh_level_row = QHBoxLayout()
     mh_level_row.setContentsMargins(20, 0, 0, 4)
@@ -308,12 +320,16 @@ def open_launch_presets_dialog(
 
     dlg_alive = _dialog_guard(dlg)
 
-    def _add_tool_preset(chk: QCheckBox, hint_text: str, bin_name: str, extra_row: QLayout | None = None) -> None:
+    def _add_tool_preset(
+        chk: QCheckBox, hint_text: str, bin_name: str, extra_row: QLayout | None = None, blocked_note: str = "",
+    ) -> None:
         chk.toggled.connect(_sync_preview)
         lay.addWidget(chk)
-        lay.addWidget(_muted_hint(hint_text))
+        lay.addWidget(_muted_hint(blocked_note or hint_text))
         if extra_row is not None:
             lay.addLayout(extra_row)
+        if blocked_note:
+            return  # the mode does not use this tool: nothing to install
         official_mh = bin_name == "mangohud"
         available = (
             official_mangohud_installed() or system_mangohud_installed()
@@ -410,12 +426,20 @@ def open_launch_presets_dialog(
             warn_lay.addWidget(install_btn)
             lay.addWidget(warn_row)
 
+    _section(tr("launch.section_performance"))
     _add_tool_preset(chk_gm, tr("launch.gamemode_hint"), "gamemoderun")
-    _add_tool_preset(chk_mh, tr("launch.mangohud_hint"), "mangohud", extra_row=mh_opts_col)
+    _add_tool_preset(chk_mh, tr("launch.mangohud_hint"), "mangohud", extra_row=mh_opts_col, blocked_note=mangohud_note)
     mh_level_combo.currentIndexChanged.connect(_sync_preview)
     mh_pos_combo.currentIndexChanged.connect(_sync_preview)
     mh_fps_combo.currentIndexChanged.connect(_sync_preview)
 
+    gpu_rows = (
+        ((not is_native_linux) and (gpu.has_nvidia or nvapi_active))
+        or ((gpu.is_hybrid and gpu.has_nvidia) or prime_active)
+        or ((not is_native_linux) and (gpu.has_nvidia or bool(st["dlss_upgrade"])))
+    )
+    if gpu_rows:
+        _section(tr("launch.section_gpu"))
     if (not is_native_linux) and (gpu.has_nvidia or nvapi_active):
         chk_nvapi.toggled.connect(_sync_preview)
         lay.addWidget(chk_nvapi)
@@ -427,14 +451,6 @@ def open_launch_presets_dialog(
         chk_prime.toggled.connect(_sync_preview)
         lay.addWidget(chk_prime)
         lay.addWidget(_muted_hint(tr("launch.prime_offload_hint")))
-    if (not is_native_linux) and (gpu.is_wayland or wayland_active):
-        chk_wayland.toggled.connect(_sync_preview)
-        lay.addWidget(chk_wayland)
-        lay.addWidget(_muted_hint(tr("launch.proton_wayland_hint")))
-    else:
-        chk_wayland.setVisible(False)
-        chk_wayland.setEnabled(False)
-
     if (not is_native_linux) and (gpu.has_nvidia or bool(st["dlss_upgrade"])):
         chk_dlss.toggled.connect(_sync_preview)
         lay.addWidget(chk_dlss)
@@ -442,6 +458,16 @@ def open_launch_presets_dialog(
     else:
         chk_dlss.setVisible(False)
         chk_dlss.setEnabled(False)
+
+    if not is_native_linux:
+        _section(tr("launch.section_compat"))
+    if (not is_native_linux) and (gpu.is_wayland or wayland_active):
+        chk_wayland.toggled.connect(_sync_preview)
+        lay.addWidget(chk_wayland)
+        lay.addWidget(_muted_hint(tr("launch.proton_wayland_hint")))
+    else:
+        chk_wayland.setVisible(False)
+        chk_wayland.setEnabled(False)
 
     if not is_native_linux:
         for chk in (chk_w3d, chk_esync, chk_fsync):
@@ -479,6 +505,7 @@ def open_launch_presets_dialog(
             lay.addWidget(ext_note)
 
     lay.addWidget(wined3d_warn)
+    _section(tr("launch.section_advanced"))
     lay.addWidget(raw_lbl)
     lay.addWidget(raw_edit)
 
@@ -486,6 +513,8 @@ def open_launch_presets_dialog(
     raw_edit.textChanged.connect(_on_raw_text_changed)
     _update_optiscaler_dxgi_guard()
     _update_wined3d_warning()
+    if mangohud_note and st["mangohud"]:
+        _sync_preview()  # drop MangoHud from options a Steam-mode game keeps from before
 
     scroll.setWidget(body)
     dlg_lay.addWidget(scroll, 1)

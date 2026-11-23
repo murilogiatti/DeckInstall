@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import shlex
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -19,7 +18,6 @@ from .app_updater import (
     download_and_replace_appimage,
 )
 from .artwork import (
-    download_steam_artwork,
     fetch_header_preview,
     search_steam_games,
 )
@@ -59,10 +57,6 @@ from .steam_paths import (
     is_steam_running,
 )
 from .steam_vdf import (
-    _format_winedlloverrides_token,
-    add_or_update_shortcut,
-    adopt_installer_prefix,
-    import_external_prefix_saves,
     infer_game_root_from_exe,
     shutdown_steam,
     start_steam,
@@ -304,106 +298,6 @@ class ScanWorker(QThread):
             self.finished_scan.emit([])
 
 
-
-
-class AddToSteamWorker(QThread):
-    """Background worker to safely shut down Steam, write VDFs, fetch art, and relaunch."""
-
-    status = Signal(str)
-    finished_ok = Signal(str)
-    failed = Signal(str, bool)
-
-    restart_failed = False
-
-    def __init__(
-        self,
-        paths: SteamPaths,
-        app_name: str,
-        exe_path: Path,
-        steam_appid: int | None,
-        enable_proton: bool,
-        restart_steam: bool,
-        launch_options: str = "",
-        winedlloverrides: str = "",
-    ) -> None:
-        super().__init__()
-        self.paths = paths
-        self.app_name = app_name
-        self.exe_path = exe_path
-        self.steam_appid = steam_appid
-        self.enable_proton = enable_proton
-        self.restart_steam = restart_steam
-        self.launch_options = launch_options
-        self.winedlloverrides = winedlloverrides
-
-    def run(self) -> None:
-        was_running = False
-        shortcut_written = False
-        done_msg: str | None = None
-        err_msg: str | None = None
-        try:
-            was_running = close_steam_for_edit(is_steam_running, shutdown_steam, self.status.emit)
-
-            self.status.emit(tr("add.writing_shortcut"))
-            effective_launch = self.launch_options.strip()
-            if self.winedlloverrides.strip():
-                dll_tok = _format_winedlloverrides_token(self.winedlloverrides)
-                if effective_launch:
-                    try:
-                        toks = shlex.split(effective_launch)
-                    except ValueError:
-                        toks = effective_launch.split()
-                    if not any(t.startswith("WINEDLLOVERRIDES=") for t in toks):
-                        effective_launch = f"{dll_tok} {effective_launch}"
-                else:
-                    effective_launch = f"{dll_tok} %command%"
-
-            shortcut_id = add_or_update_shortcut(
-                self.paths,
-                app_name=self.app_name,
-                exe_path=self.exe_path,
-                start_dir=self.exe_path.parent,
-                launch_options=effective_launch or None,
-                enable_proton=self.enable_proton,
-            )
-            shortcut_written = True
-
-            game_root = infer_game_root_from_exe(self.exe_path) or self.exe_path.parent
-            adopt_installer_prefix(self.paths, game_root, shortcut_id)
-
-            imported = import_external_prefix_saves(
-                paths=self.paths,
-                shortcut_appid_u32=shortcut_id,
-                game_name=self.app_name,
-                steam_appid=self.steam_appid,
-            )
-            if imported:
-                self.status.emit(tr("add.saves_imported", count=imported))
-            art_msg = tr("add.no_art")
-            if self.steam_appid:
-                self.status.emit(tr("add.downloading_art", appid=self.steam_appid))
-                art = download_steam_artwork(
-                    steam_appid=self.steam_appid,
-                    shortcut_appid_u32=shortcut_id,
-                    grid_dir=self.paths.grid_dir,
-                )
-                art_msg = tr(
-                    "add.art_saved",
-                    files=", ".join(art.saved_files.keys()) or tr("art.none"),
-                )
-
-            done_msg = tr("add.done", name=self.app_name, appid=shortcut_id, art=art_msg)
-        except Exception as exc:
-            err_msg = _format_worker_error(exc)
-        finally:
-            if was_running and self.restart_steam and not is_steam_running():
-                self.restart_failed = not restart_steam_after_edit(
-                    start_steam, type(self).__name__, self.status.emit,
-                )
-        if err_msg is not None:
-            self.failed.emit(err_msg, shortcut_written)
-        elif done_msg is not None:
-            self.finished_ok.emit(done_msg)
 
 
 class RuntimeUpdateWorker(QThread):
