@@ -35,6 +35,7 @@ from ..optiscaler import (
     check_optiscaler_compatibility,
     inspect_optiscaler_state,
     install_optiscaler_for_game,
+    optiscaler_executable,
     recommend_proxy,
     uninstall_optiscaler_for_game,
 )
@@ -392,7 +393,7 @@ def open_optiscaler_dialog(
 
     dlg_alive = _dialog_guard(dlg)
 
-    lbl_dir = QLabel(tr("optiscaler.exe_dir_label", path=str(exe_path.parent)))
+    lbl_dir = QLabel(tr("optiscaler.exe_dir_label", path=str(optiscaler_executable(exe_path).parent)))
     lbl_dir.setObjectName("MutedText")
     lbl_dir.setWordWrap(True)
     lay.addWidget(lbl_dir)
@@ -484,7 +485,9 @@ def open_optiscaler_dialog(
             btn_remove.setEnabled(True)
         elif isinstance(st_now, OptiScalerState):
             lbl_state.setText(
-                tr(
+                tr("optiscaler.state_needs_repair")
+                if st_now.needs_repair
+                else tr(
                     "optiscaler.state_installed",
                     proxy=f"{st_now.proxy_dll}.dll",
                     backend=st_now.backend,
@@ -494,7 +497,7 @@ def open_optiscaler_dialog(
             b_idx = combo_backend.findData(st_now.backend)
             if b_idx >= 0:
                 combo_backend.setCurrentIndex(b_idx)
-            p_idx = combo_proxy.findData(st_now.proxy_dll)
+            p_idx = combo_proxy.findData(recommended if st_now.needs_repair else st_now.proxy_dll)
             if p_idx >= 0:
                 combo_proxy.setCurrentIndex(p_idx)
             fg_raw = getattr(st_now, "fg_mode", "auto") or "auto"

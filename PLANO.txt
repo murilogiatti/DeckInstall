@@ -1,7 +1,8 @@
 DeckInstall - Plano de acao v3 (2026-11-17, atualizado 2026-11-19)
 ==========================================================
 
-STATUS: Fases 0 a 12 e revisoes de auditoria concluidas localmente. Versao atual: v0.24.0. PLANO v4 (universal, dois modos) no fim do arquivo.
+STATUS: Fases 0 a 12 e revisoes de auditoria concluidas localmente. Versao atual: v0.24.1. PLANO v4 (universal, dois modos) no fim do arquivo.
+v0.24.1: OptiScaler no diretorio do executavel Unreal que renderiza o jogo, com reparo de instalacoes antigas na pasta do launcher.
 v0.24.0: Um modo por jogo (Steam ou Autonomo) em Instalar/Adotar/Configurar, troca de modo sem residuo,
 aba Runtimes com um cartao por componente, abas no topo, aviso de jogo ja instalado, OptiScaler so para jogos com
 upscaler. NAO TESTADO A MAO: SteamOS real, Steam real nos fluxos novos (instalar no modo Steam, trocar de modo).

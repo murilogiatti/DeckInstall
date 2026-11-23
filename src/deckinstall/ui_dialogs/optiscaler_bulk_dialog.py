@@ -221,7 +221,16 @@ def _state_text(compat: OptiScalerCompatibility) -> str:
         return tr("optiscaler_bulk.state_none", proxy=f"{compat.recommended_proxy}.dll")
     if not st.complete:
         return tr("optiscaler_bulk.state_incomplete")
+    if st.needs_repair:
+        return tr("optiscaler_bulk.state_needs_repair")
     return tr("optiscaler_bulk.state_installed", proxy=f"{st.proxy_dll}.dll", version=st.version or "-")
+
+
+def _needs_install(compat: OptiScalerCompatibility) -> bool:
+    state = compat.installed_state
+    return (compat.compatible and state is None) or (
+        state is not None and state.complete and state.needs_repair
+    )
 
 
 def _outcome_line(o: BulkOutcome) -> str:
@@ -312,11 +321,9 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
             games.append(game)
             it = QTableWidgetItem(game.name)
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            # Pre-check games where OptiScaler is known to have something to hook into.
+            # Include installations that still point at the launcher folder.
             it.setCheckState(
-                Qt.CheckState.Checked
-                if compat.compatible and compat.tier == "verified" and compat.installed_state is None
-                else Qt.CheckState.Unchecked
+                Qt.CheckState.Checked if _needs_install(compat) else Qt.CheckState.Unchecked
             )
             if not compat.compatible and compat.installed_state is None:
                 # Nothing to hook into: only an existing install may be checked (to remove it).
@@ -369,8 +376,8 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
                 it.setCheckState(state)
 
     def _install_all() -> None:
-        """Check every compatible game that has no OptiScaler yet, then install on them."""
-        todo = [i for i, (_g, compat) in enumerate(current) if compat.compatible and compat.installed_state is None]
+        """Check compatible games that need installation or repair."""
+        todo = [i for i, (_g, compat) in enumerate(current) if _needs_install(compat)]
         if not todo:
             QMessageBox.information(dlg, __app_name__, tr("optiscaler_bulk.none_compatible"))
             return

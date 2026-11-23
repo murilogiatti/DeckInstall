@@ -61,6 +61,88 @@ def test_failed_install_rolls_back(tmp_path: Path) -> None:
     assert not (game / "OptiScaler.ini").exists()
 
 
+def _unreal_shipping(game: Path) -> Path:
+    (game / "Engine").mkdir()
+    shipping = game / "Game" / "Binaries" / "Win64" / "Game-Win64-Shipping.exe"
+    shipping.parent.mkdir(parents=True)
+    shipping.write_bytes(PE)
+    return shipping
+
+
+def test_unreal_bootstrapper_install_uses_the_shipping_directory(tmp_path: Path) -> None:
+    game = _game_dir(tmp_path)
+    starter = game / "Game.exe"
+    shipping = _unreal_shipping(game)
+    duplicate = game / "_original files" / shipping.relative_to(game)
+    duplicate.parent.mkdir(parents=True)
+    duplicate.write_bytes(PE)
+    (shipping.parent / "DXGI.dll").write_bytes(b"existing graphics mod")
+
+    assert opti.recommend_proxy(starter) == ("winmm", ("dxgi_taken",))
+    state = opti.install_optiscaler_for_game(starter, proxy_dll="winmm", payload_dir=_payload(tmp_path))
+    assert state.exe_dir == shipping.parent
+    assert (shipping.parent / "winmm.dll").read_bytes() == b"OPTI"
+    assert not (game / "winmm.dll").exists()
+    assert opti.inspect_optiscaler_state(starter) == opti.inspect_optiscaler_state(shipping) == state
+    opti.uninstall_optiscaler_for_game(starter)
+    assert not (shipping.parent / "winmm.dll").exists()
+    assert (shipping.parent / "DXGI.dll").read_bytes() == b"existing graphics mod"
+
+
+def test_unreal_migration_restores_originals_and_preserves_settings(tmp_path: Path) -> None:
+    game = _game_dir(tmp_path, "winmm.dll")
+    starter = game / "Game.exe"
+    payload = _payload(tmp_path)
+    opti.install_optiscaler_for_game(
+        starter, proxy_dll="winmm", backend="fsr3", overlay_menu=False,
+        overwrite_existing=True, payload_dir=payload,
+    )
+    ini = game / "OptiScaler.ini"
+    ini.write_text(ini.read_text() + "\n[Menu]\nShortcutKey=45\n", encoding="utf-8")
+    shipping = _unreal_shipping(game)
+    legacy = opti.inspect_optiscaler_state(starter)
+    assert legacy is not None and legacy.needs_repair
+
+    target = opti.BulkTarget("Game", starter, game, None, "winmm=n,b", "deckinstall")
+    with mock.patch.object(opti, "ensure_optiscaler", return_value=payload):
+        [(outcome, override)] = opti.bulk_optiscaler_targets([target])
+
+    assert outcome.status == "installed"
+    assert override == "winmm=n,b"
+    state = opti.inspect_optiscaler_state(starter)
+    assert state is not None and not state.needs_repair
+    assert state.exe_dir == shipping.parent and state.backend == "fsr3" and not state.overlay_menu
+    assert "ShortcutKey=45" in (shipping.parent / "OptiScaler.ini").read_text()
+    assert (game / "winmm.dll").read_bytes() == b"ORIGINAL-winmm.dll"
+    assert not ini.exists()
+    assert not (game / opti.OPTISCALER_MANIFEST).exists()
+
+
+def test_failed_unreal_migration_preserves_the_launcher_install(tmp_path: Path) -> None:
+    game = _game_dir(tmp_path, "dxgi.dll")
+    starter = game / "Game.exe"
+    payload = _payload(tmp_path)
+    opti.install_optiscaler_for_game(starter, overwrite_existing=True, payload_dir=payload)
+    shipping = _unreal_shipping(game)
+    write_manifest = opti._write_state_manifest
+
+    def fail_final_write(state: opti.OptiScalerState) -> None:
+        if state.complete and state.exe_dir == shipping.parent:
+            raise OSError("disk full")
+        write_manifest(state)
+
+    with mock.patch.object(opti, "_write_state_manifest", side_effect=fail_final_write), pytest.raises(OSError):
+        opti.install_optiscaler_for_game(starter, payload_dir=payload)
+
+    state = opti.inspect_optiscaler_state(starter)
+    assert state is not None and state.needs_repair and state.exe_dir == game
+    assert (game / "dxgi.dll").read_bytes() == b"OPTI"
+    assert (game / "dxgi.dll.deckinstall.bak").read_bytes() == b"ORIGINAL-dxgi.dll"
+    assert (game / "D3D12_Optiscaler" / "D3D12Core.dll").read_bytes() == b"D3D"
+    assert not (shipping.parent / "dxgi.dll").exists()
+    assert not (shipping.parent / opti.OPTISCALER_MANIFEST).exists()
+
+
 def test_interrupted_install_is_flagged_and_cleaned(tmp_path: Path) -> None:
     game = _game_dir(tmp_path, "dxgi.dll", "nvngx.dll")
 

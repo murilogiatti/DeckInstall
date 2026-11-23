@@ -9,12 +9,12 @@ import re
 import shutil
 import tempfile
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from .fsutil import atomic_copy_file, atomic_write_text, prune_empty_parents
-from .gameinfo import safe_scan_root
+from .gameinfo import is_unreal_binary_name, safe_scan_root
 from .runtime_manager import ProgressCb, _load_versions, ensure_optiscaler, get_optiscaler_dir
 from .scanner import detect_exe_kind, detect_pe_arch
 
@@ -102,6 +102,7 @@ class OptiScalerState:
     prefix_snapshot: Path | None = None
     # False while files are being copied: a crash leaves a journal that "remove" can undo.
     complete: bool = True
+    needs_repair: bool = False
 
 
 @dataclass(frozen=True)
@@ -216,6 +217,45 @@ def _graphics_api_supported(exe_path: Path, game_dir: Path | None) -> bool:
     return not any(word in low for word in ("directx", "opengl", "directdraw", "glide"))
 
 
+def optiscaler_executable(exe_path: Path) -> Path:
+    """Find the Unreal game executable when the launch entry points to its bootstrapper."""
+    if (
+        exe_path.suffix.lower() != ".exe"
+        or is_unreal_binary_name(exe_path.name)
+        or detect_exe_kind(exe_path) != "windows_pe"
+    ):
+        return exe_path
+    root = exe_path.parent
+    candidates: list[Path] = []
+    has_engine = False
+    try:
+        for project in root.iterdir():
+            if project.is_symlink() or not project.is_dir() or project.name.startswith((".", "_")):
+                continue
+            if project.name.casefold() == "engine":
+                has_engine = True
+                continue
+            for binaries in project.iterdir():
+                if binaries.name.casefold() != "binaries" or binaries.is_symlink() or not binaries.is_dir():
+                    continue
+                for build in binaries.iterdir():
+                    if build.name.casefold() not in ("win64", "wingdk") or build.is_symlink() or not build.is_dir():
+                        continue
+                    candidates.extend(
+                        p for p in build.iterdir()
+                        if p.name.lower().endswith(".exe") and is_unreal_binary_name(p.name)
+                        and not p.is_symlink() and p.is_file() and detect_pe_arch(p) == "x64"
+                    )
+    except OSError:
+        return exe_path
+    matching = [p for p in candidates if p.name.casefold().startswith(exe_path.stem.casefold() + "-")]
+    if len(matching) == 1:
+        return matching[0]
+    if has_engine and len(candidates) == 1:
+        return candidates[0]
+    return exe_path
+
+
 def check_optiscaler_compatibility(
     exe_path: Path,
     game_dir: Path | None = None,
@@ -230,8 +270,9 @@ def check_optiscaler_compatibility(
             installed_state=None,
         )
 
-    pe_arch = detect_pe_arch(exe_path)
-    exe_kind = detect_exe_kind(exe_path)
+    target = optiscaler_executable(exe_path)
+    pe_arch = detect_pe_arch(target)
+    exe_kind = detect_exe_kind(target)
     if pe_arch in ("linux_elf", "x86", "arm64") or exe_kind != "windows_pe":
         return OptiScalerCompatibility(
             compatible=False,
@@ -244,7 +285,7 @@ def check_optiscaler_compatibility(
     installed_state = inspect_optiscaler_state(exe_path)
     upscalers = find_native_upscalers(exe_path, game_dir, installed_state)
     proxy, notes = recommend_proxy(exe_path, game_dir, installed_state)
-    if not upscalers or not _graphics_api_supported(exe_path, game_dir):
+    if not upscalers or not _graphics_api_supported(target, game_dir or exe_path.parent):
         # OptiScaler only swaps an upscaler the game already has (DLSS 2+/FSR 2+/XeSS) on
         # DirectX 11/12 or Vulkan; without one there is nothing to hook into.
         return OptiScalerCompatibility(
@@ -278,18 +319,21 @@ def recommend_proxy(
     Returns (proxy, notes). Notes are short machine keys: "dxgi_taken", "winmm_onlinefix",
     "winmm_taken", "version_taken", "dbghelp_taken", "all_taken".
     """
-    if installed_state is not None:
-        return installed_state.proxy_dll, ()
     from .scanner import detect_steam_emulator
 
-    exe_dir = exe_path.parent
+    exe_dir = optiscaler_executable(exe_path).parent
+    if installed_state is not None and installed_state.exe_dir == exe_dir.resolve():
+        return installed_state.proxy_dll, ()
     try:
         present = {p.name.lower() for p in exe_dir.iterdir() if p.is_file() or p.is_symlink()}
     except OSError:
         present = set()
-    emulator, _ = detect_steam_emulator(exe_path, game_dir or exe_dir)
+    emulator, _ = detect_steam_emulator(exe_path, game_dir or exe_path.parent)
+    proxies = OPTISCALER_PROXY_DLLS
+    if installed_state is not None:
+        proxies = (installed_state.proxy_dll, *[p for p in proxies if p != installed_state.proxy_dll])
     notes: list[str] = []
-    for proxy in OPTISCALER_PROXY_DLLS:
+    for proxy in proxies:
         if proxy == "winmm" and emulator == "onlinefix":
             notes.append("winmm_onlinefix")  # OnlineFix loads itself through winmm.dll
             continue
@@ -338,7 +382,20 @@ def _serialize_manifest_path(exe_dir: Path, path: Path) -> str:
 
 def inspect_optiscaler_state(exe_path: Path) -> OptiScalerState | None:
     """Inspect the game directory for an OptiScaler installation manifest."""
-    exe_dir = exe_path.parent.resolve()
+    launch_dir = exe_path.parent.resolve()
+    exe_dir = optiscaler_executable(exe_path).parent.resolve()
+    state = _read_state_manifest(exe_dir)
+    legacy = _read_state_manifest(launch_dir) if launch_dir != exe_dir else None
+    if legacy is not None:
+        return replace(
+            state or legacy,
+            complete=legacy.complete and (state is None or state.complete),
+            needs_repair=True,
+        )
+    return state
+
+
+def _read_state_manifest(exe_dir: Path) -> OptiScalerState | None:
     manifest_path = exe_dir / OPTISCALER_MANIFEST
     if not manifest_path.is_file() or manifest_path.is_symlink():
         return None
@@ -647,6 +704,7 @@ def _restore_install_files(originals: dict[Path, Path | None], exe_dir: Path) ->
                 path.unlink(missing_ok=True)
                 prune_empty_parents(path, [exe_dir])
             else:
+                path.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(saved, path)
         except OSError:
             restored = False
@@ -685,7 +743,8 @@ def install_optiscaler_for_game(
     if detect_exe_kind(exe_path) == "linux_elf":
         raise ValueError(f"OptiScaler cannot be installed for native Linux executable: {exe_path}")
 
-    exe_dir = exe_path.parent.resolve()
+    launch_dir = exe_path.parent.resolve()
+    exe_dir = optiscaler_executable(exe_path).parent.resolve()
     if not exe_dir.is_dir():
         raise FileNotFoundError(f"Game directory does not exist: {exe_dir}")
 
@@ -700,7 +759,15 @@ def install_optiscaler_for_game(
     if not has_dll:
         raise FileNotFoundError(f"OptiScaler.dll not found in payload directory: {source_dir}")
 
-    existing_state = inspect_optiscaler_state(exe_path)
+    existing_state = _read_state_manifest(exe_dir)
+    legacy = _read_state_manifest(launch_dir) if launch_dir != exe_dir else None
+    if legacy is not None and not legacy.complete:
+        raise RuntimeError("Remove the incomplete OptiScaler installation before reinstalling.")
+    legacy_ini: str | None = None
+    if legacy is not None and existing_state is None:
+        ini_path = legacy.exe_dir / "OptiScaler.ini"
+        if ini_path in legacy.installed_files and ini_path.is_file() and not ini_path.is_symlink():
+            legacy_ini = ini_path.read_text(encoding="utf-8", errors="replace")
     managed_paths: set[Path] = set()
     backed_up_files: list[Path] = []
     if existing_state is not None:
@@ -722,7 +789,7 @@ def install_optiscaler_for_game(
         raise OptiScalerConflictError(target_proxy_path)
 
     prefix_snapshot: Path | None = (
-        existing_state.prefix_snapshot if existing_state is not None else None
+        previous.prefix_snapshot if (previous := existing_state or legacy) is not None else None
     )
     if auto_snapshot and prefix_dir is not None and prefix_dir.is_dir():
         from .save_sync import snapshot_prefix_state
@@ -773,7 +840,7 @@ def install_optiscaler_for_game(
     def track(path: Path) -> None:
         if path in originals:
             return
-        if not path.parent.resolve().is_relative_to(exe_dir):
+        if not path.parent.resolve().is_relative_to(launch_dir):
             raise ValueError(f"OptiScaler path escapes game folder: {path}")
         saved = rollback_dir / str(len(originals))
         if path.is_symlink():
@@ -851,7 +918,10 @@ def install_optiscaler_for_game(
 
                 if is_payload_root and low_name == "optiscaler.ini":
                     saw_ini = True
-                    ini_raw = src_file.read_text(encoding="utf-8", errors="replace")
+                    ini_raw = (
+                        legacy_ini if legacy_ini is not None
+                        else src_file.read_text(encoding="utf-8", errors="replace")
+                    )
                     dst_ini = _write_patched_ini(
                         exe_dir,
                         ini_raw,
@@ -889,7 +959,7 @@ def install_optiscaler_for_game(
         if not saw_ini:
             dst_ini = _write_patched_ini(
                 exe_dir,
-                "",
+                legacy_ini if legacy_ini is not None else "",
                 backend=backend,
                 fg_mode=fg_mode,
                 spoof_mode=spoof_mode,
@@ -902,6 +972,8 @@ def install_optiscaler_for_game(
             _journal()
 
         state = _state(True)
+        if legacy is not None:
+            _remove_state_files(legacy, track=track)
         _write_state_manifest(state)
     except BaseException:
         if _restore_install_files(originals, exe_dir):
@@ -914,13 +986,31 @@ def install_optiscaler_for_game(
 
 def uninstall_optiscaler_for_game(exe_path: Path) -> OptiScalerResult:
     """Remove OptiScaler files installed for exe_path and restore any backed-up DLLs."""
-    state = inspect_optiscaler_state(exe_path)
-    if state is None:
+    exe_dir = optiscaler_executable(exe_path).parent.resolve()
+    launch_dir = exe_path.parent.resolve()
+    states = [
+        state for folder in dict.fromkeys((exe_dir, launch_dir))
+        if (state := _read_state_manifest(folder)) is not None
+    ]
+    if not states:
         return OptiScalerResult(state=None, removed_count=0, restored_count=0)
+    removed_count = restored_count = 0
+    for state in states:
+        removed, restored = _remove_state_files(state)
+        removed_count += removed
+        restored_count += restored
+    _record_in_game_manifest(exe_dir, None)
+    return OptiScalerResult(state=states[0], removed_count=removed_count, restored_count=restored_count)
 
+
+def _remove_state_files(
+    state: OptiScalerState, *, track: Callable[[Path], None] | None = None
+) -> tuple[int, int]:
     removed_count = 0
     for installed in state.installed_files:
         if installed.is_file() or installed.is_symlink():
+            if track is not None:
+                track(installed)
             installed.unlink(missing_ok=True)
             removed_count += 1
         prune_empty_parents(installed, [state.exe_dir])  # e.g. D3D12_Optiscaler/, Licenses/
@@ -929,6 +1019,9 @@ def uninstall_optiscaler_for_game(exe_path: Path) -> OptiScalerResult:
     for orig in state.backed_up_files:
         backup = orig.with_name(f"{orig.name}.deckinstall.bak")
         if backup.is_file() and not backup.is_symlink() and not orig.is_symlink():
+            if track is not None:
+                track(backup)
+                track(orig)
             orig.parent.mkdir(parents=True, exist_ok=True)
             os.replace(backup, orig)
             restored_count += 1
@@ -937,14 +1030,10 @@ def uninstall_optiscaler_for_game(exe_path: Path) -> OptiScalerResult:
         restored_count += _restore_untracked_backups(state.exe_dir)
 
     manifest_path = state.exe_dir / OPTISCALER_MANIFEST
+    if track is not None:
+        track(manifest_path)
     manifest_path.unlink(missing_ok=True)
-    _record_in_game_manifest(state.exe_dir, None)
-
-    return OptiScalerResult(
-        state=state,
-        removed_count=removed_count,
-        restored_count=restored_count,
-    )
+    return removed_count, restored_count
 
 
 def _restore_untracked_backups(exe_dir: Path, max_depth: int = 4) -> int:
@@ -1072,8 +1161,9 @@ def bulk_optiscaler_targets(
                 out.append((BulkOutcome(t.name, "removed"), dll))
                 continue
 
-            arch = detect_pe_arch(t.exe_path)
-            if t.native_linux or arch in ("linux_elf", "x86", "arm64") or detect_exe_kind(t.exe_path) != "windows_pe":
+            target_exe = optiscaler_executable(t.exe_path)
+            arch = detect_pe_arch(target_exe)
+            if t.native_linux or arch in ("linux_elf", "x86", "arm64") or detect_exe_kind(target_exe) != "windows_pe":
                 out.append((BulkOutcome(t.name, "skipped", arch), None))
                 continue
             prev = inspect_optiscaler_state(t.exe_path)
@@ -1083,15 +1173,16 @@ def bulk_optiscaler_targets(
                 continue
             if payload is None:
                 payload = ensure_optiscaler()
+            repair = prev if prev is not None and prev.needs_repair else None
             state = install_optiscaler_for_game(
                 t.exe_path,
                 proxy_dll=proxy,
                 payload_dir=payload,
                 auto_snapshot=auto_snapshot,
-                backend=backend,
-                fg_mode=fg_mode,
-                spoof_mode=spoof_mode,
-                overlay_menu=overlay_menu,
+                backend=repair.backend if repair is not None and backend == "auto" else backend,
+                fg_mode=repair.fg_mode if repair is not None and fg_mode == "auto" else fg_mode,
+                spoof_mode=repair.spoof_mode if repair is not None and spoof_mode == "auto" else spoof_mode,
+                overlay_menu=repair.overlay_menu if repair is not None and overlay_menu else overlay_menu,
                 prefix_dir=t.prefix_dir,
                 game_name=t.name,
             )
