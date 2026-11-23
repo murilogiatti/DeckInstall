@@ -209,17 +209,20 @@ class UniqueLibraryActionTests(unittest.TestCase):
                 self.assertEqual(win.stack.currentIndex(), ui.PAGE_LIBRARY)
                 self.assertTrue(win.stack.widget(ui.PAGE_MAINT).isAncestorOf(win.theme_combo))
                 self.assertTrue(win.stack.widget(ui.PAGE_MAINT).isAncestorOf(win.btn_redetect_steam))
+                # Tabs on top replace the hub buttons and the "back" buttons.
                 self.assertEqual(
-                    [b.text() for b in win._hub_buttons],
-                    [tr("nav.install"), tr("nav.saves"), tr("nav.maintenance")],
+                    [win.nav_tabs.tabText(i) for i in range(win.nav_tabs.count())],
+                    [tr("nav.library"), tr("nav.install"), tr("nav.saves"), tr("nav.maintenance")],
                 )
-                for button, page in zip(win._hub_buttons, (ui.PAGE_INSTALL, ui.PAGE_SAVES, ui.PAGE_MAINT), strict=True):
-                    button.click()
+                self.assertEqual(win.nav_tabs.currentIndex(), 0)
+                for tab, page in enumerate(ui.NAV_PAGES):
+                    win.nav_tabs.setCurrentIndex(tab)
                     self.assertEqual(win.stack.currentIndex(), page)
-                    backs = [b for b in win.stack.currentWidget().findChildren(QPushButton) if b.text() == tr("nav.back")]
-                    self.assertEqual(len(backs), 1)
-                    backs[0].click()
-                    self.assertEqual(win.stack.currentIndex(), ui.PAGE_LIBRARY)
+                win._show_page(ui.PAGE_INSTALL)  # code paths that jump to a page keep the tab in sync
+                self.assertEqual(win.nav_tabs.currentIndex(), ui.NAV_PAGES.index(ui.PAGE_INSTALL))
+                win._show_page(ui.PAGE_LIBRARY)
+                self.assertEqual(win.nav_tabs.currentIndex(), 0)
+                self.assertFalse(hasattr(win, "_hub_buttons"))
                 self.assertFalse(hasattr(win, "btn_game_actions"))
                 self.assertFalse(hasattr(win, "btn_tools_menu"))
                 self.assertNotEqual(win.shortcuts_list.contextMenuPolicy(), Qt.ContextMenuPolicy.CustomContextMenu)

@@ -151,15 +151,11 @@ QPushButton#dangerBtn:disabled {
     border-color: $danger_disabled_border;
     color: $danger_disabled_fg;
 }
-QPushButton#HubBtn {
-    font-size: 15px;
+QTabBar#NavTabs::tab {
+    font-size: 14px;
     font-weight: 600;
-    padding: 12px 16px;
-    border-radius: 10px;
-}
-QPushButton#BackBtn {
-    padding: 5px 12px;
-    border-radius: 14px;
+    padding: 9px 18px;
+    min-height: 22px;
 }
 QPushButton#FilterPill {
     padding: 5px 12px;

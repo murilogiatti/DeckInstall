@@ -843,7 +843,6 @@
   "nav.install": "Instalar jogo",
   "nav.saves": "Backup e sincronização",
   "nav.maintenance": "Manutenção",
-  "nav.back": "← Biblioteca",
   "maint.app_settings_title": "Aplicativo e Steam",
   "play.stale_instance": "'{name}' ainda está rodando de uma abertura anterior (desde {since}), provavelmente travado e sem janela. O Proton só abre o jogo de novo quando ele fechar.\n\nEncerrar essa instância e abrir de novo? O progresso não salvo dela será perdido.",
   "play.stale_close_and_play": "Encerrar e jogar",
@@ -905,5 +904,6 @@
   "optiscaler_bulk.tier_no_upscaler": "Não (o jogo não tem DLSS, FSR 2+ ou XeSS para substituir)",
   "optiscaler_bulk.tier_unsupported_api": "Não (precisa de DirectX 11/12 ou Vulkan)",
   "optiscaler.confirm_no_upscaler": "Este jogo não traz DLSS, FSR 2+ ou XeSS para o OptiScaler substituir, então ele não mudaria nada.\n\nInstalar mesmo assim?",
-  "optiscaler.confirm_unsupported_api": "O OptiScaler precisa de DirectX 11/12 ou Vulkan, e este jogo usa outra API gráfica, então ele não mudaria nada.\n\nInstalar mesmo assim?"
+  "optiscaler.confirm_unsupported_api": "O OptiScaler precisa de DirectX 11/12 ou Vulkan, e este jogo usa outra API gráfica, então ele não mudaria nada.\n\nInstalar mesmo assim?",
+  "nav.library": "Biblioteca"
 }

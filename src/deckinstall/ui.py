@@ -53,6 +53,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QTabBar,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -276,6 +277,8 @@ def _setting_int(settings: QSettings, key: str, default: int = 0) -> int:
 
 
 PAGE_INSTALL, PAGE_LIBRARY, PAGE_SAVES, PAGE_MAINT = range(4)
+# Order of the tabs on top of the window (Library first); each maps to a page of the stack.
+NAV_PAGES = (PAGE_LIBRARY, PAGE_INSTALL, PAGE_SAVES, PAGE_MAINT)
 
 
 class MainWindow(QMainWindow):
@@ -542,29 +545,23 @@ class MainWindow(QMainWindow):
             sa.setWidget(w)
             return sa
 
-        def _subpage(w: QWidget) -> QWidget:
-            """A page opened from the Library: "← Library" on top, the page scrolls below it."""
-            page = QWidget()
-            lay = QVBoxLayout(page)
-            lay.setContentsMargins(0, 0, 0, 0)
-            lay.setSpacing(8)
-            back = QPushButton(tr("nav.back"), page)
-            back.setObjectName("BackBtn")
-            back.clicked.connect(lambda: self._show_page(PAGE_LIBRARY))
-            row = QHBoxLayout()
-            row.addWidget(back)
-            row.addStretch()
-            lay.addLayout(row)
-            lay.addWidget(_wrap_scroll(w), 1)
-            return page
+        # Tabs on top: Library, Install, Backup/Sync and Maintenance (no "back" buttons).
+        self.nav_tabs = QTabBar()
+        self.nav_tabs.setObjectName("NavTabs")
+        self.nav_tabs.setExpanding(False)
+        self.nav_tabs.setDrawBase(False)
+        for label in (tr("nav.library"), tr("nav.install"), tr("nav.saves"), tr("nav.maintenance")):
+            self.nav_tabs.addTab(label)
+        right_layout.addWidget(self.nav_tabs)
 
-        # Library is the hub; Install, Backup/Sync and Maintenance open from its buttons.
         self.stack = QStackedWidget()
-        self.stack.addWidget(_subpage(self._build_extract_page()))  # PAGE_INSTALL
+        self.stack.addWidget(_wrap_scroll(self._build_extract_page()))  # PAGE_INSTALL
         self.stack.addWidget(_wrap_scroll(self._build_library_page()))  # PAGE_LIBRARY
-        self.stack.addWidget(_subpage(self._build_saves_page()))  # PAGE_SAVES
-        self.stack.addWidget(_subpage(self._build_maintenance_page()))  # PAGE_MAINT
+        self.stack.addWidget(_wrap_scroll(self._build_saves_page()))  # PAGE_SAVES
+        self.stack.addWidget(_wrap_scroll(self._build_maintenance_page()))  # PAGE_MAINT
         self.stack.setCurrentIndex(PAGE_LIBRARY)  # always open on the Library (no jump after the scan)
+        self.nav_tabs.setCurrentIndex(NAV_PAGES.index(PAGE_LIBRARY))
+        self.nav_tabs.currentChanged.connect(lambda tab: self.stack.setCurrentIndex(NAV_PAGES[tab]))
         self.stack.currentChanged.connect(self._on_stack_tab_changed)
         right_layout.addWidget(self.stack)
 
@@ -631,6 +628,7 @@ class MainWindow(QMainWindow):
         style.polish(self.steam_status_lbl)
 
     def _show_page(self, idx: int) -> None:
+        self.nav_tabs.setCurrentIndex(NAV_PAGES.index(idx))
         self.stack.setCurrentIndex(idx)
 
     def _on_stack_tab_changed(self, idx: int) -> None:
@@ -1121,21 +1119,6 @@ class MainWindow(QMainWindow):
         my_lib_layout.addWidget(title)
         my_lib_layout.addWidget(sub)
 
-        hub = QHBoxLayout()
-        hub.setSpacing(10)
-        self._hub_buttons: list[QPushButton] = []
-        for label, idx in (
-            (tr("nav.install"), PAGE_INSTALL),
-            (tr("nav.saves"), PAGE_SAVES),
-            (tr("nav.maintenance"), PAGE_MAINT),
-        ):
-            btn = QPushButton(label)
-            btn.setObjectName("HubBtn")
-            btn.setMinimumHeight(56)
-            btn.clicked.connect(lambda _=False, i=idx: self._show_page(i))
-            hub.addWidget(btn, 1)
-            self._hub_buttons.append(btn)
-        my_lib_layout.addLayout(hub)
 
         lib_card, lib_layout = _make_card()
         top = QHBoxLayout()
@@ -2339,10 +2322,12 @@ class MainWindow(QMainWindow):
         )
         if not matches:
             return True
-        lines = "\n".join(
-            tr(f"add.duplicate_reason_{reason}", name=game.name, path=str(game.game_dir))
-            for game, reason in matches
-        )
+        reason_text = {
+            "folder": lambda g: tr("add.duplicate_reason_folder", name=g.name, path=str(g.game_dir)),
+            "appid": lambda g: tr("add.duplicate_reason_appid", name=g.name, path=str(g.game_dir)),
+            "name": lambda g: tr("add.duplicate_reason_name", name=g.name, path=str(g.game_dir)),
+        }
+        lines = "\n".join(reason_text[reason](game) for game, reason in matches)
         box = QMessageBox(_dialog_parent(self))
         box.setIcon(QMessageBox.Icon.Warning)
         box.setWindowTitle(__app_name__)

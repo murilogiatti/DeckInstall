@@ -753,7 +753,9 @@ def open_optiscaler_dialog(
                 answer = QMessageBox.question(
                     dlg,
                     __app_name__,
-                    tr(f"optiscaler.confirm_{compat.tier}"),
+                    tr("optiscaler.confirm_no_upscaler")
+                    if compat.tier == "no_upscaler"
+                    else tr("optiscaler.confirm_unsupported_api"),
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No,
                 )
