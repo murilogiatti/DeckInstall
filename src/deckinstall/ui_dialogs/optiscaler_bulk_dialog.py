@@ -206,11 +206,13 @@ def _write_vdf(paths: SteamPaths, writes: list[VdfWrite]) -> list[str]:
 
 
 def _tier_text(compat: OptiScalerCompatibility) -> str:
-    if not compat.compatible:
-        return tr("optiscaler_bulk.tier_incompatible", arch=compat.pe_arch)
     if compat.tier == "verified":
         return tr("optiscaler_bulk.tier_verified", upscalers=", ".join(compat.upscalers))
-    return tr("optiscaler_bulk.tier_likely")
+    if compat.tier == "no_upscaler":
+        return tr("optiscaler_bulk.tier_no_upscaler")
+    if compat.tier == "unsupported_api":
+        return tr("optiscaler_bulk.tier_unsupported_api")
+    return tr("optiscaler_bulk.tier_incompatible", arch=compat.pe_arch)
 
 
 def _state_text(compat: OptiScalerCompatibility) -> str:
@@ -316,7 +318,8 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
                 if compat.compatible and compat.tier == "verified" and compat.installed_state is None
                 else Qt.CheckState.Unchecked
             )
-            if not compat.compatible:
+            if not compat.compatible and compat.installed_state is None:
+                # Nothing to hook into: only an existing install may be checked (to remove it).
                 it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsUserCheckable)
             tbl.setItem(row, 0, it)
             tbl.setItem(row, 1, QTableWidgetItem(_source_text(game)))
@@ -387,6 +390,12 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
         if not picked:
             QMessageBox.information(dlg, __app_name__, tr("proton_bulk.none_selected"))
             return
+        if not remove:
+            usable = {id(g) for g, compat in current if compat.compatible}
+            picked = [g for g in picked if id(g) in usable]
+            if not picked:
+                QMessageBox.information(dlg, __app_name__, tr("optiscaler_bulk.none_compatible"))
+                return
         backend = str(combo_backend.currentData() or "auto")
         auto_snapshot = win._is_auto_snapshot_enabled()
         buttons = (btn_all, btn_install, btn_remove, btn_select_all, btn_select_none, btn_close, combo_backend)

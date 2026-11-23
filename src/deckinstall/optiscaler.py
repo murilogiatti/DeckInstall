@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 from collections.abc import Callable
@@ -130,6 +131,91 @@ def _resolve_upscaler_scan_root(exe_path: Path, game_dir: Path | None) -> Path:
     return safe_scan_root(exe_path, game_dir)
 
 
+# Unreal Engine ships upscalers as plugins (often linked into the game exe, no DLL by that name).
+_UE_UPSCALER_PLUGINS: dict[str, str] = {
+    "dlss": "DLSS",
+    "streamline": "DLSS",
+    "streamlinecore": "DLSS",
+    "fsr": "FSR",
+    "fsr2": "FSR",
+    "fsr3": "FSR",
+    "fsr4": "FSR",
+    "ffxfsr2": "FSR",
+    "ffxfsr3": "FSR",
+    "xess": "XeSS",
+}
+_UPSCALER_SCAN_DEPTH = 8
+_OPTISCALER_DIRS = frozenset({"d3d12_optiscaler"})
+
+
+def find_native_upscalers(
+    exe_path: Path, game_dir: Path | None, installed_state: OptiScalerState | None = None
+) -> tuple[str, ...]:
+    """Upscalers the game itself ships (DLSS/FSR/XeSS), ignoring files OptiScaler installed."""
+    scan_root = _resolve_upscaler_scan_root(exe_path, game_dir)
+    own: set[Path] = set()
+    if installed_state is not None:
+        for f in installed_state.installed_files:
+            try:
+                own.add(f.resolve())
+            except OSError:
+                continue
+    found: set[str] = set()
+    base_parts = len(scan_root.parts)
+    try:
+        for dirpath, dirnames, filenames in os.walk(scan_root, followlinks=False):
+            cur = Path(dirpath)
+            depth = len(cur.parts) - base_parts
+            in_plugins = any(part.lower() == "plugins" for part in cur.parts[base_parts:])
+            keep: list[str] = []
+            for d in dirnames:
+                low_d = d.lower()
+                if d.startswith(".") or low_d in _OPTISCALER_DIRS or (cur / d).is_symlink():
+                    continue
+                if in_plugins and low_d in _UE_UPSCALER_PLUGINS:
+                    found.add(_UE_UPSCALER_PLUGINS[low_d])
+                keep.append(d)
+            dirnames[:] = keep if depth < _UPSCALER_SCAN_DEPTH else []
+            for fname in filenames:
+                low = fname.lower()
+                if not low.endswith(".dll"):
+                    continue
+                kind = (
+                    "DLSS" if low in _DLSS_DLL_NAMES
+                    else "FSR" if low in _FSR_DLL_NAMES
+                    else "XeSS" if low in _XESS_DLL_NAMES
+                    else ""
+                )
+                if not kind or kind in found:
+                    continue
+                if own and (cur / fname).resolve() in own:
+                    continue
+                found.add(kind)
+            if len(found) == 3:
+                break
+    except OSError:
+        pass
+    return tuple(k for k in ("DLSS", "FSR", "XeSS") if k in found)
+
+
+def _graphics_api_supported(exe_path: Path, game_dir: Path | None) -> bool:
+    """False only when the detected graphics API rules OptiScaler out (no DX11/DX12/Vulkan)."""
+    from .gameinfo import detect_game_tech
+
+    try:
+        api, _engine = detect_game_tech(exe_path, game_dir)
+    except Exception:
+        logging.debug("Graphics API detection failed for %s", exe_path, exc_info=True)
+        return True
+    if not api or api.strip() in ("-", "?", ""):
+        return True
+    low = api.lower()
+    if "vulkan" in low or re.search(r"directx [\d/.]*\b1[12]\b", low):
+        return True
+    # A known API that is none of those (DirectX 8-10, OpenGL, DirectDraw, Glide) rules it out.
+    return not any(word in low for word in ("directx", "opengl", "directdraw", "glide"))
+
+
 def check_optiscaler_compatibility(
     exe_path: Path,
     game_dir: Path | None = None,
@@ -155,50 +241,22 @@ def check_optiscaler_compatibility(
             installed_state=None,
         )
 
-    scan_root = _resolve_upscaler_scan_root(exe_path, game_dir)
-    has_dlss = False
-    has_fsr = False
-    has_xess = False
-    base_parts = len(scan_root.parts)
-
-    try:
-        for dirpath, dirnames, filenames in os.walk(scan_root, followlinks=False):
-            cur = Path(dirpath)
-            depth = len(cur.parts) - base_parts
-            if depth >= 5:
-                dirnames[:] = []
-            else:
-                dirnames[:] = [
-                    d
-                    for d in dirnames
-                    if not d.startswith(".") and not (cur / d).is_symlink()
-                ]
-            for fname in filenames:
-                low = fname.lower()
-                if not low.endswith(".dll"):
-                    continue
-                if low in _DLSS_DLL_NAMES:
-                    has_dlss = True
-                elif low in _FSR_DLL_NAMES:
-                    has_fsr = True
-                elif low in _XESS_DLL_NAMES:
-                    has_xess = True
-            if has_dlss and has_fsr and has_xess:
-                break
-    except OSError:
-        pass
-
-    found: list[str] = []
-    if has_dlss:
-        found.append("DLSS")
-    if has_fsr:
-        found.append("FSR")
-    if has_xess:
-        found.append("XeSS")
-    upscalers = tuple(found)
-    tier = "verified" if upscalers else "likely"
     installed_state = inspect_optiscaler_state(exe_path)
+    upscalers = find_native_upscalers(exe_path, game_dir, installed_state)
     proxy, notes = recommend_proxy(exe_path, game_dir, installed_state)
+    if not upscalers or not _graphics_api_supported(exe_path, game_dir):
+        # OptiScaler only swaps an upscaler the game already has (DLSS 2+/FSR 2+/XeSS) on
+        # DirectX 11/12 or Vulkan; without one there is nothing to hook into.
+        return OptiScalerCompatibility(
+            compatible=False,
+            tier="no_upscaler" if not upscalers else "unsupported_api",
+            pe_arch=pe_arch,
+            upscalers=upscalers,
+            installed_state=installed_state,
+            recommended_proxy=proxy,
+            notes=notes,
+        )
+    tier = "verified"
     return OptiScalerCompatibility(
         compatible=True,
         tier=tier,

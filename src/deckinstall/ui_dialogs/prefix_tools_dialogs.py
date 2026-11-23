@@ -32,6 +32,7 @@ from ..optiscaler import (
     OPTISCALER_SPOOF_MODES,
     OptiScalerConflictError,
     OptiScalerState,
+    check_optiscaler_compatibility,
     inspect_optiscaler_state,
     install_optiscaler_for_game,
     recommend_proxy,
@@ -745,6 +746,19 @@ def open_optiscaler_dialog(
     def _start_install(overwrite_existing: bool) -> None:
         if operation["busy"]:
             return
+        if not overwrite_existing:
+            game_dir = managed.game_dir if managed is not None else getattr(obj, "game_dir", None)
+            compat = check_optiscaler_compatibility(exe_path, game_dir if isinstance(game_dir, Path) else None)
+            if not compat.compatible and compat.tier in ("no_upscaler", "unsupported_api"):
+                answer = QMessageBox.question(
+                    dlg,
+                    __app_name__,
+                    tr(f"optiscaler.confirm_{compat.tier}"),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
         proxy_dll = str(combo_proxy.currentData() or "dxgi")
         backend = str(combo_backend.currentData() or "auto")
         fg_mode = str(fg_combo.currentData() or "auto")

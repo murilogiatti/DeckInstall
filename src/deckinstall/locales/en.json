@@ -581,7 +581,6 @@
   "optiscaler_bulk.col_compat": "Compatibility",
   "optiscaler_bulk.col_state": "OptiScaler",
   "optiscaler_bulk.tier_verified": "Yes ({upscalers})",
-  "optiscaler_bulk.tier_likely": "Probably (no DLSS/FSR/XeSS DLL found)",
   "optiscaler_bulk.tier_incompatible": "No ({arch})",
   "optiscaler_bulk.state_none": "Not installed - would use {proxy}",
   "optiscaler_bulk.state_incomplete": "Half-done - remove to fix",
@@ -902,5 +901,9 @@
   "add.duplicate_reason_folder": "• {name} ({path}): this folder is, holds or came from that game",
   "add.duplicate_reason_appid": "• {name} ({path}): same Steam AppID",
   "add.duplicate_reason_name": "• {name} ({path}): same name",
-  "add.duplicate_btn_copy": "Install another copy"
+  "add.duplicate_btn_copy": "Install another copy",
+  "optiscaler_bulk.tier_no_upscaler": "No (the game has no DLSS, FSR 2+ or XeSS to replace)",
+  "optiscaler_bulk.tier_unsupported_api": "No (needs DirectX 11/12 or Vulkan)",
+  "optiscaler.confirm_no_upscaler": "This game ships no DLSS, FSR 2+ or XeSS for OptiScaler to replace, so it would change nothing.\n\nInstall anyway?",
+  "optiscaler.confirm_unsupported_api": "OptiScaler needs DirectX 11/12 or Vulkan, and this game uses another graphics API, so it would change nothing.\n\nInstall anyway?"
 }
