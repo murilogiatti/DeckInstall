@@ -39,7 +39,7 @@ def test_ludusavi_cold_cache_builds_once_and_returns_independent_values(
     assert first is not None
     assert isinstance(first["steam"], dict)
     first["steam"]["id"] = "changed"
-    assert save_sync.load_ludusavi_manifest() == {"Game": {"steam": {"id": "1"}}}
+    assert save_sync.find_manifest_game_entry("Game") == {"steam": {"id": "1"}}  # callers get copies
 
 
 def test_umu_cache_detects_replaced_inode_and_rejects_symlink(tmp_path: Path) -> None:

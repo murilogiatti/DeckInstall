@@ -355,14 +355,6 @@ def _get_ludusavi_index(manifest_path: Path | None = None) -> _LudusaviManifestI
         return _LUDUSAVI_CACHE
 
 
-def load_ludusavi_manifest(
-    manifest_path: Path | None = None,
-) -> dict[str, dict[str, object]]:
-    """Load a Ludusavi JSON manifest mapping game names to save/registry definitions."""
-    idx = _get_ludusavi_index(manifest_path)
-    return deepcopy(idx.entries) if idx is not None else {}
-
-
 def find_manifest_game_entry(
     game_name: str,
     steam_appid: int | None = None,
@@ -1808,11 +1800,6 @@ def _read_sync_base_pair(prefix_dir: Path, sync_root: Path, slug: str) -> tuple[
         loc = value.get("local")
         return (rem if isinstance(rem, str) else ""), (loc if isinstance(loc, str) else "")
     return "", ""
-
-
-def _read_sync_base(prefix_dir: Path, sync_root: Path, slug: str) -> str:
-    """Return the save digest last pushed/pulled by this device for (sync_root, slug)."""
-    return _read_sync_base_pair(prefix_dir, sync_root, slug)[0]
 
 
 def _record_sync_base(

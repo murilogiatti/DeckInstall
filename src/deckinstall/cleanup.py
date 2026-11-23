@@ -114,30 +114,6 @@ def _plain(category: str, label: str, path: Path, size_bytes: int = 0) -> Cleanu
 # --- shared helpers ---------------------------------------------------------------------------
 
 
-def collect_active_proton_tools(
-    paths: SteamPaths | None,
-    games_dir: Path | None = None,
-) -> set[str]:
-    """Return compatibility tool names in use by Steam games/shortcuts and standalone games."""
-    from .standalone import get_legacy_games_dir, list_standalone_games
-
-    tools: set[str] = set()
-    if paths is not None:
-        _, all_user_entries = _all_user_shortcuts(paths)
-        active_shortcuts = {e.appid_u32 for e in all_user_entries}
-        installed_steam = _installed_steam_appids(paths.steam_root)
-        tools.update(_active_compat_tools(paths.config_vdf, active_shortcuts | installed_steam))
-    if games_dir is None:
-        games = list_standalone_games(None)
-    else:
-        try:
-            is_legacy = games_dir.resolve() == get_legacy_games_dir().resolve()
-        except OSError:
-            is_legacy = games_dir == get_legacy_games_dir()
-        games = list_standalone_games(None if is_legacy else games_dir)
-    return tools | _standalone_proton_tools(games)
-
-
 def _standalone_proton_tools(games: Iterable[StandaloneGame]) -> set[str]:
     tools: set[str] = set()
     for game in games:

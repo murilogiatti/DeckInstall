@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from conftest import pe_exe_bytes
 
+from deckinstall import save_sync  # noqa: E402
 from deckinstall.cleanup import delete_cleanup_candidates_checked, find_cleanup_candidates
 from deckinstall.runtime_manager import (
     get_umu_protonfix_status,
@@ -20,7 +21,6 @@ from deckinstall.runtime_manager import (
 from deckinstall.save_sync import (
     _extract_registry_saves,
     _restore_registry_saves,
-    load_ludusavi_manifest,
     preview_sync_operation,
     push_game_saves,
     restore_prefix_state_snapshot,
@@ -194,9 +194,10 @@ class TestNewFeatures(unittest.TestCase):
             }
             manifest_file.write_text(json.dumps(manifest_data), encoding="utf-8")
 
-            loaded = load_ludusavi_manifest(manifest_file)
-            self.assertIn("My Game", loaded)
-            self.assertEqual(load_ludusavi_manifest(tmp_path / "missing.json"), {})
+            index = save_sync._get_ludusavi_index(manifest_file)
+            self.assertIsNotNone(index)
+            self.assertIn("My Game", index.entries if index is not None else {})
+            self.assertIsNone(save_sync._get_ludusavi_index(tmp_path / "missing.json"))
 
             src_pfx = tmp_path / "src_pfx"
             src_pfx.mkdir()

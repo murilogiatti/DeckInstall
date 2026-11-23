@@ -156,7 +156,6 @@ class AdoptionCandidate:
     icon: Path | None = None
     in_drive_c: bool = False  # the game folder lives inside the prefix's drive_c
     prefix_shared: bool = False
-    saves_hints: list[Path] = field(default_factory=list)  # folders in the prefix holding saves
     warnings: list[str] = field(default_factory=list)
     extra_save_prefixes: tuple[Path, ...] = ()
     steam_compat_dir: Path | None = None
@@ -649,7 +648,6 @@ def _finish(c: AdoptionCandidate, prefix_users: dict[Path, int], managed_prefixe
             _add(c.warnings, W_SHARED_PREFIX)
         if not _has_drive_c(c.prefix_dir):
             _add(c.warnings, W_NO_PREFIX)
-        c.saves_hints = _saves_hints(c.prefix_dir)
     elif not c.native_linux:
         _add(c.warnings, W_NO_PREFIX)
     if not c.proton_hint:

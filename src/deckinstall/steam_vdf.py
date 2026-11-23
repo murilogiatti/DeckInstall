@@ -1681,30 +1681,6 @@ def _copy_save_pair_if_newer(
         return 0
 
 
-def adopt_installer_prefix(
-    paths: SteamPaths,
-    game_root: Path,
-    shortcut_appid_u32: int,
-) -> bool:
-    """Adopt `.deckinstall_installer_pfx` saved by setup.exe into compatdata/<appid>/pfx."""
-    saved_pfx = game_root / ".deckinstall_installer_pfx"
-    if not saved_pfx.is_dir() or saved_pfx.is_symlink():
-        return False
-    paths.compatdata_dir.mkdir(parents=True, exist_ok=True)
-    compat_root_resolved = paths.compatdata_dir.resolve()
-    if not _safe_parents_within(
-        paths.compatdata_dir, compat_root_resolved, (str(shortcut_appid_u32),)
-    ):
-        raise OSError(f"Unsafe compatdata path for {shortcut_appid_u32}")
-    target_compat = paths.compatdata_dir / str(shortcut_appid_u32)
-    target_pfx = target_compat / "pfx"
-    if target_pfx.exists() or target_pfx.is_symlink():
-        return False
-    target_compat.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(saved_pfx), str(target_pfx))
-    return True
-
-
 def _resolve_prefix_drive_c_layout(
     prefix_dir: Path,
     trusted_targets: set[Path] | None = None,

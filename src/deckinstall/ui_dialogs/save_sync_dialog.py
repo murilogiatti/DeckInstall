@@ -855,12 +855,6 @@ def _find_ludusavi_backup(saved: str, name: str) -> Path | None:
     return None
 
 
-def ludusavi_backup_for(win: MainWindow, name: str) -> Path | None:
-    """The game's folder in the Ludusavi backup last used (or set in Ludusavi), when there is one."""
-    saved = str(win.settings.value(LUDUSAVI_DIR_KEY, "") or "")
-    return _find_ludusavi_backup(saved, name)
-
-
 def _import_ludusavi_checked(target: SaveTarget, folder: Path) -> lds.ImportResult:
     if target.source == "nexus" and is_nexus_running():
         raise RuntimeError(tr("saves.nexus_running"))

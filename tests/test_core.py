@@ -1386,20 +1386,6 @@ class CoreTests(unittest.TestCase):
                 self.assertEqual(res, target)
                 self.assertTrue((target / ".deckinstall_installer_pfx" / "drive_c" / "users" / "steamuser" / "reg.dat").exists())
 
-                paths = SteamPaths(
-                    steam_root=root,
-                    user_id="1",
-                    userdata_dir=root / "userdata" / "1",
-                    shortcuts_vdf=root / "shortcuts.vdf",
-                    grid_dir=root / "grid",
-                    config_vdf=root / "config.vdf",
-                    compatdata_dir=root / "compatdata",
-                )
-                adopted = sv.adopt_installer_prefix(paths, target, 777777)
-                self.assertTrue(adopted)
-                self.assertFalse((target / ".deckinstall_installer_pfx").exists())
-                self.assertTrue((root / "compatdata" / "777777" / "pfx" / "drive_c" / "users" / "steamuser" / "reg.dat").exists())
-
         with self.subTest("9_prefix_symlink_users_and_programdata_blocked"):
             with tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)

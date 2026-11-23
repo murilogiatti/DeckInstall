@@ -170,7 +170,8 @@ def test_each_source_kind_is_detected(home: Path) -> None:
 
     heroic = _only(cands, adopt.HEROIC)
     assert heroic.prefix_dir == h_pfx and heroic.proton_hint == "GE-Proton9-20" and heroic.store == "gog"
-    assert heroic.saves_hints and heroic.saves_hints[0].name == "Saved Games"
+    hints = adopt._saves_hints(heroic.prefix_dir)
+    assert hints and hints[0].name == "Saved Games"
     lutris = _only(cands, adopt.LUTRIS)
     assert lutris.in_drive_c and lutris.game_dir == l_exe.parent
     bottles = _only(cands, adopt.BOTTLES)

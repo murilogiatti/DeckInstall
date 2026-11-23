@@ -305,17 +305,6 @@ def test_existing_snapshots_match_the_installed_game_by_name(tmp_path: Path) -> 
         assert ssd.existing_snapshots_for("Returnal", [state]) == []  # only save snapshots are offered
 
 
-def test_ludusavi_backup_for_checks_the_game_name(tmp_path: Path) -> None:
-    folder = _backup(tmp_path, "My Game")
-    win = mock.Mock()
-    win.settings.value.return_value = str(tmp_path / "ludusavi")
-    with mock.patch.object(lds, "ludusavi_backup_path", return_value=None):
-        assert ssd.ludusavi_backup_for(win, "My Game") == folder
-        assert ssd.ludusavi_backup_for(win, "Another") is None
-        win.settings.value.return_value = str(folder)  # the saved root is one game's own backup
-        assert ssd.ludusavi_backup_for(win, "Another") is None
-
-
 def test_offer_existing_saves_restores_the_newest_when_accepted(tmp_path: Path) -> None:
     game = mock.Mock(native_linux=False, prefix_dir=tmp_path / "pfx", game_dir=tmp_path / "g", steam_appid=None)
     game.name = "My Game"
