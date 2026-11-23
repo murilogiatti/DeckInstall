@@ -3843,6 +3843,7 @@ class MainWindow(QMainWindow):
                 track_worker=self._track_worker,
                 snapshot_fn=self._make_pre_snapshot_fn(force=True),
                 steam_add_allowed=not self._vdf_corrupt,
+                steamos=self._steamos,
             )
             if results:
                 self.status_label.setText(tr("adopt.status_done", count=len(results)))

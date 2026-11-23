@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 from .. import adopt as ad
 from ..fsutil import unique_dir
 from ..i18n import tr
+from ..modes import STEAM, feature_note
 from ..steam_paths import SteamPaths, is_gamescope_session
 from ..ui_cards import FlowLayout, _pick_dir_async, _pick_file_async, format_size_bytes, shortcut_target_button
 from ..ui_workers_adopt import AdoptPlanWorker, AdoptScanWorker, AdoptWorker
@@ -155,8 +156,11 @@ class AdoptWizard(QDialog):
         parent: QWidget | None = None,
         snapshot_fn: ad.SnapshotFn | None = None,
         steam_add_allowed: bool = True,
+        steamos: bool = False,
     ) -> None:
         super().__init__(parent)
+        self._steamos = steamos  # SteamOS runs every game through Steam (Steam mode only)
+        self._steam_linked = False
         self._snapshot_fn = snapshot_fn
         self.setWindowTitle(tr("adopt.title"))
         self.resize(900, 620)
@@ -413,6 +417,10 @@ class AdoptWizard(QDialog):
             targets.addWidget(button)
         self.btn_shortcut_steam.setVisible(self._paths is not None)
         form.addRow(tr("add.shortcuts_label"), targets)
+        self.lbl_targets_note = QLabel()
+        self.lbl_targets_note.setObjectName("MutedText")
+        self.lbl_targets_note.setWordWrap(True)
+        form.addRow("", self.lbl_targets_note)
 
         self.steam_box = QWidget()
         slay = QVBoxLayout(self.steam_box)
@@ -658,8 +666,29 @@ class AdoptWizard(QDialog):
             blocks.append(tr("adopt.confirm_needed"))
         self.lbl_blockers.setText("\n".join(f"✖ {b}" for b in blocks))
 
+    def _sync_mode_pills(self) -> None:
+        """One mode per game: in Steam (linked or being added) means no menu/desktop launchers."""
+        steam_on = self.btn_shortcut_steam.isEnabled() and self.btn_shortcut_steam.isChecked()
+        if self._steamos and self._paths is not None and self._steam_add_allowed and not self._steam_linked:
+            if not steam_on:  # SteamOS: an adopted game always goes to Steam
+                self.btn_shortcut_steam.blockSignals(True)
+                self.btn_shortcut_steam.setChecked(True)
+                self.btn_shortcut_steam.blockSignals(False)
+                steam_on = True
+        steam_mode = self._steam_linked or steam_on
+        note = feature_note("app_shortcuts", STEAM) if steam_mode else ""
+        for button in (self.btn_shortcut_menu, self.btn_shortcut_desktop):
+            button.blockSignals(True)
+            if steam_mode:
+                button.setChecked(False)
+            button.setEnabled(not steam_mode)
+            button.blockSignals(False)
+        self.lbl_targets_note.setText(note)
+        self.lbl_targets_note.setVisible(bool(note))
+
     def _sync_steam_shortcut_pill(self, has_steam: bool, removing_steam: bool) -> None:
         linked = has_steam and not removing_steam
+        self._steam_linked = linked
         self.btn_shortcut_steam.blockSignals(True)
         self.btn_shortcut_steam.setEnabled(self._steam_add_allowed and not linked)
         self.btn_shortcut_steam.setText(
@@ -677,6 +706,7 @@ class AdoptWizard(QDialog):
         if idx < 0 or idx >= len(self.items):
             return
         it = self.items[idx]
+        self._sync_mode_pills()
         add_steam = (
             self._paths is not None
             and self.btn_shortcut_steam.isEnabled()
@@ -703,6 +733,7 @@ class AdoptWizard(QDialog):
         has_steam = it.cand.shortcut_appid is not None
         remove_steam = has_steam and self.rb_steam_remove.isChecked() and self._steam_add_allowed
         self._sync_steam_shortcut_pill(has_steam, remove_steam)
+        self._sync_mode_pills()
         it.opts = ad.AdoptOptions(
             move_game=self.chk_move_game.isChecked(),
             move_prefix=self.chk_move_prefix.isChecked(),
@@ -952,10 +983,12 @@ def open_adopt_wizard(
     track_worker: TrackFn | None = None,
     snapshot_fn: ad.SnapshotFn | None = None,
     steam_add_allowed: bool = True,
+    steamos: bool = False,
 ) -> list[ad.AdoptionResult]:
     """Show the wizard modally; return the successful adoptions."""
     dlg = AdoptWizard(
         paths, libraries, steam_writable, steam_note, track_worker, parent, snapshot_fn, steam_add_allowed,
+        steamos,
     )
     try:
         dlg.exec()

@@ -159,13 +159,17 @@ def test_wizard_lists_plans_blocks_and_adopts_in_batch(
         dlg.game_list.setCurrentRow(0)
         assert dlg.cmb_proton.currentData() == "source"
         assert dlg.btn_shortcut_steam.isEnabled() and dlg.btn_shortcut_steam.isCheckable()
-        dlg.btn_shortcut_steam.click()
         dlg.btn_shortcut_desktop.click()
-        assert dlg.items[0].opts.add_to_steam and dlg.items[0].opts.create_desktop_shortcut
-        dlg.game_list.setCurrentRow(2)
-        assert not dlg.btn_shortcut_steam.isChecked() and not dlg.btn_shortcut_desktop.isChecked()
+        assert dlg.items[0].opts.create_desktop_shortcut and not dlg.items[0].opts.add_to_steam
+        # One mode per game: adding it to Steam drops the desktop launcher and says why.
+        dlg.btn_shortcut_steam.click()
+        assert dlg.items[0].opts.add_to_steam and not dlg.items[0].opts.create_desktop_shortcut
+        assert not dlg.btn_shortcut_desktop.isEnabled()
+        assert dlg.lbl_targets_note.text() == tr("mode.note_shortcuts_steam")
+        dlg.game_list.setCurrentRow(2)  # already linked in Steam: Steam mode too
+        assert not dlg.btn_shortcut_desktop.isEnabled() and not dlg.btn_shortcut_desktop.isChecked()
         dlg.game_list.setCurrentRow(0)
-        assert dlg.btn_shortcut_steam.isChecked() and dlg.btn_shortcut_desktop.isChecked()
+        assert dlg.btn_shortcut_steam.isChecked() and not dlg.btn_shortcut_desktop.isChecked()
         dlg.cmb_library.setCurrentIndex(1)
         _wait(app, lambda: dlg.items[0].plan is not None)
         assert dlg.items[0].plan is not None and dlg.items[0].plan.library_root == lib_b
@@ -263,7 +267,7 @@ def test_main_window_has_one_adopt_entry(app: QApplication, tmp_path: Path) -> N
 
             def fake_open(
                 parent, paths, libraries, steam_writable, steam_note="", track_worker=None,
-                snapshot_fn=None, steam_add_allowed=True,
+                snapshot_fn=None, steam_add_allowed=True, steamos=False,
             ):
                 seen.update(
                     libraries=libraries, writable=steam_writable, note=steam_note, snap=snapshot_fn,
