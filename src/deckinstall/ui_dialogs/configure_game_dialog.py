@@ -33,6 +33,7 @@ from .. import __app_name__
 from ..external_actions import load_external_launch_presets
 from ..i18n import tr
 from ..launcher_scan import ExternalLauncherGame
+from ..modes import STEAM, feature_note
 from ..proton_policy import (
     DEFAULT_PROTON_ID,
     newest_ge_proton,
@@ -240,11 +241,21 @@ def open_scan_folders_dialog(win: MainWindow) -> None:
     dlg.deleteLater()
 
 
-def _launcher_checkboxes(win: MainWindow, dlg: QDialog, game: StandaloneGame) -> QWidget:
-    """Desktop / app-menu launcher boxes, checked by what really exists; toggling creates or removes."""
+def _launcher_checkboxes(win: MainWindow, dlg: QDialog, game: StandaloneGame, steam_mode: bool = False) -> QWidget:
+    """Desktop / app-menu launcher boxes, checked by what really exists; toggling creates or removes.
+
+    steam_mode: the game opens from Steam, so a launcher can only be removed (left over from before).
+    """
     box = QWidget()
-    lay = QHBoxLayout(box)
-    lay.setContentsMargins(0, 0, 0, 0)
+    outer = QVBoxLayout(box)
+    outer.setContentsMargins(0, 0, 0, 0)
+    lay = QHBoxLayout()
+    outer.addLayout(lay)
+    if steam_mode:
+        note = QLabel(feature_note("app_shortcuts", STEAM))
+        note.setObjectName("MutedText")
+        note.setWordWrap(True)
+        outer.addWidget(note)
     try:
         found = find_game_launchers(game)
     except OSError:
@@ -255,6 +266,8 @@ def _launcher_checkboxes(win: MainWindow, dlg: QDialog, game: StandaloneGame) ->
     ):
         chk = QCheckBox(label)
         chk.setChecked(bool(found.get(where)))
+        if steam_mode and not chk.isChecked():
+            chk.setEnabled(False)
 
         def _toggled(checked: bool, w: str = where, c: QCheckBox = chk) -> None:
             try:
@@ -377,7 +390,11 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         game_form.addRow(tr("configure.lbl_exe"), lbl_exe)
     game_form.addRow(tr("configure.lbl_dir"), lbl_dir)
     if sa_obj is not None:
-        game_form.addRow(tr("configure.lbl_launchers"), _launcher_checkboxes(win, dlg, sa_obj))
+        game_form.addRow(tr("configure.lbl_launchers"), _launcher_checkboxes(win, dlg, sa_obj, steam_mode=is_steam))
+    if is_steam or is_standalone:
+        lbl_mode = QLabel(tr("mode.steam") if is_steam else tr("mode.standalone"))
+        lbl_mode.setToolTip(tr("mode.desc_steam") if is_steam else tr("mode.desc_standalone"))
+        game_form.addRow(tr("mode.label"), lbl_mode)
 
     initial_opts_text = (
         load_external_launch_presets(obj)
