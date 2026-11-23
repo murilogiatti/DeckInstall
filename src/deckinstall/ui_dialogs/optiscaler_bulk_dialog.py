@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -245,7 +246,10 @@ def _outcome_line(o: BulkOutcome) -> str:
     return f"{o.name}: {labels.get(o.status, o.status)}{detail}"
 
 
-def bulk_optiscaler_dialog(win: MainWindow) -> None:
+def bulk_optiscaler_dialog(
+    win: MainWindow, *, target_version: str = "", cleanup_only: bool = False,
+    on_close: Callable[[], None] | None = None,
+) -> None:
     """Scan DeckInstall games in the background, then open the bulk OptiScaler dialog."""
     if hasattr(win, "btn_bulk_optiscaler"):
         win.btn_bulk_optiscaler.setEnabled(False)
@@ -260,10 +264,15 @@ def bulk_optiscaler_dialog(win: MainWindow) -> None:
         win.status_label.setText(tr("status.ready"))
         if win._closing_pending:
             return
-        if not isinstance(rows, list) or not rows:
+        filtered = rows if isinstance(rows, list) else []
+        if target_version or cleanup_only:
+            filtered = [row for row in filtered if row[1].installed_state is not None]
+        if not filtered:
             QMessageBox.information(_dialog_parent(win), __app_name__, tr("proton_games.empty"))
-            return
-        _show(win, rows)
+        else:
+            _show(win, filtered, target_version=target_version, cleanup_only=cleanup_only)
+        if on_close is not None:
+            on_close()
 
     def _failed(err: str) -> None:
         if hasattr(win, "btn_bulk_optiscaler"):
@@ -271,13 +280,17 @@ def bulk_optiscaler_dialog(win: MainWindow) -> None:
         win.status_label.setText(tr("status.ready"))
         if not win._closing_pending:
             QMessageBox.critical(_dialog_parent(win), __app_name__, tr("optiscaler.error", err=err))
+            if on_close is not None:
+                on_close()
 
     loader.finished_ok.connect(_loaded)
     loader.failed.connect(_failed)
     loader.start()
 
 
-def _show(win: MainWindow, rows: list[Row]) -> None:
+def _show(
+    win: MainWindow, rows: list[Row], *, target_version: str = "", cleanup_only: bool = False,
+) -> None:
     op_state = {"busy": False}
     dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: op_state["busy"])
     dlg.setWindowTitle(tr("optiscaler_bulk.title"))
@@ -301,6 +314,7 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
     tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
     header = tbl.horizontalHeader()
+    header.setSortIndicator(0, Qt.SortOrder.AscendingOrder)
     header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
     header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
     header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
@@ -308,22 +322,33 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
     header.setStretchLastSection(False)
     lay.addWidget(tbl, 1)
 
-    games: list[BulkTarget] = []
     current: list[Row] = []
 
+    def _needs_action(compat: OptiScalerCompatibility) -> bool:
+        state = compat.installed_state
+        if cleanup_only:
+            return False
+        if target_version:
+            return state is not None and compat.compatible and (
+                state.version != target_version or not state.complete or state.needs_repair
+            )
+        return _needs_install(compat)
+
     def _fill(data: list[Row]) -> None:
-        games.clear()
-        current[:] = data
+        current[:] = [
+            row for row in data if row[1].installed_state is not None
+        ] if target_version or cleanup_only else data
+        tbl.setSortingEnabled(False)
         tbl.setRowCount(0)
-        for game, compat in data:
+        for game, compat in current:
             row = tbl.rowCount()
             tbl.insertRow(row)
-            games.append(game)
             it = QTableWidgetItem(game.name)
+            it.setData(Qt.ItemDataRole.UserRole, (game, compat))
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             # Include installations that still point at the launcher folder.
             it.setCheckState(
-                Qt.CheckState.Checked if _needs_install(compat) else Qt.CheckState.Unchecked
+                Qt.CheckState.Checked if _needs_action(compat) else Qt.CheckState.Unchecked
             )
             if not compat.compatible and compat.installed_state is None:
                 # Nothing to hook into: only an existing install may be checked (to remove it).
@@ -333,6 +358,8 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
             tbl.setItem(row, 2, QTableWidgetItem(_tier_text(compat)))
             tbl.setItem(row, 3, QTableWidgetItem(_state_text(compat)))
 
+        tbl.setSortingEnabled(True)
+
     _fill(rows)
 
     form = QFormLayout()
@@ -340,7 +367,10 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
     for b in OPTISCALER_BACKENDS:
         combo_backend.addItem(b.upper() if b != "auto" else tr("optiscaler.backend_auto"), b)
     form.addRow(tr("optiscaler.backend_label"), combo_backend)
-    lay.addLayout(form)
+    if not cleanup_only:
+        lay.addLayout(form)
+    else:
+        combo_backend.hide()
 
     btn_row = QHBoxLayout()
     btn_install = QPushButton(tr("optiscaler_bulk.btn_install"))
@@ -353,8 +383,12 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
     btn_close = QPushButton(tr("proton_bulk.btn_close"))
     btn_row.addWidget(btn_select_all)
     btn_row.addWidget(btn_select_none)
-    btn_row.addWidget(btn_all)
-    btn_row.addWidget(btn_install)
+    if not cleanup_only:
+        btn_row.addWidget(btn_all)
+        btn_row.addWidget(btn_install)
+    else:
+        btn_all.hide()
+        btn_install.hide()
     btn_row.addWidget(btn_remove)
     btn_row.addStretch()
     btn_row.addWidget(btn_close)
@@ -362,12 +396,10 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
     btn_close.clicked.connect(dlg.accept)
 
     def _checked() -> list[BulkTarget]:
-        out: list[BulkTarget] = []
-        for i, game in enumerate(games):
-            it = tbl.item(i, 0)
-            if it is not None and it.checkState() == Qt.CheckState.Checked:
-                out.append(game)
-        return out
+        return [
+            it.data(Qt.ItemDataRole.UserRole)[0] for i in range(tbl.rowCount())
+            if (it := tbl.item(i, 0)) is not None and it.checkState() == Qt.CheckState.Checked
+        ]
 
     def _set_all_checked(state: Qt.CheckState) -> None:
         for i in range(tbl.rowCount()):
@@ -377,7 +409,11 @@ def _show(win: MainWindow, rows: list[Row]) -> None:
 
     def _install_all() -> None:
         """Check compatible games that need installation or repair."""
-        todo = [i for i, (_g, compat) in enumerate(current) if _needs_install(compat)]
+        todo = {
+            i for i in range(tbl.rowCount())
+            if (item := tbl.item(i, 0)) is not None
+            and _needs_action(item.data(Qt.ItemDataRole.UserRole)[1])
+        }
         if not todo:
             QMessageBox.information(dlg, __app_name__, tr("optiscaler_bulk.none_compatible"))
             return

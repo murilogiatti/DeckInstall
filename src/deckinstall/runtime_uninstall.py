@@ -76,17 +76,12 @@ def affected_steam_appids(paths: SteamPaths | None, tool_names: Iterable[str]) -
     wanted = {name.strip() for name in tool_names if name and name.strip()}
     if paths is None or not wanted:
         return []
-    try:
-        from .steam_vdf import list_compat_tool_usage
+    from .steam_vdf import get_compat_tool_map
 
-        seen: list[int] = []
-        for u in list_compat_tool_usage(paths):
-            if u.tool_name in wanted and u.appid_u32 not in seen:
-                seen.append(u.appid_u32)
-        return seen
-    except Exception:
-        logging.exception("Could not read Steam compat-tool mappings for runtime cleanup")
-        return []
+    return [
+        appid for appid, tool in get_compat_tool_map(paths.config_vdf, strict=True).items()
+        if tool in wanted
+    ]
 
 
 def list_runtimes(paths: SteamPaths | None = None) -> list[RuntimeItem]:
@@ -145,7 +140,8 @@ def list_runtimes(paths: SteamPaths | None = None) -> list[RuntimeItem]:
 
 def uninstall(items: list[RuntimeItem]) -> tuple[list[str], list[str]]:
     """Remove the items. Returns (removed names, errors)."""
-    from .proton_policy import newest_ge_proton, retarget_default_games
+    from .proton_policy import is_default, newest_ge_proton, retarget_default_games
+    from .standalone import list_standalone_games
 
     removed: list[str] = []
     errors: list[str] = []
@@ -161,6 +157,15 @@ def uninstall(items: list[RuntimeItem]) -> tuple[list[str], list[str]]:
             elif item.kind == OPTISCALER:
                 changed = rm.uninstall_optiscaler_package()
             elif item.kind == GE and rm.is_managed_compat_tool(item.path):
+                from .i18n import tr
+                from .steam_paths import _read_compat_tool_id
+
+                names = {item.name, _read_compat_tool_id(item.path / "compatibilitytool.vdf", item.name)}
+                if any(
+                    not game.native_linux and not is_default(game) and game.proton_name in names
+                    for game in list_standalone_games()
+                ):
+                    raise ValueError(tr("runtime.uninstall_pinned"))
                 rm.remove_compat_tool(item.path, managed_only=True)
                 changed = True
             else:

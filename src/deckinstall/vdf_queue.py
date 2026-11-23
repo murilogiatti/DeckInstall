@@ -73,6 +73,7 @@ class BatchApplyResult:
 
     applied: int
     errors: list[str]
+    removed_for_review: tuple[tuple[int, str], ...] = ()
 
 
 class VdfEditQueue:
@@ -222,7 +223,14 @@ class VdfEditQueue:
                 remaining.append(current)
             self._queue = remaining
             self._save()
-        return BatchApplyResult(applied=applied, errors=errors)
+        return BatchApplyResult(
+            applied=applied,
+            errors=errors,
+            removed_for_review=tuple(
+                (edit.appid_u32, edit.label) for edit in succeeded
+                if edit.op == "remove_shortcut" and edit.payload.get("review_cleanup") is True
+            ),
+        )
 
     @staticmethod
     def _account_paths(paths: SteamPaths, payload: dict[str, Any]) -> SteamPaths:

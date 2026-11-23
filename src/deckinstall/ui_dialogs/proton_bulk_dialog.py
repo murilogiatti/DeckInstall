@@ -237,7 +237,9 @@ class _ApplyWorker(QThread):
             self.failed.emit(_format_worker_error(exc))
 
 
-def bulk_proton_dialog(win: MainWindow) -> None:
+def bulk_proton_dialog(
+    win: MainWindow, *, preferred_tool: str = "", on_close: Callable[[], None] | None = None,
+) -> None:
     """Open the batch Proton dialog (load off the UI thread)."""
     win.status_label.setText(tr("proton_bulk.loading"))
     worker = _LoadWorker(win.paths)
@@ -250,13 +252,17 @@ def bulk_proton_dialog(win: MainWindow) -> None:
         rows, orphans, newest, target_info = res
         if not rows and not orphans:
             QMessageBox.information(_dialog_parent(win), __app_name__, tr("proton_bulk.empty"))
-            return
-        _show(win, rows, orphans, newest, target_info)
+        else:
+            _show(win, rows, orphans, newest, target_info, preferred_tool=preferred_tool)
+        if on_close is not None:
+            on_close()
 
     def _failed(err: str) -> None:
         win.status_label.setText(tr("status.ready"))
         if not win._closing_pending:
             QMessageBox.critical(_dialog_parent(win), __app_name__, tr("proton.error", err=err))
+            if on_close is not None:
+                on_close()
 
     worker.ready.connect(_loaded)
     worker.failed.connect(_failed)
@@ -288,6 +294,8 @@ def _show(
     orphans: list[int],
     newest: str,
     target_info: tuple[list[tuple[str, str]], dict[str, str], bool],
+    *,
+    preferred_tool: str = "",
 ) -> None:
     busy_state = {"active": False}
     dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: busy_state["active"])
@@ -315,6 +323,7 @@ def _show(
     tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
     header = tbl.horizontalHeader()
+    header.setSortIndicator(0, Qt.SortOrder.AscendingOrder)
     header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
     for col in (1, 2, 3):
         header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
@@ -359,11 +368,15 @@ def _show(
         custom_map = state_ctx["custom_map"]
         assert isinstance(custom_map, dict)
         tbl.blockSignals(True)
-        for i, r in enumerate(current):
-            matches = _row_matches_target(r, target_id, newest_local, custom_map)
+        was_sorting = tbl.isSortingEnabled()
+        tbl.setSortingEnabled(False)
+        for i in range(tbl.rowCount()):
             it = tbl.item(i, 0)
-            if it is not None:
-                it.setCheckState(Qt.CheckState.Unchecked if matches else Qt.CheckState.Checked)
+            if it is None:
+                continue
+            r = it.data(Qt.ItemDataRole.UserRole)
+            matches = _row_matches_target(r, target_id, newest_local, custom_map)
+            it.setCheckState(Qt.CheckState.Unchecked if matches else Qt.CheckState.Checked)
             tbl.setItem(
                 i,
                 3,
@@ -371,15 +384,18 @@ def _show(
                     tr("proton_bulk.state_on_target") if matches else tr("proton_bulk.state_will_change")
                 ),
             )
+        tbl.setSortingEnabled(was_sorting)
         tbl.blockSignals(False)
 
     def _fill(data: list[ProtonRow]) -> None:
         current[:] = data
+        tbl.setSortingEnabled(False)
         tbl.setRowCount(0)
         for r in data:
             row = tbl.rowCount()
             tbl.insertRow(row)
             it = QTableWidgetItem(r.name)
+            it.setData(Qt.ItemDataRole.UserRole, r)
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             tbl.setItem(row, 0, it)
             tbl.setItem(row, 1, QTableWidgetItem(_source_text(r)))
@@ -390,8 +406,13 @@ def _show(
             tbl.setItem(row, 2, QTableWidgetItem(proton))
             tbl.setItem(row, 3, QTableWidgetItem(""))
         _sync_target_states()
+        tbl.setSortingEnabled(True)
 
-    _populate_targets(target_info[0], target_info[1], target_info[2])
+    preferred_id = next(
+        (tool_id for tool_id, _ in target_info[0] if target_info[1].get(tool_id) == preferred_tool),
+        None,
+    ) if preferred_tool else None
+    _populate_targets(*target_info, preserve_id=preferred_id)
     _fill(rows)
     cmb_target.currentIndexChanged.connect(lambda _idx: _sync_target_states())
 
@@ -439,7 +460,7 @@ def _show(
 
     def _checked() -> list[ProtonRow]:
         return [
-            r for i, r in enumerate(current)
+            it.data(Qt.ItemDataRole.UserRole) for i in range(tbl.rowCount())
             if (it := tbl.item(i, 0)) is not None and it.checkState() == Qt.CheckState.Checked
         ]
 

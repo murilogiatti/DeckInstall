@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 from collections.abc import Callable
 from pathlib import Path
+from zipfile import ZipFile
 
 from PySide6.QtCore import QThread, Signal
 
@@ -23,6 +24,7 @@ from .runtime_manager import (
 from .steam_paths import SteamPaths, dir_size_bytes_many, find_proton_binary, find_steam_root
 from .steam_vdf import (
     ShortcutEntry,
+    _prefix_has_unconventional_saves,
     backup_prefix_candidates_to_zip,
     load_shortcuts,
     plan_bulk_migration,
@@ -274,23 +276,32 @@ class MaintDeleteWorker(QThread):
             if _is_wine_game_running():
                 raise RuntimeError(tr("cleanup.wine_running"))
             backup_zip_str = ""
+            backed_up_paths: set[Path] | None = None
             if self._backup_unverified:
+                backed_up_paths = set()
                 unverified_items = [
-                    c
-                    for c in self._items
-                    if c.has_saves and not c.saves_verified_migrated
+                    c for c in self._items if c.has_saves and not c.saves_verified_migrated
                 ]
                 if unverified_items:
-                    zip_path, _games, files_backed = backup_prefix_candidates_to_zip(
-                        unverified_items
-                    )
-                    if files_backed > 0:
-                        backup_zip_str = str(zip_path)
+                    if any(
+                        item.path.is_symlink() or _prefix_has_unconventional_saves(item.path)
+                        for item in unverified_items
+                    ):
+                        raise RuntimeError(tr("cleanup.backup_incomplete"))
+                    zip_path, games_backed, files_backed = backup_prefix_candidates_to_zip(unverified_items)
+                    with ZipFile(zip_path) as archive:
+                        if not files_backed or games_backed != len(unverified_items) or archive.testzip() is not None:
+                            raise RuntimeError(tr("cleanup.backup_incomplete"))
+                    backup_zip_str = str(zip_path)
+                    backed_up_paths.update(item.path.resolve() for item in unverified_items)
+            if _is_wine_game_running():
+                raise RuntimeError(tr("cleanup.wine_running"))
             deleted, freed, errs = delete_cleanup_candidates_checked(
                 self._paths,
                 self._items,
                 include_system_caches=True,
                 allow_unverified_saves=self._allow_unverified,
+                backed_up_paths=backed_up_paths,
             )
             new_cands = find_cleanup_candidates(self._paths, include_system_caches=True)
             self.done.emit(deleted, freed, errs, new_cands, backup_zip_str)

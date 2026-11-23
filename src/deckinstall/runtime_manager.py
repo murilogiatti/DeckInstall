@@ -94,6 +94,10 @@ def _serialize_runtime(name: str) -> Callable[[Callable[_P, _T]], Callable[_P, _
 
     return decorate
 
+def _runtime_temp_prefix(component: str) -> str:
+    return f"deckinstall_{component}_"
+
+
 WINETRICKS_PRESETS: dict[str, str] = {
     "vcrun2022": "Visual C++ 2015-2022 Redistributable",
     "d3dcompiler_47": "Direct3D Shader Compiler (d3dcompiler_47)",
@@ -429,7 +433,7 @@ def ensure_mangohud(force_update: bool = False, progress_cb: ProgressCb | None =
     tag = str(release.get("tag_name", "")).strip()
     asset = _pick_mangohud_asset(release)
     asset_name = _sanitize_asset_name(str(asset["name"]))
-    with tempfile.TemporaryDirectory(prefix="deckinstall_mangohud_", dir=str(mh_dir.parent)) as tmp:
+    with tempfile.TemporaryDirectory(prefix=_runtime_temp_prefix("mangohud"), dir=str(mh_dir.parent)) as tmp:
         tmp_path = Path(tmp)
         archive = tmp_path / asset_name
         _download_file(str(asset.get("browser_download_url", "")), archive, asset_name, progress_cb)
@@ -611,6 +615,69 @@ def get_steamrt4_dir() -> Path:
     return Path.home() / ".local" / "share" / "umu" / "steamrt4"
 
 
+def find_runtime_leftovers() -> dict[Path, str]:
+    """Runtime installer workspaces and replaced builds with a working successor."""
+    runtime = get_runtime_dir()
+    compat = get_compat_tools_dir()
+    opti = get_optiscaler_dir()
+    mango = get_mangohud_dir()
+    locations = (
+        (runtime, "mangohud", (_runtime_temp_prefix("mangohud"),)),
+        (runtime, "umu", (_runtime_temp_prefix("umu"),)),
+        (opti.parent, "optiscaler", (_runtime_temp_prefix("optiscaler"), f".{opti.name}_stage_")),
+        (compat, "compat-tools", (_runtime_temp_prefix("ge"), _runtime_temp_prefix("proton"))),
+    )
+    leftovers: dict[Path, str] = {}
+
+    def children(root: Path) -> list[Path]:
+        try:
+            if not root.is_dir() or root.absolute() != root.resolve():
+                return []
+            return [
+                path for path in root.iterdir()
+                if not path.is_symlink() and path.is_dir() and path.stat().st_uid == os.getuid()
+            ]
+        except (OSError, RuntimeError):
+            return []
+
+    def matches(name: str, prefix: str) -> bool:
+        return name.startswith(prefix) and bool(re.fullmatch(r"[a-z0-9_]{8}", name[len(prefix):]))
+
+    for root, lock, prefixes in locations:
+        for child in children(root):
+            if any(matches(child.name, prefix) for prefix in prefixes):
+                leftovers[child] = lock
+
+    replacements = [
+        (mango, "mangohud", official_mangohud_installed()),
+        (opti, "optiscaler", _has_optiscaler_dll(opti)),
+    ]
+    replacements.extend(
+        (path, "compat-tools", True) for path in children(compat)
+        if is_managed_compat_tool(path) and (path / "proton").is_file()
+    )
+    for current, lock, valid in replacements:
+        if not valid or current.is_symlink():
+            continue
+        prefix = f".{current.name}_old_"
+        for child in children(current.parent):
+            if matches(child.name, prefix):
+                leftovers[child] = lock
+    return leftovers
+
+
+def remove_runtime_leftover(path: Path) -> bool:
+    """Serialize deletion with the installer that owns the workspace."""
+    lock = find_runtime_leftovers().get(path)
+    if lock is None:
+        return False
+    with file_lock(get_runtime_dir() / ".locks" / f"{lock}.lock"):
+        if find_runtime_leftovers().get(path) != lock:
+            return False
+        shutil.rmtree(path)
+        return True
+
+
 def _emit_progress(
     progress_cb: ProgressCallback | None, message: str, percent: int
 ) -> None:
@@ -706,6 +773,38 @@ def is_managed_compat_tool(path: Path) -> bool:
 def is_managed_ge_proton(path: Path) -> bool:
     """True for a GE-Proton directory recorded as installed by this app."""
     return is_managed_compat_tool(path) and _parse_ge_proton_version(path.name, min_major=1) is not None
+
+
+def superseded_managed_compat_tools() -> list[Path]:
+    """Return older owned releases, preserving the newest installed build of each variant."""
+    ge = list_ge_proton_dirs(min_major=1)
+    superseded = [path for path in ge[1:] if is_managed_ge_proton(path)]
+    other_families = {
+        name.lower(): family.id
+        for family in PROTON_FAMILIES.values() if family.id != "ge-proton"
+        for name in (family.id, family.repo.rsplit("/", 1)[-1])
+    }
+    root = get_compat_tools_dir()
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return superseded
+    variants: dict[tuple[str, str], list[tuple[tuple[int, ...], Path]]] = {}
+    for tool in entries:
+        for prefix, family in other_families.items():
+            if not tool.name.lower().startswith(f"{prefix}-"):
+                continue
+            release = re.fullmatch(r"([0-9]+(?:[._-][0-9]+)*)([-_.].*)?", tool.name[len(prefix) + 1:])
+            if release is None or tool.is_symlink() or not (tool / "proton").is_file():
+                break
+            version = tuple(int(part) for part in re.findall(r"[0-9]+", release[1]))
+            variant = (release[2] or "").lower()
+            variants.setdefault((family, variant), []).append((version, tool))
+            break
+    for builds in variants.values():
+        newest = max(version for version, _ in builds)
+        superseded.extend(p for version, p in builds if version < newest and is_managed_compat_tool(p))
+    return superseded
 
 
 def list_ge_proton11_dirs() -> list[Path]:
@@ -1178,7 +1277,7 @@ def ensure_umu_run(
 
     umu_dir = get_umu_dir()
     umu_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="deckinstall_umu_", dir=str(get_runtime_dir())) as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix=_runtime_temp_prefix("umu"), dir=str(get_runtime_dir())) as tmp_dir:
         tmp_path = Path(tmp_dir)
         tar_path = tmp_path / asset_name
         _download_file(download_url, tar_path, asset_name, progress_cb=progress_cb)
@@ -1364,7 +1463,7 @@ def _ensure_optiscaler_payload(
 
     opti_parent = opti_dir.parent
     opti_parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="deckinstall_optiscaler_", dir=str(opti_parent)) as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix=_runtime_temp_prefix("optiscaler"), dir=str(opti_parent)) as tmp_dir:
         tmp_path = Path(tmp_dir)
         archive_path = tmp_path / asset_name
         _download_file(download_url, archive_path, asset_name, progress_cb=progress_cb)
@@ -1552,7 +1651,7 @@ def ensure_ge_proton11(
             return target_dir
         raise ValueError(f"Manually installed GE-Proton occupies {target_dir}; it was preserved.")
 
-    with tempfile.TemporaryDirectory(prefix="deckinstall_ge_", dir=str(compat_dir)) as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix=_runtime_temp_prefix("ge"), dir=str(compat_dir)) as tmp_dir:
         tmp_path = Path(tmp_dir)
         tar_path = tmp_path / tar_name
         sha_name = _sanitize_asset_name(str(sha_asset.get("name", f"{tag}-{arch}.sha512sum")))
@@ -1789,7 +1888,7 @@ def install_compat_tool(
     tar_name = _sanitize_asset_name(raw_tar_name)
 
     with tempfile.TemporaryDirectory(
-        prefix="deckinstall_proton_", dir=str(compat_dir)
+        prefix=_runtime_temp_prefix("proton"), dir=str(compat_dir)
     ) as tmp_dir:
         tmp_path = Path(tmp_dir)
         tar_path = tmp_path / tar_name

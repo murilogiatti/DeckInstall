@@ -123,14 +123,9 @@ class MaintenanceTests(unittest.TestCase):
                 self.assertIn(orphan_desktop.resolve(), found_paths)
                 self.assertIn(orphan_prefix.resolve(), found_paths)
                 self.assertNotIn(active_prefix.resolve(), found_paths)
-                self.assertIn(mesa_cache.resolve(), found_paths)
-                self.assertIn(nv_cache.resolve(), found_paths)
-
-                # 2 oldest zips flagged, 3 newest kept
-                self.assertIn(zip_paths[0].resolve(), found_paths)
-                self.assertIn(zip_paths[1].resolve(), found_paths)
-                for newest in zip_paths[2:]:
-                    self.assertNotIn(newest.resolve(), found_paths)
+                self.assertNotIn(mesa_cache.resolve(), found_paths)
+                self.assertNotIn(nv_cache.resolve(), found_paths)
+                self.assertTrue(all(zip_path.resolve() not in found_paths for zip_path in zip_paths))
 
                 deleted, freed, errs = delete_cleanup_candidates_checked(
                     None,
@@ -140,103 +135,41 @@ class MaintenanceTests(unittest.TestCase):
                 )
 
             self.assertEqual(errs, [])
-            self.assertEqual(deleted, 6)
+            self.assertEqual(deleted, 2)
             self.assertGreater(freed, 0)
             self.assertFalse(orphan_desktop.exists())
             self.assertFalse(orphan_prefix.exists())
-            self.assertFalse(mesa_cache.exists())
-            self.assertFalse(nv_cache.exists())
-            self.assertFalse(zip_paths[0].exists())
-            self.assertFalse(zip_paths[1].exists())
+            self.assertTrue(mesa_cache.exists())
+            self.assertTrue(nv_cache.exists())
             self.assertTrue(active_prefix.is_dir())
-            for newest in zip_paths[2:]:
-                self.assertTrue(newest.is_file())
+            self.assertTrue(all(zip_path.is_file() for zip_path in zip_paths))
 
-    def test_ge_proton11_cleanup_preserves_newest_and_active(self) -> None:
+    def test_cleanup_protects_a_pinned_game_version(self) -> None:
+        from deckinstall import steam_paths
+
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "home"
-            compat_tools = home / ".local" / "share" / "Steam" / "compatibilitytools.d"
-            ge11_10 = compat_tools / "GE-Proton11-10"
-            ge11_12 = compat_tools / "GE-Proton11-12"
-            ge10_34 = compat_tools / "GE-Proton10-34"
-            for d in (ge11_10, ge11_12, ge10_34):
-                d.mkdir(parents=True)
-                (d / "proton").write_bytes(b"proton-bin")
-
-            games_dir = home / "Games"
-            prefixes_dir = games_dir / ".prefixes"
+            compat_tools = runtime_manager.get_compat_tools_dir()
+            older, current, newest = [compat_tools / f"GE-Proton11-{n}" for n in (1, 2, 3)]
+            for tool in (older, current, newest):
+                tool.mkdir(parents=True)
+                (tool / "proton").write_bytes(b"proton-bin")
+                (tool / ".deckinstall-managed").write_text(tool.name)
 
             with (
                 mock.patch.object(cleanup, "external_prefix_roots", return_value=[]),
-                mock.patch.object(runtime_manager, "list_ge_proton11_dirs", return_value=[]),
+                mock.patch.object(steam_paths, "find_steam_root", return_value=None),
             ):
-                # Without active standalone games: GE-Proton11-12 preserved, 11-10 and 10-34 flagged
-                cands = find_cleanup_candidates(None, include_system_caches=True, home_dir=home)
-                cand_paths = {c.path.resolve() for c in cands}
-                self.assertNotIn(ge11_12.resolve(), cand_paths)
-                self.assertIn(ge11_10.resolve(), cand_paths)
-                self.assertIn(ge10_34.resolve(), cand_paths)
-
-                # Standalone game using GE-Proton10-34 -> 10-34 preserved, 11-12 still preserved
+                candidates = find_cleanup_candidates(None, include_system_caches=True, home_dir=home)
+                self.assertEqual({c.path for c in candidates}, {older, current})
                 _write_standalone_manifest(
-                    games_dir,
-                    "LegacyGame",
-                    prefixes_dir / "LegacyGame",
-                    proton_name="GE-Proton10-34",
+                    home / "Games",
+                    "PinnedGame",
+                    home / "Games" / ".prefixes" / "PinnedGame",
+                    proton_name=older.name,
                 )
-                cands_with_10 = find_cleanup_candidates(None, include_system_caches=True, home_dir=home)
-                cand_paths_with_10 = {c.path.resolve() for c in cands_with_10}
-                self.assertNotIn(ge11_12.resolve(), cand_paths_with_10)
-                self.assertNotIn(ge10_34.resolve(), cand_paths_with_10)
-                self.assertIn(ge11_10.resolve(), cand_paths_with_10)
-
-                # Standalone game using GE-Proton11-10 -> 11-10 preserved too
-                _write_standalone_manifest(
-                    games_dir,
-                    "MidGame",
-                    prefixes_dir / "MidGame",
-                    proton_name="GE-Proton11-10",
-                )
-                cands_with_11_10 = find_cleanup_candidates(None, include_system_caches=True, home_dir=home)
-                cand_paths_with_11_10 = {c.path.resolve() for c in cands_with_11_10}
-                self.assertNotIn(ge11_12.resolve(), cand_paths_with_11_10)
-                self.assertNotIn(ge11_10.resolve(), cand_paths_with_11_10)
-
-    def test_obsolete_steamrt3_detection(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            home = Path(tmp) / "home"
-            umu_dir = home / ".local" / "share" / "umu"
-            steamrt3 = umu_dir / "steamrt3"
-            steamrt3.mkdir(parents=True)
-            (steamrt3 / "toolmanifest.vdf").write_text('"manifest" {}', encoding="utf-8")
-
-            with (
-                mock.patch.object(cleanup, "external_prefix_roots", return_value=[]),
-                mock.patch.object(runtime_manager, "list_ge_proton11_dirs", return_value=[]),
-            ):
-                # Missing steamrt4/toolmanifest.vdf -> steamrt3 NOT flagged
-                cands_no_rt4 = find_cleanup_candidates(None, include_system_caches=True, home_dir=home)
-                self.assertNotIn(steamrt3.resolve(), {c.path.resolve() for c in cands_no_rt4})
-
-                # With steamrt4/toolmanifest.vdf and no Proton <= 10 tool -> steamrt3 IS flagged
-                steamrt4 = umu_dir / "steamrt4"
-                steamrt4.mkdir(parents=True)
-                (steamrt4 / "toolmanifest.vdf").write_text('"manifest" {}', encoding="utf-8")
-                cands_rt4 = find_cleanup_candidates(None, include_system_caches=True, home_dir=home)
-                self.assertIn(steamrt3.resolve(), {c.path.resolve() for c in cands_rt4})
-
-                # Standalone game using GE-Proton10-34 -> steamrt3 NOT flagged
-                games_dir = home / "Games"
-                _write_standalone_manifest(
-                    games_dir,
-                    "OldProtonGame",
-                    games_dir / ".prefixes" / "OldProtonGame",
-                    proton_name="GE-Proton10-34",
-                )
-                cands_old_proton = find_cleanup_candidates(
-                    None, include_system_caches=True, home_dir=home
-                )
-                self.assertNotIn(steamrt3.resolve(), {c.path.resolve() for c in cands_old_proton})
+                candidates = find_cleanup_candidates(None, include_system_caches=True, home_dir=home)
+                self.assertEqual({c.path for c in candidates}, {current})
 
     def test_backup_all_saves_standalone_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

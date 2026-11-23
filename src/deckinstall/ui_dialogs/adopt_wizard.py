@@ -232,6 +232,8 @@ class AdoptWizard(QDialog):
         self.tree = QTreeWidget()
         self.tree.setColumnCount(2)
         self.tree.setHeaderLabels([tr("adopt.col_game"), tr("adopt.col_location")])
+        self.tree.setSortingEnabled(True)
+        self.tree.sortItems(0, Qt.SortOrder.AscendingOrder)
         self.tree.setColumnWidth(0, 320)
         self.tree.itemChanged.connect(self._on_tree_changed)
         lay.addWidget(self.tree, 1)

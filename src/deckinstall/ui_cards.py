@@ -339,6 +339,15 @@ def _format_cleanup_candidate_label(cand: CleanupCandidate) -> str:
         "Trash": tr("cleanup.cat_trash"),
         "App Cache": tr("cleanup.cat_cache"),
         "Old Proton/Runtime": tr("cleanup.cat_runtime"),
+        "Empty Game Folder": tr("cleanup.cat_empty_game"),
+        "Unregistered Game Folder": tr("cleanup.cat_unknown_game"),
+        "Orphan Game Prefix": tr("cleanup.cat_game_prefix"),
+        "Orphan Game Logs": tr("cleanup.cat_game_logs"),
+        "Legacy Game Log": tr("cleanup.cat_legacy_logs"),
+        "Runtime Data": tr("cleanup.cat_runtime_data"),
+        "Runtime Residue": tr("cleanup.cat_runtime_residue"),
+        "Imported Save Backup": tr("cleanup.cat_imported_backup"),
+        "Duplicate Save Snapshot": tr("cleanup.cat_duplicate_snapshot"),
         "Orphan Desktop": tr("maint.cat_orphan_desktop"),
     }
     cat_disp = cat_map.get(cand.category, cand.category)

@@ -470,9 +470,14 @@ def open_launch_presets_dialog(
         chk_wayland.setEnabled(False)
 
     if not is_native_linux:
-        for chk in (chk_w3d, chk_esync, chk_fsync):
+        for chk, hint in (
+            (chk_w3d, tr("launch.wined3d_hint")),
+            (chk_esync, tr("launch.no_esync_hint")),
+            (chk_fsync, tr("launch.no_fsync_hint")),
+        ):
             chk.toggled.connect(_sync_preview)
             lay.addWidget(chk)
+            lay.addWidget(_muted_hint(hint))
         chk_dxgi.toggled.connect(_on_dxgi_toggled)
         lay.addWidget(chk_dxgi)
         lay.addWidget(_muted_hint(tr("launch.dxgi_hint")))
@@ -484,6 +489,7 @@ def open_launch_presets_dialog(
     if not is_native_linux:
         lay.addWidget(winedll_lbl)
         lay.addWidget(winedll_edit)
+        lay.addWidget(_muted_hint(tr("launch.dll_hint")))
         if kind == "standalone":
             winedll_note = QLabel(tr("launch.winedll_standalone_note"))
             winedll_note.setObjectName("MutedText")
@@ -508,6 +514,7 @@ def open_launch_presets_dialog(
     _section(tr("launch.section_advanced"))
     lay.addWidget(raw_lbl)
     lay.addWidget(raw_edit)
+    lay.addWidget(_muted_hint(tr("launch.raw_hint")))
 
     winedll_edit.textChanged.connect(_on_winedll_text_changed)
     raw_edit.textChanged.connect(_on_raw_text_changed)

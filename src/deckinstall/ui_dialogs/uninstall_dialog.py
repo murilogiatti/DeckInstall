@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -47,9 +48,16 @@ class UninstallDialog(QDialog):
     def __init__(self, plan: un.UninstallPlan, also_steam: bool = False, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.plan = plan
-        self.setWindowTitle(tr("uninstall.title", name=plan.game.name))
+        if plan.leftovers:
+            self.setWindowTitle(tr("uninstall.leftovers_title", name=plan.game.name))
+            intro_text = tr("uninstall.leftovers_intro", name=plan.game.name)
+            action_text = tr("cleanup.btn_remove_leftovers")
+        else:
+            self.setWindowTitle(tr("uninstall.title", name=plan.game.name))
+            intro_text = tr("uninstall.intro", name=plan.game.name)
+            action_text = tr("uninstall.btn_uninstall")
         lay = QVBoxLayout(self)
-        intro = QLabel(tr("uninstall.intro", name=plan.game.name))
+        intro = QLabel(intro_text)
         intro.setWordWrap(True)
         lay.addWidget(intro)
         if also_steam:
@@ -68,6 +76,11 @@ class UninstallDialog(QDialog):
             box.toggled.connect(self._refresh)
             self.boxes[item.id] = box
             grid.addWidget(box, row, 0)
+            if plan.leftovers:
+                location = QLabel("\n".join(str(path) for path in item.paths))
+                location.setWordWrap(True)
+                location.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+                grid.addWidget(location, row, 3)
             size = QLabel(format_size_bytes(item.size_bytes) if item.size_bytes else "")
             grid.addWidget(size, row, 1)
             if item.reason:
@@ -75,14 +88,17 @@ class UninstallDialog(QDialog):
                 why.setWordWrap(True)
                 why.setEnabled(False)
                 grid.addWidget(why, row, 2)
-        grid.setColumnStretch(2, 1)
+        grid.setColumnStretch(3 if plan.leftovers else 2, 1)
         lay.addLayout(grid)
 
         self.total_label = QLabel()
         lay.addWidget(self.total_label)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
-        self.btn_uninstall = buttons.addButton(tr("uninstall.btn_uninstall"), QDialogButtonBox.ButtonRole.AcceptRole)
+        self.btn_uninstall = buttons.addButton(
+            action_text,
+            QDialogButtonBox.ButtonRole.AcceptRole,
+        )
         self.btn_uninstall.setObjectName("dangerBtn")
         self.btn_uninstall.setAutoDefault(False)
         cancel = buttons.button(QDialogButtonBox.StandardButton.Cancel)
@@ -111,6 +127,8 @@ class UninstallDialog(QDialog):
             parent_on = self.boxes[parent].isChecked()
             # Covered items go with their parent; dependent ones only make sense with it.
             self.boxes[item.id].setEnabled(not parent_on if item.covered_by else parent_on)
+        if self.plan.leftovers:
+            self.btn_uninstall.setEnabled(bool(self.selected_ids()))
         freed = self.plan.freed_bytes(self.selected_ids())
         self.total_label.setText(tr("uninstall.total", size=format_size_bytes(freed)))
 

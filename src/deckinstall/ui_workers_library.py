@@ -30,7 +30,9 @@ from .runtime_manager import (
 from .standalone import (
     StandaloneGame,
     list_standalone_games,
+    match_owned_shortcuts,
     resolve_standalone_proton_fallback,
+    shortcut_game_dir,
     update_standalone_launch_options,
 )
 from .steam_paths import (
@@ -38,6 +40,7 @@ from .steam_paths import (
     find_proton_binary,
     find_steam_root,
     is_steam_running,
+    measured_dir_size_bytes,
     resolve_steam_paths,
 )
 from .steam_vdf import (
@@ -49,6 +52,7 @@ from .steam_vdf import (
     load_shortcuts,
     remove_shortcut,
     restore_saves_backup,
+    save_backup_matches_installed_games,
     shutdown_steam,
     start_steam,
 )
@@ -133,6 +137,47 @@ def compute_library_runner_labels(
 
     _add_tech_labels(labels, entries, standalone_games, external_games)
     return labels
+
+
+def compute_library_sizes(
+    entries: list[ShortcutEntry],
+    games: list[StandaloneGame],
+    external: list[ExternalLauncherGame],
+    paths: SteamPaths | None,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+) -> dict[str, int]:
+    owned = match_owned_shortcuts(entries, games, paths.user_id if paths else None)
+    jobs = {f"standalone:{game.game_dir}": game.game_dir for game in games}
+    jobs.update({f"external:{game.source}:{game.name}:{game.exe_path}": game.game_dir for game in external})
+    for entry in entries:
+        game = owned.get(entry.appid_u32)
+        try:
+            root = game.game_dir if game else shortcut_game_dir(entry)
+        except (OSError, ValueError):
+            continue
+        jobs[f"steam:{entry.appid_u32}"] = root
+
+    by_path: dict[Path, list[str]] = {}
+    for key, root in jobs.items():
+        try:
+            if root.is_symlink() or not root.is_dir():
+                continue
+            by_path.setdefault(root.resolve(), []).append(key)
+        except OSError:
+            continue
+
+    def measure(root: Path) -> int | None:
+        return measured_dir_size_bytes(root, strict=True, cancelled=cancelled)
+
+    sizes: dict[str, int] = {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for root, size in zip(by_path, pool.map(measure, by_path), strict=True):
+            if size is None:
+                continue
+            for key in by_path[root]:
+                sizes[key] = size
+    return sizes
 
 
 def _add_tech_labels(
@@ -426,12 +471,23 @@ class RestoreWorker(QThread):
         super().__init__()
         self._paths = paths
         self._zip_file = zip_file
+        self.verified_for_cleanup = False
 
     def run(self) -> None:
         try:
             if _is_wine_game_running():
                 raise RuntimeError(tr("cleanup.wine_running"))
             games, files = restore_saves_backup(self._paths, self._zip_file)
+            if files:
+                try:
+                    root = Path.home().resolve()
+                    self.verified_for_cleanup = (
+                        self._zip_file.absolute() == self._zip_file.resolve()
+                        and self._zip_file.is_relative_to(root)
+                        and save_backup_matches_installed_games(self._paths, self._zip_file)
+                    )
+                except (OSError, RuntimeError):
+                    self.verified_for_cleanup = False
             self.done.emit(games, files)
         except Exception as exc:
             self.failed.emit(_format_worker_error(exc))

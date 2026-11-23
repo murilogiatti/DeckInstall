@@ -33,6 +33,7 @@ from .steam_vdf import (
     _prefix_programdata_dir,
     _prefix_users_dir,
     _safe_parents_within,
+    _zip_member_matches_file,
 )
 
 DEFAULT_SNAPSHOTS_DIR = DEFAULT_SAVES_DIR / "snapshots"
@@ -2112,6 +2113,56 @@ def _resolve_existing_rel_parts(
     return tuple(out)
 
 
+def restored_snapshot_matches(
+    archive_path: Path,
+    prefix_dir: Path,
+    game_dir: Path | None,
+    *,
+    steam_appid: int | None = None,
+    extra_dirs: ExtraDirs | None = None,
+) -> bool:
+    """Verify that every file in this save snapshot exists at its restore destination."""
+    try:
+        root = _home_root().resolve()
+        if (
+            archive_path.absolute() != archive_path.resolve()
+            or not archive_path.is_relative_to(root)
+            or not archive_path.is_file()
+        ):
+            return False
+        if archive_has_steamcloud(archive_path):
+            if steam_appid is None or snapshot_steamcloud_appid(archive_path) != str(steam_appid):
+                return False
+        return _restore_saves_archive(
+            archive_path, prefix_dir, game_dir, extra_dirs=extra_dirs,
+            allow_home=True, verify_only=True,
+        ) > 0
+    except (OSError, ValueError, RuntimeError, NotImplementedError, zipfile.BadZipFile):
+        return False
+
+
+def remove_restored_snapshot(
+    archive_path: Path,
+    prefix_dir: Path,
+    game_dir: Path | None,
+    *,
+    steam_appid: int | None = None,
+    extra_dirs: ExtraDirs | None = None,
+) -> bool:
+    """Remove the source snapshot only if its contents still match the installed saves."""
+    try:
+        before = file_identity(archive_path.lstat())
+        with _snapshot_dir_lock(archive_path.parent):
+            if not restored_snapshot_matches(
+                archive_path, prefix_dir, game_dir, steam_appid=steam_appid, extra_dirs=extra_dirs,
+            ) or file_identity(archive_path.lstat()) != before:
+                return False
+            archive_path.unlink()
+            return True
+    except OSError:
+        return False
+
+
 def _restore_saves_archive(
     archive_path: Path,
     prefix_dir: Path,
@@ -2122,6 +2173,7 @@ def _restore_saves_archive(
     skipped: list[str] | None = None,
     *,
     allow_home: bool = False,
+    verify_only: bool = False,
 ) -> int:
     """Extract bounded save entries into explicitly selected prefix, game and extra roots.
 
@@ -2147,7 +2199,8 @@ def _restore_saves_archive(
             raise OSError(f"Unsafe target drive_c path: {drive_c}") from exc
         if not _safe_parents_within(root_prefix, root_resolved, drive_c_rel):
             raise OSError(f"Unsafe target drive_c path: {drive_c}")
-        drive_c.mkdir(parents=True, exist_ok=True)
+        if not verify_only:
+            drive_c.mkdir(parents=True, exist_ok=True)
         drive_c_resolved = drive_c.resolve()
         target_user = _detect_prefix_user(drive_c)
     else:
@@ -2164,6 +2217,8 @@ def _restore_saves_archive(
     reg_payloads: list[bytes] = []
     reg_restored = 0
     total_bytes = 0
+    expected_files = 0
+    verified_targets: set[Path] = set()
 
     try:
         with zipfile.ZipFile(archive_path, "r") as zf:
@@ -2179,6 +2234,7 @@ def _restore_saves_archive(
             for info in infolist:
                 if info.is_dir():
                     continue
+                expected_files += 1
                 # Block symlink entries stored in POSIX zip attributes.
                 if stat.S_ISLNK((info.external_attr >> 16) & 0o170000):
                     continue
@@ -2190,6 +2246,8 @@ def _restore_saves_archive(
                     raise RuntimeError(f"Sync file too large: {info.filename}")
 
                 if section == "registry":
+                    if verify_only:
+                        return 0
                     if rel_parts != ("registry.json",):
                         continue
                     if root_prefix.is_symlink():
@@ -2237,7 +2295,7 @@ def _restore_saves_archive(
                     target = home_root.joinpath(*rel_parts)
                     rel = "/".join(rel_parts)
                     covered = target.is_file() and rel in (home_overwrite or ())
-                    if target.is_symlink() or (target.exists() and not covered):
+                    if target.is_symlink() or (not verify_only and target.exists() and not covered):
                         if skipped is not None:
                             skipped.append(rel)
                         continue
@@ -2245,7 +2303,8 @@ def _restore_saves_archive(
                     extra_root = extras.get(section)
                     if extra_root is None or extra_root.is_symlink():
                         continue
-                    extra_root.mkdir(parents=True, exist_ok=True)
+                    if not verify_only:
+                        extra_root.mkdir(parents=True, exist_ok=True)
                     base_dir = extra_root
                     base_resolved = extra_root.resolve()
                     check_parts = rel_parts[:-1]
@@ -2260,6 +2319,14 @@ def _restore_saves_archive(
                     target = drive_c.joinpath(*resolved_parts)
 
                 if not _safe_parents_within(base_dir, base_resolved, check_parts):
+                    continue
+
+                if verify_only:
+                    if target in verified_targets or target == archive_path:
+                        return 0
+                    if not _zip_member_matches_file(zf, info, target):
+                        return 0
+                    verified_targets.add(target)
                     continue
 
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -2295,6 +2362,9 @@ def _restore_saves_archive(
                 if prev_tmp is not None:
                     prev_tmp.unlink(missing_ok=True)
                 staged_by_target[target] = tmp_path
+
+        if verify_only:
+            return len(verified_targets) if len(verified_targets) == expected_files else 0
 
         def _apply_regs() -> None:
             nonlocal reg_restored

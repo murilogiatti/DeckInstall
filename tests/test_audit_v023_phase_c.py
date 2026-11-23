@@ -662,7 +662,7 @@ def test_uninstall_snapshot_icon_errors_covered_and_steam_restore_status(tmp_pat
     assert backup.is_dir()
 
 
-def test_cleanup_protects_empty_bottles_unmounted_heroic_lutris_and_cleans_trashinfo(tmp_path: Path) -> None:
+def test_cleanup_protects_empty_bottles_unmounted_heroic_lutris_and_trash(tmp_path: Path) -> None:
     home = Path.home()
     # 1. Empty Bottles prefix (bottle.yml present, no External_Programs) is protected
     empty_bottle = home / ".local" / "share" / "bottles" / "bottles" / "EmptyBottle"
@@ -689,7 +689,7 @@ def test_cleanup_protects_empty_bottles_unmounted_heroic_lutris_and_cleans_trash
         encoding="utf-8",
     )
 
-    # 4. Orphan prefix still gets found + Trash/files + Trash/info/.trashinfo
+    # 4. The orphan prefix is found. Trash and its metadata are out of scope.
     orphan_pfx = home / "Games" / "Heroic" / "Prefixes" / "OrphanGame"
     (orphan_pfx / "drive_c" / "users" / "steamuser").mkdir(parents=True)
 
@@ -711,13 +711,9 @@ def test_cleanup_protects_empty_bottles_unmounted_heroic_lutris_and_cleans_trash
     assert lutris_pfx.resolve() not in cand_paths
     assert orphan_pfx.resolve() in cand_paths
 
-    trash_cand = next(c for c in cands if c.category == "Trash")
-    deleted, _freed, errors = cleanup.delete_cleanup_candidates_checked(
-        candidates=[trash_cand], include_system_caches=True
-    )
-    assert deleted == 1 and not errors
-    assert not trash_files.exists()
-    assert not (trash_info / "junk.dat.trashinfo").exists()
+    assert trash_files not in cand_paths
+    assert (trash_files / "junk.dat").is_file()
+    assert (trash_info / "junk.dat.trashinfo").is_file()
 
 
 def test_medium_safety_guards_manifest_artwork_steam_root_and_empty_library_root(tmp_path: Path) -> None:

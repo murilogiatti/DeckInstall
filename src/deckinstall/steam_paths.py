@@ -32,11 +32,20 @@ class SteamPaths:
 
 def dir_size_bytes(path: Path) -> int:
     """Return total byte size of regular files under path, skipping symlinks."""
+    return measured_dir_size_bytes(path) or 0
+
+
+def measured_dir_size_bytes(
+    path: Path, *, strict: bool = False, cancelled: Callable[[], bool] | None = None,
+) -> int | None:
+    """Measure regular files without following symlinks. Strict scans flag unreadable trees."""
     if path.is_symlink() or not path.is_dir():
-        return 0
+        return None
     total = 0
     stack: list[Path | str] = [path]
     while stack:
+        if cancelled is not None and cancelled():
+            return None
         cur = stack.pop()
         try:
             with os.scandir(cur) as it:
@@ -49,9 +58,11 @@ def dir_size_bytes(path: Path) -> int:
                         elif entry.is_dir(follow_symlinks=False):
                             stack.append(entry.path)
                     except OSError:
-                        continue
+                        if strict:
+                            return None
         except OSError:
-            continue
+            if strict:
+                return None
     return total
 
 

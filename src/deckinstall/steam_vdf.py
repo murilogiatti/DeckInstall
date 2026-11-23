@@ -18,7 +18,7 @@ import threading
 import time
 import zipfile
 import zlib
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,7 +26,7 @@ from typing import Any
 import vdf
 
 from .extractor import check_disk_space
-from .fsutil import atomic_write_bytes, file_sha256
+from .fsutil import atomic_write_bytes, file_identity, file_sha256, open_regular_fd
 from .fsutil import file_lock as _file_lock
 from .library import NON_UNIX_FS, fs_type_of
 from .manifest import read_manifest_fields
@@ -2396,6 +2396,52 @@ def _safe_parents_within(base_dir: Path, base_resolved: Path, rel_parts: tuple[s
 
 
 def restore_saves_backup(paths: SteamPaths | None, zip_path: Path) -> tuple[int, int]:
+    """Restore a backup through the same mapping used to verify an imported copy."""
+    return _process_saves_backup(paths, zip_path)
+
+
+def save_backup_matches_installed_games(paths: SteamPaths | None, zip_path: Path) -> bool:
+    """True only when every archived save has an identical file at its restore destination."""
+    try:
+        _, files = _process_saves_backup(paths, zip_path, verify_only=True)
+        return files > 0
+    except (OSError, ValueError, RuntimeError, zipfile.BadZipFile, NotImplementedError):
+        return False
+
+
+def remove_imported_save_backup(paths: SteamPaths | None, zip_path: Path) -> bool:
+    """Recheck an archive selected for cleanup and unlink only the verified source file."""
+    try:
+        before = zip_path.lstat()
+        if not stat.S_ISREG(before.st_mode) or zip_path.absolute() != zip_path.resolve():
+            return False
+        if not save_backup_matches_installed_games(paths, zip_path):
+            return False
+        if file_identity(zip_path.lstat()) != file_identity(before):
+            return False
+        zip_path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _zip_member_matches_file(zf: zipfile.ZipFile, info: zipfile.ZipInfo, path: Path) -> bool:
+    try:
+        with os.fdopen(open_regular_fd(path), "rb") as live, zf.open(info) as archived:
+            before = os.fstat(live.fileno())
+            if before.st_size != info.file_size:
+                return False
+            while chunk := archived.read(65536):
+                if live.read(len(chunk)) != chunk:
+                    return False
+            return not live.read(1) and file_identity(before) == file_identity(path.lstat())
+    except OSError:
+        return False
+
+
+def _process_saves_backup(
+    paths: SteamPaths | None, zip_path: Path, *, verify_only: bool = False,
+) -> tuple[int, int]:
     """Restore saves from a DeckInstall ZIP backup into matching Steam or Standalone prefixes."""
     from .standalone import list_standalone_games
 
@@ -2404,8 +2450,11 @@ def restore_saves_backup(paths: SteamPaths | None, zip_path: Path) -> tuple[int,
         if paths is not None
         else _file_lock(Path.home() / ".local" / "share" / "DeckInstall" / "restore.lock")
     )
-    with lock_ctx:
-        entries = load_shortcuts(paths.shortcuts_vdf) if paths is not None else []
+    with nullcontext() if verify_only else lock_ctx:
+        entries = (
+            load_shortcuts(paths.shortcuts_vdf, strict=True) if verify_only
+            else load_shortcuts(paths.shortcuts_vdf)
+        ) if paths is not None else []
         active_ids = {str(e.appid_u32) for e in entries}
         by_exact: dict[str, str | None] = {}
         norm_counts: dict[str, list[str]] = {}
@@ -2440,7 +2489,8 @@ def restore_saves_backup(paths: SteamPaths | None, zip_path: Path) -> tuple[int,
 
         compat_root_resolved: Path | None = None
         if paths is not None:
-            paths.compatdata_dir.mkdir(parents=True, exist_ok=True)
+            if not verify_only:
+                paths.compatdata_dir.mkdir(parents=True, exist_ok=True)
             compat_root_resolved = paths.compatdata_dir.resolve()
         restored_games: set[str] = set()
         restored_files = 0
@@ -2472,9 +2522,12 @@ def restore_saves_backup(paths: SteamPaths | None, zip_path: Path) -> tuple[int,
                     raise ValueError("Invalid manifest.json format")
                 manifest = {str(k): str(v) for k, v in raw_manifest.items()}
 
+            expected_members = 0
+            seen_targets: set[Path] = set()
             for info in infolist:
                 if info.is_dir() or info.filename == "manifest.json":
                     continue
+                expected_members += 1
                 if stat.S_ISLNK((info.external_attr >> 16) & 0o170000):
                     continue
                 parts = Path(info.filename).parts
@@ -2550,6 +2603,17 @@ def restore_saves_backup(paths: SteamPaths | None, zip_path: Path) -> tuple[int,
                 if not _safe_parents_within(target_root, target_root_resolved, prefix_rel):
                     continue
                 dst_base = target_prefix.joinpath(*pfx_rel, section)
+                if verify_only:
+                    target = dst_base.joinpath(*rel_parts)
+                    if target in seen_targets or target == zip_path:
+                        return 0, 0
+                    total_bytes += info.file_size
+                    if total_bytes > _RESTORE_MAX_TOTAL_BYTES or not _zip_member_matches_file(zf, info, target):
+                        return 0, 0
+                    seen_targets.add(target)
+                    restored_games.add(game_id_key)
+                    restored_files += 1
+                    continue
                 dst_base.mkdir(parents=True, exist_ok=True)
                 dst_base_resolved = dst_base.resolve()
                 if not dst_base_resolved.is_relative_to(target_root_resolved):
@@ -2590,6 +2654,8 @@ def restore_saves_backup(paths: SteamPaths | None, zip_path: Path) -> tuple[int,
                     raise
                 restored_games.add(game_id_key)
                 restored_files += 1
+        if verify_only and expected_members != restored_files:
+            return 0, 0
         return len(restored_games), restored_files
 
 
@@ -2660,13 +2726,15 @@ def sync_prefix_symlinks(
     return created, removed
 
 
-def get_compat_tool_map(config_vdf: Path) -> dict[int, str]:
+def get_compat_tool_map(config_vdf: Path, *, strict: bool = False) -> dict[int, str]:
     """Return a mapping of appid_u32 -> configured compatibility tool name from config.vdf."""
-    if not config_vdf.is_file():
-        return {}
     try:
         data = _load_vdf_mapping(config_vdf)
+    except FileNotFoundError:
+        return {}
     except Exception:
+        if strict:
+            raise
         return {}
     mapping = _compat_tool_section(data)
     if mapping is None:

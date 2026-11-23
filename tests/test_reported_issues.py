@@ -274,12 +274,12 @@ class SortableTablesTests(unittest.TestCase):
                 for widget in (win.games_list, win.shortcuts_list):
                     self.assertIsInstance(widget, QTableWidget)
                     self.assertTrue(widget.isSortingEnabled())
-                # Cleanup list: always largest first, the header does not re-sort it.
+                # Cleanup opens largest first and supports alternative sort orders.
                 from deckinstall import ui_maintenance
                 from deckinstall.cleanup import CleanupCandidate
 
-                self.assertFalse(win.maint_list.isSortingEnabled())
-                self.assertFalse(win.maint_list.horizontalHeader().sectionsClickable())
+                self.assertTrue(win.maint_list.isSortingEnabled())
+                self.assertTrue(win.maint_list.horizontalHeader().sectionsClickable())
 
                 def _cand(name: str, size: int, group: str) -> CleanupCandidate:
                     return CleanupCandidate("orphan", name, Path(tmp) / name, size, False, group=group)
@@ -296,6 +296,11 @@ class SortableTablesTests(unittest.TestCase):
                 ui_maintenance.on_maint_filter_changed(win, "all")
                 ui_maintenance._apply_maint_scan_results(win, cands[:1] + [_cand("d", 99999, "games")])
                 self.assertEqual(_sizes(), ["d", "a"])
+                win.maint_list.sortItems(2, Qt.SortOrder.AscendingOrder)
+                self.assertEqual(_sizes(), ["a", "d"])
+                win.maint_list.item(1, 0).setCheckState(Qt.CheckState.Unchecked)
+                self.assertFalse(win._maint_checked[Path(tmp) / "d"])
+                self.assertTrue(win._maint_checked[Path(tmp) / "a"])
             finally:
                 for worker in list(win._active_workers):
                     worker.wait(5000)
@@ -403,7 +408,7 @@ class LibraryColumnsFilterAndLogsTests(unittest.TestCase):
             ):
                 win = ui.MainWindow(app)
                 try:
-                    self.assertEqual(win.shortcuts_list.columnCount(), 6)
+                    self.assertEqual(win.shortcuts_list.columnCount(), 7)
                     self.assertEqual(win.saves_list.columnCount(), 6)
                     self.assertEqual(win.saves_list.rowCount(), 1)
                     self.assertTrue(win.btn_save_restore.isEnabled())

@@ -157,6 +157,7 @@ from .ui_cards import (  # noqa: F401
     _pick_file_async,
     _resolve_asset_path,
     _setting_bool,
+    _SortableTableItem,
     format_size_bytes,
     get_game_log_path,
     shortcut_target_button,
@@ -216,6 +217,7 @@ from .ui_workers import (  # noqa: F401
     SteamSearchWorker,
     compute_library_runner_labels,
 )
+from .ui_workers_library import compute_library_sizes
 from .uninstall import GAME_FILES, SHORTCUTS, UninstallPlan, UninstallResult, execute_uninstall, plan_uninstall
 from .vdf_queue import BatchApplyResult, QueuedVdfEdit, VdfEditQueue
 
@@ -386,6 +388,7 @@ class MainWindow(QMainWindow):
         self._steam_detect_req_id = 0
         self._extract_worker: ExtractWorker | None = None
         self._scan_worker: ScanWorker | None = None
+        self._library_size_worker: SteamOpWorker | None = None
         self._play = PlayMonitor(self)
         self._play.changed.connect(self._on_play_changed)
         self._play.failed.connect(self._on_play_failed)
@@ -411,6 +414,7 @@ class MainWindow(QMainWindow):
             for attr in (
                 "_extract_worker",
                 "_scan_worker",
+                "_library_size_worker",
             ):
                 if getattr(self, attr, None) is worker:
                     setattr(self, attr, None)
@@ -1281,7 +1285,7 @@ class MainWindow(QMainWindow):
         filter_row.addWidget(self.lbl_library_count)
         lib_layout.addLayout(filter_row)
 
-        self.shortcuts_list = QTableWidget(0, 6)
+        self.shortcuts_list = QTableWidget(0, 7)
         self.shortcuts_list.setHorizontalHeaderLabels(
             [
                 tr("table.name"),
@@ -1289,6 +1293,7 @@ class MainWindow(QMainWindow):
                 tr("table.runner"),
                 tr("table.graphics"),
                 tr("table.engine"),
+                tr("table.size"),
                 tr("table.executable"),
             ]
         )
@@ -1305,11 +1310,11 @@ class MainWindow(QMainWindow):
         self.shortcuts_list.horizontalHeader().setSectionResizeMode(
             2, QHeaderView.ResizeMode.ResizeToContents
         )
-        for column in (3, 4):
+        for column in (3, 4, 5):
             self.shortcuts_list.horizontalHeader().setSectionResizeMode(
                 column, QHeaderView.ResizeMode.ResizeToContents
             )
-        self.shortcuts_list.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.shortcuts_list.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.shortcuts_list.horizontalHeader().setStretchLastSection(True)
         self.shortcuts_list.horizontalHeader().setSectionsClickable(True)
         self.shortcuts_list.setSortingEnabled(True)
@@ -1539,6 +1544,13 @@ class MainWindow(QMainWindow):
             if bwrap_warn:
                 self._show_bwrap_warning_dialog(bwrap_warn)
             QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+            updated_proton = getattr(worker, "updated_proton", "")
+            updated_optiscaler = getattr(worker, "updated_optiscaler", "")
+            if any(isinstance(value, str) and value for value in (updated_proton, updated_optiscaler)):
+                self._offer_runtime_game_update(
+                    updated_proton if isinstance(updated_proton, str) else "",
+                    optiscaler=updated_optiscaler if isinstance(updated_optiscaler, str) else "",
+                )
 
         def _err(err: str) -> None:
             self._end_busy()
@@ -1550,6 +1562,34 @@ class MainWindow(QMainWindow):
         worker.finished_ok.connect(_ok)
         worker.failed.connect(_err)
         worker.start()
+
+    def _offer_runtime_game_update(self, proton: str = "", *, optiscaler: str = "") -> None:
+        def _review_old_versions() -> None:
+            if proton and not self._closing_pending:
+                from .ui_maintenance import offer_maintenance_review
+
+                offer_maintenance_review(self, "runtimes")
+
+        def _offer_optiscaler() -> None:
+            if self._closing_pending:
+                return
+            if optiscaler and QMessageBox.question(
+                _dialog_parent(self), __app_name__, tr("runtime.offer_optiscaler"),
+            ) == QMessageBox.StandardButton.Yes:
+                from .ui_dialogs.optiscaler_bulk_dialog import bulk_optiscaler_dialog
+
+                bulk_optiscaler_dialog(self, target_version=optiscaler, on_close=_review_old_versions)
+            else:
+                _review_old_versions()
+
+        if self._closing_pending:
+            return
+        if proton and QMessageBox.question(
+            _dialog_parent(self), __app_name__, tr("runtime.offer_proton", name=proton),
+        ) == QMessageBox.StandardButton.Yes:
+            bulk_proton_dialog(self, preferred_tool=proton, on_close=_offer_optiscaler)
+        else:
+            _offer_optiscaler()
 
     def _check_and_update_app(self) -> None:
         if self._steam_busy:
@@ -2490,6 +2530,9 @@ class MainWindow(QMainWindow):
         vdf_err: str,
         runner_labels: dict[tuple[str, str], str] | None = None,
     ) -> None:
+        if self._library_size_worker is not None:
+            self._library_size_worker.requestInterruption()
+        self._library_size_worker = None
         self.shortcuts_list.setSortingEnabled(False)
         self.shortcuts_list.setRowCount(0)
         if not paths_snapshot:
@@ -2574,12 +2617,51 @@ class MainWindow(QMainWindow):
             self.shortcuts_list.setItem(row, 2, QTableWidgetItem(runner))
             self.shortcuts_list.setItem(row, 3, QTableWidgetItem(labels.get(("api", key), "-")))
             self.shortcuts_list.setItem(row, 4, QTableWidgetItem(labels.get(("engine", key), "-")))
-            self.shortcuts_list.setItem(row, 5, QTableWidgetItem(executable))
+            item.setData(Qt.ItemDataRole.UserRole + 1, key)
+            loading = _SortableTableItem(tr("library.size_loading"), -1)
+            loading.setToolTip(tr("library.size_hint"))
+            self.shortcuts_list.setItem(row, 5, loading)
+            self.shortcuts_list.setItem(row, 6, QTableWidgetItem(executable))
         self.shortcuts_list.setSortingEnabled(True)
 
         self._filter_library_list()
         self._update_library_action_states()
         self._maybe_prompt_migration(standalone_games)
+        if rows:
+            self._measure_library_sizes(entries, standalone_games, external_games, paths_snapshot)
+
+    def _measure_library_sizes(
+        self, entries: list[ShortcutEntry], games: list[StandaloneGame],
+        external: list[ExternalLauncherGame], paths: SteamPaths | None,
+    ) -> None:
+        worker = SteamOpWorker(lambda: compute_library_sizes(
+            entries, games, external, paths, cancelled=worker.isInterruptionRequested,
+        ))
+        self._library_size_worker = worker
+        self._track_worker(worker)
+
+        def _finish(result: object) -> None:
+            if self._closing_pending or self._library_size_worker is not worker:
+                return
+            sizes = result if isinstance(result, dict) else {}
+            table = self.shortcuts_list
+            table.setSortingEnabled(False)
+            for row in range(table.rowCount()):
+                name = table.item(row, 0)
+                if name is None:
+                    continue
+                size = sizes.get(name.data(Qt.ItemDataRole.UserRole + 1))
+                text = format_size_bytes(size) if size is not None else tr("library.size_unavailable")
+                cell = _SortableTableItem(text, size if size is not None else -1)
+                cell.setToolTip(tr("library.size_hint"))
+                table.setItem(row, 5, cell)
+            table.setSortingEnabled(True)
+            self._filter_library_list()
+
+        worker.finished_ok.connect(_finish)
+        worker.failed.connect(lambda _err: _finish({}))
+        worker.start()
+
 
     def _maybe_prompt_migration(self, standalone_games: list[StandaloneGame]) -> None:
         """Offer once per session to move v1 games (~/Games) into the internal library."""
@@ -2975,6 +3057,7 @@ class MainWindow(QMainWindow):
                 self._update_vdf_queue_banner()
                 return
             self._refresh_shortcuts()
+            self._review_queued_game_removals(res)
             applied = getattr(res, "applied", 0)
             errors = list(getattr(res, "errors", []))
             if errors:
@@ -2998,6 +3081,21 @@ class MainWindow(QMainWindow):
         worker.finished_ok.connect(_ok)
         worker.failed.connect(_err)
         worker.start()
+
+    def _review_queued_game_removals(self, result: object) -> None:
+        if self._closing_pending or not isinstance(result, BatchApplyResult) or not result.removed_for_review:
+            return
+
+        def _review() -> None:
+            from .ui_maintenance import offer_maintenance_review
+
+            offer_maintenance_review(
+                self, "games",
+                details="\n".join(name for _, name in result.removed_for_review),
+                appids={appid for appid, _ in result.removed_for_review},
+            )
+
+        QTimer.singleShot(0, self, _review)
 
     def _maybe_offer_steam_restart(self, worker: QThread) -> None:
         if self._closed or self._closing_pending or self._relaunch_after_close is not None:
@@ -3122,6 +3220,8 @@ class MainWindow(QMainWindow):
                 self._end_busy()
                 self._update_vdf_queue_banner()
                 self._refresh_shortcuts()
+                if on_done is None:
+                    self._review_queued_game_removals(res)
                 applied = getattr(res, "applied", 0)
                 errors = list(getattr(res, "errors", []))
                 if errors:
@@ -3810,7 +3910,10 @@ class MainWindow(QMainWindow):
             msg = tr("restore.done", files=files, games=games)
             self.status_label.setText(msg)
             if not self._closing_pending:
-                QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+                if worker.verified_for_cleanup:
+                    self._offer_imported_backup_cleanup(zpath)
+                else:
+                    QMessageBox.information(_dialog_parent(self), __app_name__, msg)
 
         def _on_restore_err(err: str) -> None:
             self._end_busy()
@@ -3821,6 +3924,46 @@ class MainWindow(QMainWindow):
         self._track_worker(worker)
         worker.done.connect(_on_restore_done)
         worker.failed.connect(_on_restore_err)
+        worker.start()
+
+    def _offer_imported_backup_cleanup(
+        self, backup: Path, *, remove: Callable[[], bool] | None = None,
+    ) -> None:
+        from .steam_vdf import remove_imported_save_backup
+
+        if QMessageBox.question(
+            _dialog_parent(self), __app_name__, tr("restore.offer_remove_imported", path=str(backup)),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        paths = self.paths
+
+        def _remove() -> bool:
+            if _is_wine_game_running():
+                raise RuntimeError(tr("cleanup.wine_running"))
+            return remove() if remove is not None else remove_imported_save_backup(paths, backup)
+
+        def _done(removed: object) -> None:
+            self._end_busy()
+            if self._closing_pending:
+                return
+            self._refresh_saves_list()
+            if removed is True:
+                self.status_label.setText(tr("restore.imported_backup_removed", name=backup.name))
+            else:
+                QMessageBox.warning(_dialog_parent(self), __app_name__, tr("restore.imported_backup_kept"))
+
+        def _failed(err: str) -> None:
+            self._end_busy()
+            if not self._closing_pending:
+                QMessageBox.warning(_dialog_parent(self), __app_name__, err)
+
+        self._begin_busy()
+        worker = SteamOpWorker(_remove)
+        self._track_worker(worker)
+        worker.finished_ok.connect(_done)
+        worker.failed.connect(_failed)
         worker.start()
 
     def _adopt_library_choices(self) -> list[tuple[str, Path]]:
@@ -4155,7 +4298,7 @@ class MainWindow(QMainWindow):
 
     def _remove_steam_shortcut_async(
         self, entry: ShortcutEntry, refresh_games: bool = False, done_msg: str = "",
-        *, defer_on_cancel: bool = False,
+        *, defer_on_cancel: bool = False, review: bool = True,
     ) -> None:
         """Remove a Steam Non-Steam shortcut in a background thread (or queue it in Gaming Mode)."""
         if not self.paths or self._vdf_corrupt:
@@ -4169,7 +4312,7 @@ class MainWindow(QMainWindow):
                     "remove_shortcut",
                     entry.appid_u32,
                     entry.app_name,
-                    {},
+                    {"review_cleanup": review},
                 ),
                 trigger_watch=not closing,
             )
@@ -4201,6 +4344,12 @@ class MainWindow(QMainWindow):
                 if removed or refresh_games:
                     self._refresh_shortcuts()
                     self.status_label.setText(done_msg or tr("library.removed", name=entry.app_name))
+                if removed and review and not self._closing_pending:
+                    from .ui_maintenance import offer_maintenance_review
+
+                    offer_maintenance_review(
+                        self, "games", details=entry.app_name, appids={entry.appid_u32},
+                    )
 
             def _on_remove_err(err: str) -> None:
                 self._end_busy()
@@ -4275,8 +4424,55 @@ class MainWindow(QMainWindow):
                 )
                 if SHORTCUTS not in result.removed:
                     return
-            if steam_entry is not None and self.paths is not None:
-                self._remove_steam_shortcut_async(steam_entry, done_msg=msg, defer_on_cancel=True)
+            def _finish_shortcut() -> None:
+                if steam_entry is not None and self.paths is not None:
+                    self._remove_steam_shortcut_async(
+                        steam_entry, done_msg=msg, defer_on_cancel=True, review=result.remaining is None,
+                    )
+
+            remaining = result.remaining
+            if remaining is None:
+                _finish_shortcut()
+                return
+            selected = ask_uninstall(_dialog_parent(self), remaining)
+            if not selected:
+                _finish_shortcut()
+                return
+
+            snapshot = self._make_pre_snapshot_fn(force=True, game=sa)
+
+            def _remove_leftovers() -> UninstallResult:
+                if _is_wine_game_running():
+                    raise RuntimeError(tr("cleanup.wine_running"))
+                return execute_uninstall(remaining, selected, snapshot)
+
+            def _leftovers_done(value: object) -> None:
+                self._end_busy()
+                if self._closing_pending or not isinstance(value, UninstallResult):
+                    return
+                self._refresh_shortcuts()
+                if GAME_FILES in value.removed:
+                    self._refresh_games()
+                if value.errors:
+                    QMessageBox.warning(
+                        _dialog_parent(self), __app_name__, tr("uninstall.errors", errors="\n".join(value.errors)),
+                    )
+                else:
+                    self.status_label.setText(
+                        tr(
+                            "uninstall.done", name=sa.name,
+                            size=format_size_bytes(result.freed_bytes + value.freed_bytes),
+                        )
+                    )
+                _finish_shortcut()
+
+            self._begin_busy()
+            self.status_label.setText(tr("cleanup.scanning"))
+            cleanup_worker = SteamOpWorker(_remove_leftovers)
+            self._track_worker(cleanup_worker)
+            cleanup_worker.finished_ok.connect(_leftovers_done)
+            cleanup_worker.failed.connect(_on_err)
+            cleanup_worker.start()
 
         planner.finished_ok.connect(_on_planned)
         planner.failed.connect(_on_err)

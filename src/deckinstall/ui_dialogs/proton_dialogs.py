@@ -244,7 +244,7 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
                 installed_list.setItem(
                     row, 1, _SortableTableItem(size_str, tool.size_bytes)
                 )
-                installed_list.setItem(row, 2, QTableWidgetItem(usage_tag))
+                installed_list.setItem(row, 2, _SortableTableItem(usage_tag, len(used_entries)))
             installed_list.setSortingEnabled(True)
             btn_remove_inst.setEnabled(False)
 
@@ -375,7 +375,15 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
             _set_busy(False, tr("proton_mgr.installed", name=folder_name))
             _refresh_installed()
             win._refresh_maintenance_health()
-            QMessageBox.information(dlg, __app_name__, tr("proton_mgr.installed", name=folder_name))
+            if QMessageBox.question(
+                dlg, __app_name__, tr("runtime.offer_proton_installed", name=folder_name),
+            ) == QMessageBox.StandardButton.Yes:
+                from .proton_bulk_dialog import bulk_proton_dialog
+
+                dlg.accept()
+                bulk_proton_dialog(win, preferred_tool=folder_name)
+            else:
+                QMessageBox.information(dlg, __app_name__, tr("proton_mgr.installed", name=folder_name))
 
         def _err(err: str) -> None:
             if not dlg_alive["open"]:
@@ -460,6 +468,10 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
                     _refresh_installed()
                     win._refresh_maintenance_health()
                     win._refresh_shortcuts()
+                    from ..ui_maintenance import offer_maintenance_review
+
+                    if offer_maintenance_review(win, "runtimes", dlg, details=str(tool.path)):
+                        dlg.accept()
 
             worker.finished_ok.connect(_done)
             worker.failed.connect(_failed)

@@ -51,7 +51,9 @@ from ..save_sync import (
     preview_sync_operation,
     pull_game_saves,
     push_game_saves,
+    remove_restored_snapshot,
     restore_snapshot_safely,
+    restored_snapshot_matches,
     snapshot_after_play,
     snapshot_dir_for,
     snapshot_display_name,
@@ -620,16 +622,18 @@ def _restore_selected(win: MainWindow) -> None:
         return
 
     def _ok(res: object) -> None:
-        count, safety, skipped = res if isinstance(res, tuple) and len(res) == 3 else (0, None, 0)
+        data = res if isinstance(res, tuple) else ()
+        count, safety, skipped = data[:3] if len(data) >= 3 else (0, None, 0)
         msg = tr("saves.snapshot_restored", name=t.name, count=count, safety=safety or "-")
         if skipped:
             msg += "\n" + tr("saves.home_skipped", count=skipped)
         _info(win, msg)
+        _offer_snapshot_cleanup(win, t, entry, data)
 
     _run(
         win,
         tr("saves.restore_running", name=t.name),
-        lambda: _restore_job(t, entry),
+        lambda: _restore_and_verify_job(t, entry),
         _ok,
     )
 
@@ -664,6 +668,28 @@ def _restore_job(t: SaveTarget, entry: SaveArchiveEntry) -> object:
             tr("saves.steamcloud_appid_mismatch", snap=exc.snap_appid or "?", target=exc.target_appid or "?")
         ) from exc
     return count, safety, len(skipped)
+
+
+def _restore_and_verify_job(t: SaveTarget, entry: SaveArchiveEntry) -> object:
+    result = _restore_job(t, entry)
+    if not isinstance(result, tuple):
+        return result
+    restored, _, skipped = result
+    verified = entry.kind == "save_snapshot" and restored > 0 and not skipped and restored_snapshot_matches(
+        entry.path, t.prefix_dir, t.game_dir, steam_appid=t.steam_appid, extra_dirs=t.extra_dirs,
+    )
+    return (*result, verified)
+
+
+def _offer_snapshot_cleanup(win: MainWindow, t: SaveTarget, entry: SaveArchiveEntry, result: tuple) -> None:
+    if len(result) != 4 or not result[3] or win._closing_pending:
+        return
+    win._offer_imported_backup_cleanup(
+        entry.path,
+        remove=lambda: remove_restored_snapshot(
+            entry.path, t.prefix_dir, t.game_dir, steam_appid=t.steam_appid, extra_dirs=t.extra_dirs,
+        ),
+    )
 
 
 def _open_folder(win: MainWindow) -> None:
@@ -800,8 +826,8 @@ def _remove_import_duplicates(win: MainWindow) -> None:
             removed = 0
             for p in dupes:
                 try:
-                    p.unlink()
-                    removed += 1
+                    if lds.remove_import_duplicate(p):
+                        removed += 1
                 except OSError as exc:
                     logging.getLogger(__name__).warning("Could not remove %s: %s", p, exc)
             return removed
@@ -885,13 +911,18 @@ def offer_existing_saves(win: MainWindow, game: StandaloneGame) -> None:
             return
 
         def _restored(res: object) -> None:
-            count, safety, skipped = res if isinstance(res, tuple) and len(res) == 3 else (0, None, 0)
+            data = res if isinstance(res, tuple) else ()
+            count, safety, skipped = data[:3] if len(data) >= 3 else (0, None, 0)
             msg = tr("saves.snapshot_restored", name=game.name, count=count, safety=safety or "-")
             if skipped:
                 msg += "\n" + tr("saves.home_skipped", count=skipped)
             _info(win, msg)
+            _offer_snapshot_cleanup(win, target, newest, data)
 
-        _run(win, tr("saves.restore_running", name=game.name), lambda: _restore_job(target, newest), _restored)
+        _run(
+            win, tr("saves.restore_running", name=game.name),
+            lambda: _restore_and_verify_job(target, newest), _restored,
+        )
         return
 
     saved = str(win.settings.value(LUDUSAVI_DIR_KEY, "") or "")

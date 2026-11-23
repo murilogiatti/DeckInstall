@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from . import save_sync
-from .fsutil import is_within
+from .fsutil import file_identity, is_within
 from .launcher_scan import _split_yaml_key_value, _strip_yaml_comment, _unquote_yaml_scalar
 from .steam_vdf import (
     _RESTORE_MAX_ENTRIES,
@@ -883,25 +883,59 @@ def _newest_snapshot(snap_dir: Path) -> Path | None:
         return None
 
 
-def find_import_duplicates(dest_root: Path | None = None) -> list[Path]:
-    """Ludusavi import zips whose content equals a newer import of the same game (the newest is kept).
-
-    Keeping the newest copy keeps the newest snapshot the same: after importing A, B and A again,
-    the save restored is still A.
-    """
-    root = dest_root or save_sync.DEFAULT_SNAPSHOTS_DIR
+def _verified_import_duplicates(snap_dir: Path) -> list[Path]:
     try:
-        game_dirs = sorted(d for d in root.iterdir() if d.is_dir() and not d.is_symlink())
-    except OSError:
+        if snap_dir.absolute() != snap_dir.resolve():
+            return []
+        archives = sorted(snap_dir.glob("*-ludusavi-import*.zip"), key=_import_zip_order, reverse=True)
+    except (OSError, RuntimeError):
         return []
     dupes: list[Path] = []
-    for snap_dir in game_dirs:
-        seen: set[str] = set()
-        for zp, fp in reversed(list(import_snapshot_fingerprints(snap_dir).items())):  # newest first
-            if fp in seen:
-                dupes.append(zp)
-            seen.add(fp)
-    return sorted(dupes)
+    seen: set[tuple[str, str | None]] = set()
+    for path in archives:
+        if path.is_symlink() or not path.is_file() or not _IMPORT_ZIP_RE.match(path.name):
+            continue
+        try:
+            before = path.stat()
+            fingerprint = _zip_fingerprint(path)
+            if fingerprint is None:
+                continue
+            appid = save_sync.snapshot_steamcloud_appid(path)
+            if appid is None and save_sync.archive_has_steamcloud(path):
+                continue
+            if file_identity(before) != file_identity(path.lstat()):
+                continue
+        except (OSError, ValueError, RuntimeError, zipfile.BadZipFile):
+            continue
+        key = (fingerprint, appid)
+        if key in seen:
+            dupes.append(path)
+        seen.add(key)
+    return dupes
+
+
+def find_import_duplicates(dest_root: Path | None = None) -> list[Path]:
+    """Verify duplicate Ludusavi imports, keeping the most recent copy and cloud app identity."""
+    root = dest_root or save_sync.DEFAULT_SNAPSHOTS_DIR
+    try:
+        if root.absolute() != root.resolve():
+            return []
+        game_dirs = sorted(d for d in root.iterdir() if d.is_dir() and not d.is_symlink())
+    except (OSError, RuntimeError):
+        return []
+    return sorted(path for snap_dir in game_dirs for path in _verified_import_duplicates(snap_dir))
+
+
+def remove_import_duplicate(path: Path) -> bool:
+    """Check the duplicate again under the same lock used to write snapshots."""
+    if path.parent.absolute() != path.parent.resolve():
+        return False
+    with save_sync._snapshot_dir_lock(path.parent):
+        before = file_identity(path.lstat())
+        if path not in _verified_import_duplicates(path.parent) or file_identity(path.lstat()) != before:
+            return False
+        path.unlink()
+        return True
 
 
 def import_ludusavi_to_snapshot(

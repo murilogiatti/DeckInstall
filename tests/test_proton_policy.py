@@ -123,7 +123,7 @@ def test_runtime_update_moves_default_games_and_prunes(tmp_path: Path) -> None:
     assert worker._after_ge_update("GE-Proton11-2") == ""
 
 
-def test_runtime_update_prunes_but_keeps_steam_mapped_tools(tmp_path: Path) -> None:
+def test_runtime_update_retains_old_tools_for_review(tmp_path: Path) -> None:
     from types import SimpleNamespace
 
     from deckinstall import steam_vdf, ui_workers
@@ -134,6 +134,6 @@ def test_runtime_update_prunes_but_keeps_steam_mapped_tools(tmp_path: Path) -> N
     usage = [SimpleNamespace(tool_name="GE-Proton9-27")]
     with mock.patch.object(steam_vdf, "list_compat_tool_usage", return_value=usage):
         msg = ui_workers.RuntimeUpdateWorker(paths=mock.Mock())._after_ge_update("GE-Proton10-25")
-    assert "GE-Proton10-4" in msg
+    assert "GE-Proton11-2" in msg
     left = sorted(p.name for p in runtime_manager.get_compat_tools_dir().iterdir())
-    assert left == ["GE-Proton10-25", "GE-Proton11-2", "GE-Proton9-27"]
+    assert left == ["GE-Proton10-25", "GE-Proton10-4", "GE-Proton11-2", "GE-Proton9-27"]

@@ -249,3 +249,25 @@ def test_remove_existing_button_disabled_while_busy(tmp_path: Path) -> None:
         app.processEvents()
         win._active_workers.clear()
         win.close()
+
+
+def test_leftovers_offer_snapshots_and_rejects_replaced_paths(tmp_path: Path) -> None:
+    game = _install(tmp_path)
+    result = un.execute_uninstall(un.plan_uninstall(game), {un.LOGS})
+    assert result.remaining is not None and result.remaining.leftovers
+    assert {item.id for item in result.remaining.items} == {un.GAME_FILES, un.PREFIX, un.CACHE}
+    assert all(not item.checked for item in result.remaining.items)
+
+    assert game.cache_dir is not None
+    original_cache = game.cache_dir.with_name("original-cache")
+    game.cache_dir.rename(original_cache)
+    game.cache_dir.mkdir()
+    replacement = game.cache_dir / "must-stay"
+    replacement.write_bytes(b"new owner")
+    snapshot = mock.Mock(return_value=tmp_path / "backup.zip")
+    clean = un.execute_uninstall(result.remaining, {un.PREFIX, un.CACHE}, snapshot)
+    snapshot.assert_called_once()
+    assert un.SHORTCUTS not in clean.removed
+    assert un.PREFIX in clean.removed and not game.prefix_dir.exists()
+    assert replacement.is_file() and clean.errors
+    assert game.game_dir.is_dir()

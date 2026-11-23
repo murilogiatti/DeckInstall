@@ -1969,7 +1969,16 @@ def find_orphan_shader_caches(games_dir: Path | None = None) -> list[OrphanCache
                 except OSError:
                     pass
     # Games on an unmounted disk may keep their cache on the internal disk (exFAT/NTFS).
-    absent_uids = {g["id"] for g in _lib.list_unavailable_games() if g.get("id")} if games_dir is None else set()
+    protected_uids = {game.uid for game in active_games if game.uid}
+    if games_dir is None:
+        libraries = _lib.discover_libraries()
+        protected_uids.update(g["id"] for g in _lib.list_unavailable_games(libraries) if g.get("id"))
+        for lib in libraries:
+            if lib.available and (data := _lib.read_library_file(lib.root)) is not None:
+                protected_uids.update(
+                    str(entry["id"]) for entry in data.get("games") or []
+                    if isinstance(entry, dict) and entry.get("id")
+                )
 
     orphans: list[OrphanCacheEntry] = []
     for caches_dir in caches_dirs:
@@ -1980,7 +1989,7 @@ def find_orphan_shader_caches(games_dir: Path | None = None) -> list[OrphanCache
         for entry in entries:
             if entry.is_symlink() or not entry.is_dir() or entry.name.startswith("."):
                 continue
-            if entry.name in absent_uids:
+            if entry.name in protected_uids:
                 continue
             try:
                 resolved_entry = entry.resolve()

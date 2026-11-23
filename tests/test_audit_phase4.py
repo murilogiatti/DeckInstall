@@ -206,6 +206,10 @@ def test_bulk_proton_steamos_defaults_no_download_confirm_and_single_row_update(
                 assert m_q.call_args.args[4] == QMessageBox.StandardButton.No
                 m_dl.assert_not_called()
 
+            # Sorting before switching the target must keep the checked shortcut attached to Alpha.
+            dlg.tbl.sortItems(0, Qt.SortOrder.DescendingOrder)  # type: ignore[attr-defined]
+            assert dlg.tbl.item(0, 0).text() == "Beta"  # type: ignore[attr-defined]
+
             # Switch back to Steam Default -> clears config.vdf mapping with zero downloads.
             dlg.cmb_target.setCurrentIndex(0)  # type: ignore[attr-defined]
             app.processEvents()

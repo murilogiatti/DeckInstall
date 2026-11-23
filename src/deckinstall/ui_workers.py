@@ -315,28 +315,19 @@ class RuntimeUpdateWorker(QThread):
         super().__init__()
         self.paths = paths
         self.components = tuple(components) if components else RUNTIME_COMPONENTS
+        self.updated_proton = ""
+        self.updated_optiscaler = ""
 
     def _after_ge_update(self, previous: str) -> str:
-        """Move "Default" games to the new GE-Proton and keep only the current + previous versions."""
-        from .proton_policy import newest_ge_proton, protected_tool_names, prune_ge_proton, retarget_default_games
-        from .steam_vdf import list_compat_tool_usage
+        """Update launchers on the Default policy and leave older versions for review."""
+        from .proton_policy import newest_ge_proton, retarget_default_games
 
         newest = newest_ge_proton()
         if newest is None or newest.name == previous:
             return ""
+        self.updated_proton = newest.name
         moved = retarget_default_games(previous)
-        msg = tr("runtime.default_moved", count=moved, proton=newest.name)
-        if self.paths is None:
-            return msg  # Steam's own mappings are unknown: never delete a version it may use.
-        try:
-            steam_tools = [u.tool_name for u in list_compat_tool_usage(self.paths)]
-        except Exception:
-            logging.exception("Could not read Steam compat-tool mappings; skipping GE-Proton cleanup")
-            return msg
-        removed = prune_ge_proton(keep=2, protected=protected_tool_names(extra=steam_tools))
-        if removed:
-            msg = f"{msg} | {tr('runtime.ge_pruned', names=', '.join(p.name for p in removed))}"
-        return msg
+        return tr("runtime.default_moved", count=moved, proton=newest.name)
 
     def _update_mangohud(self) -> str:
         """Official MangoHud: installed when missing (unless the system has one), updated when GitHub
@@ -370,7 +361,7 @@ class RuntimeUpdateWorker(QThread):
         return ("+" if changed else "") + f"umu-run ({umu_path.name})"
 
     def _update_ge(self, info: dict[str, Any]) -> str:
-        """Newest GE-Proton, then move "Default" games to it and prune old versions."""
+        """Newest GE-Proton, then move "Default" games to it."""
         from .proton_policy import newest_ge_proton
 
         before = newest_ge_proton()
@@ -395,7 +386,8 @@ class RuntimeUpdateWorker(QThread):
             logging.warning("OptiScaler update failed: %s", exc)
             return tr("runtime.optiscaler_failed", err=str(exc))
         new = str(_load_versions().get("optiscaler_installed_version") or "").strip()
-        return ("+" if new and new != old else "") + f"OptiScaler {new or '-'}"
+        self.updated_optiscaler = new if new != old else ""
+        return ("+" if self.updated_optiscaler else "") + f"OptiScaler {new or '-'}"
 
     def run(self) -> None:
         try:

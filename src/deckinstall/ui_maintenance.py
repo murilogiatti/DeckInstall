@@ -129,6 +129,7 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
         pill = QPushButton(label)
         pill.setObjectName("FilterPill")
         pill.setCheckable(True)
+        pill.setProperty("cleanupGroup", key)
         if key == "all":
             pill.setChecked(True)
         pill.clicked.connect(lambda _=False, k=key: on_maint_filter_changed(win, k))
@@ -156,7 +157,8 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     win.maint_list.horizontalHeader().setSectionResizeMode(
         2, QHeaderView.ResizeMode.ResizeToContents
     )
-    win.maint_list.horizontalHeader().setSectionsClickable(False)  # always largest first (_visible_maint_candidates)
+    win.maint_list.setSortingEnabled(True)
+    win.maint_list.sortItems(2, Qt.SortOrder.DescendingOrder)
     win.maint_list.setMinimumHeight(220)
     win.maint_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
     win.maint_list.customContextMenuRequested.connect(
@@ -259,7 +261,7 @@ def _visible_maint_candidates(win: MainWindow) -> list[CleanupCandidate]:
 
 def toggle_maint_filter_selection(win: MainWindow) -> None:
     """Toggle selection for all candidates visible in the active filter."""
-    visible = _visible_maint_candidates(win)
+    visible = [cand for cand in _visible_maint_candidates(win) if not cand.review_only]
     if not visible:
         return
     all_checked = all(win._maint_checked.get(c.path, False) for c in visible)
@@ -272,6 +274,7 @@ def toggle_maint_filter_selection(win: MainWindow) -> None:
 def _populate_maint_list(win: MainWindow) -> None:
     visible = _visible_maint_candidates(win)
     win.maint_list.blockSignals(True)
+    win.maint_list.setSortingEnabled(False)
     win.maint_list.clearSpans()
     win.maint_list.setRowCount(0)
     if not visible:
@@ -291,13 +294,13 @@ def _populate_maint_list(win: MainWindow) -> None:
             win.maint_list.insertRow(row)
             item = QTableWidgetItem(_format_cleanup_candidate_label(cand))
             item.setToolTip(str(cand.path))
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            if not cand.review_only:
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             checked = win._maint_checked.get(
                 cand.path, _cleanup_candidate_auto_check(cand)
             )
-            item.setCheckState(
-                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
-            )
+            if not cand.review_only:
+                item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
             item.setData(Qt.ItemDataRole.UserRole, cand)
             win.maint_list.setItem(row, 0, item)
             win.maint_list.setItem(row, 1, QTableWidgetItem(str(cand.path)))
@@ -305,18 +308,17 @@ def _populate_maint_list(win: MainWindow) -> None:
                 format_size_bytes(cand.size_bytes), cand.size_bytes
             )
             win.maint_list.setItem(row, 2, size_item)
+    win.maint_list.setSortingEnabled(True)
     win.maint_list.blockSignals(False)
     _update_maint_summary(win)
 
 
 def _update_maint_summary(win: MainWindow) -> None:
     visible = _visible_maint_candidates(win)
-    sel_items = [c for c in visible if win._maint_checked.get(c.path, False)]
+    sel_items = [c for c in visible if not c.review_only and win._maint_checked.get(c.path, False)]
     sel_count = len(sel_items)
     sel_size = format_size_bytes(sum(c.size_bytes for c in sel_items))
-    safe_items = [
-        c for c in win._maint_candidates if _cleanup_candidate_auto_check(c)
-    ]
+    safe_items = [c for c in visible if _cleanup_candidate_auto_check(c)]
     safe_size = format_size_bytes(sum(c.size_bytes for c in safe_items))
     win.lbl_maint_summary.setText(
         tr("maint.summary", sel_size=sel_size, sel_count=sel_count, safe_size=safe_size)
@@ -328,10 +330,9 @@ def _update_maint_summary(win: MainWindow) -> None:
     win.btn_maint_clean_safe.setEnabled(len(safe_items) > 0)
     win.btn_maint_delete_selected.setEnabled(sel_count > 0)
 
-    all_checked = bool(visible) and all(
-        win._maint_checked.get(c.path, False) for c in visible
-    )
-    win.btn_maint_toggle_filter.setEnabled(bool(visible))
+    selectable = [c for c in visible if not c.review_only]
+    all_checked = bool(selectable) and all(win._maint_checked.get(c.path, False) for c in selectable)
+    win.btn_maint_toggle_filter.setEnabled(bool(selectable))
     win.btn_maint_toggle_filter.setText(
         tr("maint.btn_deselect_all_filter")
         if all_checked
@@ -351,7 +352,33 @@ def _apply_maint_scan_results(
     refresh_maintenance_health(win)
 
 
-def scan_maintenance_cleanup(win: MainWindow) -> None:
+def offer_maintenance_review(
+    win: MainWindow, group: str, parent: QWidget | None = None, *, details: str = "", appids: set[int] | None = None,
+) -> bool:
+    if win._closing_pending:
+        return False
+    box = QMessageBox(parent or _dialog_parent(win))
+    box.setIcon(QMessageBox.Icon.Information)
+    box.setWindowTitle(__app_name__)
+    box.setText(tr("cleanup.offer_review"))
+    box.setDetailedText(details)
+    review = box.addButton(tr("cleanup.review"), QMessageBox.ButtonRole.AcceptRole)
+    box.addButton(QMessageBox.StandardButton.Close)
+    box.exec()
+    if box.clickedButton() is review:
+        from .ui import NAV_PAGES, PAGE_MAINT
+
+        win.nav_tabs.setCurrentIndex(NAV_PAGES.index(PAGE_MAINT))
+        on_maint_filter_changed(win, group)
+        for button in win._maint_filter_group.buttons():
+            if button.property("cleanupGroup") == group:
+                button.setChecked(True)
+        scan_maintenance_cleanup(win, appids=appids)
+        return True
+    return False
+
+
+def scan_maintenance_cleanup(win: MainWindow, *, appids: set[int] | None = None) -> None:
     """Scan for cleanup candidates in the background."""
     win._begin_busy()
     win.status_label.setText(tr("cleanup.scanning"))
@@ -360,6 +387,13 @@ def scan_maintenance_cleanup(win: MainWindow) -> None:
         win._end_busy()
         if win._closing_pending:
             return
+        if appids:
+            names = {str(appid) for appid in appids}
+            candidates = [
+                item for item in candidates
+                if item.category in ("Compatdata Órfão", "Orphan Shadercache", "Backup")
+                and item.path.name.split(".", 1)[0] in names
+            ]
         _apply_maint_scan_results(win, candidates)
         win.status_label.setText(
             tr("cleanup.none_found") if not candidates else tr("status.ready")
@@ -424,9 +458,7 @@ def maint_clean_safe(win: MainWindow) -> None:
     if _is_wine_game_running():
         QMessageBox.warning(_dialog_parent(win), __app_name__, tr("cleanup.wine_running"))
         return
-    safe_items = [
-        c for c in win._maint_candidates if _cleanup_candidate_auto_check(c)
-    ]
+    safe_items = [c for c in _visible_maint_candidates(win) if _cleanup_candidate_auto_check(c)]
     safe_size = format_size_bytes(sum(c.size_bytes for c in safe_items))
     if not safe_items:
         QMessageBox.information(_dialog_parent(win), __app_name__, tr("maint.safe_clean_empty"))
@@ -448,7 +480,7 @@ def maint_delete_selected(win: MainWindow) -> None:
     selected = [
         c
         for c in _visible_maint_candidates(win)
-        if win._maint_checked.get(c.path, False)
+        if not c.review_only and win._maint_checked.get(c.path, False)
     ]
     if not selected:
         return
@@ -563,6 +595,7 @@ def show_maint_context_menu(win: MainWindow, pos: QPoint) -> None:
     act_backup: QAction | None = None
     if cand.path.is_dir() and cand.category in (
         "Prefixo Externo",
+        "Orphan Game Prefix",
         "external_prefix",
         "Compatdata Órfão",
         "orphan_compatdata",
@@ -616,7 +649,7 @@ def open_uninstall_runtimes_dialog(win: MainWindow, kinds: set[str] | None = Non
 
     kinds: only list these runtime kinds (a Runtimes card's "Remove"); None lists everything.
     """
-    from .runtime_uninstall import GE, RuntimeItem, affected_steam_appids, list_runtimes, uninstall
+    from .runtime_uninstall import GE, OPTISCALER, RuntimeItem, affected_steam_appids, list_runtimes, uninstall
     from .steam_paths import _read_compat_tool_id
     from .steam_vdf import bulk_migrate_compat_tool
     from .ui_workers import SteamOpWorker
@@ -662,10 +695,14 @@ def open_uninstall_runtimes_dialog(win: MainWindow, kinds: set[str] | None = Non
             it = QTableWidgetItem(item.name)
             it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             it.setCheckState(Qt.CheckState.Unchecked)
+            it.setData(Qt.ItemDataRole.UserRole, item)
+            it.setToolTip(str(item.path))
             tbl.setItem(row, 0, it)
-            tbl.setItem(row, 1, QTableWidgetItem(format_size_bytes(item.size_bytes)))
+            tbl.setItem(row, 1, _SortableTableItem(format_size_bytes(item.size_bytes), item.size_bytes))
             users = ", ".join(item.users) if item.users else ("-" if item.kind == GE else "")
             tbl.setItem(row, 2, QTableWidgetItem(users))
+        tbl.horizontalHeader().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
+        tbl.setSortingEnabled(True)
         lay.addWidget(tbl, 1)
         buttons = QHBoxLayout()
         btn_all = QPushButton(tr("optiscaler_bulk.btn_select_all"))
@@ -687,7 +724,7 @@ def open_uninstall_runtimes_dialog(win: MainWindow, kinds: set[str] | None = Non
 
         def _remove() -> None:
             chosen = [
-                items[r] for r in range(tbl.rowCount())
+                cell.data(Qt.ItemDataRole.UserRole) for r in range(tbl.rowCount())
                 if (cell := tbl.item(r, 0)) is not None and cell.checkState() == Qt.CheckState.Checked
             ]
             if not chosen:
@@ -816,21 +853,40 @@ def open_uninstall_runtimes_dialog(win: MainWindow, kinds: set[str] | None = Non
                         alive_fn=lambda: not win._closing_pending,
                     )
 
+                def _review() -> None:
+                    if not removed or win._closing_pending:
+                        return
+                    if any(item.kind == OPTISCALER and item.name in removed for item in chosen):
+                        if QMessageBox.question(win, __app_name__, tr("runtime.offer_optiscaler_cleanup")) == (
+                            QMessageBox.StandardButton.Yes
+                        ):
+                            from .ui_dialogs.optiscaler_bulk_dialog import bulk_optiscaler_dialog
+
+                            bulk_optiscaler_dialog(win, cleanup_only=True)
+                            return
+                    remaining = [
+                        str(item.path) for item in chosen
+                        if item.path.exists() or item.path.is_symlink()
+                    ]
+                    offer_maintenance_review(win, "runtimes", details="\n".join(remaining))
+
                 if not dlg_alive():
                     if not win._closing_pending:
                         QMessageBox.information(_dialog_parent(win), __app_name__, msg)
                         _cleanup_steam_mappings()
+                        _review()
                     return
-                for row in reversed(range(len(items))):
-                    if items[row].name in removed:
+                for row in reversed(range(tbl.rowCount())):
+                    cell = tbl.item(row, 0)
+                    if cell is not None and cell.data(Qt.ItemDataRole.UserRole).name in removed:
                         tbl.removeRow(row)
-                        del items[row]
                 for b in (btn_all, btn_none, btn_remove, btn_close):
                     b.setEnabled(True)
                 QMessageBox.information(dlg, __app_name__, msg)
                 if not errors:
                     dlg.accept()
                 _cleanup_steam_mappings()
+                _review()
 
             def _fail(err: str) -> None:
                 op_state["busy"] = False

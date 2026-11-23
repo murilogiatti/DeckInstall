@@ -1474,7 +1474,7 @@ class CoreTests(unittest.TestCase):
                         app.processEvents()
 
     def test_system_and_steam_cleanup_discovery(self) -> None:
-        """Verify expanded cleanup discovers orphan shadercache, logs, trash, app caches, and old runtimes."""
+        """Verify Steam cleanup covers game data and preserves system files and Steam-owned runtimes."""
         from deckinstall.cleanup import delete_cleanup_candidates_checked, find_cleanup_candidates
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1526,12 +1526,12 @@ class CoreTests(unittest.TestCase):
             self.assertIn("shadercache/99999", labels)
             self.assertNotIn("shadercache/0", labels)
             self.assertIn("Steam/logs", labels)
-            self.assertIn("Trash/files", labels)
-            self.assertIn(".cache/mesa_shader_cache", labels)
-            self.assertIn("Flatpak/com.google.Chrome/cache", labels)
-            self.assertIn("compatibilitytools.d/UMU-Proton-10.0-4", labels)
-            self.assertIn("common/Proton 10.0", labels)
-            self.assertIn("common/SteamLinuxRuntime_sniper", labels)
+            self.assertNotIn("Trash/files", labels)
+            self.assertNotIn(".cache/mesa_shader_cache", labels)
+            self.assertNotIn("Flatpak/com.google.Chrome/cache", labels)
+            self.assertNotIn("compatibilitytools.d/UMU-Proton-10.0-4", labels)
+            self.assertNotIn("common/Proton 10.0", labels)
+            self.assertNotIn("common/SteamLinuxRuntime_sniper", labels)
             with (
                 mock.patch("deckinstall.steam_vdf.load_shortcuts", return_value=[]),
                 mock.patch("pathlib.Path.home", return_value=home),

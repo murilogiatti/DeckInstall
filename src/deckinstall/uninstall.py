@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import library as _lib
@@ -74,6 +74,8 @@ class UninstallItem:
 class UninstallPlan:
     game: StandaloneGame
     items: list[UninstallItem]
+    leftovers: bool = False
+    path_ids: dict[Path, tuple[int, int]] = field(default_factory=dict)
 
     def item(self, item_id: str) -> UninstallItem | None:
         return next((i for i in self.items if i.id == item_id), None)
@@ -100,6 +102,7 @@ class UninstallResult:
     skipped: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     snapshot: Path | None = None
+    remaining: UninstallPlan | None = None
 
 
 def _file_size(path: Path) -> int:
@@ -243,6 +246,34 @@ def plan_uninstall(game: StandaloneGame) -> UninstallPlan:
     return UninstallPlan(game, items)
 
 
+def plan_uninstall_leftovers(game: StandaloneGame, result: UninstallResult) -> UninstallPlan | None:
+    """Inspect the known paths after uninstall and keep the remaining choices unchecked."""
+    if SHORTCUTS not in result.removed:
+        return None
+    fresh = plan_uninstall(game)
+    items = [
+        replace(item, checked=False)
+        for item in fresh.items
+        if item.id not in (SHORTCUTS, SAVES) and item.id not in result.removed
+    ]
+    if not items:
+        return None
+    path_ids = {}
+    for item in items:
+        for path in item.paths:
+            if (identity := _path_id(path)) is not None:
+                path_ids[path] = identity
+    return UninstallPlan(game, items, leftovers=True, path_ids=path_ids)
+
+
+def _path_id(path: Path) -> tuple[int, int] | None:
+    try:
+        state = path.lstat()
+    except OSError:
+        return None
+    return state.st_dev, state.st_ino
+
+
 def _gone(paths: Iterable[Path]) -> bool:
     return all(not p.exists() and not p.is_symlink() for p in paths)
 
@@ -252,11 +283,30 @@ def execute_uninstall(
     selected_ids: Iterable[str],
     snapshot_fn: SnapshotFn | None = None,
 ) -> UninstallResult:
-    """Remove the selected (unlocked) items of plan; the game is always unregistered."""
+    """Remove selected items and unregister the game on the initial pass."""
     game = plan.game
     selected = set(selected_ids)
     chosen = {i.id for i in plan.items if not i.locked and i.id in selected}
     result = UninstallResult()
+    if plan.leftovers:
+        from .i18n import tr
+        from .manifest import find_manifest
+
+        if find_manifest(game.game_dir) is not None:
+            result.errors.append(tr("uninstall.leftovers_changed", path=str(game.game_dir)))
+            return result
+        for item in plan.items:
+            if item.id not in chosen:
+                continue
+            changed = [
+                path for path in item.paths
+                if path not in plan.path_ids or _path_id(path) != plan.path_ids[path]
+            ]
+            if changed:
+                chosen.discard(item.id)
+                result.errors.extend(tr("uninstall.leftovers_changed", path=str(path)) for path in changed)
+        if chosen & {PREFIX, GAME_FILES}:
+            chosen.add(SAVES)
 
     def done(item: UninstallItem, ok: bool) -> None:
         if ok:
@@ -319,13 +369,14 @@ def execute_uninstall(
                 result.errors.append(f"{ICONS}: {exc}")
         done(icons_item, not icon_err and _gone(icons_item.paths))
 
-    shortcuts_item = plan.item(SHORTCUTS)
-    try:
-        remove_standalone_game(game, delete_files=False, delete_prefix=False, delete_cache=False)
-        if shortcuts_item is not None:
-            done(shortcuts_item, True)
-    except Exception as exc:
-        result.errors.append(f"{SHORTCUTS}: {exc}")
+    if not plan.leftovers:
+        shortcuts_item = plan.item(SHORTCUTS)
+        try:
+            remove_standalone_game(game, delete_files=False, delete_prefix=False, delete_cache=False)
+            if shortcuts_item is not None:
+                done(shortcuts_item, True)
+        except Exception as exc:
+            result.errors.append(f"{SHORTCUTS}: {exc}")
 
     game_item = plan.item(GAME_FILES)
     if game_item is not None and GAME_FILES in chosen:
@@ -381,4 +432,6 @@ def execute_uninstall(
             remove_path_or_tree(logs)
         done(logs_item, _gone([logs]))
 
+    if not plan.leftovers:
+        result.remaining = plan_uninstall_leftovers(game, result)
     return result
