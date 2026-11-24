@@ -55,7 +55,7 @@ mypy src
 ```
 
 ## Build AppImage (GitHub Actions)
-Push a semantic tag matching `VERSION` (e.g. `v0.26.1`) to automatically run the complete test suite on Python 3.10, 3.11, and 3.13, check lint and types, compile a standalone binary with Nuitka, smoke-test the packaged `AppDir`, build `DeckInstall-<version>-x86_64.AppImage`, and attach it plus `SHA256SUMS` to the GitHub Release. Pushes and pull requests only run the tests (in parallel), lint and types; a test AppImage can be built from **Actions > Run workflow**.
+A `main` push runs the complete test suite on Python 3.10, 3.11 and 3.13 plus lint and types; when the push changes `VERSION` it also compiles the AppImage with Nuitka (no LTO), smoke-tests the packaged `AppDir` and stores `DeckInstall-<version>-x86_64.AppImage` and `SHA256SUMS` as a workflow artifact. Push a semantic tag matching `VERSION` (e.g. `v0.26.1`) to release: the tag run reuses the tested AppImage of the run on the same commit (waiting for it if it is still running), verifies its checksum and attaches it to the GitHub Release; if no such run exists it tests and builds by itself. Pull requests only run the tests, lint and types; a test AppImage can be built from **Actions > Run workflow**.
 
 ## License
 Distributed under the [MIT License](LICENSE).

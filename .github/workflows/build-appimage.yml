@@ -312,6 +312,7 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Attach to GitHub Release
+        if: github.ref_name == format('v{0}', steps.meta.outputs.version)
         uses: softprops/action-gh-release@v3
         with:
           files: |
