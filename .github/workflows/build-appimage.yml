@@ -47,6 +47,7 @@ jobs:
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}  # this job has no checkout for gh to read the repository from
           BEFORE: ${{ github.event.before }}
         run: |
           validate=true
@@ -66,7 +67,10 @@ jobs:
             deadline=$((SECONDS + 1800))
             misses=0
             while :; do
-              run=$(find_run || true)
+              if ! run=$(find_run); then
+                echo "::warning::Could not list the runs of this commit; building here instead."
+                break
+              fi
               if [ -z "$run" ]; then
                 # The run of the branch push may not be registered yet when both are pushed together.
                 misses=$((misses + 1))
@@ -94,7 +98,10 @@ jobs:
             fi
           elif [ "$GITHUB_EVENT_NAME" = "push" ] && [[ ! "$BEFORE" =~ ^0+$ ]]; then
             # Release commits change VERSION: compile the AppImage once here so the tag can reuse it.
-            files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$GITHUB_SHA" --jq '.files[].filename' 2>/dev/null) || files=VERSION
+            if ! files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$GITHUB_SHA" --jq '.files[].filename'); then
+              echo "::warning::Could not compare $BEFORE...$GITHUB_SHA; building the AppImage to be safe."
+              files=VERSION
+            fi
             if grep -qx VERSION <<<"$files"; then build=true; fi
           fi
 
@@ -295,6 +302,7 @@ jobs:
       - name: Download the AppImage
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           REUSE_RUN: ${{ needs.plan.outputs.reuse_run }}
         run: |
           src_run="${REUSE_RUN:-${{ github.run_id }}}"
