@@ -408,7 +408,7 @@ class MainWindow(QMainWindow):
     _external_save_targets: list = []  # Steam/Hydra/UMU/Nexus games for Backup/Sync (filled by a worker)
     _save_sizes: dict = {}  # slug -> bytes of saves right now
 
-    def __init__(self, app: QApplication) -> None:
+    def __init__(self, app: QApplication, *, scan_games: bool = True) -> None:
         super().__init__()
         self.app = app
         self.settings = QSettings(__app_name__, __app_name__)
@@ -467,7 +467,8 @@ class MainWindow(QMainWindow):
         self._setup_mount_watcher()
         self._refresh_libraries()
         self._apply_saved_theme()
-        self._refresh_games()
+        if scan_games:
+            self._refresh_games()
         self._redetect_steam()
 
     def _track_worker(self, worker: QThread) -> None:
@@ -4220,8 +4221,11 @@ def main() -> int:
     if icon_file is not None:
         app.setWindowIcon(QIcon(str(icon_file)))
     install_touch_scroll(app)
-    win = MainWindow(app)
-    if "--smoke-test" in args:
+    smoke = "--smoke-test" in args
+    # The smoke test checks that the app starts; walking every mounted disk is not part of that
+    # and can take minutes on a big disk (or the CI container's bind mounts).
+    win = MainWindow(app, scan_games=not smoke)
+    if smoke:
         for w in list(win._active_workers):
             if not w.wait(5000):
                 print("Smoke test failed: background worker timed out", file=sys.stderr)

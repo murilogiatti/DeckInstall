@@ -1163,6 +1163,16 @@ class CoreTests(unittest.TestCase):
                 w.wait(2000)
             win.close()
             app.processEvents()
+        with (
+            mock.patch("deckinstall.ui.resolve_steam_paths", return_value=None),
+            mock.patch("deckinstall.ui.scan_all_games", side_effect=AssertionError("scanned")) as scan,
+        ):
+            win = MainWindow(app, scan_games=False)  # --smoke-test: no walk of the mounted disks
+            for w in list(win._active_workers):
+                w.wait(2000)
+            scan.assert_not_called()
+            win.close()
+            app.processEvents()
 
     def test_v076_audit_regressions(self) -> None:
         """Regression tests for v0.7.6 multi-agent audit findings (#1-#16)."""
