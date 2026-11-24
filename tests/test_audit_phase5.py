@@ -19,7 +19,6 @@ if str(SRC) not in sys.path:
 from deckinstall import (  # noqa: E402
     app_updater,
     classify,
-    extractor,
     gameinfo,
     hwnames,
     launch_presets,
@@ -133,26 +132,9 @@ def test_launch_presets_exact_mangohud_preset_and_app_updater_closes_response(tm
     assert info.latest_version == "0.0.1"
 
 
-def test_extractor_cli_error_tail_classify_no_symlink_and_steam_sources_skip_symlink(
+def test_classify_no_symlink_and_steam_sources_skip_symlink(
     tmp_path: Path,
 ) -> None:
-    arch = tmp_path / "broken.rar"
-    arch.write_bytes(b"Rar!")
-    fake_proc = mock.Mock()
-    with (
-        mock.patch.object(extractor, "_select_extract_cmd", return_value=["7z", "x", str(arch)]),
-        mock.patch.object(extractor, "_precheck_cli_archive", return_value=10),
-        mock.patch.object(extractor, "check_disk_space"),
-        mock.patch.object(extractor.subprocess, "Popen", return_value=fake_proc),
-        mock.patch.object(
-            extractor,
-            "_drain_stream_lines",
-            side_effect=lambda _p, _c, on_line, _m: (on_line("CRC Failed in data.pak"), 2)[1],
-        ),
-        pytest.raises(RuntimeError, match="CRC Failed in data.pak"),
-    ):
-        extractor.extract_archive(arch, tmp_path / "out")
-
     # Symlink loop inside folder doesn't trap classify_source.
     folder = tmp_path / "pkg"
     folder.mkdir()

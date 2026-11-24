@@ -325,7 +325,7 @@ class AdoptWizard(QDialog):
         self._update_nav()
 
     def set_checked(self, keys: set[str]) -> None:
-        """Select candidates by key (used by tests and after adding a folder)."""
+        """Select candidates by key (the tests drive the wizard with it)."""
         self._checked_keys = set(keys)
         self._fill_tree()
 

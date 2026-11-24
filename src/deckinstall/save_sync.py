@@ -477,6 +477,84 @@ def _expand_manifest_template(
     return results
 
 
+_LINUX_TEMPLATE_ROOTS: dict[str, tuple[str, ...]] = {
+    "<xdgData>": (".local", "share"),
+    "<xdgConfig>": (".config",),
+    "<home>": (),
+}
+_HOME_WALK_LIMIT = 2000  # files per template: a wrong template must not sweep the home folder
+
+
+def _linux_only_spec(spec: object) -> bool:
+    """A Ludusavi save path that applies on Linux (its `when` names os: linux)."""
+    if not isinstance(spec, dict):
+        return False
+    tags = spec.get("tags")
+    if isinstance(tags, list) and tags and "save" not in {str(t).strip().lower() for t in tags}:
+        return False
+    when = spec.get("when")
+    if not isinstance(when, list):
+        return False
+    return any(isinstance(w, dict) and str(w.get("os", "")).strip().lower() == "linux" for w in when)
+
+
+def _resolve_manifest_home_paths(entry: dict[str, object]) -> list[tuple[str, Path, Path]]:
+    """("home", file, path under $HOME) for the Linux save paths of a Ludusavi entry (native games).
+
+    Only <xdgData>, <xdgConfig> and <home> templates marked for Linux, and only files that
+    home_entry_allowed accepts (never dotfiles of the session, keys or executables).
+    """
+    files_spec = entry.get("files")
+    if not isinstance(files_spec, dict):
+        return []
+    root = _home_root()
+    try:
+        root_resolved = root.resolve()
+    except OSError:
+        return []
+    out: list[tuple[str, Path, Path]] = []
+    seen: set[str] = set()
+    for raw_tpl, spec in files_spec.items():
+        if not _linux_only_spec(spec):
+            continue
+        norm = str(raw_tpl).replace("\\", "/").strip()
+        base_parts: tuple[str, ...] | None = None
+        rest = ""
+        for tag, parts in _LINUX_TEMPLATE_ROOTS.items():
+            if norm.startswith(tag):
+                base_parts, rest = parts, norm[len(tag):].lstrip("/")
+                break
+        if base_parts is None or not rest or "<" in rest:
+            continue
+        base = root.joinpath(*base_parts)
+        try:
+            matches = list(base.glob(rest)) if any(ch in rest for ch in "*?[") else [base / rest]
+        except (OSError, ValueError):
+            continue
+        for cand in matches:
+            if cand.is_symlink() or not is_within(cand, root_resolved):
+                continue
+            files = [cand] if cand.is_file() else []
+            if cand.is_dir():
+                for dirpath, dirnames, filenames in os.walk(cand, followlinks=False):
+                    dirnames[:] = [d for d in dirnames if not (Path(dirpath) / d).is_symlink()]
+                    files.extend(Path(dirpath) / f for f in filenames)
+                    if len(files) > _HOME_WALK_LIMIT:
+                        break
+            for src in files[:_HOME_WALK_LIMIT]:
+                try:
+                    st = src.lstat()
+                    rel = src.relative_to(root)
+                except (OSError, ValueError):
+                    continue
+                if not stat.S_ISREG(st.st_mode) or not home_entry_allowed(rel.parts, st.st_mode):
+                    continue
+                if rel.as_posix() not in seen:
+                    seen.add(rel.as_posix())
+                    out.append(("home", src, rel))
+    return out
+
+
 def _manifest_registry_paths(entry: dict[str, object]) -> list[str]:
     """Return applicable Windows registry paths declared in a Ludusavi manifest entry."""
     reg_paths: list[str] = []
@@ -964,6 +1042,7 @@ def _collect_prefix_save_entries(
         manifest_entry = find_manifest_game_entry(game_name, steam_appid=steam_appid)
         if manifest_entry is not None:
             m_files, _ = _resolve_manifest_save_paths(prefix_dir, manifest_entry, game_dir=game_dir)
+            m_files += _resolve_manifest_home_paths(manifest_entry)
             for section, src_file, rel in m_files:
                 key = (section, rel.as_posix())
                 if key not in seen:
@@ -1253,6 +1332,26 @@ def snapshot_display_name(slug: str, dest_root: Path | None = None) -> str:
     """The name saved with a game's snapshots, or the folder name."""
     name = _read_snapshot_index((dest_root or DEFAULT_SNAPSHOTS_DIR) / slug).get("name")
     return name if isinstance(name, str) and name.strip() else slug
+
+
+def newest_save_mtime(
+    prefix_dir: Path,
+    game_name: str,
+    game_dir: Path | None = None,
+    steam_appid: int | None = None,
+    extra_dirs: ExtraDirs | None = None,
+) -> float:
+    """Modification time of the newest save file the game has now (0 when it has none)."""
+    home_files = snapshot_home_files(snapshot_dir_for(game_name))
+    newest = 0.0
+    for _section, src, _rel in _collect_prefix_save_entries(
+        prefix_dir, game_name, game_dir, steam_appid, extra_dirs, home_files
+    ):
+        try:
+            newest = max(newest, src.stat().st_mtime)
+        except OSError:
+            continue
+    return newest
 
 
 def snapshot_prefix_saves(

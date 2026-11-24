@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import shlex
 import shutil
 from collections.abc import Callable
@@ -178,6 +179,12 @@ def create_steam_shortcut_from_external(
         use_launcher_cmd=use_launcher_cmd,
     )
     appid_u32 = add_or_update_shortcut(paths, **payload)
+    try:
+        from .steamgriddb import fill_missing_artwork
+
+        fill_missing_artwork(appid_u32, paths.grid_dir, name=ext.name)
+    except Exception as exc:  # artwork is a bonus; the shortcut is already there
+        logging.debug("Skipping SteamGridDB artwork for %s: %s", ext.name, exc)
 
     if import_saves and ext.prefix_dir is not None and ext.prefix_dir.is_dir():
         target_pfx = paths.compatdata_dir / str(appid_u32) / "pfx"

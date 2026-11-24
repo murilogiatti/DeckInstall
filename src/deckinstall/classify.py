@@ -372,3 +372,52 @@ def suggest_install_name(info: SourceInfo) -> str:
     if info.kind in (REPACK, INSTALLER) and installer.stem.lower() in ("setup", "install", "installer"):
         return clean_game_name(_strip_release_tags(installer.parent.name))
     return suggest_target_name(installer)
+
+
+# Anti-cheat systems, by the folder or file names they ship in a game's folder (lower case).
+_ANTICHEAT_MARKERS: tuple[tuple[str, str], ...] = (
+    ("easyanticheat", "Easy Anti-Cheat"),
+    ("easyanticheat_eos", "Easy Anti-Cheat"),
+    ("battleye", "BattlEye"),
+    ("beservice", "BattlEye"),
+    ("eaanticheat", "EA Javelin"),
+    ("gameguard", "nProtect GameGuard"),
+    ("xigncode", "XIGNCODE3"),
+    ("vgk.sys", "Riot Vanguard"),
+    ("mhyprot", "miHoYo anti-cheat"),
+    ("ace-base", "ACE (Tencent)"),
+    ("anticheatexpert", "ACE (Tencent)"),
+    ("equ8", "EQU8"),
+    ("faceit", "FACEIT"),
+)
+_ANTICHEAT_MAX_DEPTH = 3
+_ANTICHEAT_MAX_ENTRIES = 5000
+
+
+def detect_anticheat(game_dir: Path) -> list[str]:
+    """Names of the anti-cheat systems a game folder ships (bounded walk, no symlinks followed).
+
+    Finding one only means online play may be refused under Proton; many games allow it.
+    """
+    found: list[str] = []
+    seen = 0
+    stack: list[tuple[Path, int]] = [(game_dir, 0)]
+    while stack and seen < _ANTICHEAT_MAX_ENTRIES:
+        folder, depth = stack.pop()
+        try:
+            entries = list(os.scandir(folder))
+        except OSError:
+            continue
+        for entry in entries:
+            seen += 1
+            low = entry.name.lower()
+            for marker, label in _ANTICHEAT_MARKERS:
+                if low.startswith(marker) and label not in found:
+                    found.append(label)
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                is_dir = False
+            if is_dir and depth < _ANTICHEAT_MAX_DEPTH:
+                stack.append((Path(entry.path), depth + 1))
+    return found

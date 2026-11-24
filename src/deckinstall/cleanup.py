@@ -87,10 +87,6 @@ class CleanupRule:
     finder: Callable[[_ScanContext], Iterator[_Found]]
     deep: bool = False  # include optional game caches and runtime maintenance
 
-    @property
-    def default_checked(self) -> bool:
-        return GROUP_DEFAULT_CHECKED[self.group]
-
 
 def _plain(category: str, label: str, path: Path, size_bytes: int = 0) -> CleanupCandidate:
     return CleanupCandidate(category=category, label=label, path=path, size_bytes=size_bytes, has_saves=False)
@@ -710,9 +706,12 @@ def _find_orphan_compatdata(ctx: _ScanContext) -> Iterator[_Found]:
     paths = ctx.paths
     if paths is None or not ctx.shortcuts_readable:
         return
-    for child in _compatdata_children(ctx):
-        if _is_active_appid_dir(ctx, child) is not False:
-            continue
+    orphans = [child for child in _compatdata_children(ctx) if _is_active_appid_dir(ctx, child) is False]
+    from .steam_appinfo import steam_app_names
+
+    # Steam's app cache still knows the names of uninstalled store games.
+    known_names = steam_app_names(paths.steam_root, (int(c.name) for c in orphans if c.name.isdigit()))
+    for child in orphans:
         try:
             child_resolved = child.resolve()
             if _is_prefix_referenced_by_shortcuts(child_resolved, ctx.all_user_entries):
@@ -738,7 +737,7 @@ def _find_orphan_compatdata(ctx: _ScanContext) -> Iterator[_Found]:
                 has_saves=has_saves,
                 saves_verified_migrated=saves_verified,
                 matched_game=matched_game,
-                game_hint=matched_game or _infer_prefix_game_name(child),
+                game_hint=matched_game or known_names.get(int(child.name), "") or _infer_prefix_game_name(child),
             ),
             0,
         )

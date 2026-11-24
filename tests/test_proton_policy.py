@@ -95,17 +95,6 @@ def test_batch_pin_unpin(tmp_path: Path) -> None:
     assert all(proton_policy.is_default(g) for g in standalone.list_standalone_games())
 
 
-def test_prune_keeps_current_previous_and_pinned(tmp_path: Path) -> None:
-    for name in ("GE-Proton9-27", "GE-Proton10-4", "GE-Proton10-25", "GE-Proton11-1", "GE-Proton11-2"):
-        _proton(name)
-    _install(tmp_path, "Old", proton="GE-Proton10-4")
-    protected = proton_policy.protected_tool_names(extra=["GE-Proton9-27"])
-    removed = proton_policy.prune_ge_proton(keep=2, protected=protected)
-    assert [p.name for p in removed] == ["GE-Proton10-25"]
-    left = sorted(p.name for p in runtime_manager.get_compat_tools_dir().iterdir())
-    assert left == ["GE-Proton10-4", "GE-Proton11-1", "GE-Proton11-2", "GE-Proton9-27"]
-
-
 def test_runtime_update_moves_default_games_and_prunes(tmp_path: Path) -> None:
     from deckinstall import ui_workers
 

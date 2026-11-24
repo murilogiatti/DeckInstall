@@ -186,6 +186,9 @@ def open_launch_presets_dialog(
     chk_wayland = QCheckBox(tr("launch.proton_wayland"))
     chk_wayland.setChecked(wayland_active)
 
+    chk_debug = QCheckBox(tr("launch.debug_log"))
+    chk_debug.setChecked(bool(st.get("debug_log")))
+
     chk_dlss = QCheckBox(tr("launch.dlss_upgrade"))
     chk_dlss.setChecked(bool(st["dlss_upgrade"]))
 
@@ -279,6 +282,7 @@ def open_launch_presets_dialog(
                     "nvapi": chk_nvapi.isChecked(),
                     "prime": chk_prime.isChecked(),
                     "wayland": chk_wayland.isChecked(),
+                    "debug_log": chk_debug.isChecked(),
                     "mh_level": mh_level_combo.currentData(),
                     "mh_position": str(mh_pos_combo.currentData() or ""),
                     "mh_fps_limit": mh_fps_combo.currentData(),
@@ -435,7 +439,7 @@ def open_launch_presets_dialog(
 
     gpu_rows = (
         ((not is_native_linux) and (gpu.has_nvidia or nvapi_active))
-        or ((gpu.is_hybrid and gpu.has_nvidia) or prime_active)
+        or (gpu.is_hybrid or prime_active)
         or ((not is_native_linux) and (gpu.has_nvidia or bool(st["dlss_upgrade"])))
     )
     if gpu_rows:
@@ -447,10 +451,13 @@ def open_launch_presets_dialog(
     else:
         chk_nvapi.setVisible(False)
         chk_nvapi.setEnabled(False)
-    if (gpu.is_hybrid and gpu.has_nvidia) or prime_active:
+    if gpu.is_hybrid or prime_active:
+        if not gpu.has_nvidia:
+            chk_prime.setText(tr("launch.prime_offload_mesa"))
         chk_prime.toggled.connect(_sync_preview)
         lay.addWidget(chk_prime)
-        lay.addWidget(_muted_hint(tr("launch.prime_offload_hint")))
+        prime_hint = tr("launch.prime_offload_hint") if gpu.has_nvidia else tr("launch.prime_offload_mesa_hint")
+        lay.addWidget(_muted_hint(prime_hint))
     if (not is_native_linux) and (gpu.has_nvidia or bool(st["dlss_upgrade"])):
         chk_dlss.toggled.connect(_sync_preview)
         lay.addWidget(chk_dlss)
@@ -512,6 +519,13 @@ def open_launch_presets_dialog(
 
     lay.addWidget(wined3d_warn)
     _section(tr("launch.section_advanced"))
+    if not is_native_linux:
+        chk_debug.toggled.connect(_sync_preview)
+        lay.addWidget(chk_debug)
+        lay.addWidget(_muted_hint(tr("launch.debug_log_hint")))
+    else:
+        chk_debug.setVisible(False)
+        chk_debug.setEnabled(False)
     lay.addWidget(raw_lbl)
     lay.addWidget(raw_edit)
     lay.addWidget(_muted_hint(tr("launch.raw_hint")))

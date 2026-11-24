@@ -40,6 +40,8 @@ from ..optiscaler import (
     uninstall_optiscaler_for_game,
 )
 from ..runtime_manager import (
+    WINDOWS_VERSIONS,
+    WINE_TOOLS,
     WINETRICKS_PRESETS,
     find_system_umu_run,
     get_system_package_install_cmd,
@@ -193,6 +195,45 @@ def open_winetricks_dialog(
     warn_row.setVisible(not has_winetricks)
     lay.addWidget(warn_row)
 
+    tools_row = QHBoxLayout()
+    tools_row.addWidget(QLabel(tr("winetricks.tools_label")))
+    tool_labels = {
+        "winecfg": tr("winetricks.tool_winecfg"),
+        "regedit": tr("winetricks.tool_regedit"),
+        "taskmgr": tr("winetricks.tool_taskmgr"),
+    }
+    tool_buttons: list[QPushButton] = []
+
+    def _run_tool(tool: str) -> None:
+        worker = RunExeInPrefixWorker(prefix_dir, Path(tool), proton_dir=proton_dir, allow_download=False)
+        win._track_worker(worker)
+        worker.status.connect(win.status_label.setText)
+
+        def _tool_err(err: str) -> None:
+            if not win._closing_pending:
+                QMessageBox.warning(dlg if dlg_alive() else _dialog_parent(win), __app_name__, err)
+
+        worker.failed.connect(_tool_err)
+        worker.start()
+
+    for tool in WINE_TOOLS:
+        btn_tool = QPushButton(tool_labels[tool])
+        btn_tool.setToolTip(tool)
+        btn_tool.clicked.connect(lambda _=False, t=tool: _run_tool(t))
+        tool_buttons.append(btn_tool)
+        tools_row.addWidget(btn_tool)
+    tools_row.addStretch()
+    lay.addLayout(tools_row)
+
+    winver_row = QHBoxLayout()
+    winver_row.addWidget(QLabel(tr("winetricks.winver_label")))
+    winver_combo = QComboBox()
+    winver_combo.addItem(tr("winetricks.winver_keep"), "")
+    for verb, label in WINDOWS_VERSIONS.items():
+        winver_combo.addItem(label, verb)
+    winver_row.addWidget(winver_combo, 1)
+    lay.addLayout(winver_row)
+
     lay.addWidget(QLabel(tr("winetricks.presets_label")))
     preset_checks: dict[str, QCheckBox] = {}
     for verb, desc in WINETRICKS_PRESETS.items():
@@ -289,12 +330,18 @@ def open_winetricks_dialog(
         for chk in preset_checks.values():
             chk.setEnabled(not running)
         custom_edit.setEnabled(not running)
+        winver_combo.setEnabled(not running)
+        for btn_tool in tool_buttons:
+            btn_tool.setEnabled(not running)
         btn_install.setEnabled((not running) and (shutil.which("winetricks") is not None))
         btn_cancel.setEnabled(running)
         btn_close.setEnabled(not running)
 
     def _on_run() -> None:
         verbs = [v for v, chk in preset_checks.items() if chk.isChecked()]
+        winver = str(winver_combo.currentData() or "")
+        if winver:
+            verbs.insert(0, winver)
         raw_custom = custom_edit.text().replace(",", " ").strip()
         if raw_custom:
             for tok in raw_custom.split():

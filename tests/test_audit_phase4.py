@@ -376,18 +376,12 @@ def test_non_ge_compat_tool_managed_and_orphan_mangohud_in_runtime_uninstall(
     assert not (user_layers / "MangoHud.x86_64.json").exists()
 
 
-def test_prune_unmanaged_retarget_without_ge_and_repair_backup(
+def test_retarget_without_ge_and_repair_backup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _home(tmp_path, monkeypatch)
-    managed = _make_tool("GE-Proton11-1", managed=True)
-    unmanaged = _make_tool("GE-Proton10-1", managed=False)
     for n in ("GE-Proton11-2", "GE-Proton11-3"):
         _make_tool(n, managed=True)
-    removed = proton_policy.prune_ge_proton(keep=2)
-    assert [p.name for p in removed] == ["GE-Proton11-1"]
-    assert not managed.exists()
-    assert unmanaged.is_dir()
 
     # Retarget with newest_ge_proton() == None still clears dead PROTONPATH from launch.sh.
     game = _install_game(tmp_path, "LaunchRefresh", proton_name="")

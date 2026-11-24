@@ -34,9 +34,6 @@ def test_registry_covers_every_group_and_system_is_unchecked() -> None:
     ids = [rule.id for rule in RULES]
     assert len(ids) == len(set(ids))
     assert GROUP_DEFAULT_CHECKED["system"] is False
-    for rule in RULES:
-        if rule.group == "system":
-            assert rule.default_checked is False
     assert all(r.deep for r in RULES if r.group == "runtimes")
 
 

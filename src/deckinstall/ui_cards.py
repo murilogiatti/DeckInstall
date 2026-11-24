@@ -140,17 +140,12 @@ def show_text_dialog(parent: QWidget | None, title: str, summary: str, details: 
 
 
 def _resolve_asset_path(filename: str) -> Path | None:
-    """Locate an asset file across package resources, checkout layout, and AppImage bundles."""
+    """Locate an asset: package data (pip), the repository checkout, or next to the AppImage binary."""
     candidates = [
         Path(__file__).resolve().parent / "assets" / filename,
-        Path(__file__).resolve().parent.parent / "assets" / filename,
         Path(__file__).resolve().parent.parent.parent / "assets" / filename,
         Path(sys.executable).resolve().parent / "assets" / filename,
-        Path(sys.prefix) / "share" / "deckinstall" / "assets" / filename,
     ]
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        candidates.append(Path(meipass) / "assets" / filename)
     for cand in candidates:
         if cand.is_file():
             return cand

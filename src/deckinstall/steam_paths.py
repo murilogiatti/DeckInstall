@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import re
+import shutil
 import threading
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -100,32 +103,130 @@ def _has_active_steam_profile(candidate: Path) -> bool:
     return (cfg / "loginusers.vdf").is_file() or (cfg / "config.vdf").is_file()
 
 
-def find_steam_root() -> Path | None:
-    """Return the active Steam installation directory, if present."""
-    candidates = [
-        Path.home() / ".local" / "share" / "Steam",
-        Path.home() / ".steam" / "steam",
-        Path.home() / ".steam" / "root",
-        Path.home() / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam",
-        Path.home() / ".var" / "app" / "com.valvesoftware.Steam" / ".steam" / "steam",
-    ]
-    fallback: Path | None = None
-    for candidate in candidates:
-        if not (candidate / "userdata").is_dir():
+# Steam variants: where each keeps its data (relative to $HOME) and how to start it.
+# The order is the search order when no Steam is running and none was chosen.
+STEAM_NATIVE = "native"
+STEAM_FLATPAK = "flatpak"
+STEAM_SNAP = "snap"
+STEAM_VARIANTS: dict[str, dict[str, Any]] = {
+    STEAM_NATIVE: {
+        "roots": (".local/share/Steam", ".steam/steam", ".steam/root"),
+        "command": ("steam",),
+    },
+    STEAM_FLATPAK: {
+        "roots": (
+            ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+            ".var/app/com.valvesoftware.Steam/.steam/steam",
+        ),
+        "command": ("flatpak", "run", "com.valvesoftware.Steam"),
+    },
+    STEAM_SNAP: {
+        "roots": ("snap/steam/common/.local/share/Steam", "snap/steam/common/.steam/steam"),
+        "command": ("snap", "run", "steam"),
+    },
+}
+# Env override for machines with more than one Steam: the root to use.
+STEAM_ROOT_ENV = "DECKINSTALL_STEAM_ROOT"
+
+
+def steam_variant(steam_root: Path) -> str:
+    """Which Steam package owns steam_root: "native", "flatpak" or "snap"."""
+    parts = steam_root.parts
+    if "com.valvesoftware.Steam" in parts:
+        return STEAM_FLATPAK
+    if "snap" in parts and "steam" in parts:
+        return STEAM_SNAP
+    return STEAM_NATIVE
+
+
+def steam_command(steam_root: Path | None) -> list[str]:
+    """Command that starts (or talks to) the Steam client that owns steam_root."""
+    variant = steam_variant(steam_root) if steam_root is not None else STEAM_NATIVE
+    if variant == STEAM_NATIVE:
+        return [shutil.which("steam") or "/usr/bin/steam"]
+    return list(STEAM_VARIANTS[variant]["command"])
+
+
+def find_steam_roots(home: Path | None = None) -> list[Path]:
+    """Every Steam installation of this user (native, Flatpak, Snap), each once, with userdata."""
+    base = home if home is not None else Path.home()
+    roots: list[Path] = []
+    seen: set[Path] = set()
+    for variant in STEAM_VARIANTS.values():
+        for rel in variant["roots"]:
+            candidate = base / rel
+            if not (candidate / "userdata").is_dir():
+                continue
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            roots.append(resolved)
+    return roots
+
+
+def _running_steam_root(roots: list[Path], proc_root: Path | None = None) -> Path | None:
+    """The root whose Steam client is running now (by variant), when exactly one variant runs."""
+    root_dir = proc_root if proc_root is not None else _PROC_ROOT
+    running: set[str] = set()
+    try:
+        entries = list(os.scandir(root_dir))
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.name.isdigit():
             continue
-        if _has_active_steam_profile(candidate):
-            return candidate.resolve()
-        if fallback is None:
-            fallback = candidate.resolve()
-    return fallback
+        try:
+            raw = Path(entry.path, "cmdline").read_bytes()
+        except OSError:
+            continue
+        exe = raw.split(b"\0", 1)[0].decode("utf-8", "replace")
+        if not exe.endswith(("/steam", "/steam.sh", "steamwebhelper")):
+            continue
+        if "/snap/steam/" in exe:
+            running.add(STEAM_SNAP)
+        elif exe.startswith("/app/") or "com.valvesoftware.Steam" in exe:
+            running.add(STEAM_FLATPAK)
+        else:
+            running.add(STEAM_NATIVE)
+    if len(running) != 1:
+        return None
+    variant = running.pop()
+    for root in roots:
+        if steam_variant(root) == variant:
+            return root
+    return None
 
 
-def is_flatpak_steam(steam_root: Path | None = None) -> bool:
-    """Return True if the active Steam installation is Flatpak Steam."""
-    root = steam_root or find_steam_root()
-    if root is None:
-        return False
-    return "com.valvesoftware.Steam" in root.parts
+def find_steam_root() -> Path | None:
+    """Return the Steam installation to work with, if present.
+
+    With several Steams (native + Flatpak + Snap): DECKINSTALL_STEAM_ROOT when it points at one,
+    else the one running now, else the first with a logged-in profile, in STEAM_VARIANTS order.
+    """
+    roots = find_steam_roots()
+    if not roots:
+        return None
+    override = os.environ.get(STEAM_ROOT_ENV, "").strip()
+    if override:
+        try:
+            wanted = Path(override).expanduser().resolve()
+        except OSError:
+            wanted = None
+        if wanted in roots:
+            return wanted
+        logging.warning("%s=%s is not a Steam installation; ignoring it", STEAM_ROOT_ENV, override)
+    if len(roots) > 1:
+        running = _running_steam_root(roots)
+        if running is not None:
+            return running
+    for root in roots:
+        if _has_active_steam_profile(root):
+            return root
+    return roots[0]
 
 
 _VDF_READ_ERRORS = (

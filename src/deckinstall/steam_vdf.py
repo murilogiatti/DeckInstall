@@ -32,15 +32,18 @@ from .library import NON_UNIX_FS, fs_type_of
 from .manifest import read_manifest_fields
 from .scanner import clean_game_name, detect_steam_appid
 from .steam_paths import (
+    STEAM_FLATPAK,
     SteamPaths,
     dir_size_bytes,
     find_default_proton_name,
+    find_steam_root,
     invalidate_process_cache,
-    is_flatpak_steam,
     is_gamescope_session,
     is_steam_running,
     list_steam_users,
     read_library_paths,
+    steam_command,
+    steam_variant,
 )
 
 DEFAULT_SAVES_DIR = Path.home() / "Games" / "saves"
@@ -119,6 +122,26 @@ class ShortcutEntry:
     start_dir: str
     icon: str
     launch_options: str
+
+
+def shortcuts_for_exe(entries: list[ShortcutEntry], exe_path: Path) -> list[ShortcutEntry]:
+    """Shortcuts (any name) that already start exe_path, compared after resolving links."""
+    try:
+        target = exe_path.resolve()
+    except OSError:
+        target = exe_path
+    found: list[ShortcutEntry] = []
+    for entry in entries:
+        raw = entry.exe.strip().strip('"')
+        if not raw:
+            continue
+        try:
+            same = Path(raw).resolve() == target
+        except OSError:
+            same = Path(raw) == exe_path
+        if same:
+            found.append(entry)
+    return found
 
 
 def compute_shortcut_appid(exe_quoted: str, app_name: str) -> tuple[int, int]:
@@ -285,12 +308,9 @@ def _shutdown_steam(timeout_seconds: int, steam_root: Path | None) -> bool:
         return True
     if is_gamescope_session():
         raise SteamGamingModeError("Steam cannot be closed in Gaming Mode")
-    use_flatpak = is_flatpak_steam(steam_root)
-    cmd = (
-        ["flatpak", "run", "com.valvesoftware.Steam", "-shutdown"]
-        if use_flatpak
-        else [shutil.which("steam") or "/usr/bin/steam", "-shutdown"]
-    )
+    root = steam_root or find_steam_root()
+    use_flatpak = root is not None and steam_variant(root) == STEAM_FLATPAK
+    cmd = [*steam_command(root), "-shutdown"]
     try:
         subprocess.run(
             cmd,
@@ -382,11 +402,7 @@ def _start_steam(steam_root: Path | None, wait_seconds: float) -> bool:
         return True
     if is_gamescope_session():
         return False
-    cmd = (
-        ["flatpak", "run", "com.valvesoftware.Steam", "-silent"]
-        if is_flatpak_steam(steam_root)
-        else [shutil.which("steam") or "/usr/bin/steam", "-silent"]
-    )
+    cmd = [*steam_command(steam_root or find_steam_root()), "-silent"]
     # Own systemd scope: Steam must not share DeckInstall's cgroup, or it dies when that is cleaned up
     # (app closed, ssh/tailscale session ended).
     systemd_run = shutil.which("systemd-run")
@@ -1051,14 +1067,20 @@ def list_compat_tool_usage(paths: SteamPaths) -> list[CompatMappingEntry]:
             shortcut_names.setdefault(e.appid_u32, e.app_name)
 
     steam_names = _installed_steam_app_names(paths.steam_root)
+    mapping = get_compat_tool_map(paths.config_vdf)
+    from .steam_appinfo import steam_app_names
+
+    cached_names = steam_app_names(
+        paths.steam_root, (a for a in mapping if a not in shortcut_names and a not in steam_names)
+    )
     results: list[CompatMappingEntry] = []
-    for appid, tool in get_compat_tool_map(paths.config_vdf).items():
+    for appid, tool in mapping.items():
         if appid in shortcut_names:
             source, name = "Non-Steam", shortcut_names[appid]
         elif appid in steam_names:
             source, name = "Steam", steam_names[appid]
         else:
-            source, name = "Orphan", f"AppID {appid}"
+            source, name = "Orphan", cached_names.get(appid) or f"AppID {appid}"
         results.append(CompatMappingEntry(appid_u32=appid, name=name, source=source, tool_name=tool))
     rank = {"Non-Steam": 0, "Steam": 1, "Orphan": 2}
     results.sort(key=lambda r: (rank.get(r.source, 9), r.name.lower(), r.appid_u32))
@@ -1821,9 +1843,7 @@ class MigrationPlanItem:
 
     entry: ShortcutEntry
     old_root: Path
-    new_name: str
     new_root: Path
-    has_compatdata: bool
 
 
 def plan_bulk_migration(
@@ -1865,9 +1885,7 @@ def plan_bulk_migration(
             MigrationPlanItem(
                 entry=entry,
                 old_root=old_root,
-                new_name=clean_name,
                 new_root=new_root,
-                has_compatdata=(compatdata_dir / str(entry.appid_u32)).is_dir(),
             )
         )
     return plan
@@ -2789,7 +2807,11 @@ _PRESET_ENV_KEYS = (
     "DXVK_ENABLE_NVAPI",
     "__NV_PRIME_RENDER_OFFLOAD",
     "__GLX_VENDOR_LIBRARY_NAME",
+    "__VK_LAYER_NV_optimus",
+    "DRI_PRIME",
     "PROTON_ENABLE_WAYLAND",
+    "UMU_LOG",
+    "PROTON_LOG",
     "WINEDLLOVERRIDES",
 )
 _SHELL_OPS = {"&&", "||", ";", "|", ">", ">>", "<", "2>&1", "1>&2", "%command%"}
@@ -3015,8 +3037,14 @@ def apply_launch_presets(
     mangohud_position: str = "",
     mangohud_fps_limit: int | None = None,
     preserve_mangohud_config: bool = False,
+    prime_vendor: str = "nvidia",
+    debug_log: bool = False,
 ) -> str:
-    """Toggle common SteamOS/Proton launch presets while preserving existing custom options."""
+    """Toggle common SteamOS/Proton launch presets while preserving existing custom options.
+
+    prime_vendor: "nvidia" (PRIME render offload to an NVIDIA dGPU) or "mesa" (DRI_PRIME=1:
+    the other AMD/Intel GPU on a hybrid machine without NVIDIA).
+    """
     _validate_launch_options(launch_options)
     if winedlloverrides is not None:
         _validate_launch_options(winedlloverrides)
@@ -3084,10 +3112,17 @@ def apply_launch_presets(
         preset_envs.append("PROTON_ENABLE_NVAPI=1")
         preset_envs.append("DXVK_ENABLE_NVAPI=1")
     if prime_offload:
-        preset_envs.append("__NV_PRIME_RENDER_OFFLOAD=1")
-        preset_envs.append("__GLX_VENDOR_LIBRARY_NAME=nvidia")
+        if prime_vendor == "mesa":
+            preset_envs.append("DRI_PRIME=1")
+        else:
+            preset_envs.append("__NV_PRIME_RENDER_OFFLOAD=1")
+            preset_envs.append("__GLX_VENDOR_LIBRARY_NAME=nvidia")
+            preset_envs.append("__VK_LAYER_NV_optimus=NVIDIA_only")
     if proton_wayland:
         preset_envs.append("PROTON_ENABLE_WAYLAND=1")
+    if debug_log:
+        preset_envs.append("UMU_LOG=1")
+        preset_envs.append("PROTON_LOG=1")
     if winedlloverrides is not None and winedlloverrides.strip():
         preset_envs.append(_format_winedlloverrides_token(winedlloverrides))
 

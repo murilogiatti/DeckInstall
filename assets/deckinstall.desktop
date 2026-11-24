@@ -1,8 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=DeckInstall
-GenericName=Steam Deck Game Installer
-Comment=Extract games, fetch official Steam artwork, and add Non-Steam shortcuts
+GenericName=Game Manager
+GenericName[pt_BR]=Gerenciador de jogos
+Comment=Install, run and maintain games on Linux and SteamOS, through Steam or standalone
+Comment[pt_BR]=Instale, rode e mantenha jogos no Linux e no SteamOS, pela Steam ou de forma autônoma
+Keywords=games;installer;proton;umu;steam;saves;wine;
 Exec=deckinstall
 TryExec=deckinstall
 Icon=deckinstall

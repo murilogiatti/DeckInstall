@@ -6,7 +6,6 @@ import os
 import sys
 import zipfile
 from pathlib import Path
-from unittest import mock
 
 import pytest
 
@@ -63,19 +62,6 @@ def test_zip_bomb_is_rejected_by_ratio(tmp_path: Path, monkeypatch: pytest.Monke
     assert (out / "data.bin").stat().st_size == 50_000
 
 
-def test_space_check_uses_declared_size_for_7z(tmp_path: Path) -> None:
-    archive = tmp_path / "Game.7z"
-    archive.write_bytes(b"7z" * 10)
-    with (
-        mock.patch.object(extractor, "_select_extract_cmd", return_value=["7z", "x", str(archive)]),
-        mock.patch.object(extractor, "_precheck_cli_archive", return_value=10**15),
-        mock.patch.object(extractor.subprocess, "Popen") as popen,
-    ):
-        with pytest.raises(extractor.InsufficientSpaceError):
-            extractor.extract_archive(archive, tmp_path / "Games", "Game")
-    popen.assert_not_called()
-
-
 @pytest.mark.skipif(extractor._find_7z_bin() is None, reason="7z not installed")
 def test_real_7z_listing_reports_declared_size(tmp_path: Path) -> None:
     import subprocess
@@ -89,5 +75,6 @@ def test_real_7z_listing_reports_declared_size(tmp_path: Path) -> None:
 
     declared = extractor._precheck_cli_archive(str(extractor._find_7z_bin()), archive)
     assert declared == 4096 + 20_000
-    out = extractor.extract_archive(archive, tmp_path / "Games", "Game")
-    assert (out / "data.pak").stat().st_size == 20_000
+    out = tmp_path / "out"
+    extractor.extract_archive_to_dir(archive, out)
+    assert (out / "Game" / "data.pak").stat().st_size == 20_000

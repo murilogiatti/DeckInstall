@@ -293,3 +293,13 @@ def test_launch_blocked_by_old_instance_is_an_error(mon: pm.PlayMonitor) -> None
     _wait(mon, lambda: mon.state("g") == pm.ERROR)
     (_k, _n, diag), = mon.events["failed"]  # type: ignore[attr-defined]
     assert diag.startswith(pm.tr("play.blocked_by_old", pids="50"))
+
+
+def test_session_length_reported_when_a_running_game_ends(mon: pm.PlayMonitor) -> None:
+    sessions: list[tuple[str, float]] = []
+    mon.session_ended.connect(lambda k, s: sessions.append((k, s)))
+    mon.launch("g", "Game", ["sleep", "30"])
+    _wait(mon, lambda: mon.state("g") == pm.RUNNING)
+    mon.stop("g")
+    _wait(mon, lambda: mon.state("g") == pm.IDLE)
+    assert len(sessions) == 1 and sessions[0][0] == "g" and sessions[0][1] > 0

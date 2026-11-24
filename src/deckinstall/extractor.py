@@ -14,12 +14,11 @@ import tarfile
 import tempfile
 import time
 import zipfile
-from collections import deque
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
 from . import library, runtime_manager
-from .fsutil import _safe_chmod, copy_dir_no_symlinks, move_dir_safely
+from .fsutil import _safe_chmod, clean_child_env, copy_dir_no_symlinks, move_dir_safely
 from .scanner import clean_game_name
 from .steam_paths import find_proton_binary, find_steam_root
 
@@ -76,30 +75,6 @@ def check_disk_space(
     return (needed, usage.free)
 
 
-def estimate_archive_uncompressed_size(archive: Path) -> int:
-    """Estimate uncompressed byte size from zip/tar metadata, falling back to 2x file size."""
-    try:
-        if zipfile.is_zipfile(archive):
-            with zipfile.ZipFile(archive, "r") as zf:
-                infos = zf.infolist()
-                if len(infos) > _MAX_ARCHIVE_ENTRIES:
-                    return archive_set_size(archive) * 2
-                total = sum(info.file_size for info in infos)
-                if total > 0:
-                    return total
-        elif tarfile.is_tarfile(archive):
-            with tarfile.open(archive, "r:*") as tf:
-                total = 0
-                for idx, member in enumerate(tf):
-                    if idx >= _MAX_ARCHIVE_ENTRIES:
-                        return archive_set_size(archive) * 2
-                    if member.isfile():
-                        total += max(0, int(member.size))
-                if total > 0:
-                    return total
-    except (OSError, zipfile.BadZipFile, tarfile.TarError, EOFError, ValueError):
-        pass
-    return archive_set_size(archive) * 2
 
 
 def is_archive(path: Path) -> bool:
@@ -787,84 +762,6 @@ def _drain_stream_lines(
             proc.stdout.close()
 
 
-def extract_archive(
-    archive: Path,
-    dest_root: Path,
-    game_folder_name: str | None = None,
-    on_progress: Callable[[int, str], None] | None = None,
-    cancel_flag: Callable[[], bool] | None = None,
-) -> Path:
-    """Extract an archive into dest_root/<game_folder_name> and return the target path.
-
-    Free space is checked against the uncompressed size the archive declares (zip/tar headers,
-    or the 7z/unrar/tar/unzip listing), falling back to twice the archive size.
-    """
-    low_name = archive.name.lower()
-    if low_name.endswith(".zip") or _is_tar_archive(low_name):
-        check_disk_space(dest_root, estimate_archive_uncompressed_size(archive))
-    folder_name = sanitize_folder_name(game_folder_name or suggest_target_name(archive))
-    final_dir = dest_root / folder_name
-    dest_root.mkdir(parents=True, exist_ok=True)
-
-    with tempfile.TemporaryDirectory(prefix="deckinstall_extract_", dir=str(dest_root)) as tmp:
-        tmp_path = Path(tmp)
-        low = archive.name.lower()
-        if on_progress:
-            on_progress(5, f"Extracting {archive.name}...")
-
-        used_python_extractor = False
-        if low.endswith(".zip"):
-            _extract_zip_safe(archive, tmp_path, on_progress=on_progress, cancel_flag=cancel_flag)
-            used_python_extractor = True
-        elif _is_tar_archive(low):
-            try:
-                _extract_tar_safe(archive, tmp_path, on_progress=on_progress, cancel_flag=cancel_flag)
-                used_python_extractor = True
-            except tarfile.CompressionError:
-                if not low.endswith(".tar.zst"):
-                    raise
-
-        if not used_python_extractor:
-            cmd = _select_extract_cmd(archive, tmp_path)
-            declared = _precheck_cli_archive(cmd[0], archive)
-            check_disk_space(dest_root, declared if declared > 0 else archive_set_size(archive) * 2)
-
-            proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            pct = 10
-            tail_lines: deque[str] = deque(maxlen=8)
-
-            def _handle_line(line: str) -> None:
-                nonlocal pct
-                clean = line.strip()
-                if clean:
-                    tail_lines.append(clean[:140])
-                m = re.search(r"(\d{1,3})%", line)
-                if m:
-                    pct = min(95, max(pct, int(m.group(1))))
-                elif pct < 90:
-                    pct = min(90, pct + 1)
-                if on_progress:
-                    on_progress(pct, clean[:120] or f"Extracting {archive.name}...")
-
-            rc = _drain_stream_lines(proc, cancel_flag, _handle_line, "Extraction cancelled by user.")
-            if rc != 0:
-                detail = f": {' | '.join(tail_lines)}" if tail_lines else ""
-                raise RuntimeError(f"Failed to extract {archive.name} (code {rc}){detail}.")
-
-        if on_progress:
-            on_progress(96, "Organizing files...")
-        _strip_symlinks_and_specials(tmp_path)
-        _unwrap_single_folder(tmp_path, final_dir)
-
-    if on_progress:
-        on_progress(100, f"Completed in {final_dir}")
-    return final_dir
 
 
 def _collect_regular_files(root: Path) -> set[Path]:
@@ -1075,7 +972,7 @@ def _installer_command(
     steam_root = find_steam_root()
     proton = find_proton_binary(steam_root) if steam_root is not None else None
     if steam_root is not None and proton is not None:
-        env = os.environ.copy()
+        env = clean_child_env()
         env["STEAM_COMPAT_CLIENT_INSTALL_PATH"] = str(steam_root)
         env["STEAM_COMPAT_DATA_PATH"] = str(tmp_pfx)
         if on_log:
@@ -1096,7 +993,7 @@ def _installer_command(
         if wine is None:
             raise
         logging.warning("umu-run/GE-Proton unavailable (%s); using system wine", exc)
-        env = os.environ.copy()
+        env = clean_child_env()
         env["WINEPREFIX"] = str(tmp_pfx)
         if on_log:
             on_log(f"umu-run is unavailable ({exc}); starting {installer_exe.name} with the system wine.")
