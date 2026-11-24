@@ -8,7 +8,6 @@ launchers (prefixes left by other game launchers) and game caches/logs.
 from __future__ import annotations
 
 import os
-import shlex
 import shutil
 import threading
 from collections.abc import Callable, Iterable, Iterator
@@ -39,7 +38,7 @@ class CleanupCandidate:
 
 
 # Imported after CleanupCandidate: steam_vdf re-exports it and may import this module mid-load.
-from .fsutil import file_sha256  # noqa: E402
+from .fsutil import desktop_exec_tokens, file_sha256  # noqa: E402
 from .manifest import find_manifest  # noqa: E402
 from .steam_paths import SteamPaths, _read_compat_tool_id, dir_size_bytes  # noqa: E402
 from .steam_vdf import (  # noqa: E402
@@ -141,10 +140,7 @@ def _is_orphan_desktop_file(
             path_val = stripped[5:].strip()
     if not exec_val:
         return True
-    try:
-        tokens = shlex.split(exec_val)
-    except ValueError:
-        tokens = [exec_val.strip('"')]
+    tokens = desktop_exec_tokens(exec_val)
     if not tokens:
         return True
     norm_roots = [os.path.normpath(str(r)) for r in absent_library_roots]

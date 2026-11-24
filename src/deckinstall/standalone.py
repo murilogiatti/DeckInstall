@@ -22,6 +22,8 @@ from .fsutil import (
     atomic_write_bytes,
     atomic_write_text,
     copy_or_move_dir_contents,
+    desktop_exec_quote,
+    desktop_exec_tokens,
     is_within,
     move_dir_safely,
     prune_empty_parents,
@@ -706,8 +708,7 @@ def _write_game_launcher(game: StandaloneGame) -> None:
 
 def _desktop_quote(path: Path) -> str:
     """Quote a path for .desktop Exec= value."""
-    s = str(path).replace('"', '\\"')
-    return f'"{s}"' if any(ch in s for ch in (" ", "\t", "'", '"')) else s
+    return desktop_exec_quote(path)
 
 
 def _desktop_points_to_game_dir(desktop_path: Path, target_game_dir: Path) -> bool:
@@ -730,10 +731,7 @@ def _desktop_points_to_game_dir(desktop_path: Path, target_game_dir: Path) -> bo
         elif stripped.startswith("Exec="):
             exec_line = stripped[5:].strip()
     if exec_line:
-        try:
-            tokens = shlex.split(exec_line)
-        except ValueError:
-            tokens = [exec_line.strip('"')]
+        tokens = desktop_exec_tokens(exec_line)
         if tokens:
             try:
                 return Path(tokens[0]).parent.resolve() == target_resolved
@@ -1211,7 +1209,8 @@ def _desktop_opens_game(path: Path, game: StandaloneGame) -> bool:
         return False
     script = str(game.launch_script)
     return any(
-        line.strip().startswith("Exec=") and script in line for line in text.splitlines()
+        line.strip().startswith("Exec=") and script in " ".join(desktop_exec_tokens(line.strip()[5:]))
+        for line in text.splitlines()
     )
 
 

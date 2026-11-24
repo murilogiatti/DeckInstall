@@ -1349,7 +1349,9 @@ def ensure_umu_run(
         tmp_path = Path(tmp_dir)
         tar_path = tmp_path / asset_name
         _download_file(download_url, tar_path, asset_name, progress_cb=progress_cb)
-        _verify_release_asset_integrity(release, zipapp_asset, tar_path, tmp_path, label="umu-run")
+        _verify_release_asset_integrity(
+            release, zipapp_asset, tar_path, tmp_path, label="umu-run", require_checksum=True,
+        )
 
         _emit_progress(progress_cb, "Extracting umu-run...", 90)
         extract_dir = tmp_path / "extract"

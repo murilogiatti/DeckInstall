@@ -231,6 +231,55 @@ def symlink_points_to(link: Path, target: Path) -> bool:
         return False
 
 
+_DESKTOP_RESERVED = frozenset(" \t\n\"'\\><~|&;$*?#()`")
+_DESKTOP_STRING_ESCAPES = {"s": " ", "n": "\n", "t": "\t", "r": "\r", "\\": "\\"}
+
+
+def desktop_exec_quote(path: Path) -> str:
+    """Quote a path as one Exec= argument (Desktop Entry spec: %% for %, backslash escapes inside quotes)."""
+    s = str(path).replace("%", "%%")
+    needs_quotes = any(ch in _DESKTOP_RESERVED for ch in s)
+    if not needs_quotes:
+        return s
+    for ch in ("\\", '"', "`", "$"):
+        s = s.replace(ch, "\\" + ch)
+    return '"' + s.replace("\\", "\\\\") + '"'
+
+
+def desktop_exec_tokens(value: str) -> list[str]:
+    """Split an Exec= value into arguments, undoing desktop_exec_quote (and unquoted legacy values)."""
+    text = re.sub(
+        r"\\(.)", lambda m: _DESKTOP_STRING_ESCAPES.get(m.group(1), m.group(0)), value
+    )
+    tokens: list[str] = []
+    cur: list[str] = []
+    in_token = in_quotes = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_quotes:
+            if ch == "\\" and i + 1 < len(text) and text[i + 1] in '"`$\\':
+                cur.append(text[i + 1])
+                i += 1
+            elif ch == '"':
+                in_quotes = False
+            else:
+                cur.append(ch)
+        elif ch == '"':
+            in_quotes = in_token = True
+        elif ch in " \t":
+            if in_token:
+                tokens.append("".join(cur))
+                cur, in_token = [], False
+        else:
+            cur.append(ch)
+            in_token = True
+        i += 1
+    if in_token:
+        tokens.append("".join(cur))
+    return [tok.replace("%%", "%") for tok in tokens]
+
+
 def slugify(name: str) -> str:
     """Return a lowercase hyphenated slug (used for .desktop filenames)."""
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "game"

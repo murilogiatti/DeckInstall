@@ -2380,6 +2380,20 @@ def backup_prefix_candidates_to_zip(
     return zip_path, games_count, files_count
 
 
+# Save restores write data, never programs: these are refused in every restored archive section.
+_RESTORE_BLOCKED_SUFFIXES = (
+    ".exe", ".dll", ".bat", ".cmd", ".com", ".scr", ".pif", ".cpl", ".msi", ".lnk", ".vbs", ".ps1",
+    ".jar", ".so", ".sh", ".desktop", ".appimage",
+)
+
+
+def restore_entry_blocked(rel_parts: tuple[str, ...], external_attr: int) -> bool:
+    """True for an archive entry that is a program (by suffix or Unix exec bit) and must not be restored."""
+    if rel_parts and rel_parts[-1].lower().endswith(_RESTORE_BLOCKED_SUFFIXES):
+        return True
+    return bool((external_attr >> 16) & 0o111)
+
+
 def _safe_parents_within(base_dir: Path, base_resolved: Path, rel_parts: tuple[str, ...]) -> bool:
     cur = base_dir
     for part in rel_parts:
@@ -2537,6 +2551,8 @@ def _process_saves_backup(
                 section = parts[1]
                 rel_parts = parts[2:]
                 if any(p in ("..", "", ".") for p in rel_parts):
+                    continue
+                if restore_entry_blocked(rel_parts, info.external_attr):
                     continue
                 if info.file_size > _RESTORE_MAX_FILE_BYTES:
                     raise RuntimeError(f"Backup file too large: {info.filename}")

@@ -34,6 +34,7 @@ from .steam_vdf import (
     _prefix_users_dir,
     _safe_parents_within,
     _zip_member_matches_file,
+    restore_entry_blocked,
 )
 
 DEFAULT_SNAPSHOTS_DIR = DEFAULT_SAVES_DIR / "snapshots"
@@ -836,12 +837,23 @@ _HOME_BLOCKED_ROOTS = (
     (".config", "direnv"), (".config", "wezterm"), (".config", "hypr"),
     (".config", "sway"), (".config", "i3"), (".config", "cargo"),
     (".config", "nix"), (".config", "npm"), (".config", "zsh"), (".config", "bash"),
+    # Session/WM startup and shell-extension code that runs at the next login.
+    (".local", "share", "gnome-shell"), (".config", "openbox"), (".config", "lxsession"),
+    (".config", "lxqt"), (".config", "awesome"), (".config", "qtile"), (".config", "niri"),
+    (".config", "river"), (".config", "bspwm"), (".config", "sxhkd"), (".config", "xfce4"),
+    (".config", "labwc"), (".config", "wayfire"), (".config", "foot"), (".config", "ranger"),
+    (".local", "share", "autostart"),
 )
 _HOME_BLOCKED_NAMES = frozenset({
     ".bashrc", ".profile", ".bash_profile", ".bash_login", ".bash_logout", ".zshrc", ".zprofile",
     ".zshenv", ".pam_environment", ".xprofile", ".xinitrc", ".xsession",
 })
-_HOME_BLOCKED_SUFFIXES = (".desktop", ".service", ".sh")
+_HOME_BLOCKED_SUFFIXES = (
+    ".desktop", ".service", ".sh", ".jar", ".exe", ".dll", ".so", ".bat", ".cmd", ".appimage",
+)
+# Under ~/.config these are scripts/configs of the session (WM rc files, plugins); elsewhere they may be saves.
+_HOME_CONFIG_BLOCKED_SUFFIXES = (".js", ".mjs", ".py", ".lua", ".rb", ".pl", ".kdl", ".rc")
+_HOME_BLOCKED_PREFIXES = ("autostart", "rc.", "xinitrc", "xprofile")
 
 
 def home_entry_allowed(parts: tuple[str, ...], mode: int = 0) -> bool:
@@ -855,7 +867,12 @@ def home_entry_allowed(parts: tuple[str, ...], mode: int = 0) -> bool:
     if mode & 0o111 or stat.S_ISLNK(mode):
         return False
     low = tuple(p.lower() for p in parts)
-    if low[-1] in _HOME_BLOCKED_NAMES or low[-1].endswith(_HOME_BLOCKED_SUFFIXES):
+    if (
+        low[-1] in _HOME_BLOCKED_NAMES
+        or low[-1].endswith(_HOME_BLOCKED_SUFFIXES)
+        or low[-1].startswith(_HOME_BLOCKED_PREFIXES)
+        or (low[0] == ".config" and low[-1].endswith(_HOME_CONFIG_BLOCKED_SUFFIXES))
+    ):
         return False
     if any(low[: len(root)] == root for root in _HOME_BLOCKED_ROOTS):
         return False
@@ -2242,6 +2259,8 @@ def _restore_saves_archive(
                 if parsed is None:
                     continue
                 section, rel_parts = parsed
+                if section != "registry" and restore_entry_blocked(rel_parts, info.external_attr):
+                    continue
                 if info.file_size > _RESTORE_MAX_FILE_BYTES:
                     raise RuntimeError(f"Sync file too large: {info.filename}")
 
