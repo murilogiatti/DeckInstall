@@ -47,6 +47,7 @@ from ..save_sync import (
     archive_has_steamcloud,
     auto_snapshot,
     list_save_archives,
+    newest_save_mtime,
     plan_sync_all,
     preview_sync_operation,
     pull_game_saves,
@@ -605,6 +606,20 @@ def _restore_selected(win: MainWindow) -> None:
         return
     entry = snaps[labels.index(picked)]
     question = tr("saves.confirm_restore", name=t.name, snap=entry.path.name)
+    if entry.kind == "save_snapshot":
+        try:
+            current = newest_save_mtime(
+                t.prefix_dir, t.name, t.game_dir, steam_appid=t.steam_appid, extra_dirs=t.extra_dirs
+            )
+        except OSError:
+            current = 0.0
+        if current > entry.mtime + 60:  # the saves on disk are newer than the snapshot
+            fmt = "%Y-%m-%d %H:%M"
+            question += "\n\n" + tr(
+                "saves.restore_older_warning",
+                current=time.strftime(fmt, time.localtime(current)),
+                snap=time.strftime(fmt, time.localtime(entry.mtime)),
+            )
     if t.source == "nexus":
         if is_nexus_running():
             QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.nexus_running"))

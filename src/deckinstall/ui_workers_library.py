@@ -13,6 +13,7 @@ from .external_actions import (
     import_external_saves_to_target,
 )
 from .extractor import sanitize_folder_name
+from .fsutil import clean_child_env
 from .gameinfo import detect_game_tech
 from .i18n import tr
 from .launcher_scan import ExternalLauncherGame, scan_external_launcher_games
@@ -32,6 +33,7 @@ from .standalone import (
     StandaloneGame,
     list_standalone_games,
     match_owned_shortcuts,
+    refresh_launcher_if_outdated,
     resolve_standalone_proton_fallback,
     shortcut_game_dir,
     update_standalone_launch_options,
@@ -236,6 +238,8 @@ class SteamDetectWorker(QThread):
         self._scan_external_launcher_games = (
             scan_external_launcher_games_fn or scan_external_launcher_games
         )
+        # Library folders a Flatpak/Snap Steam cannot open (set before `ready` is emitted).
+        self.sandbox_blocked: list[Path] = []
 
     def run(self) -> None:
         try:
@@ -316,6 +320,15 @@ class ShortcutsRefreshWorker(QThread):
         runner_labels = compute_library_runner_labels(
             self._paths, entries, standalone_games, external_games
         )
+        if self._paths is not None and entries:
+            try:
+                from .steam_sandbox import folders_steam_cannot_see, shortcut_folders
+
+                self.sandbox_blocked = folders_steam_cannot_see(
+                    self._paths.steam_root, shortcut_folders(e.exe for e in entries)
+                )
+            except Exception as exc:  # only a hint; never break the Library
+                logging.warning("Steam sandbox check failed: %s", exc)
         self.ready.emit(
             self._req_id, entries, standalone_games, external_games, vdf_err, runner_labels
         )
@@ -356,6 +369,10 @@ class LaunchPrepWorker(QThread):
                 obj = self._obj
                 assert isinstance(obj, StandaloneGame)
                 fallback_name = ""
+                try:
+                    refresh_launcher_if_outdated(obj)
+                except Exception as exc:  # the old launcher still works
+                    logging.warning("Could not refresh the launcher of %s: %s", obj.name, exc)
                 if not obj.native_linux:
                     if is_win32_prefix(obj.prefix_dir):
                         self.ready.emit("win32", "", [], None, None)
@@ -374,7 +391,7 @@ class LaunchPrepWorker(QThread):
                     fallback_name,
                     ["bash", str(obj.launch_script)],
                     obj.game_dir,
-                    None,
+                    clean_child_env(),
                 )
                 return
 
@@ -382,10 +399,10 @@ class LaunchPrepWorker(QThread):
                 obj = self._obj
                 assert isinstance(obj, ExternalLauncherGame)
                 if obj.launch_cmd:
-                    self.ready.emit("ok", "", list(obj.launch_cmd), None, None)
+                    self.ready.emit("ok", "", list(obj.launch_cmd), None, clean_child_env())
                     return
                 if obj.runner == "linux":
-                    self.ready.emit("ok", "", [str(obj.exe_path)], obj.game_dir, None)
+                    self.ready.emit("ok", "", [str(obj.exe_path)], obj.game_dir, clean_child_env())
                     return
                 from .runtime_manager import find_system_umu_run, list_cachyos_proton_dirs
 

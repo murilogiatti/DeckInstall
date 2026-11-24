@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import NoReturn, TypedDict, cast
 
 from PySide6.QtCore import (
+    QDateTime,
     QFileSystemWatcher,
     QLibraryInfo,
     QSettings,
@@ -28,19 +29,15 @@ from PySide6.QtGui import (
     QCloseEvent,
     QDesktopServices,
     QIcon,
-    QKeySequence,
     QPixmap,
-    QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
     QComboBox,
-    QFormLayout,
     QFrame,
     QHBoxLayout,
-    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -51,7 +48,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
-    QSplitter,
     QStackedWidget,
     QTabBar,
     QTableWidget,
@@ -61,7 +57,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __app_name__, __version__, classify, vdf_queue
+from . import __app_name__, __version__, classify, library_extras, vdf_queue
 from .app_updater import (
     GITHUB_RELEASES_URL,
     AppUpdateInfo,
@@ -75,7 +71,7 @@ from .external_actions import (
     create_steam_shortcut_from_external,
     load_external_launch_presets,
 )
-from .i18n import LOCALES_DIR, available_languages, set_language, tr
+from .i18n import LOCALES_DIR, set_language, tr
 from .launch_presets import active_flags, apply_presets
 from .launcher_scan import ExternalLauncherGame, scan_external_launcher_games
 from .library import (
@@ -142,6 +138,7 @@ from .steam_vdf import (
     _strip_vdf_quotes,
     infer_game_root_from_exe,
     load_shortcuts,
+    shortcuts_for_exe,
     start_steam,
 )
 from .theme import ThemeMode, apply_theme
@@ -237,6 +234,7 @@ class LaunchPresetState(TypedDict):
     wined3d: bool
     no_esync: bool
     no_fsync: bool
+    debug_log: bool
     winedll: str
 
 
@@ -287,6 +285,73 @@ NAV_PAGES = (PAGE_LIBRARY, PAGE_INSTALL, PAGE_RUNTIMES, PAGE_SAVES, PAGE_MAINT)
 class MainWindow(QMainWindow):
     """Main DeckInstall application window."""
 
+    # Built by ui_pages / ui_system (bound onto the window there).
+    btn_favorite: QPushButton
+    btn_protondb: QPushButton
+    _install_mode_chosen: bool
+    _standalone_launchers: tuple[bool, ...]
+    _add_launch_options: str
+    _add_winedlloverrides: str
+    _install_mode_group: QButtonGroup
+    _lib_filter_group: QButtonGroup
+    _match_install_timer: QTimer
+    _sandbox_prompt_open: bool
+    act_ext_import_saves: QAction
+    act_ext_to_steam: QAction
+    add_exe_combo: QComboBox
+    add_library_combo: QComboBox
+    add_name: QLineEdit
+    btn_add_launch_adv: QPushButton
+    btn_adopt_games: QPushButton
+    btn_bulk_optiscaler: QPushButton
+    btn_bulk_proton: QPushButton
+    btn_cancel_extract: QPushButton
+    btn_configure_game: QPushButton
+    btn_copy_diag: QPushButton
+    btn_extract: QPushButton
+    btn_install: QPushButton
+    btn_lib_sub_add: QPushButton
+    btn_mode_standalone: QPushButton
+    btn_mode_steam: QPushButton
+    btn_move_game: QPushButton
+    btn_play_game: QPushButton
+    btn_redetect_steam: QPushButton
+    btn_reload: QPushButton
+    btn_remove_existing: QPushButton
+    btn_remove_game: QPushButton
+    btn_scan: QPushButton
+    btn_scan_folders: QPushButton
+    btn_shortcut_desktop: QPushButton
+    btn_shortcut_menu: QPushButton
+    btn_shortcut_steam: QPushButton
+    btn_use_extracted: QPushButton
+    btn_vdf_apply: QPushButton
+    btn_vdf_clear: QPushButton
+    chk_keep_in_place: QCheckBox
+    chk_restart: QCheckBox
+    extract_details_box: QWidget
+    extract_dst_root: QLineEdit
+    extract_log: QTextEdit
+    extract_progress: QProgressBar
+    extract_src: QLineEdit
+    games_list: QTableWidget
+    lang_combo: QComboBox
+    lbl_add_presets: QLabel
+    lbl_library_count: QLabel
+    lbl_mode_note: QLabel
+    lbl_scan_folders_count: QLabel
+    lbl_shortcuts_note: QLabel
+    lbl_vdf_queue: QLabel
+    library_search_input: QLineEdit
+    preview_label: QLabel
+    shortcuts_list: QTableWidget
+    steam_match_combo: QComboBox
+    steam_search_input: QLineEdit
+    steam_status_lbl: QLabel
+    theme_combo: QComboBox
+    unavailable_banner: QLabel
+    vdf_error_banner: QLabel
+    vdf_queue_banner: QFrame
     _maint_candidates: list[CleanupCandidate]
     _maint_checked: dict[Path, bool]
     _maint_active_filter: str
@@ -393,6 +458,7 @@ class MainWindow(QMainWindow):
         self._play.changed.connect(self._on_play_changed)
         self._play.failed.connect(self._on_play_failed)
         self._play.timed_out.connect(self._on_play_timed_out)
+        self._play.session_ended.connect(self._on_play_session_ended)
 
         self.setWindowTitle(f"{__app_name__} v{__version__}")
         self.resize(1080, 700)
@@ -593,49 +659,24 @@ class MainWindow(QMainWindow):
         self._update_steam_mode_ui()
 
     def _build_app_settings_card(self) -> QWidget:
-        """Maintenance card with what used to be the sidebar: Steam status, theme, language and About."""
-        card, layout = _make_card()
-        title = QLabel(tr("maint.app_settings_title"))
-        title.setObjectName("SectionTitle")
-        layout.addWidget(title)
+        from .ui_pages import build_app_settings_card
 
-        steam_row = QHBoxLayout()
-        self.steam_status_lbl = QLabel(self._format_steam_status_text())
-        self.steam_status_lbl.setWordWrap(True)
-        self.btn_redetect_steam = QPushButton(tr("sidebar.redetect_steam"))
-        self.btn_redetect_steam.clicked.connect(self._redetect_steam)
-        steam_row.addWidget(self.steam_status_lbl, 1)
-        steam_row.addWidget(self.btn_redetect_steam)
-        layout.addLayout(steam_row)
+        return build_app_settings_card(self)
 
-        prefs = FlowLayout(spacing=8)
-        self.theme_combo = QComboBox()
-        self.theme_combo.addItem(tr("header.theme.auto"), "auto")
-        self.theme_combo.addItem(tr("header.theme.dark"), "dark")
-        self.theme_combo.addItem(tr("header.theme.light"), "light")
-        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
-        self.lang_combo = QComboBox()
-        self.lang_combo.addItem(tr("header.language.auto"), "auto")
-        for code, disp in available_languages():
-            self.lang_combo.addItem(disp, code)
-        saved_lang = str(self.settings.value("language", "auto"))
-        lidx = self.lang_combo.findData(saved_lang)
-        if lidx >= 0:
-            self.lang_combo.setCurrentIndex(lidx)
-        self.lang_combo.currentIndexChanged.connect(self._on_language_changed)
-        btn_about = QPushButton(tr("header.about"))
-        btn_about.clicked.connect(self._show_about_dialog)
-        for label, combo in ((tr("header.theme"), self.theme_combo), (tr("header.language"), self.lang_combo)):
-            box = QWidget()
-            row = QHBoxLayout(box)
-            row.setContentsMargins(0, 0, 0, 0)
-            row.addWidget(QLabel(label))
-            row.addWidget(combo)
-            prefs.addWidget(box)
-        prefs.addWidget(btn_about)
-        layout.addLayout(prefs)
-        self._update_steam_status_style()
-        return card
+    def _remove_everything(self) -> None:
+        from .ui_system import remove_everything
+
+        return remove_everything(self)
+
+    def _set_steamgriddb_key(self) -> None:
+        from .ui_system import set_steamgriddb_key
+
+        return set_steamgriddb_key(self)
+
+    def _copy_diagnostics(self) -> None:
+        from .ui_system import copy_diagnostics
+
+        return copy_diagnostics(self)
 
     def _update_steam_status_style(self) -> None:
         """Apply subtle semantic color to the sidebar Steam status label."""
@@ -728,301 +769,14 @@ class MainWindow(QMainWindow):
         self._update_steam_status_style()
 
     def _build_extract_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(14)
+        from .ui_pages import build_extract_page
 
-        title = QLabel(tr("install.page_title"))
-        title.setObjectName("PageTitle")
-        sub = QLabel(tr("install.page_subtitle"))
-        sub.setObjectName("MutedText")
-        sub.setWordWrap(True)
-        layout.addWidget(title)
-        layout.addWidget(sub)
-
-        drop_card = DropZoneFrame()
-        drop_card.file_dropped.connect(self._set_extract_source)
-        drop_layout = QVBoxLayout(drop_card)
-        drop_layout.setContentsMargins(18, 16, 18, 16)
-        drop_layout.setSpacing(10)
-
-        src_lbl = QLabel(tr("install.source_title"))
-        src_lbl.setObjectName("SectionTitle")
-        drop_layout.addWidget(src_lbl)
-
-        src_row = QHBoxLayout()
-        self.extract_src = QLineEdit()
-        self.extract_src.setPlaceholderText(tr("install.source_placeholder"))
-        btn_src = QPushButton(tr("install.browse"))
-        btn_src.clicked.connect(self._pick_archive_or_installer)
-        src_row.addWidget(self.extract_src, 1)
-        src_row.addWidget(btn_src)
-        drop_layout.addLayout(src_row)
-
-        # Only used for archives and installers; the game name comes from step 2.
-        dst_row = QHBoxLayout()
-        dst_row.addWidget(QLabel(tr("install.dest_label")))
-        self.extract_dst_root = QLineEdit()
-        self.extract_dst_root.setPlaceholderText(
-            tr("install.dest_library_placeholder") if uses_library_layout() else str(Path.home() / "Games")
-        )
-        btn_dst = QPushButton(tr("install.choose_folder"))
-        btn_dst.clicked.connect(self._pick_dest_root)
-        dst_row.addWidget(self.extract_dst_root, 1)
-        dst_row.addWidget(btn_dst)
-        drop_layout.addLayout(dst_row)
-
-        btn_row = FlowLayout(spacing=8)
-        self.btn_extract = QPushButton(tr("install.btn_extract"))
-        self.btn_extract.setObjectName("primaryBtn")
-        self.btn_extract.clicked.connect(self._start_extract)
-        self.btn_cancel_extract = QPushButton(tr("install.btn_cancel"))
-        self.btn_cancel_extract.setEnabled(False)
-        self.btn_cancel_extract.clicked.connect(self._cancel_extract)
-        self.btn_use_extracted = QPushButton(tr("install.btn_continue_add"))
-        self.btn_use_extracted.setEnabled(False)
-        self.btn_use_extracted.clicked.connect(self._send_extracted_to_add_tab)
-        btn_row.addWidget(self.btn_extract)
-        btn_row.addWidget(self.btn_cancel_extract)
-        btn_row.addWidget(self.btn_use_extracted)
-        drop_layout.addLayout(btn_row)
-
-
-        # Progress and log appear in the Source step once an extraction/setup starts.
-        self.extract_details_box = QWidget()
-        self.extract_details_box.setVisible(False)
-        details_lay = QVBoxLayout(self.extract_details_box)
-        details_lay.setContentsMargins(0, 4, 0, 0)
-        details_lay.setSpacing(8)
-
-        self.extract_progress = QProgressBar()
-        details_lay.addWidget(self.extract_progress)
-
-        self.extract_log = QTextEdit()
-        self.extract_log.setReadOnly(True)
-        self.extract_log.setMaximumHeight(140)
-        self.extract_log.setPlaceholderText(tr("install.log_placeholder"))
-        details_lay.addWidget(self.extract_log)
-        drop_layout.addWidget(self.extract_details_box)
-
-        layout.addWidget(drop_card)
-        layout.addWidget(self._build_add_page(), 1)
-        return page
+        return build_extract_page(self)
 
     def _build_add_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        from .ui_pages import build_add_page
 
-        list_card, list_layout = _make_card()
-        scan_row = QHBoxLayout()
-        lbl_det = QLabel(tr("install.detected_title"))
-        lbl_det.setObjectName("SectionTitle")
-        self.btn_scan = QPushButton(tr("install.btn_rescan"))
-        self.btn_scan.clicked.connect(self._refresh_games)
-        self.btn_scan_folders = QPushButton(tr("scan_folders.btn"))
-        self.btn_scan_folders.clicked.connect(self._open_scan_folders_dialog)
-        self.lbl_scan_folders_count = QLabel()
-        self.lbl_scan_folders_count.setObjectName("MutedText")
-        self._update_scan_folders_label()
-        btn_browse_exe = QPushButton(tr("install.browse"))
-        btn_browse_exe.clicked.connect(self._pick_manual_exe)
-        scan_row.addWidget(lbl_det)
-        scan_row.addStretch()
-        scan_row.addWidget(self.lbl_scan_folders_count)
-        scan_row.addWidget(self.btn_scan_folders)
-        scan_row.addWidget(self.btn_scan)
-        scan_row.addWidget(btn_browse_exe)
-        list_layout.addLayout(scan_row)
-
-        self.games_list = QTableWidget(0, 2)
-        self.games_list.setHorizontalHeaderLabels(
-            [tr("add.detected_name_column"), tr("add.detected_folder_column")]
-        )
-        self.games_list.verticalHeader().setVisible(False)
-        self.games_list.setMinimumHeight(120)
-        self.games_list.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.games_list.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.games_list.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.games_list.setSortingEnabled(True)
-        self.games_list.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.ResizeToContents
-        )
-        self.games_list.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch
-        )
-        self.games_list.horizontalHeader().setStretchLastSection(True)
-        self.games_list.horizontalHeader().setSectionsClickable(True)
-        self.games_list.currentCellChanged.connect(
-            lambda row, _column, _previous_row, _previous_column: self._on_game_selected(row)
-        )
-        list_layout.addWidget(self.games_list, 1)
-
-        # Step 2 (Game): exe, name, Steam match, where/how to install and the shortcuts, all in one place.
-        cfg_split = QSplitter(Qt.Orientation.Horizontal)
-        cfg_split.setChildrenCollapsible(False)
-
-        form_widget = QWidget()
-        form = QFormLayout(form_widget)
-        form.setContentsMargins(0, 0, 8, 0)
-        form.setSpacing(10)
-
-        self._match_install_timer = QTimer(self)
-        self._match_install_timer.setSingleShot(True)
-        self._match_install_timer.setInterval(180)
-        self._match_install_timer.timeout.connect(self._update_remove_existing_state)
-        self.add_exe_combo = QComboBox()
-        self.add_exe_combo.setEditable(True)
-        self.add_exe_combo.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
-        )
-        self.add_exe_combo.setMinimumContentsLength(24)
-        self.add_exe_combo.currentTextChanged.connect(self._on_exe_changed)
-        form.addRow(tr("install.exe_label"), self.add_exe_combo)
-
-        self.add_name = QLineEdit()
-        self.add_name.setPlaceholderText(tr("install.dest_placeholder"))
-        self.add_name.textChanged.connect(lambda: self._match_install_timer.start())
-        self.add_name.textEdited.connect(self._on_add_name_edited)
-        form.addRow(tr("install.folder_label"), self.add_name)
-
-        self.steam_match_combo = QComboBox()
-        self.steam_match_combo.setSizeAdjustPolicy(
-            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
-        )
-        self.steam_match_combo.setMinimumContentsLength(24)
-        self.steam_match_combo.currentIndexChanged.connect(self._on_steam_match_changed)
-        form.addRow(tr("add.match_label"), self.steam_match_combo)
-
-        art_row = QHBoxLayout()
-        self.steam_search_input = QLineEdit()
-        self.steam_search_input.setPlaceholderText(tr("install.game_name_placeholder"))
-        self.steam_search_input.returnPressed.connect(self._search_steam_art)
-        btn_search = QPushButton(tr("install.search_steam"))
-        btn_search.clicked.connect(self._search_steam_art)
-        art_row.addWidget(self.steam_search_input, 1)
-        art_row.addWidget(btn_search)
-        form.addRow(tr("add.steam_store_label"), art_row)
-
-        self.add_library_combo = QComboBox()
-        self.add_library_combo.setToolTip(tr("add.library_tooltip"))
-        self.add_library_combo.currentIndexChanged.connect(self._remember_library_choice)
-        form.addRow(tr("add.library"), self.add_library_combo)
-        if not uses_library_layout():
-            self.add_library_combo.setVisible(False)
-            label_item = form.labelForField(self.add_library_combo)
-            if label_item is not None:
-                label_item.setVisible(False)
-
-        self.chk_keep_in_place = QCheckBox(tr("add.keep_in_place"))
-        self.chk_keep_in_place.setChecked(False)
-        form.addRow("", self.chk_keep_in_place)
-
-        # Who runs the game: Steam (Steam mode) or DeckInstall itself (Standalone mode).
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(8)
-        self.btn_mode_steam = shortcut_target_button(tr("mode.steam"))
-        self.btn_mode_standalone = shortcut_target_button(tr("mode.standalone"))
-        self._install_mode_group = QButtonGroup(self)
-        self._install_mode_group.setExclusive(True)
-        for button in (self.btn_mode_steam, self.btn_mode_standalone):
-            self._install_mode_group.addButton(button)
-            mode_row.addWidget(button)
-            button.toggled.connect(lambda _checked: self._apply_install_mode_ui())
-            button.clicked.connect(self._on_install_mode_clicked)
-        self._install_mode_chosen = False  # until the user picks one, follow the system's default
-        self._standalone_launchers: tuple[bool, ...] = (True, False)  # menu, desktop
-        mode_row.addStretch()
-        self.lbl_mode_note = QLabel()
-        self.lbl_mode_note.setObjectName("MutedText")
-        self.lbl_mode_note.setWordWrap(True)
-        mode_box = QWidget()
-        mode_col = QVBoxLayout(mode_box)
-        mode_col.setContentsMargins(0, 0, 0, 0)
-        mode_col.setSpacing(4)
-        mode_col.addLayout(mode_row)
-        mode_col.addWidget(self.lbl_mode_note)
-        form.addRow(tr("mode.label"), mode_box)
-
-        self._add_launch_options = ""
-        self._add_winedlloverrides = ""
-        # One presets dialog for everything; the form only shows what is on.
-        launch_row = QHBoxLayout()
-        launch_row.setSpacing(10)
-        self.btn_add_launch_adv = QPushButton(tr("add.btn_launch_presets"))
-        self.btn_add_launch_adv.clicked.connect(self._open_add_launch_advanced)
-        self.lbl_add_presets = QLabel()
-        self.lbl_add_presets.setObjectName("MutedText")
-        self.lbl_add_presets.setWordWrap(True)
-        launch_row.addWidget(self.btn_add_launch_adv)
-        launch_row.addWidget(self.lbl_add_presets, 1)
-        form.addRow(tr("add.presets_label"), launch_row)
-
-        # Standalone mode: where to find the game besides the Library.
-        targets_row = FlowLayout(spacing=8)
-        self.btn_shortcut_menu = shortcut_target_button(tr("add.shortcut_menu"), selected=True)
-        self.btn_shortcut_desktop = shortcut_target_button(tr("add.shortcut_desktop"))
-        # Shows where a Steam-mode game goes; follows the mode, never clicked on its own.
-        self.btn_shortcut_steam = shortcut_target_button(tr("add.shortcut_steam"))
-        self.btn_shortcut_steam.setEnabled(False)
-        for button in (self.btn_shortcut_steam, self.btn_shortcut_menu, self.btn_shortcut_desktop):
-            targets_row.addWidget(button)
-        self.lbl_shortcuts_note = QLabel()
-        self.lbl_shortcuts_note.setObjectName("MutedText")
-        self.lbl_shortcuts_note.setWordWrap(True)
-        targets_box = QWidget()
-        targets_col = QVBoxLayout(targets_box)
-        targets_col.setContentsMargins(0, 0, 0, 0)
-        targets_col.setSpacing(4)
-        targets_col.addLayout(targets_row)
-        targets_col.addWidget(self.lbl_shortcuts_note)
-        form.addRow(tr("add.shortcuts_label"), targets_box)
-        # Steam mode: Steam closes to write the shortcut.
-        self.chk_restart = QCheckBox(tr("add.reopen_steam"))
-        self.chk_restart.setChecked(True)
-        self.chk_restart.setToolTip(tr("add.reopen_steam_tooltip"))
-        form.addRow("", self.chk_restart)
-
-        cfg_split.addWidget(form_widget)
-
-        preview_wrap = QWidget()
-        preview_lay = QVBoxLayout(preview_wrap)
-        preview_lay.setContentsMargins(8, 0, 0, 0)
-        self.preview_label = QLabel(tr("install.art_preview_empty"))
-        self.preview_label.setObjectName("PreviewBox")
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setWordWrap(True)
-        self.preview_label.setMinimumSize(180, 108)
-        preview_lay.addWidget(self.preview_label)
-        preview_lay.addStretch()
-        cfg_split.addWidget(preview_wrap)
-        cfg_split.setStretchFactor(0, 1)
-        cfg_split.setStretchFactor(1, 0)
-        cfg_split.setSizes([700, 240])
-        list_layout.addWidget(cfg_split)
-
-        actions_row = FlowLayout(spacing=8)
-        self.btn_install = QPushButton(tr("install.btn_install"))
-        self.btn_install.setObjectName("primaryBtn")
-        self.btn_install.clicked.connect(self._install_selected)
-        actions_row.addWidget(self.btn_install)
-        self.chk_keep_in_place.toggled.connect(self._update_install_label)
-        self._update_install_label()
-
-        self.btn_remove_existing = QPushButton(tr("add.btn_remove_existing"))
-        self.btn_remove_existing.setObjectName("dangerBtn")
-        self.btn_remove_existing.clicked.connect(self._remove_existing_from_add)
-        self.btn_remove_existing.setVisible(False)
-        actions_row.addWidget(self.btn_remove_existing)
-        list_layout.addLayout(actions_row)
-        layout.addWidget(list_card)
-        self._reset_add_launch_options()
-        self._apply_install_mode_ui(follow_default=True)
-
-        layout.addStretch(1)
-        return page
+        return build_add_page(self)
 
     def _setup_mount_watcher(self) -> None:
         """Refresh libraries when a disk is mounted or removed."""
@@ -1182,208 +936,9 @@ class MainWindow(QMainWindow):
             self.add_name.setFocus()
 
     def _build_library_page(self) -> QWidget:
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(12)
+        from .ui_pages import build_library_page
 
-        my_lib_page = QWidget()
-        my_lib_layout = QVBoxLayout(my_lib_page)
-        my_lib_layout.setContentsMargins(0, 0, 0, 0)
-        my_lib_layout.setSpacing(14)
-
-        title = QLabel(tr("library.page_title"))
-        title.setObjectName("PageTitle")
-        sub = QLabel(tr("library.page_subtitle"))
-        sub.setObjectName("MutedText")
-        sub.setWordWrap(True)
-        my_lib_layout.addWidget(title)
-        my_lib_layout.addWidget(sub)
-
-
-        lib_card, lib_layout = _make_card()
-        top = QHBoxLayout()
-        lbl = QLabel(tr("library.shortcuts_title"))
-        lbl.setObjectName("SectionTitle")
-        self.btn_reload = QPushButton(tr("install.btn_rescan"))
-        self.btn_reload.clicked.connect(self._refresh_shortcuts)
-        self.btn_lib_sub_add = QPushButton(tr("library.subtab_add"))
-        self.btn_lib_sub_add.clicked.connect(lambda: self._switch_library_subview(1))
-        self.btn_adopt_games = QPushButton(tr("adopt.btn_open"))
-        self.btn_adopt_games.setToolTip(tr("adopt.btn_open_tip"))
-        self.btn_adopt_games.clicked.connect(self._open_adopt_wizard)
-        top.addWidget(lbl)
-        top.addStretch()
-        top.addWidget(self.btn_adopt_games)
-        top.addWidget(self.btn_lib_sub_add)
-        top.addWidget(self.btn_reload)
-        lib_layout.addLayout(top)
-
-        self.vdf_error_banner = QLabel()
-        self.vdf_error_banner.setWordWrap(True)
-        self.vdf_error_banner.setObjectName("VdfErrorBanner")
-        self.vdf_error_banner.setVisible(False)
-        lib_layout.addWidget(self.vdf_error_banner)
-
-        self.unavailable_banner = QLabel()
-        self.unavailable_banner.setWordWrap(True)
-        self.unavailable_banner.setObjectName("UnavailableBanner")
-        self.unavailable_banner.setVisible(False)
-        lib_layout.addWidget(self.unavailable_banner)
-
-        self.vdf_queue_banner = QFrame()
-        self.vdf_queue_banner.setObjectName("VdfQueueBanner")
-        vq_lay = QHBoxLayout(self.vdf_queue_banner)
-        vq_lay.setContentsMargins(8, 4, 8, 4)
-        self.lbl_vdf_queue = QLabel()
-        self.lbl_vdf_queue.setObjectName("VdfQueueText")
-        self.lbl_vdf_queue.setWordWrap(True)
-        self.btn_vdf_apply = QPushButton(tr("vdf_queue.btn_apply"))
-        self.btn_vdf_apply.setObjectName("primaryBtn")
-        self.btn_vdf_apply.clicked.connect(lambda: self._apply_vdf_queue())
-        self.btn_vdf_clear = QPushButton(tr("vdf_queue.btn_clear"))
-        self.btn_vdf_clear.clicked.connect(self._clear_vdf_queue)
-        vq_lay.addWidget(self.lbl_vdf_queue, 1)
-        vq_lay.addWidget(self.btn_vdf_apply)
-        vq_lay.addWidget(self.btn_vdf_clear)
-        self.vdf_queue_banner.setVisible(False)
-        lib_layout.addWidget(self.vdf_queue_banner)
-
-        self._library_source_filter = "all"
-        self._lib_filter_group = QButtonGroup(self)
-        self._lib_filter_group.setExclusive(True)
-        source_row = QHBoxLayout()
-        source_row.setSpacing(6)
-        for key, label in (
-            ("all", tr("maint.filter_all")),
-            ("steam", "Steam"),
-            ("standalone", tr("library.filter_standalone")),
-            ("external", tr("library.filter_external")),
-        ):
-            pill = QPushButton(label)
-            pill.setObjectName("FilterPill")
-            pill.setCheckable(True)
-            if key == "all":
-                pill.setChecked(True)
-            pill.clicked.connect(
-                lambda _checked=False, k=key: self._on_library_source_filter_changed(k)
-            )
-            self._lib_filter_group.addButton(pill)
-            source_row.addWidget(pill)
-        source_row.addStretch()
-        lib_layout.addLayout(source_row)
-
-        filter_row = QHBoxLayout()
-        filter_row.setSpacing(8)
-        self.library_search_input = QLineEdit()
-        self.library_search_input.setPlaceholderText(tr("library.search_placeholder"))
-        self.library_search_input.setClearButtonEnabled(True)
-        self.library_search_input.textChanged.connect(self._filter_library_list)
-        self.lbl_library_count = QLabel()
-        self.lbl_library_count.setObjectName("MutedText")
-        filter_row.addWidget(self.library_search_input, 1)
-        filter_row.addWidget(self.lbl_library_count)
-        lib_layout.addLayout(filter_row)
-
-        self.shortcuts_list = QTableWidget(0, 7)
-        self.shortcuts_list.setHorizontalHeaderLabels(
-            [
-                tr("table.name"),
-                tr("table.source"),
-                tr("table.runner"),
-                tr("table.graphics"),
-                tr("table.engine"),
-                tr("table.size"),
-                tr("table.executable"),
-            ]
-        )
-        self.shortcuts_list.verticalHeader().setVisible(False)
-        self.shortcuts_list.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.shortcuts_list.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.shortcuts_list.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.shortcuts_list.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.ResizeToContents
-        )
-        self.shortcuts_list.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.ResizeToContents
-        )
-        self.shortcuts_list.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.ResizeToContents
-        )
-        for column in (3, 4, 5):
-            self.shortcuts_list.horizontalHeader().setSectionResizeMode(
-                column, QHeaderView.ResizeMode.ResizeToContents
-            )
-        self.shortcuts_list.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
-        self.shortcuts_list.horizontalHeader().setStretchLastSection(True)
-        self.shortcuts_list.horizontalHeader().setSectionsClickable(True)
-        self.shortcuts_list.setSortingEnabled(True)
-        self.shortcuts_list.horizontalHeader().sortIndicatorChanged.connect(
-            lambda *_args: QTimer.singleShot(0, self, self._filter_library_list)
-        )
-        self.shortcuts_list.currentCellChanged.connect(lambda *_args: self._update_library_action_states())
-        self.shortcuts_list.cellDoubleClicked.connect(lambda *_args: self._open_configure_game_dialog())
-        del_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Delete), self.shortcuts_list)
-        del_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
-        del_shortcut.activated.connect(self._remove_selected_shortcut)
-        lib_layout.addWidget(self.shortcuts_list, 1)
-
-        self.btn_play_game = QPushButton(tr("library.btn_play"))
-        self.btn_play_game.setObjectName("primaryBtn")
-        self.btn_play_game.clicked.connect(self._play_selected_game)
-
-
-        self.act_ext_to_steam = QAction(tr("library.btn_ext_to_steam"), self)
-        self.act_ext_to_steam.triggered.connect(self._external_add_to_steam)
-        self.act_ext_import_saves = QAction(tr("library.btn_ext_import_saves"), self)
-        self.act_ext_import_saves.triggered.connect(self._external_import_saves)
-        self.btn_configure_game = QPushButton(tr("library.btn_configure_game"))
-        self.btn_configure_game.clicked.connect(self._open_configure_game_dialog)
-
-        self.btn_move_game = QPushButton(tr("library.btn_move_disk"))
-        self.btn_move_game.clicked.connect(self._move_selected_game)
-        self.btn_bulk_optiscaler = QPushButton(tr("library.btn_bulk_optiscaler"))
-        self.btn_bulk_optiscaler.clicked.connect(self._open_bulk_optiscaler)
-        self.btn_remove_game = QPushButton(tr("library.btn_uninstall"))
-        self.btn_remove_game.setObjectName("dangerBtn")
-        self.btn_remove_game.clicked.connect(self._remove_selected_shortcut)
-
-        self.btn_bulk_proton = QPushButton(tr("library.btn_bulk_proton"))
-        self.btn_bulk_proton.setToolTip(tr("library.btn_bulk_proton_tip"))
-        self.btn_bulk_proton.clicked.connect(lambda: bulk_proton_dialog(self))
-        self.btn_migrate_legacy = QPushButton(tr("maint.btn_migrate_legacy"))
-        self.btn_migrate_legacy.setToolTip(tr("maint.migrate_legacy_tooltip"))
-        self.btn_migrate_legacy.clicked.connect(lambda: self._start_legacy_migration())
-        footer = QHBoxLayout()
-        footer.setSpacing(24)
-        for group_text, group_btns in (
-            (tr("library.group_play"), (self.btn_play_game,)),
-            (tr("library.group_configure"), (self.btn_configure_game, self.btn_move_game)),
-            (tr("library.group_uninstall"), (self.btn_remove_game,)),
-        ):
-            col = QVBoxLayout()
-            col.setSpacing(4)
-            group_lbl = QLabel(group_text)
-            group_lbl.setObjectName("MutedText")
-            col.addWidget(group_lbl)
-            btn_row = QHBoxLayout()
-            for group_btn in group_btns:
-                btn_row.addWidget(group_btn)
-            col.addLayout(btn_row)
-            footer.addLayout(col)
-            if self.btn_configure_game in group_btns:
-                footer.addStretch()
-        lib_layout.addLayout(footer)
-        batch_lbl = QLabel(tr("library.group_batch"))
-        batch_lbl.setObjectName("MutedText")
-        lib_layout.addWidget(batch_lbl)
-        batch_flow = FlowLayout(spacing=8)
-        for batch_btn in (self.btn_migrate_legacy,):
-            batch_flow.addWidget(batch_btn)
-        lib_layout.addLayout(batch_flow)
-        my_lib_layout.addWidget(lib_card, 1)
-        layout.addWidget(my_lib_page, 1)
-        return page
+        return build_library_page(self)
 
     def _open_bulk_optiscaler(self) -> None:
         from .ui_dialogs.optiscaler_bulk_dialog import bulk_optiscaler_dialog
@@ -1866,7 +1421,7 @@ class MainWindow(QMainWindow):
         self.extract_log.append(msg)
         self.status_label.setText(msg)
 
-    def _on_extract_done(self, out_dir: str, source_kind: str) -> None:
+    def _on_extract_done(self, out_dir: str, _source_kind: str) -> None:
         self._end_busy()
         self.btn_cancel_extract.setEnabled(False)
         self.btn_use_extracted.setEnabled(True)
@@ -2082,6 +1637,7 @@ class MainWindow(QMainWindow):
             "wined3d": tr("presets.short_wined3d"),
             "no_esync": tr("presets.short_no_esync"),
             "no_fsync": tr("presets.short_no_fsync"),
+            "debug_log": tr("presets.short_debug_log"),
         }
         active = [names[k] for k in active_flags(self._add_launch_options) if k in names]
         if self._add_winedlloverrides.strip():
@@ -2387,6 +1943,16 @@ class MainWindow(QMainWindow):
 
         if not self._confirm_not_duplicate(app_name, steam_appid, game_dir, inferred_container):
             return
+        anticheat = [] if inferred_container else classify.detect_anticheat(game_dir)
+        if anticheat:
+            ans = QMessageBox.question(
+                _dialog_parent(self), __app_name__,
+                tr("add.anticheat_warning", name=app_name, systems=", ".join(anticheat)),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
 
         lib_ok, target_library = self._selected_library()
         if not lib_ok:
@@ -2603,10 +2169,12 @@ class MainWindow(QMainWindow):
             for ext in external_games
             if not _inside_any(ext.exe_path, standalone_dirs)  # adopted: the DeckInstall row is the game
         )
+        favs = library_extras.favorites(self.settings)
         for row, (name, source, runner, executable, data, key) in enumerate(rows):
             self.shortcuts_list.insertRow(row)
-            item = QTableWidgetItem(name)
+            item = QTableWidgetItem(("★ " + name) if key in favs else name)
             item.setData(Qt.ItemDataRole.UserRole, data)
+            item.setToolTip(self._playtime_tooltip(*data))
             self.shortcuts_list.setItem(row, 0, item)
             self.shortcuts_list.setItem(row, 1, QTableWidgetItem(source))
             self.shortcuts_list.setItem(row, 2, QTableWidgetItem(runner))
@@ -2803,6 +2371,8 @@ class MainWindow(QMainWindow):
                 vdf_err,
                 runner_labels=runner_labels,
             )
+            if worker.sandbox_blocked and paths_snapshot is not None:
+                self._offer_steam_sandbox_access(paths_snapshot.steam_root, list(worker.sandbox_blocked))
 
         worker = ShortcutsRefreshWorker(
             req_id,
@@ -2817,6 +2387,11 @@ class MainWindow(QMainWindow):
         if on_done is not None:
             worker.finished.connect(on_done)
         worker.start()
+
+    def _offer_steam_sandbox_access(self, steam_root: Path, folders: list[Path]) -> None:
+        from .ui_system import offer_steam_sandbox_access
+
+        return offer_steam_sandbox_access(self, steam_root, folders)
 
     def _queue_shortcut_repairs(self, entries: list[ShortcutEntry], games: list[StandaloneGame]) -> None:
         """Steam shortcuts of adopted/moved games still pointing at the old folder (Steam was open):
@@ -2849,6 +2424,7 @@ class MainWindow(QMainWindow):
     def _filter_library_list(self) -> None:
         """Filter Steam, Standalone, and External library items live and update the count label."""
         source_filter = getattr(self, "_library_source_filter", "all")
+        favs = library_extras.favorites(self.settings) if source_filter == "favorites" else set()
         query = self.library_search_input.text().strip().lower()
         total = 0
         shown = 0
@@ -2859,7 +2435,10 @@ class MainWindow(QMainWindow):
             total += 1
             data = item.data(Qt.ItemDataRole.UserRole)
             kind = data[0] if isinstance(data, tuple) and len(data) == 2 else ""
-            source_ok = source_filter == "all" or kind == source_filter
+            if source_filter == "favorites":
+                source_ok = item.data(Qt.ItemDataRole.UserRole + 1) in favs
+            else:
+                source_ok = source_filter == "all" or kind == source_filter
             query_ok = not query or any(
                 query in cell.text().lower()
                 for column in range(self.shortcuts_list.columnCount())
@@ -2909,6 +2488,10 @@ class MainWindow(QMainWindow):
 
         self.btn_configure_game.setEnabled(idle and sel is not None)
         self._update_play_button(sel)
+        row_key = self._selected_row_key()
+        self.btn_favorite.setEnabled(bool(row_key))
+        self.btn_favorite.setChecked(bool(row_key) and row_key in library_extras.favorites(self.settings))
+        self.btn_protondb.setEnabled(bool(library_extras.protondb_url(self._selected_store_appid())))
         managed = self._managed_library_game(sel[1]) if sel is not None else None
         self.btn_move_game.setEnabled(managed is not None and not self._steam_busy)
 
@@ -3267,6 +2850,16 @@ class MainWindow(QMainWindow):
         ext = sel[1]
         paths = self.paths
         launch_opts = load_external_launch_presets(ext)
+        existing = shortcuts_for_exe(list(getattr(self, "_steam_shortcuts", []) or []), ext.exe_path)
+        if existing:
+            ans = QMessageBox.question(
+                _dialog_parent(self), __app_name__,
+                tr("library.ext_steam_duplicate", name=ext.name, existing=", ".join(e.app_name for e in existing)),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
 
         if self.should_queue_vdf_edits():
             payload = build_steam_shortcut_payload(ext, launch_options=launch_opts)
@@ -3493,6 +3086,60 @@ class MainWindow(QMainWindow):
             btn.setObjectName(name)
             btn.style().unpolish(btn)
             btn.style().polish(btn)
+
+    def _selected_row_key(self) -> str:
+        row = self.shortcuts_list.currentRow()
+        item = self.shortcuts_list.item(row, 0) if row >= 0 else None
+        key = item.data(Qt.ItemDataRole.UserRole + 1) if item is not None else None
+        return str(key) if key else ""
+
+    def _selected_store_appid(self) -> int | None:
+        """The Steam store AppID of the selected game, when one is known (for ProtonDB)."""
+        sel = self._selected_library_item()
+        if sel is None:
+            return None
+        managed = self._managed_library_game(sel[1])
+        appid = getattr(managed or sel[1], "steam_appid", None)
+        return appid if isinstance(appid, int) and appid > 0 else None
+
+    def _toggle_favorite(self) -> None:
+        key = self._selected_row_key()
+        if not key:
+            return
+        now = library_extras.toggle_favorite(self.settings, key)
+        row = self.shortcuts_list.currentRow()
+        item = self.shortcuts_list.item(row, 0)
+        if item is not None:
+            text = item.text().removeprefix("★ ")
+            item.setText(("★ " + text) if now else text)
+        self.btn_favorite.setChecked(now)
+        self._filter_library_list()
+
+    def _open_protondb(self) -> None:
+        url = library_extras.protondb_url(self._selected_store_appid())
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
+
+    def _focus_library_search(self) -> None:
+        """Ctrl+F: go to the Library and put the cursor in its search box."""
+        self.nav_tabs.setCurrentIndex(NAV_PAGES.index(PAGE_LIBRARY))
+        self.library_search_input.setFocus()
+        self.library_search_input.selectAll()
+
+    def _playtime_tooltip(self, kind: str, obj: object) -> str:
+        total, last = library_extras.playtime(self.settings, self._play_key(kind, obj))
+        if total <= 0:
+            return ""
+        when = QDateTime.fromSecsSinceEpoch(int(last)).toString("dd/MM/yyyy HH:mm") if last else "-"
+        return tr("library.playtime_tip", time=library_extras.format_duration(total), last=when)
+
+    def _on_play_session_ended(self, key: str, seconds: float) -> None:
+        library_extras.add_session(self.settings, key, seconds)
+        for row in range(self.shortcuts_list.rowCount()):
+            item = self.shortcuts_list.item(row, 0)
+            data = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+            if item is not None and isinstance(data, tuple) and self._play_key(*data) == key:
+                item.setToolTip(self._playtime_tooltip(*data))
 
     def _on_play_changed(self, key: str) -> None:
         sel = self._selected_library_item()
@@ -4560,6 +4207,10 @@ def main() -> int:
     if "--version" in args:
         print(f"{__app_name__} {__version__}")
         return 0
+    if "--doctor" in args:
+        from .doctor import main as doctor_main
+
+        return doctor_main(args)
     qInstallMessageHandler(_qt_message_handler)
     app = QApplication(sys.argv)
     app.setDesktopFileName("deckinstall")

@@ -382,6 +382,7 @@ class PlayMonitor(QObject):
     changed = Signal(str)  # key: state (or the Loading animation frame) changed
     failed = Signal(str, str, str)  # key, game name, diagnosis (message + log tail)
     timed_out = Signal(str, str, bool)  # key, game name, steam shortcut
+    session_ended = Signal(str, float)  # key, seconds since launch (games DeckInstall started itself)
 
     FAST_FAIL_S = 20.0  # exiting with an error before this is a failed launch
     LOADING_TIMEOUT_S = 60.0  # Loading without any sign of life
@@ -570,8 +571,10 @@ class PlayMonitor(QObject):
         self.changed.emit(key)
 
     def _finish(self, key: str) -> None:
-        self._runs.pop(key, None)
+        run = self._runs.pop(key, None)
         self._changed(key)
+        if run is not None and run.state == RUNNING and not run.steam:
+            self.session_ended.emit(key, max(0.0, self.clock() - run.started))
 
     def _fail(self, key: str, message: str) -> None:
         run = self._runs.get(key)

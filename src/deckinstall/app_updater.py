@@ -18,15 +18,13 @@ from pathlib import Path
 import requests
 
 from . import __version__
-from .fsutil import file_lock
+from .fsutil import clean_child_env, file_lock
 
 GITHUB_RELEASES_API = "https://api.github.com/repos/murilogiatti/DeckInstall/releases/latest"
 GITHUB_RELEASES_URL = "https://github.com/murilogiatti/DeckInstall/releases"
 
 _CHUNK_SIZE = 65536
 _MAX_CHECKSUM_BYTES = 512 * 1024
-_APPIMAGE_ENV_KEYS = ("APPIMAGE", "APPDIR", "ARGV0", "OWD")
-_PATH_ENV_KEYS = ("PATH", "LD_LIBRARY_PATH", "QT_PLUGIN_PATH")
 _ALLOWED_URL_HOSTS = frozenset(
     {
         "api.github.com",
@@ -360,30 +358,7 @@ def _replace_appimage(
 
 def build_clean_relaunch_env() -> dict[str, str]:
     """Build an environment dict stripped of the current AppImage's mount paths."""
-    env = os.environ.copy()
-    appdir = env.get("APPDIR", "")
-
-    for key in _APPIMAGE_ENV_KEYS:
-        env.pop(key, None)
-
-    if appdir:
-        appdir_prefix = appdir.rstrip("/") + "/"
-        appdir_clean = appdir.rstrip("/")
-        for key in _PATH_ENV_KEYS:
-            raw_val = env.get(key)
-            if not raw_val:
-                continue
-            filtered = [
-                entry
-                for entry in raw_val.split(":")
-                if entry != appdir_clean and not entry.startswith(appdir_prefix)
-            ]
-            if filtered:
-                env[key] = ":".join(filtered)
-            else:
-                env.pop(key, None)
-
-    return env
+    return clean_child_env()
 
 
 def relaunch_appimage(appimage_path: Path) -> None:

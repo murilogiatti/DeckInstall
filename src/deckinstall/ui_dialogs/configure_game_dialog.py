@@ -308,6 +308,38 @@ def _mode_switch_row(win: MainWindow, dlg: QDialog, game: StandaloneGame, label:
     return box
 
 
+def _edit_launch_hooks(win: MainWindow, parent: QDialog, game: StandaloneGame) -> None:
+    """Commands to run before and after a Standalone game (stored in its manifest, run by launch.sh)."""
+    from ..standalone import launch_hooks, set_launch_hooks
+
+    pre, post = launch_hooks(game)
+    dlg = QDialog(parent)
+    dlg.setWindowTitle(tr("hooks.title", name=game.name))
+    lay = QVBoxLayout(dlg)
+    intro = QLabel(tr("hooks.intro"))
+    intro.setWordWrap(True)
+    lay.addWidget(intro)
+    form = QFormLayout()
+    pre_edit, post_edit = QLineEdit(pre), QLineEdit(post)
+    pre_edit.setPlaceholderText("pactl set-default-sink headphones")
+    post_edit.setPlaceholderText("notify-send 'Game closed'")
+    form.addRow(tr("hooks.before"), pre_edit)
+    form.addRow(tr("hooks.after"), post_edit)
+    lay.addLayout(form)
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+    buttons.accepted.connect(dlg.accept)
+    buttons.rejected.connect(dlg.reject)
+    lay.addWidget(buttons)
+    if dlg.exec() != QDialog.DialogCode.Accepted:
+        return
+    try:
+        set_launch_hooks(game, pre_edit.text(), post_edit.text())
+    except (OSError, ValueError) as exc:
+        QMessageBox.warning(parent, __app_name__, str(exc))
+        return
+    win.status_label.setText(tr("hooks.saved", name=game.name))
+
+
 def open_configure_game_dialog(win: MainWindow) -> None:
     """Open a streamlined 2-tab configuration dialog for the selected game."""
     sel = win._selected_library_item()
@@ -444,6 +476,11 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         win._edit_launch_options_presets((kind, obj), parent=dlg, on_saved=_save_displayed_opts)
 
     btn_edit_opts.clicked.connect(_on_edit_opts)
+    if sa_obj is not None and not is_steam:
+        btn_hooks = QPushButton(tr("hooks.btn"))
+        btn_hooks.setToolTip(tr("hooks.intro"))
+        btn_hooks.clicked.connect(lambda _=False: _edit_launch_hooks(win, dlg, sa_obj))
+        game_form.addRow("", btn_hooks)
 
     legacy_log = get_game_log_path(title_name)
     run_logs = (

@@ -35,6 +35,7 @@ from .fsutil import (
     FileIdentity,
     atomic_write_bytes,
     atomic_write_text,
+    clean_child_env,
     file_identity,
     file_lock,
     file_sha256,
@@ -108,6 +109,17 @@ WINETRICKS_PRESETS: dict[str, str] = {
     "physx": "NVIDIA PhysX Runtime (physx)",
     "corefonts": "Microsoft Core Fonts (Arial, Times, etc.)",
 }
+
+# Windows version verbs (winetricks), newest first.
+WINDOWS_VERSIONS: dict[str, str] = {
+    "win11": "Windows 11",
+    "win10": "Windows 10",
+    "win81": "Windows 8.1",
+    "win7": "Windows 7",
+    "winxp": "Windows XP",
+}
+# Wine's own tools, run by name inside a prefix (umu-run hands the name to Proton).
+WINE_TOOLS = ("winecfg", "regedit", "taskmgr")
 
 ProgressCallback = Callable[[str, int], None]
 ProgressCb = ProgressCallback
@@ -204,9 +216,12 @@ def detect_gpu_profile() -> GpuProfile:
     has_intel = False
     found_vendor_file = False
 
+    gpu_cards = 0
     drm_root = Path("/sys/class/drm")
     if drm_root.is_dir():
         for vendor_file in drm_root.glob("card*/device/vendor"):
+            if "-" in vendor_file.parent.parent.name:  # connector (card1-eDP-1), not a GPU
+                continue
             try:
                 vendor_id = vendor_file.read_text(encoding="utf-8").strip().lower()
             except OSError:
@@ -214,6 +229,7 @@ def detect_gpu_profile() -> GpuProfile:
             if not vendor_id:
                 continue
             found_vendor_file = True
+            gpu_cards += 1
             if vendor_id == "0x10de":
                 has_nvidia = True
             elif vendor_id == "0x1002":
@@ -244,7 +260,8 @@ def detect_gpu_profile() -> GpuProfile:
         except (OSError, subprocess.TimeoutExpired):
             pass
 
-    is_hybrid = sum((has_nvidia, has_amd, has_intel)) >= 2
+    # Two vendors, or two GPUs of one vendor (Ryzen iGPU + Radeon dGPU, Intel iGPU + Arc).
+    is_hybrid = sum((has_nvidia, has_amd, has_intel)) >= 2 or gpu_cards >= 2
     nvidia_driver_present = (
         Path("/proc/driver/nvidia/version").exists()
         or shutil.which("nvidia-smi") is not None
@@ -993,17 +1010,82 @@ def _sanitize_asset_name(name: str) -> str:
     return cleaned
 
 
+GITHUB_TOKEN_ENV = "DECKINSTALL_GITHUB_TOKEN"
+_FETCH_RETRIES = 2  # extra attempts after a network error or a 5xx answer
+
+
+def github_cache_dir() -> Path:
+    """Where GitHub API answers are kept with their ETag (re-asked with If-None-Match)."""
+    base = os.environ.get("XDG_CACHE_HOME", "").strip()
+    root = Path(base).expanduser() if base else Path.home() / ".cache"
+    return root / "DeckInstall" / "github"
+
+
+def _github_cache_file(url: str) -> Path:
+    return github_cache_dir() / (hashlib.sha256(url.encode("utf-8")).hexdigest()[:32] + ".json")
+
+
+def _read_github_cache(url: str) -> dict[str, Any] | None:
+    try:
+        data = json.loads(_github_cache_file(url).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if isinstance(data, dict) and data.get("url") == url and isinstance(data.get("etag"), str):
+        return data
+    return None
+
+
+def _write_github_cache(url: str, etag: str, body: Any) -> None:
+    try:
+        target = _github_cache_file(url)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(target, json.dumps({"url": url, "etag": etag, "body": body}))
+    except (OSError, TypeError, ValueError) as exc:
+        logging.debug("GitHub cache not written for %s: %s", url, exc)
+
+
 def _fetch_json(url: str, timeout: int = 20) -> Any:
-    with _request_github_with_validated_redirects(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "application/vnd.github+json",
-        },
-        timeout=timeout,
-    ) as resp:
-        resp.raise_for_status()
-        return resp.json()
+    """GET a GitHub API URL as JSON.
+
+    Sends the cached ETag (a 304 answer costs no rate limit and returns the cached body),
+    retries network errors and 5xx answers twice, uses DECKINSTALL_GITHUB_TOKEN when set, and
+    falls back to the cached body when GitHub is unreachable or rate-limits us.
+    """
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/vnd.github+json"}
+    token = os.environ.get(GITHUB_TOKEN_ENV, "").strip()
+    if token and urllib.parse.urlparse(url).hostname == "api.github.com":
+        headers["Authorization"] = f"Bearer {token}"
+    cached = _read_github_cache(url)
+    if cached is not None:
+        headers["If-None-Match"] = cached["etag"]
+    last_exc: Exception | None = None
+    for attempt in range(_FETCH_RETRIES + 1):
+        if attempt:
+            time.sleep(min(4.0, 1.0 * 2 ** (attempt - 1)))
+        try:
+            with _request_github_with_validated_redirects(url, headers=headers, timeout=timeout) as resp:
+                status = resp.status_code if isinstance(resp.status_code, int) else 200
+                if status == 304 and cached is not None:
+                    return cached.get("body")
+                if status >= 500:
+                    last_exc = requests.HTTPError(f"GitHub answered {status} for {url}")
+                    continue
+                if status in (403, 429) and cached is not None:
+                    logging.warning("GitHub rate limit for %s; using the cached answer", url)
+                    return cached.get("body")
+                resp.raise_for_status()
+                body = resp.json()
+                etag = resp.headers.get("ETag") if resp.headers else None
+                if isinstance(etag, str) and etag:
+                    _write_github_cache(url, etag, body)
+                return body
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_exc = exc
+    if cached is not None:
+        logging.warning("GitHub unreachable for %s (%s); using the cached answer", url, last_exc)
+        return cached.get("body")
+    assert last_exc is not None
+    raise last_exc
 
 
 def _download_file(
@@ -2280,7 +2362,27 @@ def install_system_package(bin_name: str) -> tuple[bool, str]:
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
         return (False, err)
+    _record_package_install(cmd)
     return (True, f"{bin_name} installed.")
+
+
+_PACKAGE_REMOVE = {"apt-get": "apt remove", "dnf": "dnf remove", "pacman": "pacman -Rs", "zypper": "zypper remove"}
+
+
+def _record_package_install(install_cmd: list[str]) -> None:
+    """Note the packages in system-changes.json with the command that removes them."""
+    from .system_changes import KIND_PACKAGE, record_change
+
+    manager = install_cmd[0]
+    pkgs = [a for a in install_cmd[1:] if not a.startswith("-") and a not in ("install", "-S")]
+    remove = _PACKAGE_REMOVE.get(manager)
+    if not pkgs or remove is None:
+        return
+    try:
+        record_change(KIND_PACKAGE, " ".join(pkgs), f"sudo {remove} {' '.join(pkgs)}", needs_root=True,
+                      detail=f"installed with {manager}")
+    except OSError as exc:
+        logging.warning("Could not record the package install: %s", exc)
 
 
 def fix_bwrap_userns(confirmed: bool = False) -> tuple[bool, str]:
@@ -2289,19 +2391,27 @@ def fix_bwrap_userns(confirmed: bool = False) -> tuple[bool, str]:
         return (False, "User confirmation required to modify AppArmor bwrap profile.")
     pkexec = shutil.which("pkexec")
     if not pkexec:
-        return (False, "sudo apparmor_parser -r /etc/apparmor.d/bwrap")
+        return (False, f"sudo apparmor_parser -r {BWRAP_PROFILE}")
+    bwrap_path = _bwrap_binary_path()
+    if not re.fullmatch(r"/[\w./+-]+", bwrap_path):
+        return (False, f"Unexpected bwrap path: {bwrap_path!r}")
     script = (
         "set -e; "
         "if [ -d /etc/apparmor.d ] && command -v apparmor_parser >/dev/null 2>&1; then "
-        "cat <<'EOF' >/etc/apparmor.d/bwrap\n"
+        # Never replace a profile someone else wrote (ours carries the marker or the old exact line).
+        f"if [ -e {BWRAP_PROFILE} ] && ! grep -q -e '{_BWRAP_MARKER}' "
+        f"-e 'profile bwrap /usr/bin/bwrap flags=(unconfined)' {BWRAP_PROFILE}; then "
+        f"echo '{BWRAP_PROFILE} exists and was not written by DeckInstall.' >&2; exit 3; fi; "
+        f"cat <<'EOF' >{BWRAP_PROFILE}\n"
+        f"{_BWRAP_MARKER}\n"
         "abi <abi/4.0>,\n"
         "include <tunables/global>\n"
-        "profile bwrap /usr/bin/bwrap flags=(unconfined) {\n"
+        f"profile bwrap {bwrap_path} flags=(unconfined) {{\n"
         "  userns,\n"
         "  include if exists <local/bwrap>\n"
         "}\n"
         "EOF\n"
-        "apparmor_parser -r /etc/apparmor.d/bwrap; "
+        f"apparmor_parser -r {BWRAP_PROFILE}; "
         "else "
         "echo 'AppArmor profile directory or apparmor_parser not found.' >&2; exit 1; "
         "fi"
@@ -2319,7 +2429,34 @@ def fix_bwrap_userns(confirmed: bool = False) -> tuple[bool, str]:
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
         return (False, err)
+    try:
+        from .system_changes import KIND_APPARMOR, record_change
+
+        record_change(
+            KIND_APPARMOR,
+            BWRAP_PROFILE,
+            f"sudo apparmor_parser -R {BWRAP_PROFILE} && sudo rm {BWRAP_PROFILE}",
+            needs_root=True,
+            detail=f"lets {bwrap_path} create user namespaces (umu-run)",
+        )
+    except OSError as exc:
+        logging.warning("Could not record the AppArmor change: %s", exc)
     return (True, "OK")
+
+
+BWRAP_PROFILE = "/etc/apparmor.d/bwrap"
+_BWRAP_MARKER = "# Written by DeckInstall"
+
+
+def _bwrap_binary_path() -> str:
+    """The real bwrap binary (AppArmor matches the resolved path), /usr/bin/bwrap by default."""
+    found = shutil.which("bwrap")
+    if not found:
+        return "/usr/bin/bwrap"
+    try:
+        return str(Path(found).resolve())
+    except OSError:
+        return found
 
 
 def kill_proc_group(proc: subprocess.Popen[bytes], sig: int) -> None:
@@ -2545,7 +2682,7 @@ def run_winetricks_verbs(
                 on_log(f"Warning: prefix snapshot failed ({exc}); continuing winetricks.")
 
     prefix_dir.mkdir(parents=True, exist_ok=True)
-    env = os.environ.copy()
+    env = clean_child_env()
     env["WINEPREFIX"] = str(prefix_dir)
     if proton_dir is not None:
         for rel in ("files/bin/wine", "dist/bin/wine"):
@@ -2590,7 +2727,7 @@ def build_umu_env(
     store: str = "none",
 ) -> dict[str, str]:
     """Build environment variables for executing a Windows binary via umu-run."""
-    env = os.environ.copy()
+    env = clean_child_env()
     env["WINEPREFIX"] = str(prefix_dir)
     env["PROTONPATH"] = str(proton_dir)
     env["GAMEID"] = game_id or "umu-default"
@@ -2653,8 +2790,10 @@ def run_exe_in_prefix(
             raise RuntimeError("umu-run is not installed.")
     prefix_dir.mkdir(parents=True, exist_ok=True)
     env = build_umu_env(prefix_dir, resolved_proton, game_id=game_id)
+    builtin = str(exe_path) in WINE_TOOLS
     cmd = [str(umu_run), str(exe_path)]
-    cwd = str(exe_path.parent) if exe_path.parent.is_dir() else None
+    # A Wine tool runs from the prefix, so a same-named file in the app's folder is never picked.
+    cwd = str(prefix_dir) if builtin else (str(exe_path.parent) if exe_path.parent.is_dir() else None)
 
     if wait:
         proc = subprocess.run(cmd, cwd=cwd, env=env, check=False)

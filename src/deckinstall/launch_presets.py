@@ -13,7 +13,18 @@ from typing import Any
 from .steam_vdf import apply_launch_presets
 
 # Boolean presets, in the order the dialog and the summary show them.
-FLAGS = ("gamemode", "mangohud", "dlss_upgrade", "nvapi", "prime", "wayland", "wined3d", "no_esync", "no_fsync")
+FLAGS = (
+    "gamemode",
+    "mangohud",
+    "dlss_upgrade",
+    "nvapi",
+    "prime",
+    "wayland",
+    "wined3d",
+    "no_esync",
+    "no_fsync",
+    "debug_log",
+)
 MANGOHUD_LEVELS = (1, 2, 3, 4)
 
 
@@ -70,12 +81,14 @@ def parse_presets(opts: str) -> dict[str, Any]:
         "prime": (
             "__NV_PRIME_RENDER_OFFLOAD=1" in tokens_now
             or "__GLX_VENDOR_LIBRARY_NAME=nvidia" in tokens_now
+            or "DRI_PRIME=1" in tokens_now
         ),
         "wayland": "PROTON_ENABLE_WAYLAND=1" in tokens_now,
         "dlss_upgrade": "PROTON_DLSS_UPGRADE=1" in tokens_now,
         "wined3d": "PROTON_USE_WINED3D=1" in tokens_now,
         "no_esync": "PROTON_NO_ESYNC=1" in tokens_now,
         "no_fsync": "PROTON_NO_FSYNC=1" in tokens_now,
+        "debug_log": "UMU_LOG=1" in tokens_now or "PROTON_LOG=1" in tokens_now,
         "winedll": winedll_from_tokens,
     }
 
@@ -116,7 +129,18 @@ def apply_presets(
         proton_wayland=windows and flag("wayland"),
         mangohud_position=str(merged.get("mh_position") or ""),
         mangohud_fps_limit=fps if isinstance(fps, int) and fps > 0 else None,
+        prime_vendor=prime_vendor(),
+        debug_log=flag("debug_log"),
     )
+
+
+def prime_vendor() -> str:
+    """How to send a game to the other GPU here: "nvidia" (PRIME offload), or "mesa" (DRI_PRIME)
+    on a hybrid machine without NVIDIA (AMD + AMD, Intel + AMD, Intel + Intel Arc)."""
+    from .runtime_manager import detect_gpu_profile
+
+    gpu = detect_gpu_profile()
+    return "mesa" if gpu.is_hybrid and not gpu.has_nvidia else "nvidia"
 
 
 def active_flags(opts: str) -> list[str]:

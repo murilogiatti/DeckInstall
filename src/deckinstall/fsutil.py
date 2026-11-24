@@ -501,3 +501,34 @@ def copy_or_move_dir_contents(src_dir: Path, dst_dir: Path, move: bool) -> None:
                 if target.is_symlink() or target.is_dir():
                     remove_path_or_tree(target)
                 atomic_copy_file(item, target)
+
+
+_APPIMAGE_ENV_KEYS = ("APPIMAGE", "APPDIR", "ARGV0", "OWD")
+_PATH_ENV_KEYS = ("PATH", "LD_LIBRARY_PATH", "QT_PLUGIN_PATH")
+# Set for DeckInstall's own interpreter/Qt; a game, installer or Steam must never inherit them.
+_APP_ONLY_ENV_KEYS = ("PYTHONHOME", "PYTHONPATH", "PYTHONNOUSERSITE")
+
+
+def clean_child_env(base: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for programs DeckInstall starts (games, installers, Steam, the new AppImage).
+
+    Drops the AppImage variables and DeckInstall's own interpreter settings, and removes the
+    AppImage mount from PATH/LD_LIBRARY_PATH/QT_PLUGIN_PATH, so children use the system's libraries.
+    """
+    env = dict(os.environ if base is None else base)
+    appdir = env.get("APPDIR", "")
+    for key in (*_APPIMAGE_ENV_KEYS, *_APP_ONLY_ENV_KEYS):
+        env.pop(key, None)
+    if appdir:
+        appdir_clean = appdir.rstrip("/")
+        appdir_prefix = appdir_clean + "/"
+        for key in _PATH_ENV_KEYS:
+            raw_val = env.get(key)
+            if not raw_val:
+                continue
+            kept = [e for e in raw_val.split(":") if e != appdir_clean and not e.startswith(appdir_prefix)]
+            if kept:
+                env[key] = ":".join(kept)
+            else:
+                env.pop(key, None)
+    return env

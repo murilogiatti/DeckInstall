@@ -221,6 +221,12 @@ def _v2_fields(raw: dict[str, Any], game_dir: Path) -> dict[str, Any]:
             **({"proton_previous": _str(proton.get("previous"))} if _str(proton.get("previous")) else {}),
             **({"emulator": _str(runtime.get("emulator"))} if _str(runtime.get("emulator")) else {}),
             **({"mode": _str(runtime.get("mode"))} if _str(runtime.get("mode")) in RUN_MODES else {}),
+            **({"hooks": _hooks(runtime.get("hooks"))} if _hooks(runtime.get("hooks")) else {}),
+            **(
+                {"standalone_launchers": _launchers(runtime.get("standalone_launchers"))}
+                if _launchers(runtime.get("standalone_launchers")) is not None
+                else {}
+            ),
             "prefix_location": _str(prefix.get("location")) or "library",
             "icons": _paths(created.get("icons"), root),
             "steam": _section(created, "steam"),
@@ -253,6 +259,20 @@ def read_manifest_fields(manifest_path: Path) -> dict[str, Any] | None:
     except Exception as exc:
         logging.warning("Failed to read manifest %s: %s", manifest_path, exc)
         return None
+
+
+def _hooks(raw: object) -> dict[str, str]:
+    """{"pre", "post"} commands of a game, only the non-empty ones."""
+    if not isinstance(raw, dict):
+        return {}
+    return {k: str(raw[k]) for k in ("pre", "post") if isinstance(raw.get(k), str) and raw[k].strip()}
+
+
+def _launchers(raw: object) -> dict[str, bool] | None:
+    """Which Standalone launchers a game had before it moved to Steam mode."""
+    if not isinstance(raw, dict):
+        return None
+    return {k: bool(raw.get(k)) for k in ("menu", "desktop")}
 
 
 def build_manifest_v2(fields: dict[str, Any], library_root: Path | None) -> dict[str, Any]:
@@ -293,6 +313,12 @@ def build_manifest_v2(fields: dict[str, Any], library_root: Path | None) -> dict
             "launch_options": str(fields.get("launch_options") or ""),
             **({"emulator": str(meta["emulator"])} if meta.get("emulator") else {}),
             **({"mode": str(meta["mode"])} if meta.get("mode") in RUN_MODES else {}),
+            **({"hooks": _hooks(meta.get("hooks"))} if _hooks(meta.get("hooks")) else {}),
+            **(
+                {"standalone_launchers": _launchers(meta.get("standalone_launchers"))}
+                if _launchers(meta.get("standalone_launchers")) is not None
+                else {}
+            ),
         },
         "prefix": {
             "path": enc(fields["prefix_dir"]),

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "deckinstall"
 dynamic = ["version"]
-description = "Non-Steam Game Installer, Prefix Migrator, Save Validator & Artwork Manager for Steam Deck"
+description = "Install, run and maintain games on desktop Linux and SteamOS: Steam or standalone mode, saves, runtimes and cleanup"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Murilo Giatti"}]
@@ -39,7 +39,7 @@ where = ["src"]
 version = {attr = "deckinstall.__version__"}
 
 [tool.setuptools.package-data]
-deckinstall = ["locales/*.json", "locales/qt/*.qm", "assets/icon.png", "assets/icon.svg"]
+deckinstall = ["locales/*.json", "locales/qt/*.qm", "assets/icon.png"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

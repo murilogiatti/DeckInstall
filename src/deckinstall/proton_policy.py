@@ -166,38 +166,3 @@ def retarget_stale_default_games(games: Iterable[StandaloneGame] | None = None) 
     return moved
 
 
-def protected_tool_names(games: Iterable[StandaloneGame] | None = None, extra: Iterable[str] = ()) -> set[str]:
-    """Proton names a game is pinned to or would fall back to with "Use previous version"."""
-    names = {n.strip() for n in extra if n.strip()}
-    for game in games if games is not None else list_standalone_games():
-        if game.native_linux:
-            continue
-        for name in (game.proton_name, previous_proton_name(game)):
-            if name.strip():
-                names.add(name.strip())
-    return names
-
-
-def prune_ge_proton(keep: int = 2, protected: Iterable[str] = ()) -> list[Path]:
-    """Remove old GE-Proton versions from DeckInstall's compat-tools dir, keeping the newest `keep`.
-
-    Versions in `protected` (pinned games, Steam mappings) and anything outside the writable
-    compatibilitytools.d (Flatpak/system copies) are never touched.
-    """
-    keep_names = set(protected)
-    managed = _rm.get_compat_tools_dir()
-    removed: list[Path] = []
-    for index, tool_dir in enumerate(_rm.list_ge_proton_dirs(min_major=10)):
-        if (
-            index < keep
-            or tool_dir.name in keep_names
-            or tool_dir.parent != managed
-            or not _rm.is_managed_ge_proton(tool_dir)
-        ):
-            continue
-        try:
-            _rm.remove_compat_tool(tool_dir, managed_only=True)
-            removed.append(tool_dir)
-        except (OSError, ValueError) as exc:
-            logging.warning("Could not remove old %s: %s", tool_dir, exc)
-    return removed

@@ -21,6 +21,8 @@ Game installer for **desktop Linux and SteamOS** (Qt6) with two modes per game: 
 - **Uninstall, Adopt & Move Games**: **Uninstall** follows the game manifest and shows each item (game files, prefix, saves snapshot, Steam link, shortcuts, artwork, OptiScaler, cache, logs) with the space it frees, keeping prefixes shared with other games. **Adopt games...** brings games from **Hydra** (including ones left in `drive_c`), **Heroic**, **Lutris**, **Bottles**, **UMU**, old Steam shortcuts or a loose folder into the library, moving (not copying) game and prefix and undoing everything if a step fails. **Move to another disk** sends a game to a library on microSD/USB.
 - **Maintenance & Cleanup Rules**: Maintenance scans managed libraries and recognized gaming paths for empty install folders, orphaned game data, older runtimes and redundant saves. It opens largest first and supports sorting by any column. Uninstall offers a review of remaining files. Backups and snapshots qualify for removal after restore when every archived file matches its installed copy. Duplicate Ludusavi imports are checked against the newest equivalent snapshot. In Desktop Mode Steam edits apply right away (Steam closes and reopens); in Gaming Mode they are saved to disk and applied once Steam is closed, even across app restarts and updates. Gaming Mode is detected from the gamescope session (a game wrapped in gamescope on the desktop does not count). Legacy migration lives in the Library's **In bulk** group. The **Runtimes** tab has one card per component (Proton, umu-run + Steam Runtime, MangoHud, OptiScaler, system tools), each with its own status, update, bulk and remove actions; components a mode does not use are greyed out with the reason (on SteamOS: GE-Proton, umu-run and MangoHud), and **Update all in use** only updates what is installed.
 - **Launch Presets & Official Steam Artwork**: One presets dialog for `gamemoderun`, MangoHud (level, position, FPS limit; always the official upstream build, installed per user without root on first use, with the real name of every GPU on hybrid laptops), DLSS upgrade, NVAPI, NVIDIA PRIME, Wayland, `PROTON_USE_WINED3D` and esync/fsync, with a summary on the install form; Steam Store search and direct AppID lookup (with Flatpak/native warning); with official artwork downloaded when a game is added to Steam.
+- **Diagnostics, Sandboxed Steam & Clean Removal**: `--doctor` (and **Maintenance > Copy diagnostics**) reports OS, FUSE, GPU, user namespaces, every Steam install (native, Flatpak, Snap), runtimes and libraries. With several Steams DeckInstall uses the running one (or `DECKINSTALL_STEAM_ROOT`). When Flatpak Steam cannot open a game library it offers `flatpak override --user` (Snap: shows the `snap connect` command). Every change outside DeckInstall's folders (packages, the AppArmor profile for bwrap, Flatpak access) is recorded in `system-changes.json` with how to undo it, and **Maintenance > Remove DeckInstall from this PC** removes runtimes, settings, caches and those changes, never games or saves.
+- **Library comforts**: favorites (★ filter), **Ctrl+F** to search, a **ProtonDB** button for games with a Steam AppID, play time of games DeckInstall starts (in the name tooltip), Wine tools (winecfg, regedit, taskmgr) and the Windows version per prefix, and a warning before installing a game that ships an anti-cheat.
 - **Modular Architecture, AppImage Auto-Updater & i18n**: Separated background worker modules (`ui_workers_library.py`, `ui_workers_maint.py`), built-in AppImage auto-updater via GitHub Releases, **Auto**, **Dark**, and **Light** themes, and JSON-based localization (`src/deckinstall/locales/en.json` and `pt_BR.json`).
 
 ## Quick Start (AppImage)
@@ -32,6 +34,21 @@ chmod +x DeckInstall-0.26.1-x86_64.AppImage
 QT_QPA_PLATFORM=offscreen ./DeckInstall-0.26.1-x86_64.AppImage --smoke-test
 ./DeckInstall-0.26.1-x86_64.AppImage
 ```
+
+### Verify the download
+Every release AppImage has a signed build provenance (Sigstore, made by the release workflow; no key is stored anywhere). With the GitHub CLI:
+
+```bash
+sha256sum -c SHA256SUMS
+gh attestation verify DeckInstall-0.26.1-x86_64.AppImage --repo murilogiatti/DeckInstall
+```
+
+The in-app updater downloads only from this repository's GitHub Releases over HTTPS and refuses a file whose SHA-256 does not match `SHA256SUMS`.
+
+### Troubleshooting
+- **Check the system:** `./DeckInstall-0.26.1-x86_64.AppImage --doctor` prints what DeckInstall sees: OS, FUSE, GPU, whether `bwrap` can create user namespaces (needed by umu-run), every Steam install, runtimes, libraries and tools. Add `--json` for a machine-readable report. Exit code: 0 all fine, 1 warnings, 2 failures. **Maintenance > Copy diagnostics** puts the same report on the clipboard.
+- **The AppImage does not open ("fuse" / "fusermount" error):** install FUSE 3 (`sudo apt install fuse3`, `sudo dnf install fuse3`, `sudo pacman -S fuse3`). Without it, run `./DeckInstall-0.26.1-x86_64.AppImage --appimage-extract-and-run`, which unpacks the app to a temporary folder on every start.
+- **More than one Steam (native, Flatpak, Snap):** DeckInstall uses the one that is running, else the first one with a logged-in user. To choose, start it with `DECKINSTALL_STEAM_ROOT=~/.var/app/com.valvesoftware.Steam/.local/share/Steam` (or the path `--doctor` lists).
 
 ## Translating DeckInstall
 English (`en`) is the primary language. To add a new translation:

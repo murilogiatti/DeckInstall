@@ -161,7 +161,7 @@ def test_start_steam_uses_clean_env_and_waits(monkeypatch: pytest.MonkeyPatch) -
     with (
         mock.patch.object(steam_vdf, "is_steam_running", side_effect=lambda: next(states, True)),
         mock.patch.object(steam_vdf, "is_gamescope_session", return_value=False),
-        mock.patch.object(steam_vdf, "is_flatpak_steam", return_value=False),
+        mock.patch.object(steam_vdf, "steam_command", return_value=["/usr/bin/steam"]),
         mock.patch.object(steam_vdf.subprocess, "Popen") as popen,
         mock.patch.object(steam_vdf.time, "sleep"),
         mock.patch.object(steam_vdf.time, "monotonic", side_effect=lambda: float(next(ticks))),
@@ -218,7 +218,7 @@ def test_start_steam_ignores_bootstrap_that_dies() -> None:
     with (
         mock.patch.object(steam_vdf, "is_steam_running", side_effect=lambda: next(states, False)),
         mock.patch.object(steam_vdf, "is_gamescope_session", return_value=False),
-        mock.patch.object(steam_vdf, "is_flatpak_steam", return_value=False),
+        mock.patch.object(steam_vdf, "steam_command", return_value=["/usr/bin/steam"]),
         mock.patch.object(steam_vdf.subprocess, "Popen"),
         mock.patch.object(steam_vdf.time, "sleep"),
         mock.patch.object(steam_vdf.time, "monotonic", side_effect=lambda: next(clock, 99.0)),

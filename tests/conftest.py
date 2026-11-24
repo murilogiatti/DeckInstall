@@ -25,6 +25,7 @@ from deckinstall import (  # noqa: E402
     standalone,
     steam_paths,
     steam_vdf,
+    system_changes,
     ui_cards,
     vdf_queue,
 )
@@ -52,6 +53,10 @@ def _isolated_libraries(tmp_path_factory: pytest.TempPathFactory, monkeypatch: p
     # No network in tests, and never read the real umu-database cache.
     monkeypatch.setattr(runtime_manager, "ensure_umu_database", lambda *a, **k: None)
     monkeypatch.setattr(runtime_manager, "get_umu_database_path", lambda: base / "runtime" / "umu-database.csv")
+    # Never write the user's real system-changes ledger.
+    monkeypatch.setattr(system_changes, "ledger_path", lambda: base / "data" / "system-changes.json")
+    # Never read or write the user's GitHub answer cache.
+    monkeypatch.setattr(runtime_manager, "github_cache_dir", lambda: base / "cache" / "github")
     # Never see (or prune) the user's real Proton installs.
     compat = base / "compatibilitytools.d"
     monkeypatch.setattr(runtime_manager, "get_compat_tools_dir", lambda: compat)

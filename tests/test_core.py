@@ -31,7 +31,7 @@ from conftest import pe_exe_bytes  # noqa: E402
 from deckinstall.cleanup import find_cleanup_candidates  # noqa: E402
 from deckinstall.extractor import (  # noqa: E402
     _select_extract_cmd,
-    extract_archive,
+    extract_archive_to_dir,
     is_archive,
     sanitize_folder_name,
     suggest_target_name,
@@ -158,19 +158,6 @@ class CoreTests(unittest.TestCase):
             finally:
                 os.chmod(locked, 0o755)
 
-    def test_extract_archive_unwrap_single_folder(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            zpath = root / "Test.Game-RUNE.zip"
-            with zipfile.ZipFile(zpath, "w") as zf:
-                zf.writestr("Test.Game-RUNE/Game.exe", b"MZ")
-                zf.writestr("Test.Game-RUNE/data/config.ini", b"ok=1")
-            dest_root = root / "Games"
-            out = extract_archive(zpath, dest_root, "Test Game")
-            self.assertEqual(out, dest_root / "Test Game")
-            self.assertTrue((out / "Game.exe").is_file())
-            self.assertTrue((out / "data" / "config.ini").is_file())
-
     def test_plan_bulk_migration_and_compatdata_preserve(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -206,8 +193,7 @@ class CoreTests(unittest.TestCase):
             )
             plan = plan_bulk_migration([entry], games_root, compat_dir)
             self.assertEqual(len(plan), 1)
-            self.assertEqual(plan[0].new_name, "Stellar Blade")
-            self.assertTrue(plan[0].has_compatdata)
+            self.assertEqual(plan[0].new_root.name, "Stellar Blade")
 
     def test_sanitize_folder_name_and_tar_priority(self) -> None:
         self.assertEqual(sanitize_folder_name("My Game"), "My Game")
@@ -217,23 +203,6 @@ class CoreTests(unittest.TestCase):
             sanitize_folder_name("/abs/path")
         cmd = _select_extract_cmd(Path("game.tar.gz"), Path("/tmp/out"))
         self.assertEqual(cmd[0], "tar")
-
-    def test_extract_archive_merges_existing_directory_without_wiping(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            dest_root = root / "Games"
-            existing = dest_root / "PatchGame" / "data"
-            existing.mkdir(parents=True)
-            (existing / "keep.txt").write_text("original", encoding="utf-8")
-            (existing / "config.ini").write_text("old", encoding="utf-8")
-
-            zpath = root / "patch.zip"
-            with zipfile.ZipFile(zpath, "w") as zf:
-                zf.writestr("PatchGame/data/config.ini", "new")
-
-            out = extract_archive(zpath, dest_root, "PatchGame")
-            self.assertEqual((out / "data" / "keep.txt").read_text(encoding="utf-8"), "original")
-            self.assertEqual((out / "data" / "config.ini").read_text(encoding="utf-8"), "new")
 
     def test_infer_game_root_skips_binaries_win64_and_guards_downloads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -305,7 +274,7 @@ class CoreTests(unittest.TestCase):
             )
             plan = plan_bulk_migration([entry], games_root, compat_dir, search_roots=[lutris_root])
             self.assertEqual(len(plan), 1)
-            self.assertEqual(plan[0].new_name, "My Indie Game")
+            self.assertEqual(plan[0].new_root.name, "My Indie Game")
 
             paths = SteamPaths(
                 steam_root=root / "Steam",
@@ -940,20 +909,6 @@ class CoreTests(unittest.TestCase):
                 self.assertEqual(find_default_proton_name(steam_root), "GE-Proton9-20")
                 self.assertEqual(find_proton_binary(steam_root), ge_dir / "proton")
 
-        # 8) extract_archive handles file-vs-dir merge conflict
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            zpath = root / "patch.zip"
-            with zipfile.ZipFile(zpath, "w") as zf:
-                zf.writestr("root.txt", "root")
-                zf.writestr("sub/new.txt", "ok")
-            dest_root = root / "Games"
-            game_dir = dest_root / "ConflictGame"
-            game_dir.mkdir(parents=True)
-            (game_dir / "sub").write_text("old-file")
-            out = extract_archive(zpath, dest_root, "ConflictGame")
-            self.assertTrue((out / "sub" / "new.txt").is_file())
-
         # 9) Rollback shortcuts.vdf if set_compat_tool fails + preserve metadata
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1111,9 +1066,10 @@ class CoreTests(unittest.TestCase):
                 sym.type = tarfile.SYMTYPE
                 sym.linkname = "/etc/passwd"
                 tf.addfile(sym)
-            out = extract_archive(tgz, root / "Games", "SymGame")
-            self.assertTrue((out / "ok.txt").is_file())
-            self.assertFalse((out / "evil_link").exists() or (out / "evil_link").is_symlink())
+            out = root / "out"
+            extract_archive_to_dir(tgz, out)
+            self.assertTrue((out / "Game" / "ok.txt").is_file())
+            self.assertFalse((out / "Game" / "evil_link").exists() or (out / "Game" / "evil_link").is_symlink())
 
         # 2) /run/media steamapps skipped
         with tempfile.TemporaryDirectory() as tmp:

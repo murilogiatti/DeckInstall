@@ -117,7 +117,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -127,7 +127,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/uv
-          key: uv-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'requirements.txt') }}
+          key: uv-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
           restore-keys: |
             uv-${{ runner.os }}-py${{ matrix.python-version }}-
       - name: Install test dependencies
@@ -184,7 +184,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/uv
-          key: uv-${{ runner.os }}-build-${{ hashFiles('pyproject.toml', 'requirements.txt') }}
+          key: uv-${{ runner.os }}-build-${{ hashFiles('pyproject.toml') }}
           restore-keys: |
             uv-${{ runner.os }}-build-
 
@@ -269,6 +269,18 @@ jobs:
             "DeckInstall-${{ steps.meta.outputs.version }}-x86_64.AppImage"
           sha256sum "DeckInstall-${{ steps.meta.outputs.version }}-x86_64.AppImage" > SHA256SUMS
 
+      - name: Smoke test the AppImage file itself
+        run: |
+          APPIMAGE="./DeckInstall-${{ steps.meta.outputs.version }}-x86_64.AppImage"
+          chmod +x "$APPIMAGE"
+          # The runner may lack FUSE: --appimage-extract-and-run tests the same file without mounting it.
+          "$APPIMAGE" --appimage-extract-and-run --version | grep -qF "${{ steps.meta.outputs.version }}"
+          timeout 30s env QT_QPA_PLATFORM=offscreen "$APPIMAGE" --appimage-extract-and-run --smoke-test
+          rc=0
+          "$APPIMAGE" --appimage-extract-and-run --doctor --json > doctor.json || rc=$?
+          test "$rc" -le 2
+          python -c "import json; r = json.load(open('doctor.json')); assert r['app'][0]['detail'].endswith('${{ steps.meta.outputs.version }}'), r['app']"
+
       - name: Upload AppImage artifact
         uses: actions/upload-artifact@v7
         with:
@@ -285,6 +297,36 @@ jobs:
           retention-days: 14
           path: build/nuitka-report.xml
 
+  # The built AppImage on other distros (desktop libraries installed, as on a real desktop).
+  # Not a release gate: a failure here is a portability bug to look at, not a broken build.
+  appimage-distros:
+    needs: build-appimage
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: fedora:latest
+            deps: dnf install -y mesa-libGL mesa-libEGL libxkbcommon fontconfig glib2 dbus-libs findutils
+          - image: archlinux:latest
+            deps: pacman -Syu --noconfirm mesa libxkbcommon fontconfig glib2 dbus findutils
+          - image: ubuntu:24.04
+            deps: apt-get update && apt-get install -y libgl1 libegl1 libxkbcommon0 libfontconfig1 libglib2.0-0 libdbus-1-3
+    container: ${{ matrix.image }}
+    steps:
+      - name: Install desktop libraries
+        run: ${{ matrix.deps }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.APPIMAGE_ARTIFACT }}
+      - name: Run the AppImage
+        run: |
+          APPIMAGE=$(ls DeckInstall-*-x86_64.AppImage)
+          chmod +x "$APPIMAGE"
+          "./$APPIMAGE" --appimage-extract-and-run --version
+          QT_QPA_PLATFORM=offscreen timeout 60s "./$APPIMAGE" --appimage-extract-and-run --smoke-test
+          "./$APPIMAGE" --appimage-extract-and-run --doctor || test $? -le 2
+
   # Tag only: publishes the AppImage once the tests passed (here or on the reused run) and it was built.
   release:
     needs: [plan, validate-python, build-appimage]
@@ -295,6 +337,8 @@ jobs:
     permissions:
       contents: write
       actions: read
+      id-token: write      # Sigstore signature of the build provenance (no stored key)
+      attestations: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -318,6 +362,13 @@ jobs:
           test -f "DeckInstall-${VERSION}-x86_64.AppImage"
           sha256sum -c SHA256SUMS
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Signed provenance: anyone can check the file was built by this workflow from this tag with
+      #   gh attestation verify DeckInstall-<version>-x86_64.AppImage --repo <owner>/DeckInstall
+      - name: Sign the AppImage provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/DeckInstall-${{ steps.meta.outputs.version }}-x86_64.AppImage
 
       - name: Attach to GitHub Release
         if: github.ref_name == format('v{0}', steps.meta.outputs.version)

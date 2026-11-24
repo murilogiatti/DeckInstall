@@ -86,7 +86,9 @@ def test_round_trip_keeps_prefix_and_leaves_no_residue(tmp_path: Path) -> None:
         assert load_shortcuts(paths.shortcuts_vdf, strict=True) == []
         assert not compat.exists() and not compat.is_symlink()
         assert standalone.find_game_launchers(game)["menu"]
-        assert not standalone.find_game_launchers(game)["desktop"]
+        # It had a Desktop launcher before going to Steam, so switching back recreates it.
+        assert standalone.find_game_launchers(game)["desktop"]
+        assert "standalone_launchers" not in game.meta
         assert (game.prefix_dir / "drive_c" / "save.dat").read_text() == "progress"
         assert "MANGOHUD=1" in game.launch_options  # the Standalone settings are kept
 

@@ -56,6 +56,48 @@ def test_windows_launcher_logs_and_keeps_args(tmp_path: Path) -> None:
     standalone.update_standalone_launch_options(game.game_dir, launch_options="%command% -dx11")
     script = game.launch_script.read_text(encoding="utf-8")
     assert subprocess.run(["bash", "-n", str(game.launch_script)]).returncode == 0
-    run_line = next(line for line in script.splitlines() if "umu-run" in line)
+    run_line = next(line for line in script.splitlines() if "umu-run" in line and "|| rc=" in line)
     assert run_line.endswith("-dx11 || rc=$?") and not run_line.startswith("exec ")
+    # The run log starts with the exact command and the environment umu-run gets.
+    assert "== DeckInstall: command: " in script and "-dx11" in script.split("command: ", 1)[1].splitlines()[0]
+    assert "export STEAM_COMPAT_LIBRARY_PATHS=" in script
+    assert f"export PROTON_LOG_DIR={standalone.game_log_dir(game)}" in script
+    assert "export UMU_RUNTIME_UPDATE=0" in script  # only once the weekly check stamp is fresh
+    assert 'INHIBIT=(systemd-inhibit --what=idle' in script
+    assert run_line.startswith('${INHIBIT[@]+"${INHIBIT[@]}"} ')
     assert script.rstrip().endswith('exit "$rc"')
+
+
+def test_old_launcher_is_rewritten_once_and_foreign_one_kept(tmp_path: Path) -> None:
+    game = _install(tmp_path, "Old Game", "Game.exe", PE)
+    script = game.launch_script
+    old = script.read_text(encoding="utf-8").replace(standalone._LAUNCHER_FORMAT_LINE + "\n", "")
+    script.write_text(old, encoding="utf-8")
+    assert standalone.refresh_launcher_if_outdated(game) is True
+    assert standalone._LAUNCHER_FORMAT_LINE in script.read_text(encoding="utf-8")
+    assert standalone.refresh_launcher_if_outdated(game) is False
+
+    script.write_text("#!/bin/sh\nexec wine Game.exe\n", encoding="utf-8")  # the user's own launcher
+    assert standalone.refresh_launcher_if_outdated(game) is False
+    assert script.read_text(encoding="utf-8") == "#!/bin/sh\nexec wine Game.exe\n"
+
+
+def test_before_and_after_commands_run_around_the_game(tmp_path: Path) -> None:
+    game = _install(tmp_path, "Hook Game", "start.sh", b"#!/bin/sh\necho game-ran\nexit 4\n", native=True)
+    marker = tmp_path / "order.txt"
+    standalone.set_launch_hooks(game, f"echo before >> {marker}; false", f"echo after >> {marker}")
+    done = subprocess.run(["bash", str(game.launch_script)], capture_output=True, timeout=30)
+    assert done.returncode == 4  # the game's exit code, not the hook's
+    assert marker.read_text(encoding="utf-8").split() == ["before", "after"]
+    log = standalone.game_run_logs(game)[0].read_text(encoding="utf-8")
+    assert "the command before the game failed" in log and "game-ran" in log
+    data = json.loads((game.game_dir / MANIFEST_V2).read_text(encoding="utf-8"))
+    assert data["runtime"]["hooks"] == {"pre": f"echo before >> {marker}; false", "post": f"echo after >> {marker}"}
+    standalone.set_launch_hooks(game, "", "")
+    assert "bash -c" not in game.launch_script.read_text(encoding="utf-8")
+    try:
+        standalone.set_launch_hooks(game, "a\nb", "")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("multi-line command accepted")
