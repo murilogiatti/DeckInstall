@@ -491,19 +491,37 @@ def ensure_mangohud(force_update: bool = False, progress_cb: ProgressCb | None =
 
 
 @_serialize_runtime("mangohud")
-def mangohud_versions() -> tuple[str, str]:
+def mangohud_versions(*, force: bool = False) -> tuple[str, str]:
     """(installed tag or "", latest tag on GitHub or "") of the official MangoHud."""
     versions = _load_versions()
     installed = str(versions.get("mangohud_installed_version") or "") if official_mangohud_installed() else ""
     latest = str(versions.get("mangohud_latest_version") or "")
     now = int(time.time())
     last_check = versions.get("mangohud_last_check", 0)
-    if isinstance(last_check, int) and latest and 0 <= now - last_check < UPDATE_CACHE_TTL_SECONDS:
+    fresh = isinstance(last_check, int) and 0 <= now - last_check < UPDATE_CACHE_TTL_SECONDS
+    if not force and latest and fresh:
         return installed, latest
     release = _fetch_json(MANGOHUD_RELEASES_API)
     latest = str(release.get("tag_name", "")).strip() if isinstance(release, dict) else ""
     if latest:
         _update_versions(lambda data: data.update(mangohud_latest_version=latest, mangohud_last_check=now))
+    return installed, latest
+
+
+def optiscaler_versions(*, force: bool = False) -> tuple[str, str]:
+    """(installed tag or "", latest tag on GitHub or "") of OptiScaler, without downloading it."""
+    versions = _load_versions()
+    installed = str(versions.get("optiscaler_installed_version") or "") if optiscaler_downloaded() else ""
+    latest = str(versions.get("optiscaler_latest_version") or "")
+    now = int(time.time())
+    last_check = versions.get("optiscaler_last_check", 0)
+    fresh = isinstance(last_check, int) and 0 <= now - last_check < UPDATE_CACHE_TTL_SECONDS
+    if not force and latest and fresh:
+        return installed, latest
+    release = _fetch_json(OPTISCALER_RELEASES_API)
+    latest = str(release.get("tag_name", "")).strip() if isinstance(release, dict) else ""
+    if latest:
+        _update_versions(lambda data: data.update(optiscaler_latest_version=latest, optiscaler_last_check=now))
     return installed, latest
 
 
@@ -1012,6 +1030,17 @@ def _sanitize_asset_name(name: str) -> str:
 
 GITHUB_TOKEN_ENV = "DECKINSTALL_GITHUB_TOKEN"
 _FETCH_RETRIES = 2  # extra attempts after a network error or a 5xx answer
+_STALE = threading.local()  # per thread: did a GitHub call answer from the cache (offline/rate limit)?
+
+
+def reset_stale_answers() -> None:
+    """Start counting cached (stale) GitHub answers on this thread."""
+    _STALE.used = False
+
+
+def stale_answers_used() -> bool:
+    """True when a GitHub call on this thread fell back to its cached answer since the reset."""
+    return bool(getattr(_STALE, "used", False))
 
 
 def github_cache_dir() -> Path:
@@ -1072,6 +1101,7 @@ def _fetch_json(url: str, timeout: int = 20) -> Any:
                     continue
                 if status in (403, 429) and cached is not None:
                     logging.warning("GitHub rate limit for %s; using the cached answer", url)
+                    _STALE.used = True
                     return cached.get("body")
                 resp.raise_for_status()
                 body = resp.json()
@@ -1083,6 +1113,7 @@ def _fetch_json(url: str, timeout: int = 20) -> Any:
             last_exc = exc
     if cached is not None:
         logging.warning("GitHub unreachable for %s (%s); using the cached answer", url, last_exc)
+        _STALE.used = True
         return cached.get("body")
     assert last_exc is not None
     raise last_exc

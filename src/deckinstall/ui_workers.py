@@ -14,7 +14,6 @@ from . import classify
 from . import runtime_manager as _rm
 from .app_updater import (
     AppUpdateInfo,
-    check_app_update,
     download_and_replace_appimage,
 )
 from .artwork import (
@@ -405,17 +404,23 @@ class RuntimeUpdateWorker(QThread):
             self.failed.emit(_format_worker_error(exc))
 
 
-class AppUpdateCheckWorker(QThread):
-    """Background worker to query GitHub Releases for a newer DeckInstall AppImage."""
+class UpdatesCheckWorker(QThread):
+    """Check DeckInstall and the given runtimes for updates (updates.check_all, never raises)."""
 
     checked = Signal(object)
-    failed = Signal(str)
+
+    def __init__(self, runtimes: tuple[str, ...]) -> None:
+        super().__init__()
+        self.runtimes = runtimes
 
     def run(self) -> None:
+        from .updates import check_all
+
         try:
-            self.checked.emit(check_app_update())
-        except Exception as exc:
-            self.failed.emit(_format_worker_error(exc))
+            self.checked.emit(check_all(self.runtimes))
+        except Exception:
+            logging.exception("Update check failed")
+            self.checked.emit({})
 
 
 class AppUpdateDownloadWorker(QThread):

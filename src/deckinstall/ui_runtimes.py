@@ -71,16 +71,16 @@ def build_runtimes_page(win: MainWindow) -> QWidget:
     layout.addWidget(title)
     layout.addWidget(sub)
 
+    from .ui_updates import build_updates_card
+
+    layout.addWidget(build_updates_card(win))
+
     top = QHBoxLayout()
-    win.btn_update_runtimes = QPushButton(tr("runtimes.btn_update_all"))
-    win.btn_update_runtimes.setToolTip(tr("runtimes.btn_update_all_tip"))
-    win.btn_update_runtimes.clicked.connect(lambda: win._update_runtimes())
     win.btn_uninstall_runtimes = QPushButton(tr("runtime.btn_uninstall"))
     win.btn_uninstall_runtimes.setToolTip(tr("runtime.uninstall_tip"))
     win.btn_uninstall_runtimes.clicked.connect(lambda: open_uninstall_runtimes_dialog(win))
     win.btn_rt_refresh = QPushButton(tr("maint.btn_refresh_health"))
     win.btn_rt_refresh.clicked.connect(win._refresh_maintenance_health)
-    top.addWidget(win.btn_update_runtimes)
     top.addWidget(win.btn_uninstall_runtimes)
     top.addStretch()
     top.addWidget(win.btn_rt_refresh)

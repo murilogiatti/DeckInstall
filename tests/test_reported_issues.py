@@ -585,7 +585,7 @@ class UiUxSimplificationTests(unittest.TestCase):
                     self.assertTrue(win.stack.widget(ui.PAGE_RUNTIMES).isAncestorOf(win.btn_update_runtimes))
                     self.assertTrue(win.stack.widget(ui.PAGE_RUNTIMES).isAncestorOf(win.btn_bulk_proton))
                     self.assertTrue(win.stack.widget(ui.PAGE_RUNTIMES).isAncestorOf(win.btn_bulk_optiscaler))
-                    self.assertTrue(win.stack.widget(3).isAncestorOf(win.btn_app_update))
+                    self.assertTrue(win.stack.widget(ui.PAGE_RUNTIMES).isAncestorOf(win.btn_updates_check))  # app + runtimes together
 
                     for always_visible in (win.chk_keep_in_place, win.add_library_combo, win.btn_add_launch_adv,
                                            win.btn_shortcut_menu, win.extract_dst_root):

@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -59,7 +60,6 @@ from PySide6.QtWidgets import (
 
 from . import __app_name__, __version__, classify, library_extras, vdf_queue
 from .app_updater import (
-    GITHUB_RELEASES_URL,
     AppUpdateInfo,
     relaunch_appimage,
 )
@@ -146,6 +146,7 @@ from .touch_scroll import install_touch_scroll
 from .ui_cards import (  # noqa: F401
     DropZoneFrame,
     FlowLayout,
+    MessageBar,
     _dialog_parent,
     _is_native_linux_game,
     _is_wine_game_running,
@@ -193,7 +194,6 @@ from .ui_maintenance import (
 )
 from .ui_runtimes import apply_runtimes_mode, build_runtimes_page
 from .ui_workers import (  # noqa: F401
-    AppUpdateCheckWorker,
     AppUpdateDownloadWorker,
     BackupWorker,
     DirStatsWorker,
@@ -374,8 +374,18 @@ class MainWindow(QMainWindow):
     lbl_maint_summary: QLabel
     btn_update_runtimes: QPushButton
     btn_uninstall_runtimes: QPushButton
-    btn_app_update: QPushButton
     library_empty_state: QWidget
+    message_bar: MessageBar
+    # Updates card (ui_updates.build_updates_card)
+    lbl_updates_status: QLabel
+    btn_updates_check: QPushButton
+    chk_updates_auto: QCheckBox
+    updates_rows: QWidget
+    updates_grid: QGridLayout
+    _update_results: dict
+    _update_checks: dict
+    _updates_checking: bool
+    _updates_cooldown: QTimer
     # Runtimes tab (ui_runtimes.py)
     btn_rt_refresh: QPushButton
     btn_rt_ge_update: QPushButton
@@ -475,6 +485,10 @@ class MainWindow(QMainWindow):
         self._apply_saved_theme()
         self._refresh_games()
         self._redetect_steam()
+        if not smoke:
+            from .ui_updates import AUTO_CHECK_DELAY_MS, auto_check_updates
+
+            QTimer.singleShot(AUTO_CHECK_DELAY_MS, self, lambda: auto_check_updates(self))
 
     def _track_worker(self, worker: QThread) -> None:
         """Keep a strong reference to running QThreads until finished to prevent Qt SIGABRT."""
@@ -641,6 +655,8 @@ class MainWindow(QMainWindow):
         for label in (tr("nav.library"), tr("nav.install"), tr("nav.runtimes"), tr("nav.saves"), tr("nav.maintenance")):
             self.nav_tabs.addTab(label)
         right_layout.addWidget(self.nav_tabs)
+        self.message_bar = MessageBar()  # inline news that needs no answer (instead of a modal box)
+        right_layout.addWidget(self.message_bar)
 
         self.stack = QStackedWidget()
         self.stack.addWidget(_wrap_scroll(self._build_extract_page()))  # PAGE_INSTALL
@@ -1085,8 +1101,17 @@ class MainWindow(QMainWindow):
             wanted.append("optiscaler")
         return tuple(c for c in wanted if not env.component_note(c))
 
-    def _update_runtimes(self, components: tuple[str, ...] | None = None) -> None:
-        """Install/update one runtime component (a Runtimes card) or everything in use ("Update all")."""
+    def _update_runtimes(
+        self,
+        components: tuple[str, ...] | None = None,
+        *,
+        on_finished: Callable[[str, bool], None] | None = None,
+    ) -> None:
+        """Install/update one runtime component (a Runtimes card) or everything in use.
+
+        With on_finished(message, ok) (the Updates card): no result box; it runs after the
+        follow-up offers (Proton/OptiScaler for the games), so the caller can go on.
+        """
         if self._steam_busy:
             return
         comps = components if components is not None else self._runtime_components_for_update_all()
@@ -1108,32 +1133,50 @@ class MainWindow(QMainWindow):
             self._refresh_shortcuts()
             if bwrap_warn:
                 self._show_bwrap_warning_dialog(bwrap_warn)
-            QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+            if on_finished is None:
+                QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+                from .ui_updates import recheck_if_shown
+
+                recheck_if_shown(self)
             updated_proton = getattr(worker, "updated_proton", "")
             updated_optiscaler = getattr(worker, "updated_optiscaler", "")
+            done = (lambda: on_finished(msg, True)) if on_finished is not None else None
             if any(isinstance(value, str) and value for value in (updated_proton, updated_optiscaler)):
                 self._offer_runtime_game_update(
                     updated_proton if isinstance(updated_proton, str) else "",
                     optiscaler=updated_optiscaler if isinstance(updated_optiscaler, str) else "",
+                    on_done=done,
                 )
+            elif done is not None:
+                done()
 
         def _err(err: str) -> None:
             self._end_busy()
             msg = tr("runtime.error", err=err)
             self.status_label.setText(msg)
-            if not self._closing_pending:
+            if self._closing_pending:
+                return
+            if on_finished is not None:
+                on_finished(msg, False)
+            else:
                 QMessageBox.critical(_dialog_parent(self), __app_name__, msg)
 
         worker.finished_ok.connect(_ok)
         worker.failed.connect(_err)
         worker.start()
 
-    def _offer_runtime_game_update(self, proton: str = "", *, optiscaler: str = "") -> None:
+    def _offer_runtime_game_update(
+        self, proton: str = "", *, optiscaler: str = "", on_done: Callable[[], None] | None = None,
+    ) -> None:
+        """Offer to move games to the new Proton/OptiScaler, then to review old versions; on_done
+        runs after the last of these (whatever the answers)."""
         def _review_old_versions() -> None:
             if proton and not self._closing_pending:
                 from .ui_maintenance import offer_maintenance_review
 
                 offer_maintenance_review(self, "runtimes")
+            if on_done is not None and not self._closing_pending:
+                on_done()
 
         def _offer_optiscaler() -> None:
             if self._closing_pending:
@@ -1156,133 +1199,48 @@ class MainWindow(QMainWindow):
         else:
             _offer_optiscaler()
 
-    def _check_and_update_app(self) -> None:
-        if self._steam_busy:
-            return
+    def _download_app_update(self, info: AppUpdateInfo, on_done: Callable[[Path | None, str], None]) -> None:
+        """Download, verify and swap in the new AppImage with a progress box; then
+        on_done(new_path, "") or on_done(None, error). The running copy keeps working until restart."""
         self._begin_busy()
-        self.status_label.setText(tr("app_update.checking"))
-        worker = AppUpdateCheckWorker()
+        prog_dlg = QProgressDialog(tr("app_update.downloading", latest=info.latest_version), "", 0, 100, self)
+        prog_dlg.setWindowTitle(__app_name__)
+        prog_dlg.setCancelButton(None)
+        prog_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        prog_dlg.setAutoClose(False)
+        prog_dlg.setAutoReset(False)
+        prog_dlg.setValue(0)
+        prog_dlg.show()
+        worker = AppUpdateDownloadWorker(info)
         self._track_worker(worker)
+        worker.progress.connect(prog_dlg.setValue)
 
-        def _on_checked(info: AppUpdateInfo) -> None:
-            if self._closing_pending:
-                self._end_busy()
-                return
-            if not info.has_update:
-                self._end_busy()
-                msg = tr("app_update.up_to_date", version=info.current_version)
-                self.status_label.setText(msg)
-                QMessageBox.information(_dialog_parent(self), __app_name__, msg)
-                return
-
-            if not info.can_self_update:
-                self._end_busy()
-                url = info.html_url or GITHUB_RELEASES_URL
-                if info.cannot_update_reason == "not_appimage":
-                    msg = tr(
-                        "app_update.manual_not_appimage",
-                        latest=info.latest_version,
-                        current=info.current_version,
-                        url=url,
-                    )
-                    QMessageBox.information(_dialog_parent(self), __app_name__, msg)
-                elif info.cannot_update_reason == "not_writable":
-                    msg = tr(
-                        "app_update.manual_not_writable",
-                        latest=info.latest_version,
-                        current=info.current_version,
-                        path=str(info.appimage_path or ""),
-                        url=url,
-                    )
-                    QMessageBox.warning(_dialog_parent(self), __app_name__, msg)
-                elif info.cannot_update_reason == "no_checksum":
-                    msg = tr("app_update.manual_no_checksum", latest=info.latest_version, url=url)
-                    QMessageBox.information(_dialog_parent(self), __app_name__, msg)
-                else:
-                    msg = tr("app_update.manual_no_asset", latest=info.latest_version, url=url)
-                    QMessageBox.information(_dialog_parent(self), __app_name__, msg)
-                self.status_label.setText(msg.splitlines()[0])
-                return
-
-            ans = QMessageBox.question(
-                _dialog_parent(self),
-                __app_name__,
-                tr(
-                    "app_update.available",
-                    latest=info.latest_version,
-                    current=info.current_version,
-                ),
-            )
-            if ans != QMessageBox.StandardButton.Yes:
-                self._end_busy()
-                return
-
-            prog_dlg = QProgressDialog(
-                tr("app_update.downloading", latest=info.latest_version),
-                "",
-                0,
-                100,
-                self,
-            )
-            prog_dlg.setWindowTitle(__app_name__)
-            prog_dlg.setCancelButton(None)
-            prog_dlg.setWindowModality(Qt.WindowModality.WindowModal)
-            prog_dlg.setAutoClose(False)
-            prog_dlg.setAutoReset(False)
-            prog_dlg.setValue(0)
-            prog_dlg.show()
-
-            dl_worker = AppUpdateDownloadWorker(info)
-            self._track_worker(dl_worker)
-            dl_worker.progress.connect(prog_dlg.setValue)
-
-            def _dl_ok(updated_path: Path) -> None:
-                self._end_busy()
-                prog_dlg.close()
-                prog_dlg.deleteLater()
-                if self._closing_pending:
-                    return
-                pending = self._vdf_queue.pending_count() if self.paths is not None else 0
-                if is_gamescope_session():
-                    msg = tr("app_update.done_gamescope", latest=info.latest_version)
-                    if pending:
-                        msg += "\n\n" + tr("app_update.pending_kept", count=pending)
-                    self.status_label.setText(msg.splitlines()[0])
-                    QMessageBox.information(_dialog_parent(self), __app_name__, msg)
-                elif pending:
-                    self._ask_update_with_pending_edits(pending, updated_path)
-                else:
-                    relaunch = QMessageBox.question(
-                        _dialog_parent(self),
-                        __app_name__,
-                        tr("app_update.done_relaunch", latest=info.latest_version),
-                    )
-                    if relaunch == QMessageBox.StandardButton.Yes:
-                        self._restart_updated_appimage(updated_path)
-
-            def _dl_err(err: str) -> None:
-                self._end_busy()
-                prog_dlg.close()
-                prog_dlg.deleteLater()
-                msg = tr("app_update.error", err=err)
-                self.status_label.setText(msg)
-                if not self._closing_pending:
-                    QMessageBox.critical(_dialog_parent(self), __app_name__, msg)
-
-            dl_worker.finished_ok.connect(_dl_ok)
-            dl_worker.failed.connect(_dl_err)
-            dl_worker.start()
-
-        def _on_err(err: str) -> None:
+        def _finish(path: Path | None, err: str) -> None:
             self._end_busy()
-            msg = tr("app_update.error", err=err)
-            self.status_label.setText(msg)
+            prog_dlg.close()
+            prog_dlg.deleteLater()
             if not self._closing_pending:
-                QMessageBox.critical(_dialog_parent(self), __app_name__, msg)
+                on_done(path, err)
 
-        worker.checked.connect(_on_checked)
-        worker.failed.connect(_on_err)
+        worker.finished_ok.connect(lambda path: _finish(path, ""))
+        worker.failed.connect(lambda err: _finish(None, err))
         worker.start()
+
+    def _after_app_update(self, info: AppUpdateInfo, updated_path: Path, summary: str) -> None:
+        """The new AppImage is in place: offer the restart (Gaming Mode: reopen from Steam)."""
+        pending = self._vdf_queue.pending_count() if self.paths is not None else 0
+        if is_gamescope_session():
+            msg = tr("app_update.done_gamescope", latest=info.latest_version)
+            if pending:
+                msg += "\n\n" + tr("app_update.pending_kept", count=pending)
+            self.status_label.setText(msg.splitlines()[0])
+            QMessageBox.information(_dialog_parent(self), __app_name__, f"{summary}\n\n{msg}".strip())
+        elif pending:
+            self._ask_update_with_pending_edits(pending, updated_path, summary=summary)
+        else:
+            text = f"{summary}\n\n{tr('app_update.done_relaunch', latest=info.latest_version)}".strip()
+            if QMessageBox.question(_dialog_parent(self), __app_name__, text) == QMessageBox.StandardButton.Yes:
+                self._restart_updated_appimage(updated_path)
 
     def _probe_install_source(self, inspect: Callable[[], object], ready: Callable[[object], None]) -> None:
         self._install_probe += 1
@@ -2754,12 +2712,12 @@ class MainWindow(QMainWindow):
         self._skip_vdf_close_prompt = True
         self.close()
 
-    def _ask_update_with_pending_edits(self, pending: int, updated_path: Path) -> None:
+    def _ask_update_with_pending_edits(self, pending: int, updated_path: Path, *, summary: str = "") -> None:
         """Before restarting into the new version, offer to send the queued edits to Steam."""
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Icon.Question)
         box.setWindowTitle(__app_name__)
-        box.setText(tr("app_update.pending_prompt", count=pending))
+        box.setText(f"{summary}\n\n{tr('app_update.pending_prompt', count=pending)}".strip())
         btn_apply = box.addButton(tr("app_update.btn_apply_update"), QMessageBox.ButtonRole.AcceptRole)
         btn_update = box.addButton(tr("app_update.btn_update_only"), QMessageBox.ButtonRole.DestructiveRole)
         box.addButton(QMessageBox.StandardButton.Cancel)
@@ -3382,13 +3340,16 @@ class MainWindow(QMainWindow):
         for name in (
             "btn_extract",
             "btn_migrate_legacy",
-            "btn_update_runtimes",
             "btn_uninstall_runtimes",
-            "btn_app_update",
         ):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.setEnabled(enabled)
+        if hasattr(self, "_update_checks"):  # its buttons also depend on the selection and the check
+            from .ui_updates import _sync_apply_button, _sync_check_button
+
+            _sync_apply_button(self)
+            _sync_check_button(self)
         can_vdf = enabled and bool(self.paths) and not self._vdf_corrupt
         for name in ("btn_vdf_apply", "btn_vdf_clear"):
             widget = getattr(self, name, None)

@@ -13,6 +13,7 @@ from PySide6.QtCore import (
     QSettings,
     QSize,
     Qt,
+    QTimer,
     Signal,
 )
 from PySide6.QtGui import (
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFrame,
+    QHBoxLayout,
     QLabel,
     QLayout,
     QPlainTextEdit,
@@ -430,6 +432,91 @@ class FlowLayout(QLayout):
             x = next_x
             line_height = max(line_height, hint.height())
         return y + line_height - rect.y() + m.bottom()
+
+
+_MESSAGE_ICONS = {"info": "ℹ", "success": "✓", "warning": "⚠", "error": "✕"}  # never color alone
+
+
+class MessageBar(QFrame):
+    """Inline message (KDE HIG "inline message"): info, success, warning or error, with optional
+    action buttons and a close button. Used instead of a modal box for news that needs no answer."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("MessageBar")
+        self.setProperty("level", "info")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(12, 8, 8, 8)
+        row.setSpacing(10)
+        self._icon = QLabel()
+        self._text = QLabel()
+        self._text.setWordWrap(True)
+        self._text.setTextFormat(Qt.TextFormat.PlainText)
+        self._actions = QHBoxLayout()
+        self._actions.setSpacing(8)
+        self._close = QPushButton("✕")
+        self._close.setAccessibleName("Close")
+        self._close.setFixedWidth(40)
+        self._close.clicked.connect(self.dismiss)
+        self._icon.setStyleSheet("font-size: 16px; font-weight: 700;")
+        row.addWidget(self._icon, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(self._text, 1)
+        row.addLayout(self._actions)
+        row.addWidget(self._close, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.dismiss)
+        self.key = ""  # who posted the message (e.g. "updates"), to replace or clear only its own
+        self.setVisible(False)
+
+    def show_message(
+        self,
+        text: str,
+        level: str = "info",
+        *,
+        actions: tuple[tuple[str, Callable[[], None]], ...] = (),
+        key: str = "",
+        timeout_ms: int = 0,
+    ) -> None:
+        """Show text; each action button also closes the bar. timeout_ms > 0 hides it later."""
+        self.key = key
+        self.setProperty("level", level)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        for child in self.findChildren(QLabel):
+            child.style().unpolish(child)
+            child.style().polish(child)
+        self._icon.setText(_MESSAGE_ICONS.get(level, "ℹ"))
+        self._text.setText(text)
+        while self._actions.count():
+            item = self._actions.takeAt(0)
+            if item is not None and (w := item.widget()) is not None:
+                w.deleteLater()
+        for label, callback in actions:
+            btn = QPushButton(label)
+            btn.clicked.connect(lambda _=False, cb=callback: self._run_action(cb))
+            self._actions.addWidget(btn)
+        self._timer.stop()
+        if timeout_ms > 0:
+            self._timer.start(timeout_ms)
+        self.setVisible(True)
+
+    def _run_action(self, callback: Callable[[], None]) -> None:
+        self.dismiss()
+        callback()
+
+    def text(self) -> str:
+        return self._text.text()
+
+    def level(self) -> str:
+        return str(self.property("level"))
+
+    def dismiss(self, key: str = "") -> None:
+        """Hide the bar; with key, only when the shown message is that key's."""
+        if key and key != self.key:
+            return
+        self._timer.stop()
+        self.setVisible(False)
 
 
 def _make_card() -> tuple[QFrame, QVBoxLayout]:

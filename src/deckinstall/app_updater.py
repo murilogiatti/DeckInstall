@@ -14,6 +14,7 @@ import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import requests
 
@@ -201,21 +202,32 @@ def _release_checksum(assets: list[dict], name: str, headers: dict[str, str], ti
         return ""
 
 
-def check_app_update(timeout: float = 10.0) -> AppUpdateInfo:
-    """Query GitHub Releases for a newer DeckInstall AppImage release."""
+def check_app_update(
+    timeout: float = 10.0, fetch_json: Callable[[str], Any] | None = None,
+) -> AppUpdateInfo:
+    """Query GitHub Releases for a newer DeckInstall AppImage release.
+
+    fetch_json(url): optional fetcher for the release JSON (the Updates card passes the runtime
+    one, which sends the cached ETag and falls back to the cached answer when offline/limited).
+    """
     current_version = __version__
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": f"DeckInstall/{current_version}",
     }
     api_url = _validate_github_url(GITHUB_RELEASES_API)
-    response = _request_github_with_validated_redirects(api_url, headers=headers, timeout=timeout)
-    try:
-        response.raise_for_status()
-        data = response.json()
-    finally:
-        if hasattr(response, "close"):
-            response.close()
+    if fetch_json is not None:
+        data = fetch_json(api_url)
+        if not isinstance(data, dict):
+            raise RuntimeError("Unexpected GitHub release response for DeckInstall.")
+    else:
+        response = _request_github_with_validated_redirects(api_url, headers=headers, timeout=timeout)
+        try:
+            response.raise_for_status()
+            data = response.json()
+        finally:
+            if hasattr(response, "close"):
+                response.close()
 
     tag_name = str(data.get("tag_name") or "").strip()
     latest_version = tag_name.lstrip("vV")

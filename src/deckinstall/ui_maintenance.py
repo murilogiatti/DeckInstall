@@ -94,9 +94,15 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     hint.setWordWrap(True)
     health_layout.addWidget(hint)
     health_actions = FlowLayout(spacing=8)
-    win.btn_app_update = QPushButton(tr("app_update.btn"))
-    win.btn_app_update.clicked.connect(win._check_and_update_app)
-    health_actions.addWidget(win.btn_app_update)
+    btn_updates = QPushButton(tr("updates.btn_open"))  # one place for app + runtime updates
+
+    def _open_updates() -> None:
+        from .ui import PAGE_RUNTIMES
+
+        win._show_page(PAGE_RUNTIMES)
+
+    btn_updates.clicked.connect(_open_updates)
+    health_actions.addWidget(btn_updates)
     health_layout.addLayout(health_actions)
     layout.addWidget(health_card)
 

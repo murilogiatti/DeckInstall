@@ -202,6 +202,15 @@ QFrame#VdfQueueBanner {
     background-color: $info_bg; border: 1px solid $info_fg; border-radius: 6px; padding: 6px;
 }
 QLabel#VdfQueueText { color: $info_fg; }
+QFrame#MessageBar { border-radius: 8px; border: 1px solid $info_fg; background-color: $info_bg; }
+QFrame#MessageBar QLabel { background: transparent; border: none; color: $info_fg; }
+QFrame#MessageBar[level="success"] { border-color: $good_fg; background-color: $good_bg; }
+QFrame#MessageBar[level="success"] QLabel { color: $good_fg; }
+QFrame#MessageBar[level="warning"] { border-color: $warning_fg; background-color: $warning_bg; }
+QFrame#MessageBar[level="warning"] QLabel { color: $warning_fg; }
+QFrame#MessageBar[level="error"] { border-color: $error_fg; background-color: $error_bg; }
+QFrame#MessageBar[level="error"] QLabel { color: $error_fg; }
+QLabel#UpdateBadge { color: $info_fg; font-weight: 600; }
 """)
 
 _DARK_TOKENS: dict[str, str] = {
@@ -246,6 +255,7 @@ _DARK_TOKENS: dict[str, str] = {
     "info_fg": "#90caf9",
     "info_bg": "#1b2b3d",
     "good_fg": "#a5d6a7",
+    "good_bg": "#1b2e22",
     "bg_alt": "#181c26",
     "highlight_bg": "#1d6fa5",
     "highlight_fg": "#ffffff",
@@ -295,6 +305,7 @@ _LIGHT_TOKENS: dict[str, str] = {
     "info_fg": "#155885",
     "info_bg": "#eaf5ff",
     "good_fg": "#27602b",
+    "good_bg": "#ecf7ec",
     "bg_alt": "#e9eef6",
     "highlight_bg": "#1d6fa5",
     "highlight_fg": "#ffffff",
