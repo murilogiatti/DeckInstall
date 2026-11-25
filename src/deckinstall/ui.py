@@ -360,13 +360,11 @@ class MainWindow(QMainWindow):
     _maint_filter_group: QButtonGroup
     maint_list: QTableWidget
     btn_migrate_legacy: QPushButton
-    btn_maint_refresh_health: QPushButton
     btn_maint_scan: QPushButton
     btn_maint_revalidate: QPushButton
     btn_maint_toggle_filter: QPushButton
     btn_maint_clean_safe: QPushButton
     btn_maint_delete_selected: QPushButton
-    lbl_maint_app: QLabel
     lbl_maint_umu: QLabel
     lbl_maint_proton: QLabel
     lbl_maint_steamrt4: QLabel

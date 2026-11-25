@@ -21,8 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import __app_name__, __version__
-from .app_updater import get_running_appimage
+from . import __app_name__
 from .cleanup import GROUP_ORDER, CleanupCandidate
 from .i18n import tr
 from .ui_cards import (
@@ -73,39 +72,6 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     layout.addWidget(title)
     layout.addWidget(sub)
 
-    health_card, health_layout = _make_card()
-    health_top = QHBoxLayout()
-    health_lbl = QLabel(tr("maint.health_title"))
-    health_lbl.setObjectName("SectionTitle")
-    win.btn_maint_refresh_health = QPushButton(tr("maint.btn_refresh_health"))
-    win.btn_maint_refresh_health.clicked.connect(lambda: refresh_maintenance_health(win))
-    health_top.addWidget(health_lbl)
-    health_top.addStretch()
-    health_top.addWidget(win.btn_maint_refresh_health)
-    health_layout.addLayout(health_top)
-
-    win.lbl_maint_app = QLabel()
-    win.lbl_maint_disk = QLabel()
-    for lbl in (win.lbl_maint_app, win.lbl_maint_disk):
-        lbl.setWordWrap(True)
-        health_layout.addWidget(lbl)
-    hint = QLabel(tr("maint.runtimes_moved"))
-    hint.setObjectName("MutedText")
-    hint.setWordWrap(True)
-    health_layout.addWidget(hint)
-    health_actions = FlowLayout(spacing=8)
-    btn_updates = QPushButton(tr("updates.btn_open"))  # one place for app + runtime updates
-
-    def _open_updates() -> None:
-        from .ui import PAGE_RUNTIMES
-
-        win._show_page(PAGE_RUNTIMES)
-
-    btn_updates.clicked.connect(_open_updates)
-    health_actions.addWidget(btn_updates)
-    health_layout.addLayout(health_actions)
-    layout.addWidget(health_card)
-
     clean_card, clean_layout = _make_card()
     clean_top = QHBoxLayout()
     clean_lbl = QLabel(tr("maint.cleanup_title"))
@@ -120,6 +86,11 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     clean_top.addWidget(win.btn_maint_scan)
     clean_top.addWidget(win.btn_maint_revalidate)
     clean_layout.addLayout(clean_top)
+    win.lbl_maint_disk = QLabel()  # where the space goes, filled by the runtime health check
+    win.lbl_maint_disk.setObjectName("MutedText")
+    win.lbl_maint_disk.setWordWrap(True)
+    win.lbl_maint_disk.setVisible(False)
+    clean_layout.addWidget(win.lbl_maint_disk)
 
     pills_flow = FlowLayout(spacing=6)
     win._maint_filter_group = QButtonGroup(win)
@@ -195,15 +166,7 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
 
 
 def refresh_maintenance_health(win: MainWindow) -> None:
-    """Refresh app mode, runtime health, and disk usage labels asynchronously."""
-    mode = (
-        tr("maint.mode_appimage")
-        if get_running_appimage() is not None
-        else tr("maint.mode_python")
-    )
-    win.lbl_maint_app.setText(
-        tr("maint.health_app", app=__app_name__, version=__version__, mode=mode)
-    )
+    """Refresh the runtime health (Runtimes tab) and the disk usage line asynchronously."""
     win._maint_health_req_id += 1
     req_id = win._maint_health_req_id
     paths_snapshot = win.paths
@@ -226,9 +189,9 @@ def refresh_maintenance_health(win: MainWindow) -> None:
                 "maint.health_disk",
                 prefixes=format_size_bytes(data["prefixes_bytes"]),
                 runtimes=format_size_bytes(data["runtimes_bytes"]),
-                caches=format_size_bytes(data["caches_bytes"]),
             )
         )
+        win.lbl_maint_disk.setVisible(True)
 
     ui_mod = sys.modules.get("deckinstall.ui")
     find_steam_fn = getattr(ui_mod, "find_steam_root", None) if ui_mod is not None else None
