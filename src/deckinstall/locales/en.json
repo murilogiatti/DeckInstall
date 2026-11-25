@@ -1051,5 +1051,6 @@
   "settings.scale_100": "100%",
   "settings.scale_125": "125% (handheld, TV)",
   "settings.scale_tip": "Bigger text and buttons, easier to read and touch on the Steam Deck. Takes effect when DeckInstall opens again.",
-  "settings.scale_restart": "The new interface size takes effect the next time DeckInstall opens."
+  "settings.scale_restart": "The new interface size takes effect the next time DeckInstall opens.",
+  "status.busy": "Working…"
 }

@@ -377,6 +377,7 @@ class MainWindow(QMainWindow):
     library_empty_state: QWidget
     message_bar: MessageBar
     scale_combo: QComboBox
+    busy_bar: QProgressBar
     # Updates card (ui_updates.build_updates_card)
     lbl_updates_status: QLabel
     btn_updates_check: QPushButton
@@ -490,6 +491,24 @@ class MainWindow(QMainWindow):
             from .ui_updates import AUTO_CHECK_DELAY_MS, auto_check_updates
 
             QTimer.singleShot(AUTO_CHECK_DELAY_MS, self, lambda: auto_check_updates(self))
+
+    _NOTIFY_SUCCESS_MS = 15000  # successes fade; info, warnings and errors stay until closed
+
+    def notify(self, text: str, level: str = "success") -> None:
+        """News that needs no answer: the message bar, not a modal box (KDE HIG inline message).
+
+        When one of our dialogs is open on top, the bar would be hidden behind it, so the
+        message goes in a box over that dialog instead.
+        """
+        if self._closing_pending or not text:
+            return
+        parent = _dialog_parent(self)
+        if parent is not self:
+            box = QMessageBox.warning if level in ("warning", "error") else QMessageBox.information
+            box(parent, __app_name__, text)
+            return
+        timeout = self._NOTIFY_SUCCESS_MS if level == "success" else 0
+        self.message_bar.show_message(text, level, key="notify", timeout_ms=timeout)
 
     def _track_worker(self, worker: QThread) -> None:
         """Keep a strong reference to running QThreads until finished to prevent Qt SIGABRT."""
@@ -675,7 +694,17 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel(tr("status.ready"))
         self.status_label.setObjectName("MutedText")
         self.status_label.setWordWrap(True)
-        right_layout.addWidget(self.status_label)
+        self.busy_bar = QProgressBar()  # moving bar while any background operation runs
+        self.busy_bar.setRange(0, 0)
+        self.busy_bar.setTextVisible(False)
+        self.busy_bar.setFixedSize(96, 8)
+        self.busy_bar.setAccessibleName(tr("status.busy"))
+        self.busy_bar.setVisible(False)
+        status_row = QHBoxLayout()
+        status_row.setSpacing(10)
+        status_row.addWidget(self.busy_bar, 0, Qt.AlignmentFlag.AlignVCenter)
+        status_row.addWidget(self.status_label, 1)
+        right_layout.addLayout(status_row)
 
         shell.addWidget(right)
         self.setCentralWidget(central)
@@ -1019,11 +1048,7 @@ class MainWindow(QMainWindow):
     def _on_language_changed(self) -> None:
         code = str(self.lang_combo.currentData() or "auto")
         self.settings.setValue("language", code)
-        QMessageBox.information(
-            _dialog_parent(self),
-            __app_name__,
-            tr("lang.changed", name=self.lang_combo.currentText()),
-        )
+        self.notify(tr("lang.changed", name=self.lang_combo.currentText()), "info")
 
     def _show_about_dialog(self) -> None:
         QMessageBox.about(
@@ -1072,7 +1097,7 @@ class MainWindow(QMainWindow):
                 if self._closing_pending:
                     return
                 if ok:
-                    QMessageBox.information(_dialog_parent(self), __app_name__, tr("runtime.bwrap_fix_done"))
+                    self.notify(tr("runtime.bwrap_fix_done"), "success")
                 else:
                     QMessageBox.warning(_dialog_parent(self), __app_name__, tr("runtime.bwrap_fix_error", err=out))
 
@@ -1135,7 +1160,7 @@ class MainWindow(QMainWindow):
             if bwrap_warn:
                 self._show_bwrap_warning_dialog(bwrap_warn)
             if on_finished is None:
-                QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+                self.notify(msg, "success")
                 from .ui_updates import recheck_if_shown
 
                 recheck_if_shown(self)
@@ -1277,7 +1302,7 @@ class MainWindow(QMainWindow):
                 self.btn_use_extracted.setEnabled(False)
                 msg = tr("install.archive_extract_first")
                 self.status_label.setText(msg)
-                QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+                self.notify(msg, "info")
                 return
             if info.needs_install and info.installer is not None:
                 self.extract_src.setText(str(info.installer))
@@ -1981,7 +2006,7 @@ class MainWindow(QMainWindow):
                     return
                 if bwrap_warn:
                     self._show_bwrap_warning_dialog(bwrap_warn)
-                QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+                self.notify(msg, "success")
                 if steam_target is not None:
                     self._add_installed_shortcuts_to_steam(
                         steam_target, [game], restart_steam=restart_steam,
@@ -2257,7 +2282,7 @@ class MainWindow(QMainWindow):
                 text = tr("migrate.nothing")
                 if skipped_text:
                     text += "\n\n" + tr("migrate.skipped", items=skipped_text)
-                QMessageBox.information(_dialog_parent(self), __app_name__, text)
+                self.notify(text, "info")
             return
         names = "\n".join(f"• {i.game.name}" for i in todo)
         text = tr("migrate.confirm", count=len(todo), dest=str(internal_library_root()), names=names)
@@ -2793,7 +2818,7 @@ class MainWindow(QMainWindow):
                     if on_done is not None:
                         on_done(True)
                     elif not self._closing_pending:
-                        QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+                        self.notify(msg, "success")
 
             def _err(err: str) -> None:
                 self._vdf_applying = False
@@ -2854,7 +2879,7 @@ class MainWindow(QMainWindow):
             msg = tr("vdf_queue.enqueued", name=ext.name)
             self.status_label.setText(msg)
             if not self._closing_pending:
-                QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+                self.notify(msg, "info")
             return
 
         def _proceed() -> None:
@@ -2876,7 +2901,7 @@ class MainWindow(QMainWindow):
                 msg = tr("library.ext_added_steam", name=ext.name)
                 self.status_label.setText(msg)
                 if not self._closing_pending:
-                    QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+                    self.notify(msg, "success")
 
             def _err(err: str) -> None:
                 self._end_busy()
@@ -2897,7 +2922,7 @@ class MainWindow(QMainWindow):
             return
         ext = sel[1]
         if ext.prefix_dir is None or not ext.prefix_dir.is_dir():
-            QMessageBox.information(_dialog_parent(self), __app_name__, tr("library.ext_no_prefix"))
+            self.notify(tr("library.ext_no_prefix"), "info")
             return
 
         targets: list[tuple[str, Path]] = []
@@ -2909,7 +2934,7 @@ class MainWindow(QMainWindow):
                 targets.append((f"{tr('library.tag_standalone')} {sg.name}", sg.prefix_dir))
 
         if not targets:
-            QMessageBox.information(_dialog_parent(self), __app_name__, tr("library.ext_no_import_targets"))
+            self.notify(tr("library.ext_no_import_targets"), "info")
             return
 
         labels = [t[0] for t in targets]
@@ -2938,7 +2963,7 @@ class MainWindow(QMainWindow):
             msg = tr("library.ext_saves_imported", count=copied, target=target_label)
             self.status_label.setText(msg)
             if not self._closing_pending:
-                QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+                self.notify(msg, "success")
 
         def _err(err: str) -> None:
             self._end_busy()
@@ -3264,7 +3289,7 @@ class MainWindow(QMainWindow):
                 obj.proton_name = msg_or_fallback
                 fb_msg = tr("play.proton_fallback", name=obj.name, proton=msg_or_fallback)
                 self.status_label.setText(fb_msg)
-                QMessageBox.information(_dialog_parent(self), __app_name__, fb_msg)
+                self.notify(fb_msg, "warning")
             # DeckInstall games log every run from their own launch.sh (any launcher).
             standalone = isinstance(obj, StandaloneGame)
             log_file = None if standalone else get_game_log_path(title_name)
@@ -3314,6 +3339,7 @@ class MainWindow(QMainWindow):
 
     def _apply_busy_state(self) -> None:
         enabled = self._busy_count == 0
+        self.busy_bar.setVisible(not enabled)
         for w in (
             self.btn_redetect_steam,
             self.btn_reload,
@@ -3482,7 +3508,7 @@ class MainWindow(QMainWindow):
                 msg = tr("backup.done", files=files, games=games, path=zpath)
             self._refresh_saves_list()
             self.status_label.setText(msg.splitlines()[0])
-            QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+            self.notify(msg, "success")
 
         def _err(err: str) -> None:
             self._end_busy()
@@ -3536,7 +3562,7 @@ class MainWindow(QMainWindow):
                 if worker.verified_for_cleanup:
                     self._offer_imported_backup_cleanup(zpath)
                 else:
-                    QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+                    self.notify(msg, "success")
 
         def _on_restore_err(err: str) -> None:
             self._end_busy()

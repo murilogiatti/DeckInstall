@@ -163,3 +163,63 @@ def test_scale_combo_saves_and_says_it_needs_a_restart() -> None:
             assert not win.message_bar.isHidden()
         finally:
             _close(app, win)
+
+
+def test_notify_uses_the_bar_and_a_box_only_over_our_open_dialog() -> None:
+    from PySide6.QtWidgets import QDialog
+
+    app = _app()
+    with tempfile.TemporaryDirectory() as tmp:
+        win = _window(app, tmp)
+        try:
+            with mock.patch.object(ui.QMessageBox, "information") as box:
+                win.notify("Backup done", "success")
+                box.assert_not_called()
+            assert win.message_bar.text() == "Backup done" and win.message_bar.level() == "success"
+            assert win.message_bar._timer.isActive()  # successes fade
+            win.notify("Proton fallback", "warning")
+            assert not win.message_bar._timer.isActive()  # warnings stay until closed
+            dlg = QDialog(win)
+            dlg.setModal(True)
+            dlg.show()
+            app.processEvents()
+            with (
+                mock.patch.object(ui, "_dialog_parent", return_value=dlg),
+                mock.patch.object(ui.QMessageBox, "information") as box,
+            ):
+                win.notify("Saved", "success")
+                assert box.call_args.args[0] is dlg  # never hidden behind our own dialog
+            dlg.close()
+        finally:
+            _close(app, win)
+
+
+def test_message_bar_actions_and_keys() -> None:
+    from deckinstall.ui_cards import MessageBar
+
+    _app()
+    bar = MessageBar()
+    hits: list[str] = []
+    bar.show_message("Update ready", "info", actions=(("Open", lambda: hits.append("open")),), key="updates")
+    bar.dismiss("other")
+    assert not bar.isHidden()  # only its owner (or anyone without a key) clears it
+    btn = [b for b in bar.findChildren(ui.QPushButton) if b.text() == "Open"][0]
+    btn.click()
+    assert hits == ["open"] and bar.isHidden()
+
+
+def test_busy_bar_shows_while_an_operation_runs() -> None:
+    app = _app()
+    with tempfile.TemporaryDirectory() as tmp:
+        win = _window(app, tmp)
+        try:
+            assert win.busy_bar.isHidden()
+            win._begin_busy()
+            win._begin_busy()
+            assert not win.busy_bar.isHidden()
+            win._end_busy()
+            assert not win.busy_bar.isHidden()  # one operation still running
+            win._end_busy()
+            assert win.busy_bar.isHidden()
+        finally:
+            _close(app, win)

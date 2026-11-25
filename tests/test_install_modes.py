@@ -155,8 +155,8 @@ def test_card_remove_lists_only_its_component(tmp_path: Path) -> None:
             mock.patch.object(ui_maintenance.QMessageBox, "information") as info,
         ):
             ui_maintenance.open_uninstall_runtimes_dialog(win, kinds={"ge"})
-        info.assert_called_once()  # nothing of that kind: "nothing to remove", no dialog
-        assert info.call_args.args[2] == tr("runtime.uninstall_none")
+        info.assert_not_called()  # nothing of that kind: "nothing to remove" in the bar, no box
+        assert win.message_bar.text() == tr("runtime.uninstall_none") and not win.message_bar.isHidden()
     finally:
         _drain(win, app)
         win.close()

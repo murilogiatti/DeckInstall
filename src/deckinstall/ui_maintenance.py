@@ -467,7 +467,7 @@ def maint_clean_safe(win: MainWindow) -> None:
     safe_items = [c for c in _visible_maint_candidates(win) if _cleanup_candidate_auto_check(c)]
     safe_size = format_size_bytes(sum(c.size_bytes for c in safe_items))
     if not safe_items:
-        QMessageBox.information(_dialog_parent(win), __app_name__, tr("maint.safe_clean_empty"))
+        win.notify(tr("maint.safe_clean_empty"), "info")
         return
     ans = QMessageBox.question(
         _dialog_parent(win),
@@ -565,7 +565,7 @@ def _run_maint_delete(
         if errs:
             QMessageBox.warning(_dialog_parent(win), __app_name__, msg)
         else:
-            QMessageBox.information(_dialog_parent(win), __app_name__, msg)
+            win.notify(msg, "success")
 
     def _on_failed(err: str) -> None:
         win._end_busy()
@@ -626,13 +626,9 @@ def show_maint_context_menu(win: MainWindow, pos: QPoint) -> None:
             if files_backed > 0:
                 if hasattr(win, "_refresh_saves_list"):
                     win._refresh_saves_list()
-                QMessageBox.information(
-                    _dialog_parent(win),
-                    __app_name__,
-                    tr("maint.backup_done", path=zip_str, files=files_backed),
-                )
+                win.notify(tr("maint.backup_done", path=zip_str, files=files_backed), "success")
             else:
-                QMessageBox.information(_dialog_parent(win), __app_name__, tr("maint.backup_empty"))
+                win.notify(tr("maint.backup_empty"), "info")
 
         def _on_backup_failed(err: str) -> None:
             win._end_busy()
@@ -677,7 +673,7 @@ def open_uninstall_runtimes_dialog(win: MainWindow, kinds: set[str] | None = Non
         if win._closing_pending:
             return
         if not items:
-            QMessageBox.information(_dialog_parent(win), __app_name__, tr("runtime.uninstall_none"))
+            win.notify(tr("runtime.uninstall_none"), "info")
             return
         op_state = {"busy": False}
         dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: op_state["busy"])
@@ -835,13 +831,9 @@ def open_uninstall_runtimes_dialog(win: MainWindow, kinds: set[str] | None = Non
                             win._end_busy()
                             win._refresh_shortcuts()
                             if not win._closing_pending:
-                                QMessageBox.information(
-                                    _dialog_parent(win),
-                                    __app_name__,
-                                    tr(
-                                        "runtime.uninstall_steam_cleaned",
-                                        count=cnt if isinstance(cnt, int) else 0,
-                                    ),
+                                win.notify(
+                                    tr("runtime.uninstall_steam_cleaned", count=cnt if isinstance(cnt, int) else 0),
+                                    "success",
                                 )
 
                         def _clean_err(cerr: str) -> None:

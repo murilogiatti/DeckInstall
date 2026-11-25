@@ -91,7 +91,7 @@ def offer_steam_sandbox_access(win: MainWindow, steam_root: Path, folders: list[
         if win._closing_pending:
             return
         if ok:
-            QMessageBox.information(_dialog_parent(win), __app_name__, tr("steam_sandbox.granted"))
+            win.notify(tr("steam_sandbox.granted"), "success")
         else:
             QMessageBox.warning(_dialog_parent(win), __app_name__, tr("steam_sandbox.failed", err=out))
 

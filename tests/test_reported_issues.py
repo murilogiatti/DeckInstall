@@ -616,7 +616,8 @@ class UiUxSimplificationTests(unittest.TestCase):
                         for worker in list(win._active_workers):
                             self.assertTrue(worker.wait(5000))
                         app.processEvents()
-                    info_box.assert_called_once()
+                    info_box.assert_not_called()  # "extract it first" goes to the message bar
+                    self.assertEqual(win.message_bar.text(), ui.tr("install.archive_extract_first"))
                     self.assertEqual(win.extract_src.text(), "")
                     self.assertTrue(win.extract_details_box.isHidden())
 

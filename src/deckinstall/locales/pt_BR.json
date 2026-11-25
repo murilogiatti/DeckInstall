@@ -1051,5 +1051,6 @@
   "settings.scale_100": "100%",
   "settings.scale_125": "125% (portátil, TV)",
   "settings.scale_tip": "Texto e botões maiores, mais fáceis de ler e tocar no Steam Deck. Vale ao abrir o DeckInstall de novo.",
-  "settings.scale_restart": "O novo tamanho da interface vale na próxima vez que o DeckInstall abrir."
+  "settings.scale_restart": "O novo tamanho da interface vale na próxima vez que o DeckInstall abrir.",
+  "status.busy": "Trabalhando…"
 }
