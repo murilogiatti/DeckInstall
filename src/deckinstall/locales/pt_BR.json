@@ -256,7 +256,7 @@
   "maint.page_subtitle": "Veja se os runtimes estão em dia e limpe com segurança prefixos sem uso, caches e versões antigas do Proton.",
   "maint.health_title": "Saúde do sistema e espaço",
   "maint.cleanup_title": "O que dá para limpar",
-  "maint.btn_refresh_health": "Atualizar",
+  "maint.btn_refresh_health": "Recarregar",
   "maint.btn_scan": "Procurar agora",
   "maint.btn_clean_safe": "Limpeza segura ({size})",
   "maint.btn_delete_selected": "Apagar selecionados ({size})",
@@ -381,7 +381,7 @@
   "proton_mgr.column_usage": "Uso",
   "proton_mgr.column_file": "Arquivo",
   "proton_mgr.installed_label": "Ferramentas de compatibilidade instaladas (compatibilitytools.d):",
-  "proton_mgr.btn_refresh_installed": "Atualizar",
+  "proton_mgr.btn_refresh_installed": "Recarregar",
   "proton_mgr.btn_remove": "Remover selecionado",
   "proton_mgr.download_label": "Baixar e instalar nova versão do Proton:",
   "proton_mgr.btn_fetch": "Buscar versões",
@@ -412,7 +412,7 @@
   "save_sync.plan_label": "Situação dos saves:",
   "save_sync.table_action": "Ação",
   "save_sync.table_reason": "Situação",
-  "save_sync.btn_refresh": "Atualizar",
+  "save_sync.btn_refresh": "Recarregar",
   "save_sync.btn_sync_now": "Sincronizar agora",
   "save_sync.no_games": "Nenhum jogo com prefixo Wine/Proton encontrado.",
   "save_sync.pick_folder": "Escolher a pasta de sincronização",
@@ -1024,5 +1024,9 @@
   "hooks.intro": "Comandos de terminal opcionais que o lançador do jogo roda (modo Autônomo): um antes de o jogo abrir e outro depois que ele fecha. Rodam na pasta do jogo, com o ambiente dele; a saída vai para o log de execução do jogo.",
   "hooks.before": "Antes:",
   "hooks.after": "Depois:",
-  "hooks.saved": "Comandos salvos para {name}."
+  "hooks.saved": "Comandos salvos para {name}.",
+  "runtimes.loading": "Verificando…",
+  "library.empty_title": "Nenhum jogo ainda",
+  "library.empty_body": "Instale um jogo a partir de uma pasta ou arquivo compactado, ou adote jogos que já estão neste computador.",
+  "library.empty_install": "Instalar jogo"
 }

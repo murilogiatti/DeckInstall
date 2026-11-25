@@ -350,6 +350,44 @@ def build_add_page(win: MainWindow) -> QWidget:
     return page
 
 
+def _page_install() -> int:
+    from .ui import PAGE_INSTALL  # ui imports this module
+
+    return PAGE_INSTALL
+
+
+def _build_library_empty_state(win: MainWindow) -> QWidget:
+    """Shown instead of the table when the library has no game at all (not when a filter hides them)."""
+    box = QWidget()
+    box.setObjectName("LibraryEmptyState")
+    lay = QVBoxLayout(box)
+    lay.addStretch(1)
+    title = QLabel(tr("library.empty_title"))
+    title.setObjectName("SectionTitle")
+    title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    body = QLabel(tr("library.empty_body"))
+    body.setObjectName("MutedText")
+    body.setWordWrap(True)
+    body.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    row = QHBoxLayout()
+    row.addStretch(1)
+    install = QPushButton(tr("library.empty_install"))
+    install.setObjectName("primaryBtn")
+    install.clicked.connect(lambda: win._show_page(_page_install()))
+    adopt = QPushButton(tr("adopt.btn_open"))
+    adopt.clicked.connect(win._open_adopt_wizard)
+    row.addWidget(install)
+    row.addWidget(adopt)
+    row.addStretch(1)
+    for w in (title, body):
+        lay.addWidget(w)
+    lay.addLayout(row)
+    lay.addStretch(1)
+    box.setVisible(False)
+    win.library_empty_state = box
+    return box
+
+
 def build_library_page(win: MainWindow) -> QWidget:
     page = QWidget()
     layout = QVBoxLayout(page)
@@ -497,6 +535,7 @@ def build_library_page(win: MainWindow) -> QWidget:
     del_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
     del_shortcut.activated.connect(win._remove_selected_shortcut)
     lib_layout.addWidget(win.shortcuts_list, 1)
+    lib_layout.addWidget(_build_library_empty_state(win), 1)
 
     win.btn_play_game = QPushButton(tr("library.btn_play"))
     win.btn_play_game.setObjectName("primaryBtn")

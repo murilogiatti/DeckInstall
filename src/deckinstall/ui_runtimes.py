@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
 
 def _status_label() -> QLabel:
-    lbl = QLabel()
+    lbl = QLabel(tr("runtimes.loading"))  # filled by the health check; never an empty gap meanwhile
     lbl.setWordWrap(True)
     return lbl
 

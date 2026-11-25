@@ -375,6 +375,7 @@ class MainWindow(QMainWindow):
     btn_update_runtimes: QPushButton
     btn_uninstall_runtimes: QPushButton
     btn_app_update: QPushButton
+    library_empty_state: QWidget
     # Runtimes tab (ui_runtimes.py)
     btn_rt_refresh: QPushButton
     btn_rt_ge_update: QPushButton
@@ -426,6 +427,7 @@ class MainWindow(QMainWindow):
         self._library_steam_games: dict[int, StandaloneGame] = {}
         self._external_games: list[ExternalLauncherGame] = []
         self._steam_shortcuts: list[ShortcutEntry] = []
+        self._library_loaded = False  # the library table was filled at least once
         self._active_workers: set[QThread] = set()
         self._closing_pending = False
         self._closed = False
@@ -2098,6 +2100,7 @@ class MainWindow(QMainWindow):
         vdf_err: str,
         runner_labels: dict[tuple[str, str], str] | None = None,
     ) -> None:
+        self._library_loaded = True
         if self._library_size_worker is not None:
             self._library_size_worker.requestInterruption()
         self._library_size_worker = None
@@ -2461,6 +2464,9 @@ class MainWindow(QMainWindow):
             self.shortcuts_list.setCurrentCell(-1, -1)
         self._update_library_action_states()
         self.lbl_library_count.setText(tr("library.count_summary", shown=shown, total=total))
+        empty = total == 0 and self._library_loaded  # not while the first detection still runs
+        self.library_empty_state.setVisible(empty)
+        self.shortcuts_list.setVisible(not empty)
 
     def _selected_library_item(
         self,

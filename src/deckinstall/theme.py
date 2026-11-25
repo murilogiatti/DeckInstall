@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import Mapping
+from pathlib import Path
 from string import Template
 from typing import Literal
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QColor, QImage, QPainter, QPalette, QPen
 from PySide6.QtWidgets import QApplication
 
 ThemeMode = Literal["auto", "dark", "light"]
@@ -184,9 +187,9 @@ QProgressBar::chunk {
     background-color: $progress_fill;
     border-radius: 7px;
 }
-QLabel#SteamReady { color: $good_fg; font-size: 11px; }
-QLabel#SteamWarning { color: $warning_fg; font-size: 11px; }
-QLabel#SteamUnavailable { color: $info_fg; font-size: 11px; }
+QLabel#SteamReady { color: $good_fg; font-size: 12px; }
+QLabel#SteamWarning { color: $warning_fg; font-size: 12px; }
+QLabel#SteamUnavailable { color: $info_fg; font-size: 12px; }
 QLabel#VdfErrorBanner {
     color: $error_fg; background-color: $error_bg; border: 1px solid $error_fg;
     border-radius: 6px; padding: 8px;
@@ -328,6 +331,67 @@ def resolve_is_dark(app: QApplication, mode: ThemeMode) -> bool:
     return bg.lightness() < 128
 
 
+_CHECKED_BG = "#1d6fa5"  # same blue as the primary button and the selection, in both themes
+
+
+def _check_mark_png() -> str:
+    """White check mark as a PNG in the cache, made once (QSS needs a file; PNG needs no plugin)."""
+    base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "DeckInstall" / "ui"
+    path = base / "check-v1.png"
+    if path.is_file():
+        return path.as_posix()
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        img = QImage(48, 48, QImage.Format.Format_ARGB32)
+        img.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(img)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor("#ffffff"), 6.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.drawPolyline([QPointF(11, 25), QPointF(20, 34), QPointF(37, 15)])
+        painter.end()
+        tmp = path.with_name(f".check-{os.getpid()}.png")  # the suffix picks the format
+        if not img.save(str(tmp)):
+            return ""
+        os.replace(tmp, path)
+    except OSError as exc:
+        logging.warning("Could not write the check box image: %s", exc)
+        return ""
+    return path.as_posix()
+
+
+def indicator_qss(tokens: Mapping[str, str], check_png: str) -> str:
+    """Check boxes drawn by the stylesheet: the platform style drew an unchecked box with ~1.1:1
+    contrast on the dark cards. The border uses the muted text color (>= 3:1 on both themes)."""
+    image = f"image: url({check_png});" if check_png else ""
+    return f"""
+QCheckBox::indicator, QAbstractItemView::indicator {{
+    width: 16px; height: 16px;
+    border: 1px solid {tokens["muted_fg"]};
+    border-radius: 4px;
+    background-color: {tokens["bg_input"]};
+}}
+QCheckBox::indicator:hover, QAbstractItemView::indicator:hover {{
+    border-color: {tokens["focus_border"]};
+}}
+QCheckBox::indicator:checked, QAbstractItemView::indicator:checked {{
+    background-color: {_CHECKED_BG};
+    border-color: {_CHECKED_BG};
+    {image}
+}}
+QCheckBox::indicator:disabled, QAbstractItemView::indicator:disabled {{
+    border-color: {tokens["disabled_border"]};
+    background-color: {tokens["input_disabled_bg"]};
+}}
+QCheckBox::indicator:checked:disabled, QAbstractItemView::indicator:checked:disabled {{
+    background-color: {tokens["primary_disabled_bg"]};
+    border-color: {tokens["primary_disabled_border"]};
+}}
+"""
+
+
 def apply_theme(app: QApplication, mode: ThemeMode = "auto") -> bool:
     """Apply Dark or Light stylesheet to QApplication. Returns True if dark."""
     dark = resolve_is_dark(app, mode)
@@ -348,5 +412,5 @@ def apply_theme(app: QApplication, mode: ThemeMode = "auto") -> bool:
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(tokens["disabled_fg"]))
     palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(tokens["disabled_fg"]))
     app.setPalette(palette)
-    app.setStyleSheet(DARK_QSS if dark else LIGHT_QSS)
+    app.setStyleSheet((DARK_QSS if dark else LIGHT_QSS) + indicator_qss(tokens, _check_mark_png()))
     return dark

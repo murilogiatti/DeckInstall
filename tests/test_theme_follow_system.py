@@ -43,11 +43,11 @@ def test_auto_mode_reapplies_stylesheet_and_palette_on_system_change() -> None:
             with mock.patch.object(theme, "resolve_is_dark", return_value=True):
                 # Same path Qt takes when the desktop switches scheme (signal is wired).
                 app.styleHints().colorSchemeChanged.emit(Qt.ColorScheme.Dark)
-            assert app.styleSheet() == theme.DARK_QSS
+            assert app.styleSheet().startswith(theme.DARK_QSS)
             dark_window = app.palette().window().color().name()
             with mock.patch.object(theme, "resolve_is_dark", return_value=False):
                 win._on_system_scheme_changed()
-            assert app.styleSheet() == theme.LIGHT_QSS
+            assert app.styleSheet().startswith(theme.LIGHT_QSS)
             assert app.palette().window().color().name() != dark_window
         finally:
             _close(app, win)
@@ -63,6 +63,6 @@ def test_fixed_mode_ignores_system_change() -> None:
             before = app.styleSheet()
             with mock.patch.object(theme, "resolve_is_dark", return_value=False):
                 win._on_system_scheme_changed()
-            assert app.styleSheet() == before == theme.DARK_QSS
+            assert app.styleSheet() == before and before.startswith(theme.DARK_QSS)
         finally:
             _close(app, win)

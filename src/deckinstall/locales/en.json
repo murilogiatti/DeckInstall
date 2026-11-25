@@ -256,7 +256,7 @@
   "maint.page_subtitle": "Monitor runtime health and safely clean orphan prefixes, caches, shaders, and old Proton versions.",
   "maint.health_title": "System Health & Disk Usage",
   "maint.cleanup_title": "Cleanup Candidates",
-  "maint.btn_refresh_health": "Refresh Health",
+  "maint.btn_refresh_health": "Reload",
   "maint.btn_scan": "Scan Now",
   "maint.btn_clean_safe": "1-Click Safe Clean ({size})",
   "maint.btn_delete_selected": "Delete Selected ({size})",
@@ -381,7 +381,7 @@
   "proton_mgr.column_usage": "Usage",
   "proton_mgr.column_file": "File",
   "proton_mgr.installed_label": "Installed compatibility tools (compatibilitytools.d):",
-  "proton_mgr.btn_refresh_installed": "Refresh",
+  "proton_mgr.btn_refresh_installed": "Reload",
   "proton_mgr.btn_remove": "Remove Selected",
   "proton_mgr.download_label": "Download & install new Proton release:",
   "proton_mgr.btn_fetch": "Fetch Releases",
@@ -412,7 +412,7 @@
   "save_sync.plan_label": "Detected save sync status:",
   "save_sync.table_action": "Action",
   "save_sync.table_reason": "Status",
-  "save_sync.btn_refresh": "Refresh",
+  "save_sync.btn_refresh": "Reload",
   "save_sync.btn_sync_now": "Sync Now",
   "save_sync.no_games": "No Wine/Proton game prefixes found.",
   "save_sync.pick_folder": "Select Save Sync Folder",
@@ -1024,5 +1024,9 @@
   "hooks.intro": "Optional shell commands DeckInstall runs from the game's launcher (Standalone mode): one before the game starts and one after it closes. They run in the game's folder with its environment; their output goes to the game's run log.",
   "hooks.before": "Before:",
   "hooks.after": "After:",
-  "hooks.saved": "Commands saved for {name}."
+  "hooks.saved": "Commands saved for {name}.",
+  "runtimes.loading": "Checking…",
+  "library.empty_title": "No games yet",
+  "library.empty_body": "Install a game from a folder or archive, or adopt games that are already on this computer.",
+  "library.empty_install": "Install game"
 }
