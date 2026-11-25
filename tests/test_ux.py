@@ -223,3 +223,57 @@ def test_busy_bar_shows_while_an_operation_runs() -> None:
             assert win.busy_bar.isHidden()
         finally:
             _close(app, win)
+
+
+def test_library_cover_grid_mirrors_the_table(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QImage
+    from PySide6.QtWidgets import QTableWidgetItem
+
+    from deckinstall import ui_library_grid
+
+    app = _app()
+    grid_dir = tmp_path / "grid"
+    grid_dir.mkdir()
+    img = QImage(60, 90, QImage.Format.Format_RGB32)
+    img.fill(Qt.GlobalColor.darkGreen)
+    assert img.save(str(grid_dir / "1234p.png"))
+    with tempfile.TemporaryDirectory() as tmp:
+        win = _window(app, tmp)
+        try:
+            assert ui._wait_for_workers(app, win, 10.0)
+            win.paths = SimpleNamespace(grid_dir=grid_dir, steam_root=tmp_path / "steam")  # type: ignore[assignment]
+            table = win.shortcuts_list
+            table.setSortingEnabled(False)
+            games = (("Alpha Quest", ("steam", SimpleNamespace(appid_u32=1234))), ("Beta", ("external", object())))
+            for row, (name, data) in enumerate(games):
+                table.insertRow(row)
+                cell = QTableWidgetItem(name)
+                cell.setData(Qt.ItemDataRole.UserRole, data)
+                cell.setData(Qt.ItemDataRole.UserRole + 1, f"key:{name}")
+                table.setItem(row, 0, cell)
+            assert ui_library_grid.cover_path("steam", games[0][1][1], win.paths) == grid_dir / "1234p.png"
+            assert ui_library_grid.cover_path("external", object(), win.paths) is None
+            win.btn_view_grid.click()
+            assert win.settings.value("library/view") == "grid"
+            grid = win.library_grid
+            assert not grid.isHidden() and table.isHidden() and grid.count() == 2
+            assert win.btn_view_grid.isChecked() and not win.btn_view_list.isChecked()
+            grid.setCurrentRow(1)
+            assert table.currentRow() == 1  # picking a cover selects the row: actions work unchanged
+            win.library_search_input.setText("alpha")
+            assert grid.count() == 1 and grid.item(0).text() == "Alpha Quest"
+            win.btn_view_list.click()
+            assert grid.isHidden() and not table.isHidden()
+        finally:
+            _close(app, win)
+
+
+def test_cover_tile_without_art_shows_initials() -> None:
+    from deckinstall import ui_library_grid
+
+    _app()
+    pix = ui_library_grid._cover_pixmap(None, "★ Hollow Knight")
+    assert pix.size() == ui_library_grid.COVER and not pix.isNull()

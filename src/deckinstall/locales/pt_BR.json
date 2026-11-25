@@ -1057,5 +1057,7 @@
   "settings.page_subtitle": "A aparência do DeckInstall, qual Steam ele usa e o próprio aplicativo.",
   "settings.look_title": "Aparência",
   "settings.steam_title": "Steam",
-  "settings.app_title": "DeckInstall"
+  "settings.app_title": "DeckInstall",
+  "library.view_list": "Lista",
+  "library.view_grid": "Capas"
 }

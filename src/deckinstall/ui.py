@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -378,6 +379,9 @@ class MainWindow(QMainWindow):
     message_bar: MessageBar
     scale_combo: QComboBox
     busy_bar: QProgressBar
+    library_grid: QListWidget
+    btn_view_list: QPushButton
+    btn_view_grid: QPushButton
     # Updates card (ui_updates.build_updates_card)
     lbl_updates_status: QLabel
     btn_updates_check: QPushButton
@@ -2450,7 +2454,9 @@ class MainWindow(QMainWindow):
         self.lbl_library_count.setText(tr("library.count_summary", shown=shown, total=total))
         empty = total == 0 and self._library_loaded  # not while the first detection still runs
         self.library_empty_state.setVisible(empty)
-        self.shortcuts_list.setVisible(not empty)
+        from .ui_library_grid import sync_views
+
+        sync_views(self, empty)
 
     def _selected_library_item(
         self,

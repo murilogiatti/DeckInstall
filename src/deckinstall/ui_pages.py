@@ -491,6 +491,15 @@ def build_library_page(win: MainWindow) -> QWidget:
     win.lbl_library_count.setObjectName("MutedText")
     filter_row.addWidget(win.library_search_input, 1)
     filter_row.addWidget(win.lbl_library_count)
+    from .ui_library_grid import set_view
+
+    win.btn_view_list = QPushButton(tr("library.view_list"))
+    win.btn_view_grid = QPushButton(tr("library.view_grid"))
+    for btn, view in ((win.btn_view_list, "list"), (win.btn_view_grid, "grid")):
+        btn.setObjectName("FilterPill")
+        btn.setCheckable(True)
+        btn.clicked.connect(lambda _=False, v=view: set_view(win, v))
+        filter_row.addWidget(btn)
     lib_layout.addLayout(filter_row)
 
     win.shortcuts_list = QTableWidget(0, 7)
@@ -535,6 +544,9 @@ def build_library_page(win: MainWindow) -> QWidget:
     del_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
     del_shortcut.activated.connect(win._remove_selected_shortcut)
     lib_layout.addWidget(win.shortcuts_list, 1)
+    from .ui_library_grid import build_library_grid
+
+    lib_layout.addWidget(build_library_grid(win), 1)
     lib_layout.addWidget(_build_library_empty_state(win), 1)
 
     win.btn_play_game = QPushButton(tr("library.btn_play"))
