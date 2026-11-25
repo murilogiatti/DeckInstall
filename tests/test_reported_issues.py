@@ -646,7 +646,7 @@ class UiUxSimplificationTests(unittest.TestCase):
                     win.close()
                     app.processEvents()
 
-    def test_smart_initial_tab_and_two_tab_configure_dialog(self) -> None:
+    def test_smart_initial_tab_and_three_tab_configure_dialog(self) -> None:
         from PySide6.QtCore import QSettings, QTimer
         from PySide6.QtWidgets import QApplication, QComboBox, QTabWidget
 
@@ -750,7 +750,7 @@ class UiUxSimplificationTests(unittest.TestCase):
                         QTimer.singleShot(0, _inspect_and_close)
                         configure_game_dialog.open_configure_game_dialog(win)
 
-                    self.assertEqual(observed.get("tabs"), 2)
+                    self.assertEqual(observed.get("tabs"), 3)  # Game, Launch, Tools
                     self.assertGreaterEqual(observed.get("combos", 0), 1)
                 finally:
                     for worker in list(win._active_workers):

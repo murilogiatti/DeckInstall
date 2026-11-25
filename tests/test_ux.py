@@ -379,3 +379,52 @@ def test_the_theme_keeps_the_tables_heights() -> None:
                 assert win.maint_list.minimumHeight() == 220
         finally:
             _close(app, win)
+
+
+def test_ctrl_tab_cycles_the_tabs_in_a_loop() -> None:
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    app = _app()
+    with tempfile.TemporaryDirectory() as tmp:
+        win = _window(app, tmp)
+        try:
+            win.show()
+            app.processEvents()
+            last = win.nav_tabs.count() - 1
+            win.nav_tabs.setCurrentIndex(last)
+            QTest.keyClick(win, Qt.Key.Key_Tab, Qt.KeyboardModifier.ControlModifier)
+            assert win.nav_tabs.currentIndex() == 0  # after the last comes the first
+            QTest.keyClick(win, Qt.Key.Key_Backtab, Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)
+            assert win.nav_tabs.currentIndex() == last  # and back the other way
+            win._cycle_nav_tab(1)
+            assert win.nav_tabs.currentIndex() == 0
+        finally:
+            _close(app, win)
+
+
+def test_an_action_message_does_not_follow_to_other_tabs() -> None:
+    app = _app()
+    with tempfile.TemporaryDirectory() as tmp:
+        win = _window(app, tmp)
+        try:
+            win.notify("No artwork found for: Game", "warning")
+            assert not win.message_bar.isHidden()
+            win._show_page(ui.PAGE_SAVES)
+            assert win.message_bar.isHidden()  # the Library's news stays with the Library
+            win.message_bar.show_message("2 updates", "info", key="updates")
+            win._show_page(ui.PAGE_INSTALL)
+            assert not win.message_bar.isHidden()  # app-wide news stays until closed
+        finally:
+            _close(app, win)
+
+
+def test_dialogs_use_theme_colors_not_fixed_ones() -> None:
+    """A fixed light yellow (#ffd180) was unreadable on the light theme: warnings use theme names."""
+    src = Path(ui.__file__).parent
+    offenders = [
+        str(path.relative_to(src))
+        for path in src.rglob("*.py")
+        if path.name != "theme.py" and "color: #" in path.read_text(encoding="utf-8")
+    ]
+    assert offenders == []

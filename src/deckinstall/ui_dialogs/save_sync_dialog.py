@@ -72,7 +72,9 @@ from ..ui_cards import (
     _setting_bool,
     _SortableTableItem,
     action_row,
+    dialog_footer,
     format_size_bytes,
+    page_layout,
     section_card,
     show_text_dialog,
 )
@@ -247,18 +249,7 @@ def _snapshots_of(slug: str) -> list[SaveArchiveEntry]:
 def build_saves_page(win: MainWindow) -> QWidget:
     """The Saves page, by purpose: per-game copies first, then whole backups and sync, then
     Ludusavi, then the automatic-copy settings."""
-    page = QWidget()
-    layout = QVBoxLayout(page)
-    layout.setContentsMargins(0, 0, 0, 0)
-    layout.setSpacing(14)
-
-    title = QLabel(tr("saves.page_title"))
-    title.setObjectName("PageTitle")
-    subtitle = QLabel(tr("saves.page_subtitle"))
-    subtitle.setObjectName("MutedText")
-    subtitle.setWordWrap(True)
-    layout.addWidget(title)
-    layout.addWidget(subtitle)
+    page, layout = page_layout(tr("saves.page_title"), tr("saves.page_subtitle"))
 
     # 1. Copies of each game: the everyday part.
     card, card_layout, top = section_card(tr("saves.section_games"), tr("saves.section_games_hint"))
@@ -1229,18 +1220,13 @@ def open_save_sync_dialog(win: MainWindow) -> None:
     lbl_status.setWordWrap(True)
     lay.addWidget(lbl_status)
 
-    footer = QHBoxLayout()
     btn_preview = QPushButton(tr("save_sync.btn_preview"))
     btn_preview.setEnabled(False)
     btn_sync = QPushButton(tr("save_sync.btn_sync_now"))
     btn_sync.setObjectName("primaryBtn")
     btn_close = QPushButton(tr("proton_mgr.btn_close"))
     btn_close.clicked.connect(dlg.reject)
-    footer.addWidget(btn_preview)
-    footer.addWidget(btn_sync)
-    footer.addStretch()
-    footer.addWidget(btn_close)
-    lay.addLayout(footer)
+    lay.addLayout(dialog_footer(btn_sync, btn_close, left=(btn_preview,)))
 
     current_plan: list[SyncPlanItem] = []
 

@@ -9,11 +9,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from PySide6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QLabel, QPushButton, QWidget
 
 from .i18n import tr
 from .runtime_uninstall import GE, MANGOHUD, OPTISCALER, STEAMRT4, UMU
-from .ui_cards import FlowLayout, _make_card, action_grid, action_row, section_card
+from .ui_cards import FlowLayout, _make_card, action_grid, action_row, page_layout, section_card
 
 if TYPE_CHECKING:
     from .ui import MainWindow
@@ -58,18 +58,7 @@ def build_runtimes_page(win: MainWindow) -> QWidget:
     """Build the Runtimes tab and bind its labels and buttons onto ``win``."""
     from .ui_maintenance import open_uninstall_runtimes_dialog
 
-    page = QWidget()
-    layout = QVBoxLayout(page)
-    layout.setContentsMargins(0, 0, 0, 0)
-    layout.setSpacing(14)
-
-    title = QLabel(tr("runtimes.page_title"))
-    title.setObjectName("PageTitle")
-    sub = QLabel(tr("runtimes.page_subtitle"))
-    sub.setObjectName("MutedText")
-    sub.setWordWrap(True)
-    layout.addWidget(title)
-    layout.addWidget(sub)
+    page, layout = page_layout(tr("nav.runtimes"), tr("runtimes.page_subtitle"))
 
     from .ui_updates import build_updates_card
 

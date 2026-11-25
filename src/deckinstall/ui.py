@@ -30,7 +30,9 @@ from PySide6.QtGui import (
     QCloseEvent,
     QDesktopServices,
     QIcon,
+    QKeySequence,
     QPixmap,
+    QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -282,6 +284,8 @@ def _setting_int(settings: QSettings, key: str, default: int = 0) -> int:
 PAGE_INSTALL, PAGE_LIBRARY, PAGE_SAVES, PAGE_MAINT, PAGE_RUNTIMES, PAGE_SETTINGS = range(6)
 # Order of the tabs on top of the window (Library first); each maps to a page of the stack.
 NAV_PAGES = (PAGE_LIBRARY, PAGE_INSTALL, PAGE_SAVES, PAGE_SETTINGS)
+# Message bar keys about one tab's action; switching tabs clears them (updates and welcome stay).
+_PAGE_MESSAGE_KEYS = ("notify", "scale")
 # The Settings tab holds three pages, picked with the section pills under the tabs.
 SETTINGS_PAGES = (PAGE_SETTINGS, PAGE_RUNTIMES, PAGE_MAINT)
 SETTINGS_SECTION_KEY = "ui/settings_section"
@@ -762,6 +766,10 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(PAGE_LIBRARY)  # always open on the Library (no jump after the scan)
         self.nav_tabs.setCurrentIndex(NAV_PAGES.index(PAGE_LIBRARY))
         self.nav_tabs.currentChanged.connect(self._on_nav_tab_changed)
+        # Ctrl+Tab / Ctrl+Shift+Tab: next / previous tab, in a loop (after the last comes the first).
+        for keys, step in ((QKeySequence.StandardKey.NextChild, 1), (QKeySequence.StandardKey.PreviousChild, -1)):
+            shortcut = QShortcut(keys, self)  # every binding of the platform (Ctrl+Tab, Ctrl+F6…)
+            shortcut.activated.connect(lambda s=step: self._cycle_nav_tab(s))
         self.stack.currentChanged.connect(self._sync_settings_sections)
         self.stack.currentChanged.connect(self._on_stack_tab_changed)
         right_layout.addWidget(self.stack)
@@ -817,7 +825,14 @@ class MainWindow(QMainWindow):
         self.nav_tabs.setCurrentIndex(nav_tab_of(idx))
         self.stack.setCurrentIndex(idx)
 
+    def _cycle_nav_tab(self, step: int) -> None:
+        if self.nav_tabs.isEnabled():
+            self.nav_tabs.setCurrentIndex((self.nav_tabs.currentIndex() + step) % self.nav_tabs.count())
+
     def _on_nav_tab_changed(self, tab: int) -> None:
+        # News about the tab being left (an action's result) must not follow the user to other tabs.
+        for key in _PAGE_MESSAGE_KEYS:
+            self.message_bar.dismiss(key)
         page = NAV_PAGES[tab]
         if page == PAGE_SETTINGS:  # back to the section opened last
             try:

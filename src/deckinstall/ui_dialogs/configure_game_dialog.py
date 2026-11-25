@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -68,7 +70,6 @@ from ..steam_vdf import (
     set_shortcut_proton,
 )
 from ..ui_cards import (
-    FlowLayout,
     _BusyGuardedDialog,
     _dialog_guard,
     _dialog_parent,
@@ -76,7 +77,12 @@ from ..ui_cards import (
     _is_native_linux_game,
     _is_wine_game_running,
     _pick_dir_async,
+    action_grid,
+    action_row,
+    dialog_footer,
     get_game_log_path,
+    note_label,
+    section_card,
 )
 from ..ui_workers import SteamOpWorker
 from ..vdf_queue import QueuedVdfEdit
@@ -341,7 +347,7 @@ def _edit_launch_hooks(win: MainWindow, parent: QDialog, game: StandaloneGame) -
 
 
 def open_configure_game_dialog(win: MainWindow) -> None:
-    """Open a streamlined 2-tab configuration dialog for the selected game."""
+    """Configure the selected game: three tabs by purpose (the game, running it, tools)."""
     sel = win._selected_library_item()
     if not sel:
         return
@@ -373,12 +379,31 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     tabs = QTabWidget(dlg)
     root_lay.addWidget(tabs, 1)
 
-    # --- Tab 1: Game, Launch & Compatibility ---
-    tab_game = QWidget()
-    game_tab_lay = QVBoxLayout(tab_game)
+    def _tab(title: str) -> QVBoxLayout:
+        """One tab: cards stacked in a scroll area (the Deck screen is short)."""
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setSpacing(12)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(body)
+        tabs.addTab(scroll, title)
+        return lay
+
+    def _with_button(label: QLabel, button: QPushButton) -> QWidget:
+        box = QWidget()
+        row = QHBoxLayout(box)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(label, 1)
+        row.addWidget(button)
+        return box
+
+    # --- Tab 1: the game (its files, how it runs, its shortcuts) ---
+    game_tab_lay = _tab(tr("configure.tab_game"))
+    files_card, files_lay, _top = section_card(tr("configure.card_files"))
     game_form = QFormLayout()
-    game_form.addRow(tr("configure.lbl_name"), QLabel(title_name))
-    game_form.addRow(tr("configure.lbl_type"), QLabel(kind))
+    files_lay.addLayout(game_form)
     lbl_exe = QLabel(exe_str)
     lbl_exe.setWordWrap(True)
     lbl_dir = QLabel(dir_str)
@@ -438,17 +463,69 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         game_form.addRow(tr("configure.lbl_exe"), exe_combo)
     else:
         game_form.addRow(tr("configure.lbl_exe"), lbl_exe)
-    game_form.addRow(tr("configure.lbl_dir"), lbl_dir)
-    if sa_obj is not None:
-        game_form.addRow(tr("configure.lbl_launchers"), _launcher_checkboxes(win, dlg, sa_obj, steam_mode=is_steam))
+    btn_open_dir = QPushButton(tr("configure.btn_open_folder"))
+    btn_open_dir.setEnabled(Path(dir_str).is_dir())
+    btn_open_dir.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(dir_str)))
+    game_form.addRow(tr("configure.lbl_dir"), _with_button(lbl_dir, btn_open_dir))
+    game_tab_lay.addWidget(files_card)
+
+    mode_card, mode_lay, _top = section_card(tr("configure.card_mode"))
+    mode_form = QFormLayout()
+    mode_lay.addLayout(mode_form)
     if is_steam or is_standalone:
         lbl_mode = QLabel(tr("mode.steam") if is_steam else tr("mode.standalone"))
         lbl_mode.setToolTip(tr("mode.desc_steam") if is_steam else tr("mode.desc_standalone"))
         if sa_obj is None:
-            game_form.addRow(tr("mode.label"), lbl_mode)
+            mode_form.addRow(tr("mode.label"), lbl_mode)
         else:
-            game_form.addRow(tr("mode.label"), _mode_switch_row(win, dlg, sa_obj, lbl_mode, is_steam))
+            mode_form.addRow(tr("mode.label"), _mode_switch_row(win, dlg, sa_obj, lbl_mode, is_steam))
+    elif is_external and isinstance(obj, ExternalLauncherGame):
+        mode_form.addRow(tr("mode.label"), QLabel(tr("configure.via_launcher", launcher=obj.source.title())))
+    if sa_obj is not None:
+        mode_form.addRow(tr("configure.lbl_launchers"), _launcher_checkboxes(win, dlg, sa_obj, steam_mode=is_steam))
+    if mode_form.rowCount():
+        game_tab_lay.addWidget(mode_card)
+    game_tab_lay.addStretch()
 
+    # --- Tab 2: running it (Proton, launch options, commands, the log) ---
+    run_tab_lay = _tab(tr("configure.tab_run"))
+    runner_card, runner_lay, _top = section_card(tr("configure.tab_runner"))
+    lbl_cur_proton: QLabel | None = None
+    lbl_umu_badge: QLabel | None = None
+    proton_combo: QComboBox | None = None
+    btn_previous_proton: QPushButton | None = None
+    active_proton_ref: list[str] = [""]
+
+    if is_native:
+        runner_lay.addWidget(note_label(tr("configure.native_no_proton")))
+    else:
+        runner_form = QFormLayout()
+        if is_steam or is_standalone:
+            proton_combo = QComboBox()
+            proton_combo.addItem(tr("configure.loading"), "")
+            proton_combo.setEnabled(False)
+            if sa_obj is not None:
+                btn_previous_proton = QPushButton(tr("configure.btn_previous_proton"))
+                btn_previous_proton.setEnabled(False)
+                proton_row = QWidget()
+                proton_row_lay = QHBoxLayout(proton_row)
+                proton_row_lay.setContentsMargins(0, 0, 0, 0)
+                proton_row_lay.addWidget(proton_combo, 1)
+                proton_row_lay.addWidget(btn_previous_proton)
+                runner_form.addRow(tr("configure.lbl_current_proton"), proton_row)
+            else:
+                runner_form.addRow(tr("configure.lbl_current_proton"), proton_combo)
+        else:
+            lbl_cur_proton = QLabel(tr("configure.loading"))
+            runner_form.addRow(tr("configure.lbl_current_proton"), lbl_cur_proton)
+        if sa_obj is not None:
+            lbl_umu_badge = QLabel(tr("configure.loading"))
+            lbl_umu_badge.setWordWrap(True)
+            runner_form.addRow(tr("configure.lbl_umu_status"), lbl_umu_badge)
+        runner_lay.addLayout(runner_form)
+    run_tab_lay.addWidget(runner_card)
+
+    launch_card, launch_lay, _top = section_card(tr("configure.card_launch"), tr("configure.card_launch_hint"))
     initial_opts_text = (
         load_external_launch_presets(obj)
         if isinstance(obj, ExternalLauncherGame)
@@ -456,7 +533,8 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     )
     opts_edit = QLineEdit(initial_opts_text)
     opts_edit.setReadOnly(True)
-    game_form.addRow(tr("configure.lbl_launch_opts"), opts_edit)
+    opts_edit.setPlaceholderText(tr("configure.no_launch_opts"))
+    launch_lay.addWidget(opts_edit)
 
     btn_edit_opts = QPushButton(tr("configure.btn_edit_launch_opts"))
     btn_edit_opts.setEnabled(is_steam or is_standalone or is_external)
@@ -476,11 +554,12 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         win._edit_launch_options_presets((kind, obj), parent=dlg, on_saved=_save_displayed_opts)
 
     btn_edit_opts.clicked.connect(_on_edit_opts)
+    launch_grid = action_grid()
+    action_row(launch_grid, 0, btn_edit_opts, tr("configure.edit_opts_hint"))
     if sa_obj is not None and not is_steam:
         btn_hooks = QPushButton(tr("hooks.btn"))
-        btn_hooks.setToolTip(tr("hooks.intro"))
         btn_hooks.clicked.connect(lambda _=False: _edit_launch_hooks(win, dlg, sa_obj))
-        game_form.addRow("", btn_hooks)
+        action_row(launch_grid, 1, btn_hooks, tr("hooks.hint"))
 
     legacy_log = get_game_log_path(title_name)
     run_logs = (
@@ -520,75 +599,25 @@ def open_configure_game_dialog(win: MainWindow) -> None:
 
         run_combo.currentIndexChanged.connect(_show_run)
         _show_run()
-        top = QHBoxLayout()
-        top.addWidget(run_combo, 1)
+        log_lay.addWidget(run_combo)
+        log_lay.addWidget(viewer, 1)
         btn_folder = QPushButton(tr("configure.btn_open_log_folder"))
         btn_folder.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(str(run_combo.currentData())).parent)))
         )
-        top.addWidget(btn_folder)
-        log_lay.addLayout(top)
-        log_lay.addWidget(viewer, 1)
         close_btn = QPushButton(tr("configure.btn_close"))
         close_btn.clicked.connect(log_dlg.accept)
-        log_lay.addWidget(close_btn)
+        log_lay.addLayout(dialog_footer(close_btn, left=(btn_folder,)))
         log_dlg.exec()
 
     btn_view_log.clicked.connect(_on_view_log)
+    action_row(launch_grid, 2, btn_view_log, tr("configure.view_log_hint"))
+    launch_lay.addLayout(launch_grid)
+    run_tab_lay.addWidget(launch_card)
+    run_tab_lay.addStretch()
 
-    game_actions_row = QHBoxLayout()
-    game_actions_row.addWidget(btn_edit_opts)
-    game_actions_row.addWidget(btn_view_log)
-    game_actions_row.addStretch()
-    game_form.addRow("", game_actions_row)
-
-    game_tab_lay.addLayout(game_form)
-
-    compat_hdr = QLabel(tr("configure.tab_runner"))
-    compat_hdr.setObjectName("SectionTitle")
-    game_tab_lay.addSpacing(8)
-    game_tab_lay.addWidget(compat_hdr)
-
-    lbl_cur_proton: QLabel | None = None
-    lbl_umu_badge: QLabel | None = None
-    proton_combo: QComboBox | None = None
-    btn_previous_proton: QPushButton | None = None
-    active_proton_ref: list[str] = [""]
-
-    if is_native:
-        lbl_native = QLabel(tr("configure.native_no_proton"))
-        lbl_native.setWordWrap(True)
-        game_tab_lay.addWidget(lbl_native)
-    else:
-        runner_form = QFormLayout()
-        if is_steam or is_standalone:
-            proton_combo = QComboBox()
-            proton_combo.addItem(tr("configure.loading"), "")
-            proton_combo.setEnabled(False)
-            runner_form.addRow(tr("configure.lbl_current_proton"), proton_combo)
-        else:
-            lbl_cur_proton = QLabel(tr("configure.loading"))
-            runner_form.addRow(tr("configure.lbl_current_proton"), lbl_cur_proton)
-        if sa_obj is not None:
-            lbl_umu_badge = QLabel(tr("configure.loading"))
-            lbl_umu_badge.setWordWrap(True)
-            runner_form.addRow(tr("configure.lbl_umu_status"), lbl_umu_badge)
-        game_tab_lay.addLayout(runner_form)
-
-        proton_btns = QHBoxLayout()
-        if sa_obj is not None:
-            btn_previous_proton = QPushButton(tr("configure.btn_previous_proton"))
-            btn_previous_proton.setEnabled(False)
-            proton_btns.addWidget(btn_previous_proton)
-        proton_btns.addStretch()
-        game_tab_lay.addLayout(proton_btns)
-
-    game_tab_lay.addStretch()
-    tabs.addTab(tab_game, tr("configure.tab_game"))
-
-    # --- Tab 2: Prefix Tools & Organization ---
-    tab_prefix = QWidget()
-    prefix_lay = QVBoxLayout(tab_prefix)
+    # --- Tab 3: tools for the Wine prefix, and moving the game elsewhere ---
+    prefix_lay = _tab(tr("configure.tab_prefix"))
     pfx_label: QLabel | None = None
     win32_warn: QLabel | None = None
     btn_wt: QPushButton | None = None
@@ -597,35 +626,41 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     btn_compat_migrate: QPushButton | None = None
     compat_state_ref: dict[str, object] = {"state": "missing", "targets": []}
     resolved_pfx_ref: list[Path | None] = [None]
+    pfx_card, pfx_card_lay, _top = section_card(tr("configure.card_prefix"), tr("configure.card_prefix_hint"))
     if is_native:
-        lbl_no_pfx = QLabel(tr("configure.native_no_prefix"))
-        lbl_no_pfx.setWordWrap(True)
-        prefix_lay.addWidget(lbl_no_pfx)
+        pfx_card_lay.addWidget(note_label(tr("configure.native_no_prefix")))
+        prefix_lay.addWidget(pfx_card)
     else:
         pfx_label = QLabel(tr("configure.loading"))
         pfx_label.setWordWrap(True)
+        btn_open_pfx = QPushButton(tr("configure.btn_open_folder"))
+        btn_open_pfx.setEnabled(False)
+        btn_open_pfx.clicked.connect(
+            lambda: resolved_pfx_ref[0] is not None
+            and QDesktopServices.openUrl(QUrl.fromLocalFile(str(resolved_pfx_ref[0])))
+        )
         pfx_form = QFormLayout()
-        pfx_form.addRow(tr("configure.lbl_prefix_path"), pfx_label)
-        if is_steam and win.paths and managed_game is None:
+        pfx_form.addRow(tr("configure.lbl_prefix_path"), _with_button(pfx_label, btn_open_pfx))
+        if is_steam and win.paths and isinstance(obj, ShortcutEntry) and managed_game is None:
             lbl_compat_storage = QLabel(tr("configure.loading"))
             lbl_compat_storage.setWordWrap(True)
-            pfx_form.addRow(tr("configure.lbl_compat_storage"), lbl_compat_storage)
-        prefix_lay.addLayout(pfx_form)
-
-        win32_warn = QLabel("")
-        win32_warn.setWordWrap(True)
-        win32_warn.setStyleSheet("color: #ffd180;")
+            btn_compat_migrate = QPushButton(tr("configure.btn_compat_migrate"))
+            btn_compat_migrate.setEnabled(False)
+            pfx_form.addRow(tr("configure.lbl_compat_storage"), _with_button(lbl_compat_storage, btn_compat_migrate))
+        pfx_card_lay.addLayout(pfx_form)
+        win32_warn = note_label(kind="WarningText")
         win32_warn.setVisible(False)
-        prefix_lay.addWidget(win32_warn)
+        pfx_card_lay.addWidget(win32_warn)
+        prefix_lay.addWidget(pfx_card)
 
-        tools_flow = FlowLayout(spacing=8)
+        tools_card, tools_lay, _top = section_card(tr("configure.card_tools"))
         btn_wt = QPushButton(tr("library.btn_winetricks"))
         btn_wt.setEnabled((is_steam and bool(win.paths)) or is_standalone)
         btn_wt.clicked.connect(lambda: win._open_winetricks_dialog(kind, obj))
-        tools_flow.addWidget(btn_wt)
 
         btn_opti = QPushButton(tr("library.btn_optiscaler"))
         btn_opti.setEnabled((is_steam and bool(win.paths)) or is_standalone or kind == "external")
+
         def _open_opti() -> None:
             current = obj
             if isinstance(current, ShortcutEntry) and sa_obj is not None:
@@ -633,43 +668,25 @@ def open_configure_game_dialog(win: MainWindow) -> None:
             win._open_optiscaler_dialog(kind, current, on_saved=_save_displayed_opts)
 
         btn_opti.clicked.connect(_open_opti)
-        tools_flow.addWidget(btn_opti)
-
         btn_run_exe = QPushButton(tr("library.btn_run_exe_in_prefix"))
         btn_run_exe.setEnabled((is_steam and bool(win.paths)) or is_standalone)
         btn_run_exe.clicked.connect(lambda: win._run_exe_in_prefix_dialog(kind, obj))
-        tools_flow.addWidget(btn_run_exe)
+        tools_grid = action_grid()
+        action_row(tools_grid, 0, btn_wt, tr("configure.winetricks_hint"))
+        action_row(tools_grid, 1, btn_opti, tr("configure.optiscaler_hint"))
+        action_row(tools_grid, 2, btn_run_exe, tr("configure.run_exe_hint"))
+        tools_lay.addLayout(tools_grid)
+        prefix_lay.addWidget(tools_card)
 
-        btn_open_pfx = QPushButton(tr("configure.btn_open_prefix"))
-        btn_open_pfx.setEnabled(False)
-        btn_open_pfx.clicked.connect(
-            lambda: resolved_pfx_ref[0] is not None
-            and QDesktopServices.openUrl(QUrl.fromLocalFile(str(resolved_pfx_ref[0])))
-        )
-        tools_flow.addWidget(btn_open_pfx)
-
-        if is_steam and win.paths and isinstance(obj, ShortcutEntry) and managed_game is None:
-            btn_compat_migrate = QPushButton(tr("configure.btn_compat_migrate"))
-            btn_compat_migrate.setEnabled(False)
-            tools_flow.addWidget(btn_compat_migrate)
-
-        prefix_lay.addLayout(tools_flow)
-
-    visible_org_actions = [
-        action
-        for action in (
-            win.act_ext_to_steam,
-            win.act_ext_import_saves,
-        )
-        if action.isVisible() and action.isEnabled()
-    ]
+    org_hints = {
+        win.act_ext_to_steam: tr("configure.ext_to_steam_hint"),
+        win.act_ext_import_saves: tr("configure.ext_import_saves_hint"),
+    }
+    visible_org_actions = [action for action in org_hints if action.isVisible() and action.isEnabled()]
     if visible_org_actions:
-        org_hdr = QLabel(tr("configure.tab_organization"))
-        org_hdr.setObjectName("SectionTitle")
-        prefix_lay.addSpacing(8)
-        prefix_lay.addWidget(org_hdr)
-        org_flow = FlowLayout(spacing=8)
-        for action in visible_org_actions:
+        org_card, org_lay, _top = section_card(tr("configure.tab_organization"))
+        org_grid = action_grid()
+        for row, action in enumerate(visible_org_actions):
             button = QPushButton(action.text())
 
             def run_action(_checked=False, selected_action=action):
@@ -677,11 +694,10 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                 selected_action.trigger()
 
             button.clicked.connect(run_action)
-            org_flow.addWidget(button)
-        prefix_lay.addLayout(org_flow)
-
+            action_row(org_grid, row, button, org_hints[action])
+        org_lay.addLayout(org_grid)
+        prefix_lay.addWidget(org_card)
     prefix_lay.addStretch()
-    tabs.addTab(tab_prefix, tr("configure.tab_prefix"))
 
     if not is_native:
         paths_snap = win.paths
@@ -1140,10 +1156,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
 
     btn_close = QPushButton(tr("configure.btn_close"))
     btn_close.clicked.connect(dlg.accept)
-    close_row = QHBoxLayout()
-    close_row.addStretch()
-    close_row.addWidget(btn_close)
-    root_lay.addLayout(close_row)
+    root_lay.addLayout(dialog_footer(btn_close))
 
     dlg.exec()
     dlg.deleteLater()

@@ -12,7 +12,6 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QFormLayout,
-    QHBoxLayout,
     QHeaderView,
     QLabel,
     QMessageBox,
@@ -52,7 +51,7 @@ from ..steam_vdf import (
     set_steam_app_launch_options,
     update_shortcut_launch_options,
 )
-from ..ui_cards import _BusyGuardedDialog, _dialog_guard, _dialog_parent
+from ..ui_cards import _BusyGuardedDialog, _dialog_guard, _dialog_parent, dialog_footer
 from ..ui_workers import SteamOpWorker
 from ..vdf_queue import QueuedVdfEdit, VdfEditOp
 
@@ -372,7 +371,6 @@ def _show(
     else:
         combo_backend.hide()
 
-    btn_row = QHBoxLayout()
     btn_install = QPushButton(tr("optiscaler_bulk.btn_install"))
     btn_install.setObjectName("primaryBtn")
     btn_select_all = QPushButton(tr("optiscaler_bulk.btn_select_all"))
@@ -381,18 +379,13 @@ def _show(
     btn_all.setToolTip(tr("optiscaler_bulk.btn_install_all_tooltip"))
     btn_remove = QPushButton(tr("optiscaler_bulk.btn_remove"))
     btn_close = QPushButton(tr("proton_bulk.btn_close"))
-    btn_row.addWidget(btn_select_all)
-    btn_row.addWidget(btn_select_none)
-    if not cleanup_only:
-        btn_row.addWidget(btn_all)
-        btn_row.addWidget(btn_install)
-    else:
+    btn_remove.setObjectName("dangerBtn")
+    if cleanup_only:
         btn_all.hide()
         btn_install.hide()
-    btn_row.addWidget(btn_remove)
-    btn_row.addStretch()
-    btn_row.addWidget(btn_close)
-    lay.addLayout(btn_row)
+    lay.addLayout(
+        dialog_footer(btn_all, btn_install, btn_close, left=(btn_select_all, btn_select_none, btn_remove))
+    )
     btn_close.clicked.connect(dlg.accept)
 
     def _checked() -> list[BulkTarget]:

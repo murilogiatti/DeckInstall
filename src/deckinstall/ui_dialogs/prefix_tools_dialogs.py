@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -57,6 +58,7 @@ from ..steam_vdf import (
     update_shortcut_launch_options,
 )
 from ..ui_cards import (
+    ShownWhenEnabledButton,
     _BusyGuardedDialog,
     _dialog_guard,
     _dialog_parent,
@@ -65,6 +67,9 @@ from ..ui_cards import (
     _parse_launch_preset_state,
     _pick_file_async,
     _resolve_game_exe_path,
+    dialog_footer,
+    note_label,
+    section_card,
 )
 from ..ui_workers import RunExeInPrefixWorker, SteamOpWorker, WinetricksWorker
 from ..vdf_queue import QueuedVdfEdit
@@ -171,32 +176,27 @@ def open_winetricks_dialog(
     active_worker: dict[str, WinetricksWorker | None] = {"w": None}
     dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: active_worker["w"] is not None)
     dlg.setWindowTitle(tr("winetricks.title", name=title_name))
-    dlg.resize(560, 480)
+    dlg.resize(620, 640)
     lay = QVBoxLayout(dlg)
-
-    lbl_prefix = QLabel(tr("winetricks.prefix_label", path=str(prefix_dir)))
-    lbl_prefix.setObjectName("MutedText")
-    lbl_prefix.setWordWrap(True)
-    lay.addWidget(lbl_prefix)
+    lay.setSpacing(12)
+    lay.addWidget(note_label(tr("winetricks.prefix_label", path=str(prefix_dir))))
 
     dlg_alive = _dialog_guard(dlg)
 
     warn_row = QWidget()
     warn_lay = QHBoxLayout(warn_row)
-    warn_lay.setContentsMargins(0, 0, 0, 4)
+    warn_lay.setContentsMargins(0, 0, 0, 0)
     warn_lay.setSpacing(8)
-    warn_lbl = QLabel(tr("winetricks.missing_warn"))
-    warn_lbl.setWordWrap(True)
-    warn_lbl.setStyleSheet("color: #ffd180;")
-    warn_lay.addWidget(warn_lbl, 1)
+    warn_lay.addWidget(note_label(tr("winetricks.missing_warn"), "WarningText"), 1)
     btn_install_wt = QPushButton(tr("launch.btn_install_bin", bin="winetricks"))
     warn_lay.addWidget(btn_install_wt)
     has_winetricks = shutil.which("winetricks") is not None
     warn_row.setVisible(not has_winetricks)
     lay.addWidget(warn_row)
 
+    # 1. Wine's own tools: open at once, nothing to install.
+    tools_card, tools_lay, _top = section_card(tr("winetricks.tools_label"), tr("winetricks.tools_hint"))
     tools_row = QHBoxLayout()
-    tools_row.addWidget(QLabel(tr("winetricks.tools_label")))
     tool_labels = {
         "winecfg": tr("winetricks.tool_winecfg"),
         "regedit": tr("winetricks.tool_regedit"),
@@ -223,47 +223,49 @@ def open_winetricks_dialog(
         tool_buttons.append(btn_tool)
         tools_row.addWidget(btn_tool)
     tools_row.addStretch()
-    lay.addLayout(tools_row)
+    tools_lay.addLayout(tools_row)
+    lay.addWidget(tools_card)
 
-    winver_row = QHBoxLayout()
-    winver_row.addWidget(QLabel(tr("winetricks.winver_label")))
+    # 2. Dependencies: pick, then install (the log shows up once it runs).
+    deps_card, deps_lay, _top = section_card(tr("winetricks.presets_label"), tr("winetricks.presets_hint"))
+    deps_form = QFormLayout()
     winver_combo = QComboBox()
     winver_combo.addItem(tr("winetricks.winver_keep"), "")
     for verb, label in WINDOWS_VERSIONS.items():
         winver_combo.addItem(label, verb)
-    winver_row.addWidget(winver_combo, 1)
-    lay.addLayout(winver_row)
-
-    lay.addWidget(QLabel(tr("winetricks.presets_label")))
+    deps_form.addRow(tr("winetricks.winver_label"), winver_combo)
+    deps_lay.addLayout(deps_form)
     preset_checks: dict[str, QCheckBox] = {}
-    for verb, desc in WINETRICKS_PRESETS.items():
-        chk = QCheckBox(f"{verb} — {desc}")
+    checks_grid = QGridLayout()
+    checks_grid.setHorizontalSpacing(16)
+    for i, (verb, desc) in enumerate(WINETRICKS_PRESETS.items()):
+        chk = QCheckBox(desc)
+        chk.setToolTip(verb)
         preset_checks[verb] = chk
-        lay.addWidget(chk)
-
-    lay.addWidget(QLabel(tr("winetricks.custom_label")))
+        checks_grid.addWidget(chk, i // 2, i % 2)
+    deps_lay.addLayout(checks_grid)
     custom_edit = QLineEdit()
     custom_edit.setPlaceholderText(tr("winetricks.custom_placeholder"))
-    lay.addWidget(custom_edit)
+    deps_form_extra = QFormLayout()
+    deps_form_extra.addRow(tr("winetricks.custom_label"), custom_edit)
+    deps_lay.addLayout(deps_form_extra)
+    lay.addWidget(deps_card)
 
     log_edit = QPlainTextEdit()
     log_edit.setReadOnly(True)
     log_edit.setMaximumBlockCount(500)
+    log_edit.setVisible(False)
     lay.addWidget(log_edit, 1)
+    lay.addStretch()
 
-    btn_row = QHBoxLayout()
     btn_install = QPushButton(tr("winetricks.btn_install"))
     btn_install.setObjectName("primaryBtn")
     btn_install.setEnabled(has_winetricks)
-    btn_cancel = QPushButton(tr("winetricks.btn_cancel"))
+    btn_cancel = ShownWhenEnabledButton(tr("winetricks.btn_cancel"))
     btn_cancel.setEnabled(False)
     btn_close = QPushButton(tr("winetricks.btn_close"))
     btn_close.clicked.connect(dlg.accept)
-    btn_row.addWidget(btn_install)
-    btn_row.addWidget(btn_cancel)
-    btn_row.addStretch()
-    btn_row.addWidget(btn_close)
-    lay.addLayout(btn_row)
+    lay.addLayout(dialog_footer(btn_install, btn_close, left=(btn_cancel,)))
 
     def _on_install_wt_pkg() -> None:
         cmd = get_system_package_install_cmd("winetricks")
@@ -352,6 +354,7 @@ def open_winetricks_dialog(
             return
 
         log_edit.clear()
+        log_edit.setVisible(True)
         log_edit.appendPlainText(tr("winetricks.running"))
         _set_running(True)
 
@@ -437,20 +440,24 @@ def open_optiscaler_dialog(
     operation = {"busy": False, "refresh_id": 0}
     dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: bool(operation["busy"]))
     dlg.setWindowTitle(tr("optiscaler.title", name=title_name))
-    dlg.resize(520, 360)
+    dlg.resize(560, 460)
     lay = QVBoxLayout(dlg)
+    lay.setSpacing(12)
 
     dlg_alive = _dialog_guard(dlg)
 
-    lbl_dir = QLabel(tr("optiscaler.exe_dir_label", path=str(optiscaler_executable(exe_path).parent)))
-    lbl_dir.setObjectName("MutedText")
-    lbl_dir.setWordWrap(True)
-    lay.addWidget(lbl_dir)
-
+    # 1. Where it goes and whether it is there.
+    state_card, state_lay, _top = section_card(tr("optiscaler.state_title"))
     lbl_state = QLabel()
     lbl_state.setWordWrap(True)
-    lay.addWidget(lbl_state)
+    state_lay.addWidget(lbl_state)
+    state_lay.addWidget(
+        note_label(tr("optiscaler.exe_dir_label", path=str(optiscaler_executable(exe_path).parent)))
+    )
+    lay.addWidget(state_card)
 
+    # 2. How it runs (Automatic picks what fits this game and GPU).
+    opts_card, opts_lay, _top = section_card(tr("optiscaler.options_title"), tr("optiscaler.options_hint"))
     form = QFormLayout()
     combo_backend = QComboBox()
     backend_labels = {
@@ -495,31 +502,21 @@ def open_optiscaler_dialog(
     chk_overlay_menu = QCheckBox(tr("optiscaler.overlay_menu_label"))
     chk_overlay_menu.setChecked(True)
     form.addRow("", chk_overlay_menu)
-    lay.addLayout(form)
+    opts_lay.addLayout(form)
+    lay.addWidget(opts_card)
 
-    lbl_note = QLabel(tr("optiscaler.note_overlay"))
-    lbl_note.setObjectName("MutedText")
-    lbl_note.setWordWrap(True)
-    lay.addWidget(lbl_note)
-
-    lbl_progress = QLabel("")
-    lbl_progress.setObjectName("MutedText")
-    lbl_progress.setWordWrap(True)
+    lbl_progress = note_label()
     lbl_progress.setVisible(False)
     lay.addWidget(lbl_progress)
     lay.addStretch(1)
 
-    btn_row = QHBoxLayout()
     btn_install = QPushButton(tr("optiscaler.btn_install"))
     btn_install.setObjectName("primaryBtn")
     btn_remove = QPushButton(tr("optiscaler.btn_remove"))
+    btn_remove.setObjectName("dangerBtn")
     btn_close = QPushButton(tr("optiscaler.btn_close"))
     btn_close.clicked.connect(dlg.accept)
-    btn_row.addWidget(btn_install)
-    btn_row.addWidget(btn_remove)
-    btn_row.addStretch()
-    btn_row.addWidget(btn_close)
-    lay.addLayout(btn_row)
+    lay.addLayout(dialog_footer(btn_install, btn_close, left=(btn_remove,)))
 
 
     def _on_state_refreshed(req_id: int, st_now: object, recommended: str = "") -> None:

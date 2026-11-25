@@ -192,6 +192,8 @@ QProgressBar::chunk {
 }
 QLabel#SteamReady { color: $good_fg; font-size: 12px; }
 QLabel#SteamWarning { color: $warning_fg; font-size: 12px; }
+QLabel#WarningText { color: $warning_fg; }
+QLabel#ErrorText { color: $error_fg; }
 QLabel#SteamUnavailable { color: $info_fg; font-size: 12px; }
 QLabel#VdfErrorBanner {
     color: $error_fg; background-color: $error_bg; border: 1px solid $error_fg;

@@ -51,7 +51,7 @@ from ..steam_vdf import (
     orphan_shortcut_mappings,
     remove_orphan_shortcut_mappings,
 )
-from ..ui_cards import _BusyGuardedDialog, _dialog_guard, _dialog_parent, _format_worker_error
+from ..ui_cards import _BusyGuardedDialog, _dialog_guard, _dialog_parent, _format_worker_error, dialog_footer
 from ..ui_workers import SteamOpWorker
 from ..vdf_queue import QueuedVdfEdit
 
@@ -427,17 +427,8 @@ def _show(
     btn_orphans.setVisible(bool(orphans))
     btn_versions = QPushButton(tr("library.btn_manage_protons"))
     btn_close = QPushButton(tr("proton_bulk.btn_close"))
-    row1 = QHBoxLayout()
-    for b in (btn_select_all, btn_select_none, btn_update_all, btn_update):
-        row1.addWidget(b)
-    row1.addStretch()
-    row2 = QHBoxLayout()
-    for b in (btn_previous, btn_orphans, btn_versions):
-        row2.addWidget(b)
-    row2.addStretch()
-    row2.addWidget(btn_close)
-    lay.addLayout(row1)
-    lay.addLayout(row2)
+    lay.addLayout(dialog_footer(btn_update_all, btn_update, left=(btn_select_all, btn_select_none)))
+    lay.addLayout(dialog_footer(btn_close, left=(btn_previous, btn_orphans, btn_versions)))
     actions = (
         cmb_target,
         btn_update,

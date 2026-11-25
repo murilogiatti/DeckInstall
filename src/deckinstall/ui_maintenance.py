@@ -34,7 +34,10 @@ from .ui_cards import (
     _is_wine_game_running,
     _make_card,
     _SortableTableItem,
+    dialog_footer,
     format_size_bytes,
+    page_layout,
+    section_card,
 )
 from .ui_runtimes import show_runtime_health
 from .ui_workers_maint import (
@@ -54,23 +57,12 @@ _GROUP_RANK = {group: idx for idx, group in enumerate(GROUP_ORDER)}
 
 def build_maintenance_page(win: MainWindow) -> QWidget:
     """Build the Maintenance & Cleanup page widget and bind controls onto ``win``."""
-    page = QWidget()
-    layout = QVBoxLayout(page)
-    layout.setContentsMargins(0, 0, 0, 0)
-    layout.setSpacing(14)
+    page, layout = page_layout(tr("nav.maintenance"), tr("maint.page_subtitle"))
 
     win._maint_candidates = []
     win._maint_checked = {}
     win._maint_active_filter = "all"
     win._maint_scanned = False
-
-    title = QLabel(tr("maint.page_title"))
-    title.setObjectName("PageTitle")
-    sub = QLabel(tr("maint.page_subtitle"))
-    sub.setObjectName("MutedText")
-    sub.setWordWrap(True)
-    layout.addWidget(title)
-    layout.addWidget(sub)
 
     clean_card, clean_layout = _make_card()
     clean_top = QHBoxLayout()
@@ -162,6 +154,14 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     footer.addWidget(win.btn_maint_delete_selected)
     clean_layout.addLayout(footer)
     layout.addWidget(clean_card, 1)
+
+    # Last and apart: undo everything DeckInstall changed on this PC.
+    remove_card, remove_layout, _top = section_card(tr("remove_all.card_title"), tr("remove_all.open_tip"))
+    btn_remove_all = QPushButton(tr("remove_all.open_btn"))
+    btn_remove_all.setObjectName("dangerBtn")
+    btn_remove_all.clicked.connect(win._remove_everything)
+    remove_layout.addWidget(btn_remove_all, 0, Qt.AlignmentFlag.AlignLeft)
+    layout.addWidget(remove_card)
 
     _populate_maint_list(win)
     return page
@@ -673,17 +673,12 @@ def open_uninstall_runtimes_dialog(win: MainWindow, kinds: set[str] | None = Non
         tbl.horizontalHeader().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
         tbl.setSortingEnabled(True)
         lay.addWidget(tbl, 1)
-        buttons = QHBoxLayout()
         btn_all = QPushButton(tr("optiscaler_bulk.btn_select_all"))
         btn_none = QPushButton(tr("optiscaler_bulk.btn_select_none"))
         btn_remove = QPushButton(tr("runtime.uninstall_btn_selected"))
         btn_remove.setObjectName("dangerBtn")
         btn_close = QPushButton(tr("proton_bulk.btn_close"))
-        for b in (btn_all, btn_none, btn_remove):
-            buttons.addWidget(b)
-        buttons.addStretch()
-        buttons.addWidget(btn_close)
-        lay.addLayout(buttons)
+        lay.addLayout(dialog_footer(btn_remove, btn_close, left=(btn_all, btn_none)))
 
         def _set_all(state: Qt.CheckState) -> None:
             for r in range(tbl.rowCount()):

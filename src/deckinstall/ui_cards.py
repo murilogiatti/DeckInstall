@@ -566,6 +566,40 @@ class ShownWhenEnabledButton(QPushButton):
             self.setHidden(self.testAttribute(Qt.WidgetAttribute.WA_ForceDisabled))
 
 
+def page_layout(title_text: str, subtitle_text: str) -> tuple[QWidget, QVBoxLayout]:
+    """Every tab starts the same way: its name, one line on what it is for, then its cards."""
+    page = QWidget()
+    layout = QVBoxLayout(page)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(14)
+    title = QLabel(title_text)
+    title.setObjectName("PageTitle")
+    layout.addWidget(title)
+    layout.addWidget(note_label(subtitle_text))
+    return page, layout
+
+
+def note_label(text: str = "", kind: str = "MutedText") -> QLabel:
+    """A wrapped hint or notice. kind: MutedText (hint), WarningText or ErrorText (theme colors,
+    readable in light and dark), or UnavailableBanner (a boxed warning)."""
+    label = QLabel(text)
+    label.setObjectName(kind)
+    label.setWordWrap(True)
+    return label
+
+
+def dialog_footer(*right: QPushButton, left: tuple[QPushButton, ...] = ()) -> QHBoxLayout:
+    """The bottom row every dialog shares: extra or risky actions on the left; the main action,
+    then Close or Cancel, on the right."""
+    row = QHBoxLayout()
+    for button in left:
+        row.addWidget(button)
+    row.addStretch()
+    for button in right:
+        row.addWidget(button)
+    return row
+
+
 def action_grid() -> QGridLayout:
     """Rows of action_row(): buttons on the left, what they do on the right."""
     grid = QGridLayout()

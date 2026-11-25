@@ -44,6 +44,8 @@ from .ui_cards import (
     _make_card,
     action_grid,
     action_row,
+    note_label,
+    page_layout,
     section_card,
     shortcut_target_button,
 )
@@ -56,18 +58,7 @@ if TYPE_CHECKING:
 
 
 def build_extract_page(win: MainWindow) -> QWidget:
-    page = QWidget()
-    layout = QVBoxLayout(page)
-    layout.setContentsMargins(0, 0, 0, 0)
-    layout.setSpacing(14)
-
-    title = QLabel(tr("install.page_title"))
-    title.setObjectName("PageTitle")
-    sub = QLabel(tr("install.page_subtitle"))
-    sub.setObjectName("MutedText")
-    sub.setWordWrap(True)
-    layout.addWidget(title)
-    layout.addWidget(sub)
+    page, layout = page_layout(tr("install.page_title"), tr("install.page_subtitle"))
 
     drop_card = DropZoneFrame()
     drop_card.file_dropped.connect(win._set_extract_source)
@@ -409,18 +400,7 @@ def build_library_page(win: MainWindow) -> QWidget:
     layout.setContentsMargins(0, 0, 0, 0)
     layout.setSpacing(12)
 
-    my_lib_page = QWidget()
-    my_lib_layout = QVBoxLayout(my_lib_page)
-    my_lib_layout.setContentsMargins(0, 0, 0, 0)
-    my_lib_layout.setSpacing(14)
-
-    title = QLabel(tr("library.page_title"))
-    title.setObjectName("PageTitle")
-    sub = QLabel(tr("library.page_subtitle"))
-    sub.setObjectName("MutedText")
-    sub.setWordWrap(True)
-    my_lib_layout.addWidget(title)
-    my_lib_layout.addWidget(sub)
+    my_lib_page, my_lib_layout = page_layout(tr("library.page_title"), tr("library.page_subtitle"))
 
 
     # 1. The games: pick one, then act on it (the everyday part).
@@ -631,23 +611,6 @@ def build_library_page(win: MainWindow) -> QWidget:
     return page
 
 
-def _labeled(label: str, widget: QWidget) -> QWidget:
-    box = QWidget()
-    row = QHBoxLayout(box)
-    row.setContentsMargins(0, 0, 0, 0)
-    row.addWidget(QLabel(label))
-    row.addWidget(widget)
-    return box
-
-
-def _card_with_title(title: str) -> tuple[QWidget, QVBoxLayout]:
-    card, layout = _make_card()
-    head = QLabel(title)
-    head.setObjectName("SectionTitle")
-    layout.addWidget(head)
-    return card, layout
-
-
 def update_sgdb_state(win: MainWindow) -> None:
     """Say whether a SteamGridDB key is saved (the key itself is never shown)."""
     from .steamgriddb import api_key
@@ -656,23 +619,13 @@ def update_sgdb_state(win: MainWindow) -> None:
 
 
 def build_settings_page(win: MainWindow) -> QWidget:
-    """Settings tab: appearance, Steam and the app itself (they used to share Maintenance)."""
+    """Settings > General: appearance, Steam, game artwork and the app itself."""
     from .ui_scale import SCALE_KEY
 
-    page = QWidget()
-    layout = QVBoxLayout(page)
-    layout.setContentsMargins(0, 0, 0, 0)
-    layout.setSpacing(14)
-    title = QLabel(tr("settings.page_title"))
-    title.setObjectName("PageTitle")
-    sub = QLabel(tr("settings.page_subtitle"))
-    sub.setObjectName("MutedText")
-    sub.setWordWrap(True)
-    layout.addWidget(title)
-    layout.addWidget(sub)
+    page, layout = page_layout(tr("settings.section_general"), tr("settings.page_subtitle"))
 
-    # Appearance
-    look, look_layout = _card_with_title(tr("settings.look_title"))
+    # Appearance: a form, one setting per line.
+    look, look_layout, _top = section_card(tr("settings.look_title"))
     win.theme_combo = QComboBox()
     win.theme_combo.addItem(tr("header.theme.auto"), "auto")
     win.theme_combo.addItem(tr("header.theme.dark"), "dark")
@@ -687,7 +640,6 @@ def build_settings_page(win: MainWindow) -> QWidget:
         win.lang_combo.setCurrentIndex(lidx)
     win.lang_combo.currentIndexChanged.connect(win._on_language_changed)
     win.scale_combo = QComboBox()
-    win.scale_combo.setToolTip(tr("settings.scale_tip"))
     win.scale_combo.addItem(tr("settings.scale_auto"), "auto")
     win.scale_combo.addItem(tr("settings.scale_100"), "1")
     win.scale_combo.addItem(tr("settings.scale_125"), "1.25")
@@ -699,49 +651,45 @@ def build_settings_page(win: MainWindow) -> QWidget:
         win.message_bar.show_message(tr("settings.scale_restart"), "info", key="scale")
 
     win.scale_combo.currentIndexChanged.connect(_on_scale_changed)
-    prefs = FlowLayout(spacing=12)
-    prefs.addWidget(_labeled(tr("header.theme"), win.theme_combo))
-    prefs.addWidget(_labeled(tr("header.language"), win.lang_combo))
-    prefs.addWidget(_labeled(tr("settings.scale"), win.scale_combo))
-    look_layout.addLayout(prefs)
-    scale_note = QLabel(tr("settings.scale_tip"))
-    scale_note.setObjectName("MutedText")
-    scale_note.setWordWrap(True)
-    look_layout.addWidget(scale_note)
+    look_form = QFormLayout()
+    look_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+    look_form.addRow(tr("header.theme"), win.theme_combo)
+    look_form.addRow(tr("header.language"), win.lang_combo)
+    look_form.addRow(tr("settings.scale"), win.scale_combo)
+    look_form.addRow(note_label(tr("settings.scale_tip")))  # the whole width: it is a sentence
+    look_layout.addLayout(look_form)
     layout.addWidget(look)
 
-    # Steam
-    steam, steam_layout = _card_with_title(tr("settings.steam_title"))
+    # Steam: which one is in use, and the button to look again (top right, like every status card).
+    steam, steam_layout, steam_top = section_card(tr("settings.steam_title"))
+    win.btn_redetect_steam = QPushButton(tr("sidebar.redetect_steam"))
+    win.btn_redetect_steam.clicked.connect(win._redetect_steam)
+    steam_top.addWidget(win.btn_redetect_steam)
     win.steam_status_lbl = QLabel(win._format_steam_status_text())
     win.steam_status_lbl.setWordWrap(True)
     steam_layout.addWidget(win.steam_status_lbl)
-    win.btn_redetect_steam = QPushButton(tr("sidebar.redetect_steam"))
-    win.btn_redetect_steam.clicked.connect(win._redetect_steam)
-    btn_sgdb = QPushButton(tr("sgdb.btn"))
-    btn_sgdb.clicked.connect(win._set_steamgriddb_key)
-    steam_grid = action_grid()
-    action_row(steam_grid, 0, win.btn_redetect_steam, tr("settings.redetect_hint"))
-    action_row(steam_grid, 1, btn_sgdb, tr("sgdb.tip"))
-    win.lbl_sgdb_state = QLabel()
-    win.lbl_sgdb_state.setObjectName("MutedText")
-    steam_grid.addWidget(win.lbl_sgdb_state, 2, 1)
-    steam_layout.addLayout(steam_grid)
-    update_sgdb_state(win)
+    steam_layout.addWidget(note_label(tr("settings.redetect_hint")))
     layout.addWidget(steam)
 
-    # The app
-    app_card, app_layout = _card_with_title(tr("settings.app_title"))
+    # Artwork: the SteamGridDB key (never shown, only whether one is saved).
+    art, art_layout, art_top = section_card(tr("settings.art_title"), tr("sgdb.tip"))
+    win.lbl_sgdb_state = note_label()
+    art_top.addWidget(win.lbl_sgdb_state)
+    btn_sgdb = QPushButton(tr("sgdb.btn"))
+    btn_sgdb.clicked.connect(win._set_steamgriddb_key)
+    art_top.addWidget(btn_sgdb)
+    update_sgdb_state(win)
+    layout.addWidget(art)
+
+    # The app: about and support (removing it all lives in Cleanup).
+    app_card, app_layout, _top = section_card(tr("settings.app_title"))
     btn_about = QPushButton(tr("header.about"))
     btn_about.clicked.connect(win._show_about_dialog)
     win.btn_copy_diag = QPushButton(tr("maint.copy_diagnostics"))
     win.btn_copy_diag.clicked.connect(win._copy_diagnostics)
-    btn_remove_all = QPushButton(tr("remove_all.open_btn"))
-    btn_remove_all.setObjectName("dangerBtn")
-    btn_remove_all.clicked.connect(win._remove_everything)
     app_grid = action_grid()
     action_row(app_grid, 0, btn_about, tr("settings.about_hint"))
     action_row(app_grid, 1, win.btn_copy_diag, tr("maint.copy_diagnostics_tip"))
-    action_row(app_grid, 2, btn_remove_all, tr("remove_all.open_tip"))
     app_layout.addLayout(app_grid)
     layout.addWidget(app_card)
     layout.addStretch(1)

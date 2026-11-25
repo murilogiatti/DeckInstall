@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
-    QLabel,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -45,7 +44,10 @@ from ..ui_cards import (
     _format_worker_error,
     _is_wine_game_running,
     _SortableTableItem,
+    dialog_footer,
     format_size_bytes,
+    note_label,
+    section_card,
 )
 from ..ui_workers import SteamOpWorker
 
@@ -79,13 +81,15 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
     busy_state = {"active": False}
     dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: busy_state["active"])
     dlg.setWindowTitle(tr("proton_mgr.title"))
-    dlg.resize(640, 580)
+    dlg.resize(680, 640)
     lay = QVBoxLayout(dlg)
+    lay.setSpacing(12)
     dlg_alive = {"open": True}
 
     dlg.finished.connect(lambda _result: dlg_alive.__setitem__("open", False))
 
-    lay.addWidget(QLabel(tr("proton_mgr.installed_label")))
+    # 1. What is installed, and what uses it (remove only what nothing uses).
+    inst_card, inst_lay, inst_top = section_card(tr("proton_mgr.installed_label"), tr("proton_mgr.installed_hint"))
     installed_list = QTableWidget(0, 3)
     installed_list.setHorizontalHeaderLabels(
         [tr("proton_mgr.column_version"), tr("proton_mgr.column_size"), tr("proton_mgr.column_usage")]
@@ -100,19 +104,17 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
     installed_list.horizontalHeader().setStretchLastSection(True)
     installed_list.horizontalHeader().setSectionsClickable(True)
     installed_list.setSortingEnabled(True)
-    lay.addWidget(installed_list, 1)
-
-    inst_btns = QHBoxLayout()
+    inst_lay.addWidget(installed_list, 1)
     btn_refresh_inst = QPushButton(tr("proton_mgr.btn_refresh_installed"))
+    inst_top.addWidget(btn_refresh_inst)
     btn_remove_inst = QPushButton(tr("proton_mgr.btn_remove"))
     btn_remove_inst.setObjectName("dangerBtn")
     btn_remove_inst.setEnabled(False)
-    inst_btns.addWidget(btn_refresh_inst)
-    inst_btns.addStretch()
-    inst_btns.addWidget(btn_remove_inst)
-    lay.addLayout(inst_btns)
+    inst_lay.addWidget(btn_remove_inst, 0, Qt.AlignmentFlag.AlignLeft)
+    lay.addWidget(inst_card, 1)
 
-    lay.addWidget(QLabel(tr("proton_mgr.download_label")))
+    # 2. Another version: pick a family, look up its releases, install one.
+    dl_card, dl_lay, _top = section_card(tr("proton_mgr.download_label"))
     fetch_row = QHBoxLayout()
     family_combo = QComboBox()
     for fam in PROTON_FAMILIES.values():
@@ -120,7 +122,7 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
     btn_fetch = QPushButton(tr("proton_mgr.btn_fetch"))
     fetch_row.addWidget(family_combo, 1)
     fetch_row.addWidget(btn_fetch)
-    lay.addLayout(fetch_row)
+    dl_lay.addLayout(fetch_row)
 
     releases_list = QTableWidget(0, 3)
     releases_list.setHorizontalHeaderLabels(
@@ -136,11 +138,10 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
     releases_list.horizontalHeader().setStretchLastSection(True)
     releases_list.horizontalHeader().setSectionsClickable(True)
     releases_list.setSortingEnabled(True)
-    lay.addWidget(releases_list, 1)
+    dl_lay.addWidget(releases_list, 1)
+    lay.addWidget(dl_card, 1)
 
-    lbl_status = QLabel(tr("status.ready"))
-    lbl_status.setObjectName("MutedText")
-    lbl_status.setWordWrap(True)
+    lbl_status = note_label(tr("status.ready"))
     lay.addWidget(lbl_status)
 
     progress = QProgressBar()
@@ -148,16 +149,12 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
     progress.setVisible(False)
     lay.addWidget(progress)
 
-    footer = QHBoxLayout()
     btn_install = QPushButton(tr("proton_mgr.btn_install"))
     btn_install.setObjectName("primaryBtn")
     btn_install.setEnabled(False)
     btn_close = QPushButton(tr("proton_mgr.btn_close"))
     btn_close.clicked.connect(dlg.reject)
-    footer.addWidget(btn_install)
-    footer.addStretch()
-    footer.addWidget(btn_close)
-    lay.addLayout(footer)
+    lay.addLayout(dialog_footer(btn_install, btn_close))
 
     def _can_remove_selected() -> bool:
         if busy_state["active"]:

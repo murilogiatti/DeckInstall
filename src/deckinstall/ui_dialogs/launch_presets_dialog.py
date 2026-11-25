@@ -52,6 +52,8 @@ from ..ui_cards import (
     _is_native_linux_game,
     _parse_launch_preset_state,
     _resolve_game_exe_path,
+    note_label,
+    section_card,
 )
 from ..ui_workers import SteamOpWorker
 from ..vdf_queue import QueuedVdfEdit
@@ -92,21 +94,26 @@ def open_launch_presets_dialog(
     dlg = QDialog(parent if parent is not None else _dialog_parent(win))
     dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
     dlg.setWindowTitle(tr("launch.title", name=title))
-    dlg.resize(580, 500)
+    dlg.resize(640, 640)
     dlg_lay = QVBoxLayout(dlg)
 
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setFrameShape(QFrame.Shape.NoFrame)
     body = QWidget()
-    lay = QVBoxLayout(body)
-    lay.setContentsMargins(0, 0, 4, 0)
+    body_lay = QVBoxLayout(body)
+    body_lay.setContentsMargins(0, 0, 4, 0)
+    body_lay.setSpacing(12)
+    current = {"lay": body_lay}  # the card the next options go into
 
     def _section(text: str) -> None:
-        lbl = QLabel(text)
-        lbl.setObjectName("SectionTitle")
-        lbl.setContentsMargins(0, 8, 0, 2)
-        lay.addWidget(lbl)
+        card, card_lay, _top = section_card(text)
+        card_lay.setSpacing(4)
+        body_lay.addWidget(card)
+        current["lay"] = card_lay
+
+    def _add(widget: QWidget) -> None:
+        current["lay"].addWidget(widget)
 
     def _muted_hint(text: str) -> QLabel:
         lbl = QLabel(text)
@@ -204,15 +211,9 @@ def open_launch_presets_dialog(
     winedll_lbl = QLabel(tr("launch.winedlloverrides_label"))
     winedll_edit = QLineEdit(winedll_now)
 
-    wined3d_warn = QLabel(tr("launch.wined3d_vulkan_warn"))
-    wined3d_warn.setWordWrap(True)
-    wined3d_warn.setStyleSheet(
-        "color: #ffd180; background-color: rgba(180, 110, 20, 0.22); "
-        "border: 1px solid #c77c1a; border-radius: 6px; padding: 6px;"
-    )
+    wined3d_warn = note_label(tr("launch.wined3d_vulkan_warn"), "UnavailableBanner")
     wined3d_warn.setVisible(False)
 
-    raw_lbl = QLabel(tr("launch.raw_label"))
     raw_edit = QLineEdit(opts_now)
 
     syncing = {"active": False}
@@ -328,10 +329,10 @@ def open_launch_presets_dialog(
         chk: QCheckBox, hint_text: str, bin_name: str, extra_row: QLayout | None = None, blocked_note: str = "",
     ) -> None:
         chk.toggled.connect(_sync_preview)
-        lay.addWidget(chk)
-        lay.addWidget(_muted_hint(blocked_note or hint_text))
+        _add(chk)
+        _add(_muted_hint(blocked_note or hint_text))
         if extra_row is not None:
-            lay.addLayout(extra_row)
+            current["lay"].addLayout(extra_row)
         if blocked_note:
             return  # the mode does not use this tool: nothing to install
         official_mh = bin_name == "mangohud"
@@ -344,11 +345,10 @@ def open_launch_presets_dialog(
             warn_lay = QHBoxLayout(warn_row)
             warn_lay.setContentsMargins(20, 0, 0, 4)
             warn_lay.setSpacing(8)
-            warn_lbl = QLabel(
-                tr("launch.mangohud_official_missing") if official_mh else tr("launch.missing_bin_warn", bin=bin_name)
+            warn_lbl = note_label(
+                tr("launch.mangohud_official_missing") if official_mh else tr("launch.missing_bin_warn", bin=bin_name),
+                "WarningText",
             )
-            warn_lbl.setWordWrap(True)
-            warn_lbl.setStyleSheet("color: #ffd180;")
             warn_lay.addWidget(warn_lbl, 1)
 
             install_btn = QPushButton(tr("launch.btn_install_bin", bin=bin_name))
@@ -428,7 +428,7 @@ def open_launch_presets_dialog(
 
             install_btn.clicked.connect(_on_install_bin)
             warn_lay.addWidget(install_btn)
-            lay.addWidget(warn_row)
+            _add(warn_row)
 
     _section(tr("launch.section_performance"))
     _add_tool_preset(chk_gm, tr("launch.gamemode_hint"), "gamemoderun")
@@ -446,8 +446,8 @@ def open_launch_presets_dialog(
         _section(tr("launch.section_gpu"))
     if (not is_native_linux) and (gpu.has_nvidia or nvapi_active):
         chk_nvapi.toggled.connect(_sync_preview)
-        lay.addWidget(chk_nvapi)
-        lay.addWidget(_muted_hint(tr("launch.nvidia_nvapi_hint")))
+        _add(chk_nvapi)
+        _add(_muted_hint(tr("launch.nvidia_nvapi_hint")))
     else:
         chk_nvapi.setVisible(False)
         chk_nvapi.setEnabled(False)
@@ -455,13 +455,13 @@ def open_launch_presets_dialog(
         if not gpu.has_nvidia:
             chk_prime.setText(tr("launch.prime_offload_mesa"))
         chk_prime.toggled.connect(_sync_preview)
-        lay.addWidget(chk_prime)
+        _add(chk_prime)
         prime_hint = tr("launch.prime_offload_hint") if gpu.has_nvidia else tr("launch.prime_offload_mesa_hint")
-        lay.addWidget(_muted_hint(prime_hint))
+        _add(_muted_hint(prime_hint))
     if (not is_native_linux) and (gpu.has_nvidia or bool(st["dlss_upgrade"])):
         chk_dlss.toggled.connect(_sync_preview)
-        lay.addWidget(chk_dlss)
-        lay.addWidget(_muted_hint(tr("launch.dlss_hint")))
+        _add(chk_dlss)
+        _add(_muted_hint(tr("launch.dlss_hint")))
     else:
         chk_dlss.setVisible(False)
         chk_dlss.setEnabled(False)
@@ -470,8 +470,8 @@ def open_launch_presets_dialog(
         _section(tr("launch.section_compat"))
     if (not is_native_linux) and (gpu.is_wayland or wayland_active):
         chk_wayland.toggled.connect(_sync_preview)
-        lay.addWidget(chk_wayland)
-        lay.addWidget(_muted_hint(tr("launch.proton_wayland_hint")))
+        _add(chk_wayland)
+        _add(_muted_hint(tr("launch.proton_wayland_hint")))
     else:
         chk_wayland.setVisible(False)
         chk_wayland.setEnabled(False)
@@ -483,52 +483,35 @@ def open_launch_presets_dialog(
             (chk_fsync, tr("launch.no_fsync_hint")),
         ):
             chk.toggled.connect(_sync_preview)
-            lay.addWidget(chk)
-            lay.addWidget(_muted_hint(hint))
+            _add(chk)
+            _add(_muted_hint(hint))
         chk_dxgi.toggled.connect(_on_dxgi_toggled)
-        lay.addWidget(chk_dxgi)
-        lay.addWidget(_muted_hint(tr("launch.dxgi_hint")))
+        _add(chk_dxgi)
+        _add(_muted_hint(tr("launch.dxgi_hint")))
+        _add(wined3d_warn)
     else:
         for chk in (chk_w3d, chk_esync, chk_fsync, chk_dxgi):
             chk.setVisible(False)
             chk.setEnabled(False)
 
+    # Advanced: the debug log and the raw DLL overrides (Wine games only).
     if not is_native_linux:
-        lay.addWidget(winedll_lbl)
-        lay.addWidget(winedll_edit)
-        lay.addWidget(_muted_hint(tr("launch.dll_hint")))
-        if kind == "standalone":
-            winedll_note = QLabel(tr("launch.winedll_standalone_note"))
-            winedll_note.setObjectName("MutedText")
-            winedll_note.setWordWrap(True)
-            lay.addWidget(winedll_note)
-        elif kind == "external":
-            ext_note = QLabel(tr("launch.external_nondestructive_note"))
-            ext_note.setObjectName("MutedText")
-            ext_note.setWordWrap(True)
-            lay.addWidget(ext_note)
-    else:
-        winedll_lbl.setVisible(False)
-        winedll_edit.setVisible(False)
-        winedll_edit.setEnabled(False)
-        if kind == "external":
-            ext_note = QLabel(tr("launch.external_nondestructive_note"))
-            ext_note.setObjectName("MutedText")
-            ext_note.setWordWrap(True)
-            lay.addWidget(ext_note)
-
-    lay.addWidget(wined3d_warn)
-    _section(tr("launch.section_advanced"))
-    if not is_native_linux:
+        _section(tr("launch.section_advanced"))
         chk_debug.toggled.connect(_sync_preview)
-        lay.addWidget(chk_debug)
-        lay.addWidget(_muted_hint(tr("launch.debug_log_hint")))
+        _add(chk_debug)
+        _add(_muted_hint(tr("launch.debug_log_hint")))
+        _add(winedll_lbl)
+        _add(winedll_edit)
+        _add(_muted_hint(tr("launch.dll_hint")))
+        if kind == "standalone":
+            _add(note_label(tr("launch.winedll_standalone_note")))
     else:
         chk_debug.setVisible(False)
         chk_debug.setEnabled(False)
-    lay.addWidget(raw_lbl)
-    lay.addWidget(raw_edit)
-    lay.addWidget(_muted_hint(tr("launch.raw_hint")))
+        winedll_lbl.setVisible(False)
+        winedll_edit.setVisible(False)
+        winedll_edit.setEnabled(False)
+    body_lay.addStretch(1)
 
     winedll_edit.textChanged.connect(_on_winedll_text_changed)
     raw_edit.textChanged.connect(_on_raw_text_changed)
@@ -539,6 +522,15 @@ def open_launch_presets_dialog(
 
     scroll.setWidget(body)
     dlg_lay.addWidget(scroll, 1)
+
+    # The result, always in sight: the line the game starts with (editable by hand).
+    result_card, result_lay, _top = section_card(tr("launch.raw_label"))
+    result_lay.setSpacing(4)
+    result_lay.addWidget(raw_edit)
+    result_lay.addWidget(note_label(tr("launch.raw_hint")))
+    if kind == "external":
+        result_lay.addWidget(note_label(tr("launch.external_nondestructive_note")))
+    dlg_lay.addWidget(result_card)
 
     btns = QDialogButtonBox(
         QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
