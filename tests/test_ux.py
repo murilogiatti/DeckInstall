@@ -314,3 +314,51 @@ def test_closing_stops_the_game_scan_instead_of_waiting(tmp_path: Path) -> None:
     worker = ScanWorker(roots=[tmp_path], scan_fn=lambda **kw: seen.append(kw["should_stop"]) or [])
     worker.run()
     assert seen == [worker.isInterruptionRequested]  # closeEvent's requestInterruption() reaches the walk
+
+
+def test_close_hides_at_once_when_only_read_only_work_runs() -> None:
+    import threading
+
+    from PySide6.QtCore import QThread
+
+    from deckinstall.i18n import tr
+
+    class _Busy(QThread):
+        def __init__(self, read_only: bool) -> None:
+            super().__init__()
+            self.read_only = read_only
+            self.release = threading.Event()
+
+        def run(self) -> None:
+            self.release.wait(10)
+
+    app = _app()
+    with tempfile.TemporaryDirectory() as tmp:
+        win = _window(app, tmp)
+        try:
+            assert ui._wait_for_workers(app, win, 10.0)
+            win.show()
+            for read_only in (True, False):
+                worker = _Busy(read_only)
+                win._track_worker(worker)
+                worker.start()
+                with (
+                    mock.patch.object(ui.QMessageBox, "question") as asked,
+                    mock.patch.object(ui.QCoreApplication, "quit") as quit_app,
+                ):
+                    win.close()
+                    if read_only:  # a scan: nothing to lose, the window goes away now
+                        assert not win.isVisible() and win._closing_pending
+                    else:  # it writes: the window stays and says why
+                        assert win.isVisible() and win.status_label.text() == tr("status.closing_wait")
+                    worker.release.set()
+                    assert ui._wait_for_workers(app, win, 5.0)
+                    asked.assert_not_called()
+                    assert win._closed
+                    assert quit_app.called == read_only  # a hidden window must end the app itself
+                win._closed = False
+                win._hidden_for_close = False
+                win.show()
+        finally:
+            win._force_closing = True
+            _close(app, win)

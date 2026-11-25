@@ -37,6 +37,8 @@ from .ui_cards import _format_worker_error, _is_wine_game_running
 class MaintHealthWorker(QThread):
     """Collect runtime health and disk usage metrics for the Maintenance page."""
 
+    read_only = True  # only reads: closing the window never waits for it on screen
+
     ready = Signal(int, dict)
     failed = Signal(int, str)
 
@@ -206,6 +208,8 @@ class MaintHealthWorker(QThread):
 
 class MaintScanWorker(QThread):
     """Scan for cleanup candidates including system caches."""
+
+    read_only = True  # only reads: closing the window never waits for it on screen
 
     found = Signal(list)
     failed = Signal(str)

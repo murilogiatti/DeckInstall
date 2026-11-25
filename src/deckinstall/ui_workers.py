@@ -268,6 +268,8 @@ class SteamOpWorker(QThread):
 class ScanWorker(QThread):
     """Background worker to scan game folders without blocking the UI thread."""
 
+    read_only = True  # only reads: closing the window never waits for it on screen
+
     finished_scan = Signal(list)
 
     def __init__(
@@ -407,6 +409,8 @@ class RuntimeUpdateWorker(QThread):
 
 class UpdatesCheckWorker(QThread):
     """Check DeckInstall and the given runtimes for updates (updates.check_all, never raises)."""
+
+    read_only = True  # only reads: closing the window never waits for it on screen
 
     checked = Signal(object)
 

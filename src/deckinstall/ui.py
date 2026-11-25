@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import NoReturn, TypedDict, cast
 
 from PySide6.QtCore import (
+    QCoreApplication,
     QDateTime,
     QFileSystemWatcher,
     QLibraryInfo,
@@ -457,6 +458,7 @@ class MainWindow(QMainWindow):
         self._closed = False
         self._relaunch_after_close: Path | None = None
         self._force_closing = False
+        self._hidden_for_close = False  # closed while only read-only work ran: quit when it ends
         self._close_force_timer: QTimer | None = None
         self._busy_count = 0
         self._vdf_corrupt = False
@@ -565,10 +567,13 @@ class MainWindow(QMainWindow):
             self._closing_pending = False
             self.close()
             return
-        ans = QMessageBox.question(
-            _dialog_parent(self),
-            __app_name__,
-            tr("status.closing_force_prompt"),
+        hidden_read_only = not self.isVisible() and self._only_read_only_work()
+        if hidden_read_only:  # a scan stuck on a slow disk: it only reads, so stop it without asking
+            logging.warning("Read-only workers still running after close: %s", [type(w).__name__ for w in running])
+        ans = (
+            QMessageBox.StandardButton.Yes
+            if hidden_read_only
+            else QMessageBox.question(_dialog_parent(self), __app_name__, tr("status.closing_force_prompt"))
         )
         if ans == QMessageBox.StandardButton.Yes:
             for w in list(self._active_workers):
@@ -582,16 +587,41 @@ class MainWindow(QMainWindow):
             if self._close_force_timer is not None:
                 self._close_force_timer.start(5000)
 
+    _READ_ONLY_CLOSE_GRACE_MS = 10000
+
+    def _quit_if_hidden_for_close(self) -> None:
+        # Closing a window that is already hidden does not end the event loop by itself.
+        if self._hidden_for_close:
+            QCoreApplication.quit()
+
+    def _only_read_only_work(self) -> bool:
+        """True when everything still running only reads (scans, sizes, checks): nothing to lose."""
+        running = [w for w in self._active_workers if w.isRunning()]
+        return bool(running) and not self._vdf_applying and all(getattr(w, "read_only", False) for w in running)
+
     def _defer_close_for_workers(self, event: QCloseEvent) -> None:
-        """Keep the window open while background workers finish and arm the force-close timer."""
+        """Wait for background workers before closing and arm the force-close timer.
+
+        When they only read (the scans started with the window), the window goes away at once
+        and the process ends as soon as they stop; there is nothing to wait for on screen.
+        """
         self._closing_pending = True
-        self.status_label.setText(tr("status.closing_wait"))
+        running = sorted(type(w).__name__ for w in self._active_workers if w.isRunning())
+        read_only = self._only_read_only_work()
+        logging.info(
+            "Close waits for %s%s", ", ".join(running) or "a Steam write", " (window hidden)" if read_only else ""
+        )
+        if read_only:
+            self._hidden_for_close = True
+            self.hide()
+        else:
+            self.status_label.setText(tr("status.closing_wait"))
         if self._close_force_timer is None:
             self._close_force_timer = QTimer(self)
             self._close_force_timer.setSingleShot(True)
             self._close_force_timer.timeout.connect(self._on_close_force_timeout)
         if not self._close_force_timer.isActive():
-            self._close_force_timer.start(5000)
+            self._close_force_timer.start(self._READ_ONLY_CLOSE_GRACE_MS if read_only else 5000)
         event.ignore()
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -602,6 +632,7 @@ class MainWindow(QMainWindow):
             self._closed = True
             self._play.release()
             super().closeEvent(event)
+            self._quit_if_hidden_for_close()
             return
         if self._vdf_applying:
             # Never cancel or double-prompt while an async VDF queue write is in flight.
@@ -657,6 +688,7 @@ class MainWindow(QMainWindow):
         self._play.release()  # stop following running games; they keep running
         self._closed = True
         super().closeEvent(event)
+        self._quit_if_hidden_for_close()
         updated_path, self._relaunch_after_close = self._relaunch_after_close, None
         if updated_path is not None:
             try:
@@ -2247,6 +2279,7 @@ class MainWindow(QMainWindow):
         worker = SteamOpWorker(lambda: compute_library_sizes(
             entries, games, external, paths, cancelled=worker.isInterruptionRequested,
         ))
+        worker.read_only = True  # type: ignore[attr-defined]  # closing never waits for it on screen
         self._library_size_worker = worker
         self._track_worker(worker)
 

@@ -214,6 +214,8 @@ def _add_tech_labels(
 class SteamDetectWorker(QThread):
     """Detect Steam paths and load Steam, standalone, and external games."""
 
+    read_only = True  # only reads: closing the window never waits for it on screen
+
     ready = Signal(int, int, object, bool, list, list, list, str, object)
     failed = Signal(str)
 
