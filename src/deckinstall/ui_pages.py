@@ -608,23 +608,41 @@ def build_library_page(win: MainWindow) -> QWidget:
     return page
 
 
-def build_app_settings_card(win: MainWindow) -> QWidget:
-    """Maintenance card with what used to be the sidebar: Steam status, theme, language and About."""
+def _labeled(label: str, widget: QWidget) -> QWidget:
+    box = QWidget()
+    row = QHBoxLayout(box)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.addWidget(QLabel(label))
+    row.addWidget(widget)
+    return box
+
+
+def _card_with_title(title: str) -> tuple[QWidget, QVBoxLayout]:
     card, layout = _make_card()
-    title = QLabel(tr("maint.app_settings_title"))
-    title.setObjectName("SectionTitle")
+    head = QLabel(title)
+    head.setObjectName("SectionTitle")
+    layout.addWidget(head)
+    return card, layout
+
+
+def build_settings_page(win: MainWindow) -> QWidget:
+    """Settings tab: appearance, Steam and the app itself (they used to share Maintenance)."""
+    from .ui_scale import SCALE_KEY
+
+    page = QWidget()
+    layout = QVBoxLayout(page)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(14)
+    title = QLabel(tr("settings.page_title"))
+    title.setObjectName("PageTitle")
+    sub = QLabel(tr("settings.page_subtitle"))
+    sub.setObjectName("MutedText")
+    sub.setWordWrap(True)
     layout.addWidget(title)
+    layout.addWidget(sub)
 
-    steam_row = QHBoxLayout()
-    win.steam_status_lbl = QLabel(win._format_steam_status_text())
-    win.steam_status_lbl.setWordWrap(True)
-    win.btn_redetect_steam = QPushButton(tr("sidebar.redetect_steam"))
-    win.btn_redetect_steam.clicked.connect(win._redetect_steam)
-    steam_row.addWidget(win.steam_status_lbl, 1)
-    steam_row.addWidget(win.btn_redetect_steam)
-    layout.addLayout(steam_row)
-
-    prefs = FlowLayout(spacing=8)
+    # Appearance
+    look, look_layout = _card_with_title(tr("settings.look_title"))
     win.theme_combo = QComboBox()
     win.theme_combo.addItem(tr("header.theme.auto"), "auto")
     win.theme_combo.addItem(tr("header.theme.dark"), "dark")
@@ -634,13 +652,10 @@ def build_app_settings_card(win: MainWindow) -> QWidget:
     win.lang_combo.addItem(tr("header.language.auto"), "auto")
     for code, disp in available_languages():
         win.lang_combo.addItem(disp, code)
-    saved_lang = str(win.settings.value("language", "auto"))
-    lidx = win.lang_combo.findData(saved_lang)
+    lidx = win.lang_combo.findData(str(win.settings.value("language", "auto")))
     if lidx >= 0:
         win.lang_combo.setCurrentIndex(lidx)
     win.lang_combo.currentIndexChanged.connect(win._on_language_changed)
-    from .ui_scale import SCALE_KEY
-
     win.scale_combo = QComboBox()
     win.scale_combo.setToolTip(tr("settings.scale_tip"))
     win.scale_combo.addItem(tr("settings.scale_auto"), "auto")
@@ -654,32 +669,54 @@ def build_app_settings_card(win: MainWindow) -> QWidget:
         win.message_bar.show_message(tr("settings.scale_restart"), "info", key="scale")
 
     win.scale_combo.currentIndexChanged.connect(_on_scale_changed)
+    prefs = FlowLayout(spacing=12)
+    prefs.addWidget(_labeled(tr("header.theme"), win.theme_combo))
+    prefs.addWidget(_labeled(tr("header.language"), win.lang_combo))
+    prefs.addWidget(_labeled(tr("settings.scale"), win.scale_combo))
+    look_layout.addLayout(prefs)
+    scale_note = QLabel(tr("settings.scale_tip"))
+    scale_note.setObjectName("MutedText")
+    scale_note.setWordWrap(True)
+    look_layout.addWidget(scale_note)
+    layout.addWidget(look)
+
+    # Steam
+    steam, steam_layout = _card_with_title(tr("settings.steam_title"))
+    steam_row = QHBoxLayout()
+    win.steam_status_lbl = QLabel(win._format_steam_status_text())
+    win.steam_status_lbl.setWordWrap(True)
+    win.btn_redetect_steam = QPushButton(tr("sidebar.redetect_steam"))
+    win.btn_redetect_steam.clicked.connect(win._redetect_steam)
+    steam_row.addWidget(win.steam_status_lbl, 1)
+    steam_row.addWidget(win.btn_redetect_steam)
+    steam_layout.addLayout(steam_row)
+    sgdb_row = QHBoxLayout()
+    sgdb_note = QLabel(tr("sgdb.tip"))
+    sgdb_note.setObjectName("MutedText")
+    sgdb_note.setWordWrap(True)
+    btn_sgdb = QPushButton(tr("sgdb.btn"))
+    btn_sgdb.clicked.connect(win._set_steamgriddb_key)
+    sgdb_row.addWidget(sgdb_note, 1)
+    sgdb_row.addWidget(btn_sgdb)
+    steam_layout.addLayout(sgdb_row)
+    layout.addWidget(steam)
+
+    # The app
+    app_card, app_layout = _card_with_title(tr("settings.app_title"))
+    actions = FlowLayout(spacing=8)
     btn_about = QPushButton(tr("header.about"))
     btn_about.clicked.connect(win._show_about_dialog)
-    for label, combo in (
-        (tr("header.theme"), win.theme_combo),
-        (tr("header.language"), win.lang_combo),
-        (tr("settings.scale"), win.scale_combo),
-    ):
-        box = QWidget()
-        row = QHBoxLayout(box)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.addWidget(QLabel(label))
-        row.addWidget(combo)
-        prefs.addWidget(box)
-    prefs.addWidget(btn_about)
     win.btn_copy_diag = QPushButton(tr("maint.copy_diagnostics"))
     win.btn_copy_diag.setToolTip(tr("maint.copy_diagnostics_tip"))
     win.btn_copy_diag.clicked.connect(win._copy_diagnostics)
-    prefs.addWidget(win.btn_copy_diag)
-    btn_sgdb = QPushButton(tr("sgdb.btn"))
-    btn_sgdb.setToolTip(tr("sgdb.tip"))
-    btn_sgdb.clicked.connect(win._set_steamgriddb_key)
-    prefs.addWidget(btn_sgdb)
     btn_remove_all = QPushButton(tr("remove_all.open_btn"))
+    btn_remove_all.setObjectName("dangerBtn")
     btn_remove_all.setToolTip(tr("remove_all.open_tip"))
     btn_remove_all.clicked.connect(win._remove_everything)
-    prefs.addWidget(btn_remove_all)
-    layout.addLayout(prefs)
+    for btn in (btn_about, win.btn_copy_diag, btn_remove_all):
+        actions.addWidget(btn)
+    app_layout.addLayout(actions)
+    layout.addWidget(app_card)
+    layout.addStretch(1)
     win._update_steam_status_style()
-    return card
+    return page

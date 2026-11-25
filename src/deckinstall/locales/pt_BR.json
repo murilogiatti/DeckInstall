@@ -245,7 +245,7 @@
   "app_update.done_gamescope": "DeckInstall atualizado para v{latest}!\nNo Modo Jogo, feche o DeckInstall e abra de novo pela Steam para usar a nova versão.",
   "app_update.error": "Erro ao atualizar DeckInstall: {err}",
   "maint.page_title": "Manutenção e limpeza",
-  "maint.page_subtitle": "Veja se os runtimes estão em dia e limpe com segurança prefixos sem uso, caches e versões antigas do Proton.",
+  "maint.page_subtitle": "Veja quanto espaço jogos e runtimes ocupam e limpe com segurança prefixos sem uso, caches e versões antigas do Proton.",
   "maint.health_title": "Saúde do sistema e espaço",
   "maint.cleanup_title": "O que dá para limpar",
   "maint.btn_refresh_health": "Recarregar",
@@ -816,7 +816,6 @@
   "nav.install": "Instalar jogo",
   "nav.saves": "Backup e sincronização",
   "nav.maintenance": "Manutenção",
-  "maint.app_settings_title": "Aplicativo e Steam",
   "play.stale_instance": "'{name}' ainda está rodando de uma abertura anterior (desde {since}), provavelmente travado e sem janela. O Proton só abre o jogo de novo quando ele fechar.\n\nEncerrar essa instância e abrir de novo? O progresso não salvo dela será perdido.",
   "play.stale_close_and_play": "Encerrar e jogar",
   "play.blocked_by_old": "O jogo não abriu porque uma instância anterior dele ainda está rodando (processo {pids}); o Proton espera ela fechar antes de abrir outra. Clique em Jogar de novo para encerrá-la e abrir.",
@@ -1052,5 +1051,11 @@
   "settings.scale_125": "125% (portátil, TV)",
   "settings.scale_tip": "Texto e botões maiores, mais fáceis de ler e tocar no Steam Deck. Vale ao abrir o DeckInstall de novo.",
   "settings.scale_restart": "O novo tamanho da interface vale na próxima vez que o DeckInstall abrir.",
-  "status.busy": "Trabalhando…"
+  "status.busy": "Trabalhando…",
+  "nav.settings": "Configurações",
+  "settings.page_title": "Configurações",
+  "settings.page_subtitle": "A aparência do DeckInstall, qual Steam ele usa e o próprio aplicativo.",
+  "settings.look_title": "Aparência",
+  "settings.steam_title": "Steam",
+  "settings.app_title": "DeckInstall"
 }

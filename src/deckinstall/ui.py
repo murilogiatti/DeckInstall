@@ -277,9 +277,9 @@ def _setting_int(settings: QSettings, key: str, default: int = 0) -> int:
     return default
 
 
-PAGE_INSTALL, PAGE_LIBRARY, PAGE_SAVES, PAGE_MAINT, PAGE_RUNTIMES = range(5)
+PAGE_INSTALL, PAGE_LIBRARY, PAGE_SAVES, PAGE_MAINT, PAGE_RUNTIMES, PAGE_SETTINGS = range(6)
 # Order of the tabs on top of the window (Library first); each maps to a page of the stack.
-NAV_PAGES = (PAGE_LIBRARY, PAGE_INSTALL, PAGE_RUNTIMES, PAGE_SAVES, PAGE_MAINT)
+NAV_PAGES = (PAGE_LIBRARY, PAGE_INSTALL, PAGE_RUNTIMES, PAGE_SAVES, PAGE_MAINT, PAGE_SETTINGS)
 
 
 class MainWindow(QMainWindow):
@@ -672,7 +672,10 @@ class MainWindow(QMainWindow):
         self.nav_tabs.setObjectName("NavTabs")
         self.nav_tabs.setExpanding(False)
         self.nav_tabs.setDrawBase(False)
-        for label in (tr("nav.library"), tr("nav.install"), tr("nav.runtimes"), tr("nav.saves"), tr("nav.maintenance")):
+        for label in (
+            tr("nav.library"), tr("nav.install"), tr("nav.runtimes"), tr("nav.saves"), tr("nav.maintenance"),
+            tr("nav.settings"),
+        ):
             self.nav_tabs.addTab(label)
         right_layout.addWidget(self.nav_tabs)
         self.message_bar = MessageBar()  # inline news that needs no answer (instead of a modal box)
@@ -685,6 +688,7 @@ class MainWindow(QMainWindow):
         runtimes_page = _wrap_scroll(build_runtimes_page(self))  # its labels are filled by the health check
         self.stack.addWidget(_wrap_scroll(self._build_maintenance_page()))  # PAGE_MAINT
         self.stack.addWidget(runtimes_page)  # PAGE_RUNTIMES
+        self.stack.addWidget(_wrap_scroll(self._build_settings_page()))  # PAGE_SETTINGS
         self.stack.setCurrentIndex(PAGE_LIBRARY)  # always open on the Library (no jump after the scan)
         self.nav_tabs.setCurrentIndex(NAV_PAGES.index(PAGE_LIBRARY))
         self.nav_tabs.currentChanged.connect(lambda tab: self.stack.setCurrentIndex(NAV_PAGES[tab]))
@@ -710,10 +714,10 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         self._update_steam_mode_ui()
 
-    def _build_app_settings_card(self) -> QWidget:
-        from .ui_pages import build_app_settings_card
+    def _build_settings_page(self) -> QWidget:
+        from .ui_pages import build_settings_page
 
-        return build_app_settings_card(self)
+        return build_settings_page(self)
 
     def _remove_everything(self) -> None:
         from .ui_system import remove_everything
@@ -1014,11 +1018,7 @@ class MainWindow(QMainWindow):
         refresh_saves_page(self)
 
     def _build_maintenance_page(self) -> QWidget:
-        page = build_maintenance_page(self)
-        layout = page.layout()
-        assert isinstance(layout, QVBoxLayout)
-        layout.insertWidget(3, self._build_app_settings_card())  # after the title, subtitle and health card
-        return page
+        return build_maintenance_page(self)
 
 
     def _refresh_maintenance_health(self) -> None:

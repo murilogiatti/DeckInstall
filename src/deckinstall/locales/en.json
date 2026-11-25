@@ -245,7 +245,7 @@
   "app_update.done_gamescope": "DeckInstall updated to v{latest}!\nIn Gaming Mode (Gamescope), close and relaunch from Steam to load the new version.",
   "app_update.error": "Error updating DeckInstall: {err}",
   "maint.page_title": "Maintenance & Cleanup",
-  "maint.page_subtitle": "Monitor runtime health and safely clean orphan prefixes, caches, shaders, and old Proton versions.",
+  "maint.page_subtitle": "See how much space games and runtimes use, and safely clean unused prefixes, caches and old Proton versions.",
   "maint.health_title": "System Health & Disk Usage",
   "maint.cleanup_title": "Cleanup Candidates",
   "maint.btn_refresh_health": "Reload",
@@ -816,7 +816,6 @@
   "nav.install": "Install game",
   "nav.saves": "Backup & sync",
   "nav.maintenance": "Maintenance",
-  "maint.app_settings_title": "App and Steam",
   "play.stale_instance": "'{name}' is still running from an earlier launch (since {since}), probably hung without a window. Proton only opens the game again once it closes.\n\nClose that instance and play again? Its unsaved progress will be lost.",
   "play.stale_close_and_play": "Close and play",
   "play.blocked_by_old": "The game did not open because an earlier instance is still running (process {pids}); Proton waits for it to close before opening another. Click Play again to close it and open the game.",
@@ -1052,5 +1051,11 @@
   "settings.scale_125": "125% (handheld, TV)",
   "settings.scale_tip": "Bigger text and buttons, easier to read and touch on the Steam Deck. Takes effect when DeckInstall opens again.",
   "settings.scale_restart": "The new interface size takes effect the next time DeckInstall opens.",
-  "status.busy": "Working…"
+  "status.busy": "Working…",
+  "nav.settings": "Settings",
+  "settings.page_title": "Settings",
+  "settings.page_subtitle": "How DeckInstall looks, which Steam it uses, and the app itself.",
+  "settings.look_title": "Appearance",
+  "settings.steam_title": "Steam",
+  "settings.app_title": "DeckInstall"
 }

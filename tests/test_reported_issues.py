@@ -203,16 +203,19 @@ class UniqueLibraryActionTests(unittest.TestCase):
                 self.assertEqual(win.btn_remove_game.text(), tr("library.btn_uninstall"))
                 self.assertIsNone(win.btn_remove_game.menu())
                 self.assertIsNone(win.btn_save_sync.menu())
-                self.assertEqual(win.stack.count(), 5)
+                self.assertEqual(win.stack.count(), 6)
                 self.assertFalse(hasattr(win, "_nav_buttons"))  # no sidebar
                 self.assertEqual(win.findChildren(QWidget, "Sidebar"), [])
                 self.assertEqual(win.stack.currentIndex(), ui.PAGE_LIBRARY)
-                self.assertTrue(win.stack.widget(ui.PAGE_MAINT).isAncestorOf(win.theme_combo))
-                self.assertTrue(win.stack.widget(ui.PAGE_MAINT).isAncestorOf(win.btn_redetect_steam))
+                self.assertTrue(win.stack.widget(ui.PAGE_SETTINGS).isAncestorOf(win.theme_combo))
+                self.assertTrue(win.stack.widget(ui.PAGE_SETTINGS).isAncestorOf(win.btn_redetect_steam))
                 # Tabs on top replace the hub buttons and the "back" buttons.
                 self.assertEqual(
                     [win.nav_tabs.tabText(i) for i in range(win.nav_tabs.count())],
-                    [tr("nav.library"), tr("nav.install"), tr("nav.runtimes"), tr("nav.saves"), tr("nav.maintenance")],
+                    [
+                        tr("nav.library"), tr("nav.install"), tr("nav.runtimes"), tr("nav.saves"),
+                        tr("nav.maintenance"), tr("nav.settings"),
+                    ],
                 )
                 self.assertEqual(win.nav_tabs.currentIndex(), 0)
                 for tab, page in enumerate(ui.NAV_PAGES):
