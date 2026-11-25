@@ -73,6 +73,9 @@ QLineEdit, QComboBox, QListWidget, QTableWidget, QTextEdit {
     border-radius: 8px;
     padding: 7px 11px;
     color: $fg_text;
+}
+/* Only single-line fields: a QSS min-height on lists and tables would override their setMinimumHeight. */
+QLineEdit, QComboBox {
     min-height: 20px;
 }
 QLineEdit:focus, QComboBox:focus, QListWidget:focus, QTableWidget:focus, QTextEdit:focus {

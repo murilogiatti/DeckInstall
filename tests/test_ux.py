@@ -362,3 +362,20 @@ def test_close_hides_at_once_when_only_read_only_work_runs() -> None:
         finally:
             win._force_closing = True
             _close(app, win)
+
+
+def test_the_theme_keeps_the_tables_heights() -> None:
+    """A QSS min-height on lists/tables overrode setMinimumHeight: the Library showed 5 rows."""
+    app = _app()
+    with tempfile.TemporaryDirectory() as tmp:
+        win = _window(app, tmp)
+        try:
+            for mode in ("dark", "light"):
+                theme.apply_theme(app, mode)  # type: ignore[arg-type]
+                app.processEvents()
+                assert win.shortcuts_list.minimumHeight() == 420
+                assert win.library_grid.minimumHeight() == 420
+                assert win.saves_list.minimumHeight() == 330
+                assert win.maint_list.minimumHeight() == 220
+        finally:
+            _close(app, win)
