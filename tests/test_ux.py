@@ -298,3 +298,19 @@ def test_welcome_only_on_a_first_start(monkeypatch) -> None:
             assert not win._first_run
         finally:
             _close(app, win)
+
+
+def test_closing_stops_the_game_scan_instead_of_waiting(tmp_path: Path) -> None:
+    from deckinstall import scanner
+    from deckinstall.ui_workers import ScanWorker
+
+    for i in range(3):
+        game = tmp_path / "Games" / f"Game{i}"
+        game.mkdir(parents=True)
+        (game / "game.exe").write_bytes(b"MZ" + b"\0" * 64)
+    assert scanner.scan_all_games(roots=[tmp_path / "Games"], should_stop=lambda: True) == []
+    assert scanner.find_home_game_dirs(tmp_path, should_stop=lambda: True) == []
+    seen: list[object] = []
+    worker = ScanWorker(roots=[tmp_path], scan_fn=lambda **kw: seen.append(kw["should_stop"]) or [])
+    worker.run()
+    assert seen == [worker.isInterruptionRequested]  # closeEvent's requestInterruption() reaches the walk

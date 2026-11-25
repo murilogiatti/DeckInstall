@@ -282,7 +282,8 @@ class ScanWorker(QThread):
     def run(self) -> None:
         try:
             fn = self._scan_fn or scan_all_games
-            self.finished_scan.emit(fn(roots=self.roots))
+            # closeEvent calls requestInterruption(): stop the disk walk instead of making it wait
+            self.finished_scan.emit(fn(roots=self.roots, should_stop=self.isInterruptionRequested))
         except Exception:
             logging.exception("ScanWorker failed")
             self.finished_scan.emit([])

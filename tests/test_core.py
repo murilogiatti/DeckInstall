@@ -1178,7 +1178,7 @@ class CoreTests(unittest.TestCase):
         ):
             win = MainWindow(app, smoke=True)
             self.assertTrue(ui_mod._wait_for_workers(app, win, 10.0))
-            scan.assert_called_once_with(roots=[])
+            scan.assert_called_once_with(roots=[], should_stop=mock.ANY)
             standalone.assert_called_once()
             self.assertIsNotNone(standalone.call_args.args[0])  # one games folder, not every disk
             discover.assert_called_with([])
@@ -1448,10 +1448,10 @@ class CoreTests(unittest.TestCase):
                 (g_good / "game.exe").write_bytes(pe_exe_bytes())
                 orig_scan = scan_game_folder
 
-                def _flaky_scan(folder: Path):
+                def _flaky_scan(folder: Path, should_stop=None):
                     if folder.name == "BadAppID":
                         raise PermissionError("denied")
-                    return orig_scan(folder)
+                    return orig_scan(folder, should_stop)
 
                 with mock.patch("deckinstall.scanner.scan_game_folder", side_effect=_flaky_scan):
                     games = scan_all_games([root])

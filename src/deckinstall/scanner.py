@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -302,8 +303,12 @@ def _scan_game_tree_scandir(
     game_dir: Path,
     exe_max_depth: int = 4,
     appid_max_depth: int = 8,
+    should_stop: Callable[[], bool] | None = None,
 ) -> tuple[list[Path], int | None]:
-    """Traverse game_dir once via os.scandir(), returning (ranked_exes, steam_appid)."""
+    """Traverse game_dir once via os.scandir(), returning (ranked_exes, steam_appid).
+
+    should_stop: polled between folders; when it says True the walk gives up and finds nothing.
+    """
     exe_scored: list[tuple[tuple[int, int, int, int, int], Path]] = []
     native_scored: list[tuple[tuple[int, int, int], Path]] = []
     appid_files: list[Path] = []
@@ -317,6 +322,8 @@ def _scan_game_tree_scandir(
     queue: deque[tuple[Path, int]] = deque([(game_dir, 0)])
 
     while queue:
+        if should_stop is not None and should_stop():
+            return [], None
         cur_dir, dir_depth = queue.popleft()
         subdirs: list[Path] = []
         collect_exes = dir_depth < exe_max_depth
@@ -375,11 +382,11 @@ def _scan_game_tree_scandir(
     return ranked_exes, steam_appid
 
 
-def scan_game_folder(game_dir: Path) -> DetectedGame | None:
+def scan_game_folder(game_dir: Path, should_stop: Callable[[], bool] | None = None) -> DetectedGame | None:
     """Inspect a single game directory and return a DetectedGame if executables exist."""
     if not game_dir.is_dir():
         return None
-    exes, steam_appid = _scan_game_tree_scandir(game_dir)
+    exes, steam_appid = _scan_game_tree_scandir(game_dir, should_stop=should_stop)
     if not exes:
         return None
     return DetectedGame(
@@ -461,7 +468,10 @@ def _dir_has_game_exe(path: Path) -> bool:
 
 
 def find_home_game_dirs(
-    home: Path, max_depth: int = HOME_SCAN_MAX_DEPTH, max_dirs: int = HOME_SCAN_MAX_DIRS
+    home: Path,
+    max_depth: int = HOME_SCAN_MAX_DEPTH,
+    max_dirs: int = HOME_SCAN_MAX_DIRS,
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[Path]:
     """Game folders under home: walks down until the first folder that holds an exe.
 
@@ -473,6 +483,8 @@ def find_home_game_dirs(
     queue: deque[tuple[Path, int]] = deque([(home, 0)])
     visited = 0
     while queue and visited < max_dirs:
+        if should_stop is not None and should_stop():
+            return []
         cur, depth = queue.popleft()
         visited += 1
         try:
@@ -628,8 +640,13 @@ def default_scan_roots() -> list[Path]:
     return deduped
 
 
-def scan_all_games(roots: list[Path] | None = None) -> list[DetectedGame]:
+def scan_all_games(
+    roots: list[Path] | None = None, should_stop: Callable[[], bool] | None = None
+) -> list[DetectedGame]:
     """Scan roots for installed/extracted games.
+
+    should_stop: polled while walking; when it says True the scan ends early with no games
+    (closing the window must not wait for a full disk walk).
 
     The home folder is walked down to each game folder (find_home_game_dirs); any other root is a
     container whose top-level folders are games. None = home + cards/disks (default_scan_roots).
@@ -649,7 +666,7 @@ def scan_all_games(roots: list[Path] | None = None) -> list[DetectedGame]:
         except OSError:
             is_home = False
         if is_home:
-            for child in find_home_game_dirs(root):
+            for child in find_home_game_dirs(root, should_stop=should_stop):
                 try:
                     resolved = child.resolve()
                 except OSError:
@@ -688,11 +705,11 @@ def scan_all_games(roots: list[Path] | None = None) -> list[DetectedGame]:
             seen.add(resolved)
             candidates.append(child)
 
-    if not candidates:
+    if not candidates or (should_stop is not None and should_stop()):
         return []
     if len(candidates) == 1:
         try:
-            detected = scan_game_folder(candidates[0])
+            detected = scan_game_folder(candidates[0], should_stop)
         except Exception:
             return []
         return [detected] if detected is not None else []
@@ -701,8 +718,12 @@ def scan_all_games(roots: list[Path] | None = None) -> list[DetectedGame]:
     max_workers = min(8, os.cpu_count() or 4)
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(scan_game_folder, child) for child in candidates]
+            futures = [executor.submit(scan_game_folder, child, should_stop) for child in candidates]
             for fut in futures:
+                if should_stop is not None and should_stop():
+                    for pending in futures:
+                        pending.cancel()
+                    return []
                 try:
                     detected = fut.result()
                 except Exception:
@@ -711,8 +732,10 @@ def scan_all_games(roots: list[Path] | None = None) -> list[DetectedGame]:
                     results.append(detected)
     except RuntimeError:
         for child in candidates:
+            if should_stop is not None and should_stop():
+                return []
             try:
-                detected = scan_game_folder(child)
+                detected = scan_game_folder(child, should_stop)
             except Exception:
                 continue
             if detected is not None:
