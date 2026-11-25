@@ -129,6 +129,14 @@ def test_page_imports_backup_of_games_not_installed(tmp_path: Path) -> None:
             assert len(list(snaps.rglob("*.zip"))) == 2
             names = {win.saves_list.item(r, 0).text() for r in range(win.saves_list.rowCount())}
             assert names == {tr("saves.orphan", name="Alpha"), tr("saves.orphan", name="Beta")}
+            table = win.saves_list
+            assert win.chk_saves_orphans.isChecked()  # what was just imported is on screen
+            assert not any(table.isRowHidden(r) for r in range(table.rowCount()))
+            assert win.chk_saves_orphans.text() == tr("saves.show_orphans", count=2)
+            win.chk_saves_orphans.setChecked(False)  # not installed: out of the way unless asked for
+            assert all(table.isRowHidden(r) for r in range(table.rowCount()))
+            assert win.settings.value("saves/show_orphans") in (False, "false")
+            win.chk_saves_orphans.setChecked(True)
             win.saves_list.setCurrentCell(0, 0)
             assert not win.btn_save_restore_selected.isEnabled()  # restore waits for the game to be installed
         finally:

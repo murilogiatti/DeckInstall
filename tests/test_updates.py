@@ -204,7 +204,8 @@ def test_card_rows_badge_and_banner_follow_the_check(monkeypatch: pytest.MonkeyP
         try:
             ui_updates.check_updates(win, silent=True)
             app.processEvents()
-            assert win.nav_tabs.tabText(ui.NAV_PAGES.index(ui.PAGE_RUNTIMES)).endswith("(2)")
+            assert win.nav_tabs.tabText(ui.nav_tab_of(ui.PAGE_RUNTIMES)).endswith("(2)")
+            assert win._section_buttons[ui.PAGE_RUNTIMES].text().endswith("(2)")
             assert win.btn_update_runtimes.isEnabled() and win.btn_update_runtimes.text().endswith("(2)")
             boxes = {c: w for c, w in win._update_checks.items() if isinstance(w, QCheckBox)}
             assert boxes["app"].isChecked() and not boxes["ge_proton"].isEnabled()

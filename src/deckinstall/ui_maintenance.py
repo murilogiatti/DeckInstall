@@ -335,9 +335,9 @@ def offer_maintenance_review(
     box.addButton(QMessageBox.StandardButton.Close)
     box.exec()
     if box.clickedButton() is review:
-        from .ui import NAV_PAGES, PAGE_MAINT
+        from .ui import PAGE_MAINT
 
-        win.nav_tabs.setCurrentIndex(NAV_PAGES.index(PAGE_MAINT))
+        win._show_page(PAGE_MAINT)
         on_maint_filter_changed(win, group)
         for button in win._maint_filter_group.buttons():
             if button.property("cleanupGroup") == group:

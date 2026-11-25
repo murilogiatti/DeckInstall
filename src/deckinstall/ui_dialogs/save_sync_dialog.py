@@ -287,6 +287,15 @@ def build_saves_page(win: MainWindow) -> QWidget:
 
     # 1. Copies of each game: the everyday part.
     card, card_layout, top = _section(tr("saves.section_games"), tr("saves.section_games_hint"))
+    win.chk_saves_orphans = QCheckBox(tr("saves.show_orphans", count=0))
+    win.chk_saves_orphans.setChecked(_setting_bool(win.settings, SHOW_ORPHANS_KEY, False))
+
+    def _toggle_orphans(on: bool) -> None:
+        win.settings.setValue(SHOW_ORPHANS_KEY, bool(on))
+        _apply_orphan_filter(win)
+
+    win.chk_saves_orphans.toggled.connect(_toggle_orphans)
+    top.addWidget(win.chk_saves_orphans)
     win.btn_save_refresh = QPushButton(tr("save_sync.btn_refresh"))
     win.btn_save_refresh.clicked.connect(lambda: refresh_saves_page(win))
     top.addWidget(win.btn_save_refresh)
@@ -405,6 +414,28 @@ def build_saves_page(win: MainWindow) -> QWidget:
     return page
 
 
+SHOW_ORPHANS_KEY = "saves/show_orphans"
+
+
+def _apply_orphan_filter(win: MainWindow) -> None:
+    """Copies of games that are not installed (old installs, Ludusavi imports) stay out of the
+    way unless asked for; the check box says how many there are."""
+    table = win.saves_list
+    show = win.chk_saves_orphans.isChecked()
+    orphans = 0
+    for r in range(table.rowCount()):
+        item = table.item(r, 0)
+        data = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        orphan = isinstance(data, SaveRow) and data.target is None
+        orphans += orphan
+        table.setRowHidden(r, orphan and not show)
+    win.chk_saves_orphans.setText(tr("saves.show_orphans", count=orphans))
+    win.chk_saves_orphans.setVisible(orphans > 0)
+    current = table.currentRow()
+    if current >= 0 and table.isRowHidden(current):
+        table.setCurrentCell(-1, -1)
+
+
 def save_row_buttons(win: MainWindow) -> tuple[QPushButton, ...]:
     return (
         win.btn_save_snapshot_now,
@@ -479,6 +510,7 @@ def refresh_saves_page(win: MainWindow, after_play: bool = True, scan_sources: b
             if same_row:
                 table.setCurrentCell(r, 0)
     table.setSortingEnabled(True)
+    _apply_orphan_filter(win)
     win.lbl_saves_empty.setVisible(not rows)
     update_saves_action_states(win)
     if after_play and _setting_bool(win.settings, AFTER_PLAY_KEY, True):
@@ -805,6 +837,7 @@ def _import_to_snapshots(win: MainWindow, root: Path, row: SaveRow | None) -> No
             return done
 
         def _ok(import_res: object) -> None:
+            win.chk_saves_orphans.setChecked(True)  # show what was just imported, installed or not
             show_import_result(win, import_res if isinstance(import_res, list) else [])
 
         _run(win, tr("saves.import_running", name=root.name), _job, _ok)

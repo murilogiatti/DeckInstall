@@ -151,13 +151,14 @@ def _sync_apply_button(win: MainWindow) -> None:
 
 
 def _sync_badge(win: MainWindow) -> None:
-    from .ui import NAV_PAGES, PAGE_RUNTIMES
+    from .ui import PAGE_RUNTIMES, nav_tab_of
 
     count = len(pending(win._update_results))
-    label = tr("nav.runtimes")
-    win.nav_tabs.setTabText(
-        NAV_PAGES.index(PAGE_RUNTIMES), tr("updates.tab_badge", label=label, count=count) if count else label
-    )
+    for label, set_text in (
+        (tr("nav.settings"), lambda text: win.nav_tabs.setTabText(nav_tab_of(PAGE_RUNTIMES), text)),
+        (tr("nav.runtimes"), win._section_buttons[PAGE_RUNTIMES].setText),
+    ):
+        set_text(tr("updates.tab_badge", label=label, count=count) if count else label)
 
 
 def _runtimes_in_use(win: MainWindow) -> tuple[str, ...]:

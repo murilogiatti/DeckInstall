@@ -212,15 +212,24 @@ class UniqueLibraryActionTests(unittest.TestCase):
                 # Tabs on top replace the hub buttons and the "back" buttons.
                 self.assertEqual(
                     [win.nav_tabs.tabText(i) for i in range(win.nav_tabs.count())],
-                    [
-                        tr("nav.library"), tr("nav.install"), tr("nav.runtimes"), tr("nav.saves"),
-                        tr("nav.maintenance"), tr("nav.settings"),
-                    ],
+                    [tr("nav.library"), tr("nav.install"), tr("nav.saves"), tr("nav.settings")],
                 )
                 self.assertEqual(win.nav_tabs.currentIndex(), 0)
+                self.assertTrue(win.settings_sections.isHidden())
                 for tab, page in enumerate(ui.NAV_PAGES):
                     win.nav_tabs.setCurrentIndex(tab)
                     self.assertEqual(win.stack.currentIndex(), page)
+                # Runtimes and Cleanup are sections of the Settings tab.
+                self.assertFalse(win.settings_sections.isHidden())
+                win._section_buttons[ui.PAGE_MAINT].click()
+                self.assertEqual(win.stack.currentIndex(), ui.PAGE_MAINT)
+                self.assertEqual(win.nav_tabs.currentIndex(), ui.NAV_PAGES.index(ui.PAGE_SETTINGS))
+                win._show_page(ui.PAGE_LIBRARY)
+                self.assertTrue(win.settings_sections.isHidden())
+                win.nav_tabs.setCurrentIndex(ui.NAV_PAGES.index(ui.PAGE_SETTINGS))
+                self.assertEqual(win.stack.currentIndex(), ui.PAGE_MAINT)  # the section opened last
+                win._show_page(ui.PAGE_RUNTIMES)
+                self.assertTrue(win._section_buttons[ui.PAGE_RUNTIMES].isChecked())
                 win._show_page(ui.PAGE_INSTALL)  # code paths that jump to a page keep the tab in sync
                 self.assertEqual(win.nav_tabs.currentIndex(), ui.NAV_PAGES.index(ui.PAGE_INSTALL))
                 win._show_page(ui.PAGE_LIBRARY)
