@@ -6,6 +6,7 @@ import gc
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 import zipfile
@@ -1163,16 +1164,83 @@ class CoreTests(unittest.TestCase):
                 w.wait(2000)
             win.close()
             app.processEvents()
+        # --smoke-test: every worker still runs (the AppImage check covers them), none walks the disks.
+        from deckinstall import ui as ui_mod
+
         with (
             mock.patch("deckinstall.ui.resolve_steam_paths", return_value=None),
-            mock.patch("deckinstall.ui.scan_all_games", side_effect=AssertionError("scanned")) as scan,
+            mock.patch("deckinstall.ui.find_steam_root", return_value=None),
+            mock.patch("deckinstall.ui.scan_external_launcher_games", return_value=[]),
+            mock.patch("deckinstall.ui.list_standalone_games", return_value=[]) as standalone,
+            mock.patch("deckinstall.ui.scan_all_games", return_value=[]) as scan,
+            mock.patch("deckinstall.ui.discover_libraries", return_value=[]) as discover,
+            mock.patch("deckinstall.ui.disks_without_library", return_value=[]) as disks,
         ):
-            win = MainWindow(app, scan_games=False)  # --smoke-test: no walk of the mounted disks
-            for w in list(win._active_workers):
-                w.wait(2000)
-            scan.assert_not_called()
-            win.close()
+            win = MainWindow(app, smoke=True)
+            self.assertTrue(ui_mod._wait_for_workers(app, win, 10.0))
+            scan.assert_called_once_with(roots=[])
+            standalone.assert_called_once()
+            self.assertIsNotNone(standalone.call_args.args[0])  # one games folder, not every disk
+            discover.assert_called_with([])
+            disks.assert_called_with([])
+            self.assertTrue(win.close())
             app.processEvents()
+
+    def test_main_smoke_flag_reaches_main_window(self) -> None:
+        """main() --smoke-test builds the window in smoke mode and waits for its workers."""
+        try:
+            from PySide6.QtWidgets import QApplication
+        except ImportError:
+            self.skipTest("PySide6 not installed in this environment")
+        from deckinstall import ui as ui_mod
+
+        app = QApplication.instance() or QApplication([])
+        fake_win = mock.Mock(_active_workers=set())
+        fake_win.close.return_value = True
+        with (
+            mock.patch.object(sys, "argv", ["deckinstall", "--smoke-test"]),
+            mock.patch("deckinstall.ui.QApplication", return_value=app),
+            mock.patch("deckinstall.ui.qInstallMessageHandler"),
+            mock.patch("deckinstall.ui.install_touch_scroll"),
+            mock.patch("deckinstall.ui.MainWindow", return_value=fake_win) as main_window,
+        ):
+            self.assertEqual(ui_mod.main(), 0)
+        main_window.assert_called_once_with(app, smoke=True)
+        fake_win.close.assert_called_once()
+        fake_win.showMaximized.assert_not_called()
+
+    def test_wait_for_workers_follows_chained_workers(self) -> None:
+        """The smoke wait also covers a worker started by another worker's result."""
+        try:
+            from PySide6.QtCore import QThread
+            from PySide6.QtWidgets import QApplication
+        except ImportError:
+            self.skipTest("PySide6 not installed in this environment")
+        from deckinstall import ui as ui_mod
+
+        app = QApplication.instance() or QApplication([])
+        class Sleeper(QThread):
+            def __init__(self, seconds: float) -> None:
+                super().__init__()
+                self.seconds = seconds
+
+            def run(self) -> None:
+                time.sleep(self.seconds)
+
+        win = mock.Mock(_active_workers=set())
+        first, second = Sleeper(0.1), Sleeper(0.3)
+
+        def _first_done() -> None:  # like a result handler that starts another worker
+            win._active_workers.discard(first)
+            win._active_workers.add(second)
+            second.start()
+
+        first.finished.connect(_first_done)
+        second.finished.connect(lambda: win._active_workers.discard(second))
+        win._active_workers.add(first)
+        first.start()
+        self.assertTrue(ui_mod._wait_for_workers(app, win, 5.0))
+        self.assertTrue(second.isFinished())
 
     def test_v076_audit_regressions(self) -> None:
         """Regression tests for v0.7.6 multi-agent audit findings (#1-#16)."""

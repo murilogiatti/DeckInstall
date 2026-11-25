@@ -408,9 +408,13 @@ class MainWindow(QMainWindow):
     _external_save_targets: list = []  # Steam/Hydra/UMU/Nexus games for Backup/Sync (filled by a worker)
     _save_sizes: dict = {}  # slug -> bytes of saves right now
 
-    def __init__(self, app: QApplication, *, scan_games: bool = True) -> None:
+    def __init__(self, app: QApplication, *, smoke: bool = False) -> None:
         super().__init__()
         self.app = app
+        # --smoke-test: start every worker, but none of them walks the mounted disks (minutes on a
+        # big disk or on the CI container's bind mounts); the app only has to start and close.
+        self._smoke = smoke
+        self._mount_search_roots: list[Path] | None = [] if smoke else None
         self.settings = QSettings(__app_name__, __app_name__)
         _install_qt_translator(app, set_language(str(self.settings.value("language", "auto"))))
         self.paths: SteamPaths | None = None
@@ -467,8 +471,7 @@ class MainWindow(QMainWindow):
         self._setup_mount_watcher()
         self._refresh_libraries()
         self._apply_saved_theme()
-        if scan_games:
-            self._refresh_games()
+        self._refresh_games()
         self._redetect_steam()
 
     def _track_worker(self, worker: QThread) -> None:
@@ -752,7 +755,9 @@ class MainWindow(QMainWindow):
             resolve_steam_paths_fn=resolve_steam_paths,
             find_steam_root_fn=find_steam_root,
             load_shortcuts_fn=load_shortcuts,
-            list_standalone_games_fn=list_standalone_games,
+            list_standalone_games_fn=(
+                (lambda: list_standalone_games(get_games_dir())) if self._smoke else list_standalone_games
+            ),
             scan_external_launcher_games_fn=scan_external_launcher_games,
         )
         self._track_worker(worker)
@@ -796,8 +801,8 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "add_library_combo"):
             return
         try:
-            libs = discover_libraries()
-            disks = disks_without_library()
+            libs = discover_libraries(self._mount_search_roots)
+            disks = disks_without_library(self._mount_search_roots)
             unavailable = list_unavailable_games(libs)
         except Exception as exc:
             logging.warning("Library discovery failed: %s", exc)
@@ -1542,7 +1547,8 @@ class MainWindow(QMainWindow):
     def _refresh_games(self, *, on_done: Callable[[], None] | None = None) -> None:
         self.btn_scan.setEnabled(False)
         self._update_scan_folders_label()
-        worker = ScanWorker(roots=self._enabled_scan_roots(), scan_fn=scan_all_games)
+        roots = [] if self._smoke else self._enabled_scan_roots()
+        worker = ScanWorker(roots=roots, scan_fn=scan_all_games)
         self._scan_worker = worker
         self._track_worker(worker)
         worker.finished_scan.connect(
@@ -4202,6 +4208,29 @@ def _qt_message_handler(mode, _context, message: str) -> None:
     logging.warning("Qt[%s]: %s", mode, message)
 
 
+_SMOKE_WAIT_S = 20.0
+
+
+def _wait_for_workers(app: QApplication, win: MainWindow, timeout_s: float) -> bool:
+    """Wait until every worker is done, including ones started by another worker's result.
+
+    A worker leaves _active_workers when its queued `finished` is handled, after its results;
+    an empty set means every result was delivered and no handler started anything new.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        app.processEvents()
+        if not win._active_workers:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        running = [w for w in win._active_workers if w.isRunning()]
+        if running:
+            running[0].wait(100)
+        else:
+            time.sleep(0.01)  # finished, its queued signals not handled yet
+
+
 def main() -> int:
     """Application entry point."""
     args = sys.argv[1:]
@@ -4222,14 +4251,11 @@ def main() -> int:
         app.setWindowIcon(QIcon(str(icon_file)))
     install_touch_scroll(app)
     smoke = "--smoke-test" in args
-    # The smoke test checks that the app starts; walking every mounted disk is not part of that
-    # and can take minutes on a big disk (or the CI container's bind mounts).
-    win = MainWindow(app, scan_games=not smoke)
+    win = MainWindow(app, smoke=smoke)
     if smoke:
-        for w in list(win._active_workers):
-            if not w.wait(5000):
-                print("Smoke test failed: background worker timed out", file=sys.stderr)
-                return 1
+        if not _wait_for_workers(app, win, _SMOKE_WAIT_S):
+            print("Smoke test failed: background worker timed out", file=sys.stderr)
+            return 1
         if not win.close():
             print("Smoke test failed: MainWindow did not close cleanly", file=sys.stderr)
             return 1
