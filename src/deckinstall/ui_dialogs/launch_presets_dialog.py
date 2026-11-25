@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 from collections.abc import Callable
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import shiboken6
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -28,7 +30,7 @@ from PySide6.QtWidgets import (
 from .. import __app_name__
 from ..external_actions import load_external_launch_presets, save_external_launch_presets
 from ..i18n import tr
-from ..launch_presets import apply_presets
+from ..launch_presets import FRAME_RATES, TOGGLES, apply_presets, parse_presets, toggle_offered
 from ..launcher_scan import ExternalLauncherGame
 from ..modes import feature_note, mode_of_kind
 from ..optiscaler import inspect_optiscaler_state
@@ -50,6 +52,7 @@ from ..ui_cards import (
     _dialog_guard,
     _dialog_parent,
     _is_native_linux_game,
+    _make_card,
     _parse_launch_preset_state,
     _resolve_game_exe_path,
     note_label,
@@ -97,20 +100,27 @@ def open_launch_presets_dialog(
     dlg.resize(640, 640)
     dlg_lay = QVBoxLayout(dlg)
 
-    scroll = QScrollArea()
-    scroll.setWidgetResizable(True)
-    scroll.setFrameShape(QFrame.Shape.NoFrame)
-    body = QWidget()
-    body_lay = QVBoxLayout(body)
-    body_lay.setContentsMargins(0, 0, 4, 0)
-    body_lay.setSpacing(12)
-    current = {"lay": body_lay}  # the card the next options go into
+    # One tab per group, so every setting of the game (upscaler included) is in this one window.
+    tabs = QTabWidget()
+    bodies: list[QVBoxLayout] = []
+    current: dict[str, QVBoxLayout] = {}  # the card the next options go into
 
     def _section(text: str) -> None:
-        card, card_lay, _top = section_card(text)
+        body = QWidget()
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(0, 8, 4, 0)
+        body_lay.setSpacing(12)
+        card, card_lay = _make_card()
         card_lay.setSpacing(4)
         body_lay.addWidget(card)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(body)
+        tabs.addTab(scroll, text)
+        bodies.append(body_lay)
         current["lay"] = card_lay
+        current["body"] = body_lay
 
     def _add(widget: QWidget) -> None:
         current["lay"].addWidget(widget)
@@ -208,6 +218,31 @@ def open_launch_presets_dialog(
     chk_dxgi = QCheckBox(tr("launch.dxgi_preset"))
     chk_dxgi.setChecked(remove_winedlloverride(winedll_now, "dxgi") != winedll_now)
 
+    st_all = parse_presets(opts_now)
+    toggle_texts = {  # label, hint
+        "fsr4_upgrade": (tr("launch.fsr4_upgrade"), tr("launch.fsr4_upgrade_hint")),
+        "fsr4_rdna3": (tr("launch.fsr4_rdna3"), tr("launch.fsr4_rdna3_hint")),
+        "xess_upgrade": (tr("launch.xess_upgrade"), tr("launch.xess_upgrade_hint")),
+        "hdr": (tr("launch.hdr"), tr("launch.hdr_hint")),
+        "vendor_amd": (tr("launch.vendor_amd"), tr("launch.vendor_amd_hint")),
+        "large_address": (tr("launch.large_address"), tr("launch.large_address_hint")),
+        "prefer_sdl": (tr("launch.prefer_sdl"), tr("launch.prefer_sdl_hint")),
+    }
+    toggle_checks: dict[str, QCheckBox] = {}
+    for toggle in TOGGLES:
+        chk = QCheckBox(toggle_texts[toggle.key][0])
+        chk.setChecked(bool(st_all.get(toggle.key)))
+        toggle_checks[toggle.key] = chk
+    frame_combo = QComboBox()
+    frame_combo.addItem(tr("launch.mangohud_fps_unlimited"), 0)
+    for fps_val in FRAME_RATES:
+        frame_combo.addItem(tr("launch.mangohud_fps_value", fps=fps_val), fps_val)
+    frame_idx = frame_combo.findData(int(st_all.get("frame_rate") or 0))
+    if frame_idx < 0:  # a value typed by hand: keep it selectable
+        frame_combo.addItem(tr("launch.mangohud_fps_value", fps=st_all.get("frame_rate")), st_all.get("frame_rate"))
+        frame_idx = frame_combo.count() - 1
+    frame_combo.setCurrentIndex(frame_idx)
+
     winedll_lbl = QLabel(tr("launch.winedlloverrides_label"))
     winedll_edit = QLineEdit(winedll_now)
 
@@ -287,6 +322,8 @@ def open_launch_presets_dialog(
                     "mh_level": mh_level_combo.currentData(),
                     "mh_position": str(mh_pos_combo.currentData() or ""),
                     "mh_fps_limit": mh_fps_combo.currentData(),
+                    "frame_rate": frame_combo.currentData(),
+                    **{key: chk.isChecked() for key, chk in toggle_checks.items()},
                 },
                 winedlloverrides=dll_val,
                 native_linux=is_native_linux,
@@ -430,17 +467,71 @@ def open_launch_presets_dialog(
             warn_lay.addWidget(install_btn)
             _add(warn_row)
 
+    def _on_opti_saved(new_opts: str) -> None:
+        """OptiScaler changed the game's DLL overrides: show them here so OK keeps them."""
+        if not dlg_alive():
+            return
+        if kind == "standalone":
+            new_dll = str(getattr(game_obj, "winedlloverrides", "") or "")
+        else:
+            new_dll = str(parse_presets(new_opts).get("winedll") or "")
+        winedll_edit.setText(new_dll)
+        _update_optiscaler_dxgi_guard()
+
+    def _add_optiscaler_card() -> None:
+        card, card_lay, top = section_card(tr("launch.optiscaler_title"), tr("configure.optiscaler_hint"))
+        current["body"].addWidget(card)
+        btn_opti = QPushButton(tr("library.btn_optiscaler"))
+        top.addWidget(btn_opti)
+        target = game_obj
+        if isinstance(target, ShortcutEntry):
+            managed = win._managed_library_game(target)
+            if managed is not None:
+                target = replace(target, exe=str(managed.exe_path))
+        usable = target is not None and kind in ("steam", "standalone", "external") and (
+            kind != "steam" or win.paths is not None
+        )
+        btn_opti.setEnabled(usable)
+        if not usable:
+            card_lay.addWidget(note_label(tr("launch.optiscaler_after_install")))
+        btn_opti.clicked.connect(lambda: win._open_optiscaler_dialog(kind, target, on_saved=_on_opti_saved))
+
     _section(tr("launch.section_performance"))
     _add_tool_preset(chk_gm, tr("launch.gamemode_hint"), "gamemoderun")
     _add_tool_preset(chk_mh, tr("launch.mangohud_hint"), "mangohud", extra_row=mh_opts_col, blocked_note=mangohud_note)
     mh_level_combo.currentIndexChanged.connect(_sync_preview)
     mh_pos_combo.currentIndexChanged.connect(_sync_preview)
     mh_fps_combo.currentIndexChanged.connect(_sync_preview)
+    if not is_native_linux:
+        frame_row = QHBoxLayout()
+        frame_row.addWidget(QLabel(tr("launch.frame_rate_label")))
+        frame_row.addWidget(frame_combo)
+        frame_row.addStretch()
+        current["lay"].addLayout(frame_row)
+        _add(_muted_hint(tr("launch.frame_rate_hint")))
+        frame_combo.currentIndexChanged.connect(_sync_preview)
+
+    def _add_toggles(section: str) -> None:
+        for toggle in TOGGLES:
+            chk = toggle_checks[toggle.key]
+            if toggle.section != section:
+                continue
+            if is_native_linux or not toggle_offered(toggle, gpu, chk.isChecked()):
+                chk.setVisible(False)
+                continue
+            chk.toggled.connect(_sync_preview)
+            _add(chk)
+            _add(_muted_hint(toggle_texts[toggle.key][1]))
+
+    def _offered(section: str) -> bool:
+        return not is_native_linux and any(
+            t.section == section and toggle_offered(t, gpu, toggle_checks[t.key].isChecked()) for t in TOGGLES
+        )
 
     gpu_rows = (
         ((not is_native_linux) and (gpu.has_nvidia or nvapi_active))
         or (gpu.is_hybrid or prime_active)
-        or ((not is_native_linux) and (gpu.has_nvidia or bool(st["dlss_upgrade"])))
+        or _offered("gpu")
     )
     if gpu_rows:
         _section(tr("launch.section_gpu"))
@@ -458,10 +549,22 @@ def open_launch_presets_dialog(
         _add(chk_prime)
         prime_hint = tr("launch.prime_offload_hint") if gpu.has_nvidia else tr("launch.prime_offload_mesa_hint")
         _add(_muted_hint(prime_hint))
-    if (not is_native_linux) and (gpu.has_nvidia or bool(st["dlss_upgrade"])):
-        chk_dlss.toggled.connect(_sync_preview)
-        _add(chk_dlss)
-        _add(_muted_hint(tr("launch.dlss_hint")))
+    if gpu_rows:
+        _add_toggles("gpu")
+
+    # Upscaler: Proton's own upgrades, then OptiScaler (files in the game folder) for this game.
+    if not is_native_linux:
+        _section(tr("launch.section_upscaler"))
+        if gpu.has_nvidia or bool(st["dlss_upgrade"]):
+            chk_dlss.toggled.connect(_sync_preview)
+            _add(chk_dlss)
+            _add(_muted_hint(tr("launch.dlss_hint")))
+        else:
+            chk_dlss.setVisible(False)
+            chk_dlss.setEnabled(False)
+        _add_toggles("upscaler")
+        _add(note_label(tr("launch.upscaler_needs_ge")))
+        _add_optiscaler_card()
     else:
         chk_dlss.setVisible(False)
         chk_dlss.setEnabled(False)
@@ -485,6 +588,7 @@ def open_launch_presets_dialog(
             chk.toggled.connect(_sync_preview)
             _add(chk)
             _add(_muted_hint(hint))
+        _add_toggles("compat")
         chk_dxgi.toggled.connect(_on_dxgi_toggled)
         _add(chk_dxgi)
         _add(_muted_hint(tr("launch.dxgi_hint")))
@@ -511,7 +615,8 @@ def open_launch_presets_dialog(
         winedll_lbl.setVisible(False)
         winedll_edit.setVisible(False)
         winedll_edit.setEnabled(False)
-    body_lay.addStretch(1)
+    for body_lay in bodies:
+        body_lay.addStretch(1)
 
     winedll_edit.textChanged.connect(_on_winedll_text_changed)
     raw_edit.textChanged.connect(_on_raw_text_changed)
@@ -520,8 +625,7 @@ def open_launch_presets_dialog(
     if mangohud_note and st["mangohud"]:
         _sync_preview()  # drop MangoHud from options a Steam-mode game keeps from before
 
-    scroll.setWidget(body)
-    dlg_lay.addWidget(scroll, 1)
+    dlg_lay.addWidget(tabs, 1)
 
     # The result, always in sight: the line the game starts with (editable by hand).
     result_card, result_lay, _top = section_card(tr("launch.raw_label"))

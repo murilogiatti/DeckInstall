@@ -18,6 +18,7 @@ import threading
 import time
 import zipfile
 import zlib
+from collections.abc import Collection, Sequence
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -3039,11 +3040,16 @@ def apply_launch_presets(
     preserve_mangohud_config: bool = False,
     prime_vendor: str = "nvidia",
     debug_log: bool = False,
+    extra_envs: Sequence[str] = (),
+    managed_tokens: Collection[str] = (),
+    managed_keys: Collection[str] = (),
 ) -> str:
     """Toggle common SteamOS/Proton launch presets while preserving existing custom options.
 
     prime_vendor: "nvidia" (PRIME render offload to an NVIDIA dGPU) or "mesa" (DRI_PRIME=1:
     the other AMD/Intel GPU on a hybrid machine without NVIDIA).
+    extra_envs: more preset variables to add; managed_tokens (exact tokens) and managed_keys
+    (any value) are the ones the caller manages, removed first so turning one off drops it.
     """
     _validate_launch_options(launch_options)
     if winedlloverrides is not None:
@@ -3079,7 +3085,7 @@ def apply_launch_presets(
             elif env_key == "WINEDLLOVERRIDES":
                 if winedlloverrides is not None:
                     continue
-            elif env_key in _PRESET_ENV_KEYS:
+            elif env_key in _PRESET_ENV_KEYS or env_key in managed_keys or tok in managed_tokens:
                 continue
         filtered.append(tok)
 
@@ -3123,6 +3129,7 @@ def apply_launch_presets(
     if debug_log:
         preset_envs.append("UMU_LOG=1")
         preset_envs.append("PROTON_LOG=1")
+    preset_envs.extend(extra_envs)
     if winedlloverrides is not None and winedlloverrides.strip():
         preset_envs.append(_format_winedlloverrides_token(winedlloverrides))
 

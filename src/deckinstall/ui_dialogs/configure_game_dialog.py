@@ -658,23 +658,12 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         btn_wt.setEnabled((is_steam and bool(win.paths)) or is_standalone)
         btn_wt.clicked.connect(lambda: win._open_winetricks_dialog(kind, obj))
 
-        btn_opti = QPushButton(tr("library.btn_optiscaler"))
-        btn_opti.setEnabled((is_steam and bool(win.paths)) or is_standalone or kind == "external")
-
-        def _open_opti() -> None:
-            current = obj
-            if isinstance(current, ShortcutEntry) and sa_obj is not None:
-                current = replace(current, exe=str(sa_obj.exe_path))
-            win._open_optiscaler_dialog(kind, current, on_saved=_save_displayed_opts)
-
-        btn_opti.clicked.connect(_open_opti)
         btn_run_exe = QPushButton(tr("library.btn_run_exe_in_prefix"))
         btn_run_exe.setEnabled((is_steam and bool(win.paths)) or is_standalone)
         btn_run_exe.clicked.connect(lambda: win._run_exe_in_prefix_dialog(kind, obj))
         tools_grid = action_grid()
         action_row(tools_grid, 0, btn_wt, tr("configure.winetricks_hint"))
-        action_row(tools_grid, 1, btn_opti, tr("configure.optiscaler_hint"))
-        action_row(tools_grid, 2, btn_run_exe, tr("configure.run_exe_hint"))
+        action_row(tools_grid, 1, btn_run_exe, tr("configure.run_exe_hint"))
         tools_lay.addLayout(tools_grid)
         prefix_lay.addWidget(tools_card)
 

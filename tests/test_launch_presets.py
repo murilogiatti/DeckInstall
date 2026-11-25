@@ -118,3 +118,34 @@ def test_edit_presets_uses_given_game_and_parent_and_warns_without_steam(tmp_pat
     finally:
         parent.deleteLater()
         app.processEvents()
+
+
+def test_toggle_presets_round_trip_and_keep_custom_values() -> None:
+    from deckinstall.launch_presets import TOGGLES, apply_presets, parse_presets
+
+    every = {toggle.key: True for toggle in TOGGLES}
+    opts = apply_presets("CUSTOM=1 %command% -dx11", every, winedlloverrides="", frame_rate=60)
+    state = parse_presets(opts)
+    assert all(state[toggle.key] for toggle in TOGGLES)
+    assert state["frame_rate"] == 60 and "VKD3D_FRAME_RATE=60" in opts
+    assert opts.startswith("CUSTOM=1 ") and opts.endswith("%command% -dx11")
+    off = apply_presets(opts, {key: False for key in every}, winedlloverrides="", frame_rate=0)
+    assert off == "CUSTOM=1 %command% -dx11"  # turning them off leaves nothing behind
+    hand = "PROTON_FSR4_UPGRADE=4.0.1 %command%"  # a version typed by hand is not ours to drop
+    assert apply_presets(hand) == hand and not parse_presets(hand)["fsr4_upgrade"]
+    native = apply_presets("", every, winedlloverrides="", native_linux=True, frame_rate=60)
+    assert native == ""  # Proton-only presets never reach a native Linux game
+
+
+def test_toggles_are_offered_by_gpu_and_always_while_on() -> None:
+    from types import SimpleNamespace
+
+    from deckinstall.launch_presets import TOGGLES, toggle_offered
+
+    by_key = {toggle.key: toggle for toggle in TOGGLES}
+    intel = SimpleNamespace(has_amd=False, has_intel=True, has_nvidia=False, is_wayland=False)
+    assert toggle_offered(by_key["vendor_amd"], intel, False)
+    assert not toggle_offered(by_key["fsr4_upgrade"], intel, False)
+    assert toggle_offered(by_key["fsr4_upgrade"], intel, True)  # on: shown so it can be turned off
+    assert toggle_offered(by_key["xess_upgrade"], intel, False)
+    assert not toggle_offered(by_key["hdr"], intel, False)

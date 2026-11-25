@@ -38,15 +38,19 @@ from .standalone import (
     uses_library_layout,
 )
 from .ui_cards import (
+    SHORTCUT_DESKTOP_KEY,
+    SHORTCUT_MENU_KEY,
     DropZoneFrame,
     FlowLayout,
     ShownWhenEnabledButton,
     _make_card,
+    _setting_bool,
     action_grid,
     action_row,
     note_label,
     page_layout,
     section_card,
+    shortcut_check,
     shortcut_target_button,
 )
 from .ui_dialogs import (
@@ -261,7 +265,10 @@ def build_add_page(win: MainWindow) -> QWidget:
         button.toggled.connect(lambda _checked: win._apply_install_mode_ui())
         button.clicked.connect(win._on_install_mode_clicked)
     win._install_mode_chosen = False  # until the user picks one, follow the system's default
-    win._standalone_launchers = (True, False)  # menu, desktop
+    win._standalone_launchers = (  # menu, desktop: as left last time
+        _setting_bool(win.settings, SHORTCUT_MENU_KEY, True),
+        _setting_bool(win.settings, SHORTCUT_DESKTOP_KEY, False),
+    )
     mode_row.addStretch()
     win.lbl_mode_note = QLabel()
     win.lbl_mode_note.setObjectName("MutedText")
@@ -289,14 +296,21 @@ def build_add_page(win: MainWindow) -> QWidget:
     run_form.addRow(tr("add.presets_label"), launch_row)
 
     # Standalone mode: where to find the game besides the Library.
-    targets_row = FlowLayout(spacing=8)
-    win.btn_shortcut_menu = shortcut_target_button(tr("add.shortcut_menu"), selected=True)
-    win.btn_shortcut_desktop = shortcut_target_button(tr("add.shortcut_desktop"))
+    targets_row = FlowLayout(spacing=16)
+    # Standalone launchers start as they were left last time.
+    win.btn_shortcut_menu = shortcut_check(
+        tr("add.shortcut_menu"), _setting_bool(win.settings, SHORTCUT_MENU_KEY, True)
+    )
+    win.btn_shortcut_desktop = shortcut_check(
+        tr("add.shortcut_desktop"), _setting_bool(win.settings, SHORTCUT_DESKTOP_KEY, False)
+    )
+    for box, key in ((win.btn_shortcut_menu, SHORTCUT_MENU_KEY), (win.btn_shortcut_desktop, SHORTCUT_DESKTOP_KEY)):
+        box.toggled.connect(lambda on, k=key: win._remember_shortcut_choice(k, on))
     # Shows where a Steam-mode game goes; follows the mode, never clicked on its own.
-    win.btn_shortcut_steam = shortcut_target_button(tr("add.shortcut_steam"))
+    win.btn_shortcut_steam = shortcut_check(tr("add.shortcut_steam"))
     win.btn_shortcut_steam.setEnabled(False)
-    for button in (win.btn_shortcut_steam, win.btn_shortcut_menu, win.btn_shortcut_desktop):
-        targets_row.addWidget(button)
+    for target_box in (win.btn_shortcut_steam, win.btn_shortcut_menu, win.btn_shortcut_desktop):
+        targets_row.addWidget(target_box)
     win.lbl_shortcuts_note = QLabel()
     win.lbl_shortcuts_note.setObjectName("MutedText")
     win.lbl_shortcuts_note.setWordWrap(True)

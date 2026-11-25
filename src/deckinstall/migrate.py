@@ -95,11 +95,15 @@ def _referenced(path: Path, refs: list[str]) -> bool:
     return False
 
 
-def plan_migration(paths: SteamPaths | None = None) -> list[MigrationItem]:
-    """List every v1 game and whether it can be migrated (no changes are made)."""
+def plan_migration(paths: SteamPaths | None = None, lib_root: Path | None = None) -> list[MigrationItem]:
+    """List every v1 game and whether it can be migrated (no changes are made).
+
+    lib_root: the library that receives the games in the old folder (default: the internal one);
+    v1 games elsewhere stay where they are and only get the current format.
+    """
     if not standalone.uses_library_layout():
         return []
-    lib_root = _lib.internal_library_root()
+    lib_root = lib_root or _lib.internal_library_root()
     games_dir = lib_root / _lib.GAMES
     legacy_games = standalone.get_legacy_games_dir()
     legacy_prefixes = standalone.get_legacy_prefixes_dir()
@@ -400,17 +404,21 @@ def _migrate_one(item: MigrationItem, journal: _Journal, lib: _lib.Library) -> S
 def migrate_legacy_games(
     items: list[MigrationItem] | None = None,
     paths: SteamPaths | None = None,
+    lib_root: Path | None = None,
 ) -> MigrationResult:
-    """Migrate the planned v1 games into the internal library. Safe to call when nothing is pending."""
-    plan = items if items is not None else plan_migration(paths)
+    """Migrate the planned v1 games into a library (default: the internal one; use the same
+    lib_root as plan_migration). Safe to call when nothing is pending."""
+    plan = items if items is not None else plan_migration(paths, lib_root)
     result = MigrationResult(journal=None)
     todo = [i for i in plan if i.action == "migrate"]
     result.skipped = [(i.game.name, i.reason) for i in plan if i.action != "migrate"]
     if not todo:
         return result
-    lib = _lib.ensure_library(_lib.internal_library_root(), internal=True)
+    internal = _lib.internal_library_root()
+    root = lib_root or internal
+    lib = _lib.ensure_library(root, label="" if root == internal else root.parent.name, internal=root == internal)
     if not lib.unix_fs:
-        raise RuntimeError(f"The internal library is on {lib.fs_type}, which cannot hold Wine prefixes.")
+        raise RuntimeError(f"The library {lib.root} is on {lib.fs_type}, which cannot hold Wine prefixes.")
     journal = _new_journal(lib.root)
     result.journal = journal.path
     for item in todo:

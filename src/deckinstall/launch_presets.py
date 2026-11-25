@@ -1,4 +1,4 @@
-"""Launch presets (MangoHud, gamemode, DLSS, NVAPI, PRIME, Wayland, wined3d, esync/fsync).
+"""Launch presets (MangoHud, gamemode, upscaler upgrades, NVAPI, PRIME, HDR, Wayland, wined3d, ...).
 
 One place to read the presets out of a launch-options string, re-apply them after a change
 and describe them; the single presets dialog and every caller go through here.
@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import shlex
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from .steam_vdf import apply_launch_presets
 
 # Boolean presets, in the order the dialog and the summary show them.
-FLAGS = (
+FLAGS: tuple[str, ...] = (
     "gamemode",
     "mangohud",
     "dlss_upgrade",
@@ -26,6 +27,45 @@ FLAGS = (
     "debug_log",
 )
 MANGOHUD_LEVELS = (1, 2, 3, 4)
+
+
+@dataclass(frozen=True)
+class Toggle:
+    """An on/off preset that is just environment variables (exact tokens, so a custom value the
+    user typed, e.g. PROTON_FSR4_UPGRADE=4.0.1, is left alone and the box shows off).
+
+    gpu: when the dialog offers it: "" always, "amd"/"intel"/"nvidia" with that GPU, "wayland" in
+    a Wayland session; it is always shown while it is on.
+    """
+
+    key: str
+    tokens: tuple[str, ...]
+    section: str  # "gpu", "upscaler" or "compat"
+    gpu: str = ""
+
+
+# Data, not code: one line per preset. Upscaler upgrades need GE-Proton (or Proton-CachyOS).
+TOGGLES: tuple[Toggle, ...] = (
+    Toggle("fsr4_upgrade", ("PROTON_FSR4_UPGRADE=1",), "upscaler", "amd"),
+    Toggle("fsr4_rdna3", ("PROTON_FSR4_RDNA3_UPGRADE=1",), "upscaler", "amd"),
+    Toggle("xess_upgrade", ("PROTON_XESS_UPGRADE=1",), "upscaler"),
+    Toggle("hdr", ("PROTON_ENABLE_HDR=1",), "gpu", "wayland"),
+    Toggle("vendor_amd", ("DXVK_CONFIG=dxgi.customVendorId=1002",), "gpu", "intel"),
+    Toggle("large_address", ("PROTON_FORCE_LARGE_ADDRESS_AWARE=1",), "compat"),
+    Toggle("prefer_sdl", ("PROTON_PREFER_SDL=1",), "compat"),
+)
+TOGGLE_TOKENS = frozenset(tok for toggle in TOGGLES for tok in toggle.tokens)
+# Frame cap without MangoHud (works in Steam mode too): DXVK (D3D8-11) and VKD3D-Proton (D3D12).
+FRAME_RATES = (30, 40, 45, 60, 90, 120, 144)
+_FRAME_RATE_KEYS = ("DXVK_FRAME_RATE", "VKD3D_FRAME_RATE")
+FLAGS = FLAGS + tuple(toggle.key for toggle in TOGGLES)
+
+
+def toggle_offered(toggle: Toggle, gpu: Any, active: bool) -> bool:
+    """Whether the dialog shows this toggle on this machine (always while it is on)."""
+    if active or not toggle.gpu:
+        return True
+    return bool(getattr(gpu, {"wayland": "is_wayland"}.get(toggle.gpu, f"has_{toggle.gpu}"), False))
 
 
 def parse_presets(opts: str) -> dict[str, Any]:
@@ -65,9 +105,16 @@ def parse_presets(opts: str) -> dict[str, Any]:
                         pass
 
     winedll_from_tokens = ""
+    frame_rate = 0
     for tok in tokens_list:
         if tok.startswith("WINEDLLOVERRIDES="):
             winedll_from_tokens = tok.split("=", 1)[1]
+        elif tok.startswith("DXVK_FRAME_RATE="):
+            try:
+                frame_rate = max(0, int(tok.split("=", 1)[1]))
+            except ValueError:
+                pass
+    toggles = {toggle.key: all(tok in tokens_now for tok in toggle.tokens) for toggle in TOGGLES}
 
     return {
         "tokens_list": tokens_list,
@@ -90,6 +137,8 @@ def parse_presets(opts: str) -> dict[str, Any]:
         "no_fsync": "PROTON_NO_FSYNC=1" in tokens_now,
         "debug_log": "UMU_LOG=1" in tokens_now or "PROTON_LOG=1" in tokens_now,
         "winedll": winedll_from_tokens,
+        "frame_rate": frame_rate,
+        **toggles,
     }
 
 
@@ -114,6 +163,10 @@ def apply_presets(
 
     level = merged.get("mh_level")
     fps = merged.get("mh_fps_limit")
+    frame = merged.get("frame_rate")
+    extra = [tok for toggle in TOGGLES if windows and flag(toggle.key) for tok in toggle.tokens]
+    if windows and isinstance(frame, int) and frame > 0:
+        extra += [f"{key}={frame}" for key in _FRAME_RATE_KEYS]
     return apply_launch_presets(
         opts,
         gamemode=flag("gamemode"),
@@ -131,6 +184,9 @@ def apply_presets(
         mangohud_fps_limit=fps if isinstance(fps, int) and fps > 0 else None,
         prime_vendor=prime_vendor(),
         debug_log=flag("debug_log"),
+        extra_envs=extra,
+        managed_tokens=TOGGLE_TOKENS,
+        managed_keys=_FRAME_RATE_KEYS,
     )
 
 

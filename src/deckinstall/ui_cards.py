@@ -26,6 +26,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QFileDialog,
     QFrame,
@@ -355,13 +356,25 @@ def _format_cleanup_candidate_label(cand: CleanupCandidate) -> str:
 
 
 def shortcut_target_button(label: str, selected: bool = False) -> QPushButton:
-    """A checkable button for a shortcut destination selected before installation."""
+    """A pill for one choice among a few (e.g. the mode: Steam or Standalone)."""
     button = QPushButton(label)
     button.setObjectName("FilterPill")
     button.setCheckable(True)
     button.setAutoDefault(False)
     button.setChecked(selected)
     return button
+
+
+# Install > shortcuts: the last choice of each launcher box.
+SHORTCUT_MENU_KEY = "install/shortcut_menu"
+SHORTCUT_DESKTOP_KEY = "install/shortcut_desktop"
+
+
+def shortcut_check(label: str, selected: bool = False) -> QCheckBox:
+    """A check box for a shortcut made when the install finishes (each one on or off by itself)."""
+    box = QCheckBox(label)
+    box.setChecked(selected)
+    return box
 
 
 class FlowLayout(QLayout):

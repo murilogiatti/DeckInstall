@@ -210,3 +210,20 @@ def test_ui_migrate_and_undo_buttons(tmp_path: Path, monkeypatch: pytest.MonkeyP
 
         win._active_workers.clear()
         win.close()
+
+
+def test_migrate_into_the_library_chosen_not_a_fixed_one(tmp_path: Path) -> None:
+    """The destination is any library (the one chosen last on the Install tab), not ~/DeckInstall."""
+    _make_v1_game("Hollow")
+    other = tmp_path / "OtherDisk" / "DeckInstall"
+    plan = migrate.plan_migration(lib_root=other)
+    assert [(i.game.name, i.action) for i in plan] == [("Hollow", "migrate")]
+    assert plan[0].new_game_dir == other / "Games" / "Hollow"
+
+    result = migrate.migrate_legacy_games(plan, lib_root=other)
+
+    assert result.migrated == ["Hollow"] and not result.failed
+    assert (other / "Games" / "Hollow" / "bin" / "game.exe").is_file()
+    assert not (library.internal_library_root() / "Games" / "Hollow").exists()
+    lib_file = library.read_library_file(other)
+    assert lib_file is not None and [g["name"] for g in lib_file["games"]] == ["Hollow"]

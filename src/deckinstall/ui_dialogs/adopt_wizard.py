@@ -43,7 +43,7 @@ from ..fsutil import unique_dir
 from ..i18n import tr
 from ..modes import STEAM, feature_note
 from ..steam_paths import SteamPaths, is_gamescope_session
-from ..ui_cards import FlowLayout, _pick_dir_async, _pick_file_async, format_size_bytes, shortcut_target_button
+from ..ui_cards import FlowLayout, _pick_dir_async, _pick_file_async, format_size_bytes, shortcut_check
 from ..ui_workers_adopt import AdoptPlanWorker, AdoptScanWorker, AdoptWorker
 
 TrackFn = Callable[[QThread], None]
@@ -410,10 +410,10 @@ class AdoptWizard(QDialog):
         self.cmb_proton = QComboBox()
         self.cmb_proton.currentIndexChanged.connect(self._on_options_changed)
         form.addRow(tr("adopt.proton"), self.cmb_proton)
-        targets = FlowLayout(spacing=8)
-        self.btn_shortcut_menu = shortcut_target_button(tr("add.shortcut_menu"))
-        self.btn_shortcut_desktop = shortcut_target_button(tr("add.shortcut_desktop"))
-        self.btn_shortcut_steam = shortcut_target_button(tr("add.shortcut_steam"))
+        targets = FlowLayout(spacing=16)
+        self.btn_shortcut_menu = shortcut_check(tr("add.shortcut_menu"))
+        self.btn_shortcut_desktop = shortcut_check(tr("add.shortcut_desktop"))
+        self.btn_shortcut_steam = shortcut_check(tr("add.shortcut_steam"))
         for button in (self.btn_shortcut_menu, self.btn_shortcut_desktop, self.btn_shortcut_steam):
             button.toggled.connect(self._on_shortcut_targets_changed)
             targets.addWidget(button)

@@ -76,7 +76,7 @@ from .external_actions import (
     load_external_launch_presets,
 )
 from .i18n import LOCALES_DIR, set_language, tr
-from .launch_presets import active_flags, apply_presets
+from .launch_presets import active_flags, apply_presets, parse_presets
 from .launcher_scan import ExternalLauncherGame, scan_external_launcher_games
 from .library import (
     Library,
@@ -119,6 +119,7 @@ from .standalone import (
     find_existing_installs,
     game_log_dir,
     get_games_dir,
+    get_legacy_games_dir,
     list_standalone_games,
     match_owned_shortcuts,
     planned_game_dir,
@@ -242,20 +243,13 @@ class LaunchPresetState(TypedDict):
     winedll: str
 
 
-# Boolean presets remembered for the next install: preset key -> QSettings name.
+INSTALL_MODE_KEY = "install/mode"  # the mode chosen last, offered first on the next install
 _VDF_WATCH_MS = 5000  # how often queued Steam edits check whether Steam has closed
 
-_LAST_PREFS_FLAGS = {
-    "gamemode": "gamemode",
-    "mangohud": "mangohud",
-    "nvapi": "nvapi",
-    "prime": "prime",
-    "wayland": "wayland",
-    "dlss_upgrade": "dlss_upgrade",
-    "wined3d": "wined3d",
-    "no_esync": "no_esync",
-    "no_fsync": "no_fsync",
-}
+# How versions before 0.32 stored the last presets (one setting each); still read once.
+_OLD_LAST_PREFS_FLAGS = (
+    "gamemode", "mangohud", "nvapi", "prime", "wayland", "dlss_upgrade", "wined3d", "no_esync", "no_fsync",
+)
 
 
 def _parse_launch_preset_state(opts: str) -> LaunchPresetState:
@@ -338,9 +332,9 @@ class MainWindow(QMainWindow):
     btn_remove_game: QPushButton
     btn_scan: QPushButton
     btn_scan_folders: QPushButton
-    btn_shortcut_desktop: QPushButton
-    btn_shortcut_menu: QPushButton
-    btn_shortcut_steam: QPushButton
+    btn_shortcut_desktop: QCheckBox
+    btn_shortcut_menu: QCheckBox
+    btn_shortcut_steam: QCheckBox
     btn_use_extracted: QPushButton
     btn_vdf_apply: QPushButton
     btn_vdf_clear: QPushButton
@@ -995,6 +989,12 @@ class MainWindow(QMainWindow):
         else:
             self.unavailable_banner.hide()
 
+    def _remember_shortcut_choice(self, key: str, on: bool) -> None:
+        """Remember a launcher box only when the user sets it (Standalone mode), not when Steam
+        mode turns the boxes off."""
+        if self._selected_install_mode() == STANDALONE:
+            self.settings.setValue(key, on)
+
     def _remember_library_choice(self, _idx: int) -> None:
         data = self.add_library_combo.currentData()
         if isinstance(data, str) and data:
@@ -1039,6 +1039,7 @@ class MainWindow(QMainWindow):
 
     def _on_install_mode_clicked(self) -> None:
         self._install_mode_chosen = True
+        self.settings.setValue(INSTALL_MODE_KEY, self._selected_install_mode())  # the default next time
 
     def _selected_install_mode(self) -> str:
         return STEAM if self.btn_mode_steam.isChecked() else STANDALONE
@@ -1054,7 +1055,9 @@ class MainWindow(QMainWindow):
             button.setEnabled(not note)
             button.setToolTip(note)
         checked = self._install_mode_group.checkedButton()
-        default_btn = self.btn_mode_steam if env.default_mode == STEAM else self.btn_mode_standalone
+        last = str(self.settings.value(INSTALL_MODE_KEY, "") or "")
+        preferred = last if last in (STEAM, STANDALONE) and not env.mode_note(last) else env.default_mode
+        default_btn = self.btn_mode_steam if preferred == STEAM else self.btn_mode_standalone
         if (
             checked is None
             or not checked.isEnabled()
@@ -1071,13 +1074,13 @@ class MainWindow(QMainWindow):
         if mode == STEAM and self.btn_shortcut_menu.isEnabled():
             # Leaving Standalone: remember its launcher choice and show them off (Steam mode has none).
             self._standalone_launchers = tuple(b.isChecked() for b in launchers)
-            for button in launchers:
-                button.setChecked(False)
+            for box in launchers:
+                box.setChecked(False)
         elif mode == STANDALONE and not self.btn_shortcut_menu.isEnabled():
-            for button, was_on in zip(launchers, self._standalone_launchers, strict=True):
-                button.setChecked(was_on)
-        for button in launchers:
-            button.setEnabled(mode == STANDALONE)
+            for box, was_on in zip(launchers, self._standalone_launchers, strict=True):
+                box.setChecked(was_on)
+        for box in launchers:
+            box.setEnabled(mode == STANDALONE)
         self.btn_shortcut_steam.setChecked(mode == STEAM)  # always disabled: the mode decides it
         self.lbl_shortcuts_note.setText(shortcuts_note)
         self.lbl_shortcuts_note.setVisible(bool(shortcuts_note))
@@ -1681,38 +1684,37 @@ class MainWindow(QMainWindow):
             self._populate_game_form(self._detected_games[game_index])
 
     def _save_last_launch_prefs(self, launch_opts: str, winedll: str) -> None:
-        """Persist last-used launch option preferences to QSettings."""
-        st = _parse_launch_preset_state(launch_opts)
+        """Remember the presets chosen last (every preset, current and future: the managed part of
+        the line, without the game's own arguments) for the next install."""
+        try:
+            presets_only = apply_presets("", parse_presets(launch_opts), winedlloverrides="")
+        except ValueError:
+            return
         self.settings.setValue("last_launch_opts/has_saved", True)
-        self.settings.setValue("last_launch_opts/gamemode", bool(st["gamemode"]))
-        self.settings.setValue("last_launch_opts/mangohud", bool(st["mangohud"]))
-        self.settings.setValue("last_launch_opts/mh_level", int(st["mh_level"] or 0))
-        self.settings.setValue("last_launch_opts/mh_position", str(st.get("mh_position") or ""))
-        self.settings.setValue("last_launch_opts/mh_fps_limit", int(st.get("mh_fps_limit") or 0))
-        self.settings.setValue("last_launch_opts/nvapi", bool(st["nvapi"]))
-        self.settings.setValue("last_launch_opts/prime", bool(st["prime"]))
-        self.settings.setValue("last_launch_opts/wayland", bool(st["wayland"]))
-        self.settings.setValue("last_launch_opts/dlss_upgrade", bool(st["dlss_upgrade"]))
-        self.settings.setValue("last_launch_opts/wined3d", bool(st["wined3d"]))
-        self.settings.setValue("last_launch_opts/no_esync", bool(st["no_esync"]))
-        self.settings.setValue("last_launch_opts/no_fsync", bool(st["no_fsync"]))
+        self.settings.setValue("last_launch_opts/presets", presets_only)
         self.settings.setValue("last_launch_opts/winedll", winedll.strip())
 
     def _load_last_launch_prefs(self) -> tuple[str, str]:
-        """Load last-used launch option preferences from QSettings."""
+        """The presets chosen last (empty on a first install)."""
         if not _setting_bool(self.settings, "last_launch_opts/has_saved", False):
             return "", ""
-        state: dict[str, object] = {
-            key: _setting_bool(self.settings, f"last_launch_opts/{setting}", False)
-            for key, setting in _LAST_PREFS_FLAGS.items()
-        }
-        state["mh_level"] = _setting_int(self.settings, "last_launch_opts/mh_level", 0)
-        state["mh_fps_limit"] = _setting_int(self.settings, "last_launch_opts/mh_fps_limit", 0)
-        state["mh_position"] = str(self.settings.value("last_launch_opts/mh_position", "") or "")
-        try:
-            opts = apply_presets("", state, winedlloverrides="")
-        except ValueError:
-            opts = ""
+        saved = self.settings.value("last_launch_opts/presets", None)
+        if saved is not None:
+            try:
+                opts = apply_presets(str(saved), winedlloverrides="")  # drops anything not a preset
+            except ValueError:
+                opts = ""
+        else:  # saved by an older version, one setting per preset
+            state: dict[str, object] = {
+                key: _setting_bool(self.settings, f"last_launch_opts/{key}", False) for key in _OLD_LAST_PREFS_FLAGS
+            }
+            state["mh_level"] = _setting_int(self.settings, "last_launch_opts/mh_level", 0)
+            state["mh_fps_limit"] = _setting_int(self.settings, "last_launch_opts/mh_fps_limit", 0)
+            state["mh_position"] = str(self.settings.value("last_launch_opts/mh_position", "") or "")
+            try:
+                opts = apply_presets("", state, winedlloverrides="")
+            except ValueError:
+                opts = ""
         winedll = str(self.settings.value("last_launch_opts/winedll", "") or "").strip()
         return opts, winedll
 
@@ -1734,8 +1736,18 @@ class MainWindow(QMainWindow):
             "no_esync": tr("presets.short_no_esync"),
             "no_fsync": tr("presets.short_no_fsync"),
             "debug_log": tr("presets.short_debug_log"),
+            "fsr4_upgrade": tr("presets.short_fsr4"),
+            "fsr4_rdna3": tr("presets.short_fsr4"),
+            "xess_upgrade": tr("presets.short_xess"),
+            "hdr": tr("presets.short_hdr"),
+            "vendor_amd": tr("presets.short_vendor_amd"),
+            "large_address": tr("presets.short_large_address"),
+            "prefer_sdl": tr("presets.short_prefer_sdl"),
         }
-        active = [names[k] for k in active_flags(self._add_launch_options) if k in names]
+        active = list(dict.fromkeys(names[k] for k in active_flags(self._add_launch_options) if k in names))
+        frame = int(parse_presets(self._add_launch_options).get("frame_rate") or 0)
+        if frame:
+            active.append(tr("presets.short_frame_rate", fps=frame))
         if self._add_winedlloverrides.strip():
             active.append(tr("presets.short_dll"))
         self.lbl_add_presets.setText(", ".join(active) if active else tr("presets.none"))
@@ -2325,7 +2337,7 @@ class MainWindow(QMainWindow):
 
 
     def _maybe_prompt_migration(self, standalone_games: list[StandaloneGame]) -> None:
-        """Offer once per session to move v1 games (~/Games) into the internal library."""
+        """Offer once per session to bring games from old DeckInstall versions into a library."""
         try:
             from .proton_policy import retarget_stale_default_games
 
@@ -2342,21 +2354,22 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda: self._start_legacy_migration(from_startup=True))
 
     def _start_legacy_migration(self, from_startup: bool = False) -> None:
-        """Plan, confirm and run the migration of v1 games into ~/DeckInstall."""
+        """Plan, confirm and run the migration of v1 games into the library chosen on the Install tab."""
         if self._closing_pending or self._steam_busy or not uses_library_layout():
             return
         paths = self.paths
+        lib_root = self._target_library_root()
         self._begin_busy()
 
         def _inspect() -> list[MigrationItem] | None:
-            return None if _is_wine_game_running() else plan_migration(paths)
+            return None if _is_wine_game_running() else plan_migration(paths, lib_root)
 
         def _planned(result: object) -> None:
             self._end_busy()
             if self._closed or self._closing_pending or self.paths != paths:
                 return
             if isinstance(result, list):
-                self._confirm_legacy_migration(result, from_startup, paths)
+                self._confirm_legacy_migration(result, from_startup, paths, lib_root)
             elif not from_startup:
                 QMessageBox.warning(_dialog_parent(self), __app_name__, tr("migrate.game_running"))
 
@@ -2371,8 +2384,18 @@ class MainWindow(QMainWindow):
         planner.failed.connect(_failed)
         planner.start()
 
+    def _target_library_root(self) -> Path:
+        """The library chosen last on the Install tab (nothing is created here)."""
+        data = str(self.add_library_combo.currentData() or "") if hasattr(self, "add_library_combo") else ""
+        kind, _, raw = data.partition(":")
+        if kind == "lib" and raw:
+            return Path(raw)
+        if kind == "disk" and raw:
+            return Path(raw) / "DeckInstall"
+        return internal_library_root()
+
     def _confirm_legacy_migration(
-        self, plan: list[MigrationItem], from_startup: bool, paths: SteamPaths | None,
+        self, plan: list[MigrationItem], from_startup: bool, paths: SteamPaths | None, lib_root: Path,
     ) -> None:
         todo = [i for i in plan if i.action == "migrate"]
         skipped = [i for i in plan if i.action != "migrate"]
@@ -2389,7 +2412,9 @@ class MainWindow(QMainWindow):
                 self.notify(text, "info")
             return
         names = "\n".join(f"• {i.game.name}" for i in todo)
-        text = tr("migrate.confirm", count=len(todo), dest=str(internal_library_root()), names=names)
+        text = tr(
+            "migrate.confirm", count=len(todo), dest=str(lib_root), old=str(get_legacy_games_dir()), names=names
+        )
         if skipped_text:
             text += "\n\n" + tr("migrate.skipped", items=skipped_text)
         box = QMessageBox(_dialog_parent(self))
@@ -2417,7 +2442,7 @@ class MainWindow(QMainWindow):
         def _migrate() -> MigrationResult:
             if _is_wine_game_running():
                 raise RuntimeError(tr("migrate.game_running"))
-            return migrate_legacy_games(todo, paths)
+            return migrate_legacy_games(todo, paths, lib_root)
 
         worker = SteamOpWorker(_migrate)
         self._track_worker(worker)

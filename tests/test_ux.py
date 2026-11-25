@@ -428,3 +428,34 @@ def test_dialogs_use_theme_colors_not_fixed_ones() -> None:
         if path.name != "theme.py" and "color: #" in path.read_text(encoding="utf-8")
     ]
     assert offenders == []
+
+
+def test_install_remembers_the_last_choices() -> None:
+    from PySide6.QtWidgets import QCheckBox
+
+    from deckinstall.launch_presets import parse_presets
+    from deckinstall.modes import STANDALONE
+
+    app = _app()
+    with tempfile.TemporaryDirectory() as tmp:
+        win = _window(app, tmp)
+        try:
+            assert isinstance(win.btn_shortcut_menu, QCheckBox) and isinstance(win.btn_shortcut_desktop, QCheckBox)
+            win._save_last_launch_prefs("PROTON_XESS_UPGRADE=1 DXVK_FRAME_RATE=40 gamemoderun %command% -game", "")
+            if win.btn_mode_standalone.isEnabled():
+                win.btn_mode_standalone.click()
+                win.btn_shortcut_desktop.setChecked(True)
+                win.btn_shortcut_menu.setChecked(False)
+        finally:
+            _close(app, win)
+        win = _window(app, tmp)  # a new start reads the same settings
+        try:
+            opts, _dll = win._load_last_launch_prefs()
+            state = parse_presets(opts)
+            assert state["xess_upgrade"] and state["gamemode"] and state["frame_rate"] == 40
+            assert "-game" not in opts  # a game's own arguments are not carried to the next one
+            if win.btn_mode_standalone.isEnabled():
+                assert win._selected_install_mode() == STANDALONE
+                assert win.btn_shortcut_desktop.isChecked() and not win.btn_shortcut_menu.isChecked()
+        finally:
+            _close(app, win)
