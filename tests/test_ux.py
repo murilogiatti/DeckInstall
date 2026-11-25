@@ -100,3 +100,66 @@ def test_reload_buttons_do_not_say_update_in_portuguese() -> None:
     pt = json.loads((LOCALES_DIR / "pt_BR.json").read_text(encoding="utf-8"))
     for key in ("maint.btn_refresh_health", "proton_mgr.btn_refresh_installed", "save_sync.btn_refresh"):
         assert pt[key] == "Recarregar"
+
+
+def test_ui_scale_choice_resolution() -> None:
+    from deckinstall.ui_scale import resolve_scale
+
+    assert resolve_scale("auto", gaming_mode=True, env={}) == "1.25"
+    assert resolve_scale("auto", gaming_mode=False, env={}) is None
+    assert resolve_scale("1", gaming_mode=True, env={}) is None
+    assert resolve_scale("1.25", gaming_mode=False, env={}) == "1.25"
+    assert resolve_scale("1.5", gaming_mode=True, env={}) == "1.25"  # unknown value: Auto
+    assert resolve_scale("1.25", gaming_mode=True, env={"QT_SCALE_FACTOR": "2"}) is None  # the user's own
+
+
+def test_ui_scale_env_is_set_only_around_the_qapplication() -> None:
+    from deckinstall.ui_scale import clear_scale_env, set_scale_env
+
+    env: dict[str, str] = {}
+    assert set_scale_env("1.25", env) and env == {"QT_SCALE_FACTOR": "1.25"}
+    clear_scale_env(True, env)
+    assert env == {}
+    env = {"QT_SCALE_FACTOR": "2"}
+    assert not set_scale_env(None, env)
+    clear_scale_env(False, env)
+    assert env == {"QT_SCALE_FACTOR": "2"}  # never removes the user's variable
+
+
+def test_main_applies_the_scale_and_children_do_not_inherit_it(monkeypatch) -> None:
+    import os
+    import sys
+
+    seen: dict[str, str | None] = {}
+    app = _app()
+
+    def fake_qapp(_argv: object) -> QApplication:
+        seen["during"] = os.environ.get("QT_SCALE_FACTOR")
+        return app
+
+    fake_win = mock.Mock(_active_workers=set())
+    fake_win.close.return_value = True
+    monkeypatch.delenv("QT_SCALE_FACTOR", raising=False)
+    with (
+        mock.patch.object(sys, "argv", ["deckinstall", "--smoke-test"]),
+        mock.patch.object(ui, "QApplication", side_effect=fake_qapp),
+        mock.patch.object(ui, "qInstallMessageHandler"),
+        mock.patch.object(ui, "install_touch_scroll"),
+        mock.patch.object(ui, "is_gamescope_session", return_value=True),
+        mock.patch.object(ui, "MainWindow", return_value=fake_win),
+    ):
+        assert ui.main() == 0
+    assert seen["during"] == "1.25"  # Auto in Gaming Mode
+    assert "QT_SCALE_FACTOR" not in os.environ
+
+
+def test_scale_combo_saves_and_says_it_needs_a_restart() -> None:
+    app = _app()
+    with tempfile.TemporaryDirectory() as tmp:
+        win = _window(app, tmp)
+        try:
+            win.scale_combo.setCurrentIndex(win.scale_combo.findData("1.25"))
+            assert win.settings.value("ui/scale") == "1.25"
+            assert not win.message_bar.isHidden()
+        finally:
+            _close(app, win)

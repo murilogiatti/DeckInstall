@@ -376,6 +376,7 @@ class MainWindow(QMainWindow):
     btn_uninstall_runtimes: QPushButton
     library_empty_state: QWidget
     message_bar: MessageBar
+    scale_combo: QComboBox
     # Updates card (ui_updates.build_updates_card)
     lbl_updates_status: QLabel
     btn_updates_check: QPushButton
@@ -4209,7 +4210,12 @@ def main() -> int:
 
         return doctor_main(args)
     qInstallMessageHandler(_qt_message_handler)
+    from .ui_scale import SCALE_KEY, clear_scale_env, resolve_scale, set_scale_env
+
+    scale_choice = str(QSettings(__app_name__, __app_name__).value(SCALE_KEY, "auto") or "auto")
+    scale_set = set_scale_env(resolve_scale(scale_choice, gaming_mode=is_gamescope_session(), env=os.environ))
     app = QApplication(sys.argv)
+    clear_scale_env(scale_set)
     app.setDesktopFileName("deckinstall")
     app.setApplicationName(__app_name__)
     app.setApplicationVersion(__version__)

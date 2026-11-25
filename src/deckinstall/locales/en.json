@@ -1045,5 +1045,11 @@
   "updates.app_done": "DeckInstall {latest} downloaded and verified.",
   "updates.wait": "Wait a minute before checking again (GitHub limits how often apps can ask).",
   "updates.err_rate_limit": "GitHub is limiting checks right now; try again later",
-  "updates.err_offline": "no connection"
+  "updates.err_offline": "no connection",
+  "settings.scale": "Interface size:",
+  "settings.scale_auto": "Automatic (125% in Gaming Mode)",
+  "settings.scale_100": "100%",
+  "settings.scale_125": "125% (handheld, TV)",
+  "settings.scale_tip": "Bigger text and buttons, easier to read and touch on the Steam Deck. Takes effect when DeckInstall opens again.",
+  "settings.scale_restart": "The new interface size takes effect the next time DeckInstall opens."
 }

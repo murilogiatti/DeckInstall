@@ -639,9 +639,28 @@ def build_app_settings_card(win: MainWindow) -> QWidget:
     if lidx >= 0:
         win.lang_combo.setCurrentIndex(lidx)
     win.lang_combo.currentIndexChanged.connect(win._on_language_changed)
+    from .ui_scale import SCALE_KEY
+
+    win.scale_combo = QComboBox()
+    win.scale_combo.setToolTip(tr("settings.scale_tip"))
+    win.scale_combo.addItem(tr("settings.scale_auto"), "auto")
+    win.scale_combo.addItem(tr("settings.scale_100"), "1")
+    win.scale_combo.addItem(tr("settings.scale_125"), "1.25")
+    sidx = win.scale_combo.findData(str(win.settings.value(SCALE_KEY, "auto") or "auto"))
+    win.scale_combo.setCurrentIndex(max(0, sidx))
+
+    def _on_scale_changed(_idx: int) -> None:
+        win.settings.setValue(SCALE_KEY, win.scale_combo.currentData())
+        win.message_bar.show_message(tr("settings.scale_restart"), "info", key="scale")
+
+    win.scale_combo.currentIndexChanged.connect(_on_scale_changed)
     btn_about = QPushButton(tr("header.about"))
     btn_about.clicked.connect(win._show_about_dialog)
-    for label, combo in ((tr("header.theme"), win.theme_combo), (tr("header.language"), win.lang_combo)):
+    for label, combo in (
+        (tr("header.theme"), win.theme_combo),
+        (tr("header.language"), win.lang_combo),
+        (tr("settings.scale"), win.scale_combo),
+    ):
         box = QWidget()
         row = QHBoxLayout(box)
         row.setContentsMargins(0, 0, 0, 0)
