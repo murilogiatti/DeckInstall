@@ -68,11 +68,12 @@ from ..ui_cards import (
     _dialog_parent,
     _format_worker_error,
     _is_wine_game_running,
-    _make_card,
     _pick_dir_async,
     _setting_bool,
     _SortableTableItem,
+    action_row,
     format_size_bytes,
+    section_card,
     show_text_dialog,
 )
 from ..ui_workers import SteamOpWorker
@@ -243,32 +244,6 @@ def _snapshots_of(slug: str) -> list[SaveArchiveEntry]:
     ]
 
 
-def _section(title_text: str, hint_text: str = "") -> tuple[QWidget, QVBoxLayout, QHBoxLayout]:
-    """A card with a section title (and room on its right), plus an optional one-line hint."""
-    card, layout = _make_card()
-    top = QHBoxLayout()
-    title = QLabel(title_text)
-    title.setObjectName("SectionTitle")
-    top.addWidget(title)
-    top.addStretch()
-    layout.addLayout(top)
-    if hint_text:
-        hint = QLabel(hint_text)
-        hint.setObjectName("MutedText")
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
-    return card, layout, top
-
-
-def _action_row(layout: QGridLayout, row: int, button: QPushButton, hint_text: str) -> None:
-    """A button with what it does next to it: the user picks by purpose, not by guessing."""
-    hint = QLabel(hint_text)
-    hint.setObjectName("MutedText")
-    hint.setWordWrap(True)
-    layout.addWidget(button, row, 0)
-    layout.addWidget(hint, row, 1)
-
-
 def build_saves_page(win: MainWindow) -> QWidget:
     """The Saves page, by purpose: per-game copies first, then whole backups and sync, then
     Ludusavi, then the automatic-copy settings."""
@@ -286,7 +261,7 @@ def build_saves_page(win: MainWindow) -> QWidget:
     layout.addWidget(subtitle)
 
     # 1. Copies of each game: the everyday part.
-    card, card_layout, top = _section(tr("saves.section_games"), tr("saves.section_games_hint"))
+    card, card_layout, top = section_card(tr("saves.section_games"), tr("saves.section_games_hint"))
     win.chk_saves_orphans = QCheckBox(tr("saves.show_orphans", count=0))
     win.chk_saves_orphans.setChecked(_setting_bool(win.settings, SHOW_ORPHANS_KEY, False))
 
@@ -347,7 +322,7 @@ def build_saves_page(win: MainWindow) -> QWidget:
     layout.addWidget(card, 1)
 
     # 2. Every game at once: a .zip to keep elsewhere, or a folder kept in step (Syncthing, SD card).
-    all_card, all_layout, _top = _section(tr("saves.section_all"))
+    all_card, all_layout, _top = section_card(tr("saves.section_all"))
     grid = QGridLayout()
     grid.setHorizontalSpacing(12)
     grid.setColumnStretch(1, 1)
@@ -357,14 +332,14 @@ def build_saves_page(win: MainWindow) -> QWidget:
     win.btn_save_restore.clicked.connect(win._restore_saves_backup)
     win.btn_save_sync = QPushButton(tr("saves.btn_sync"))
     win.btn_save_sync.clicked.connect(win._open_save_sync_dialog)
-    _action_row(grid, 0, win.btn_save_backup, tr("saves.backup_hint"))
-    _action_row(grid, 1, win.btn_save_restore, tr("saves.restore_hint"))
-    _action_row(grid, 2, win.btn_save_sync, tr("saves.sync_hint"))
+    action_row(grid, 0, win.btn_save_backup, tr("saves.backup_hint"))
+    action_row(grid, 1, win.btn_save_restore, tr("saves.restore_hint"))
+    action_row(grid, 2, win.btn_save_sync, tr("saves.sync_hint"))
     all_layout.addLayout(grid)
     layout.addWidget(all_card)
 
     # 3. Ludusavi: only for people who already use it.
-    lds_card, lds_layout, _top = _section(tr("saves.section_ludusavi"), tr("saves.section_ludusavi_hint"))
+    lds_card, lds_layout, _top = section_card(tr("saves.section_ludusavi"), tr("saves.section_ludusavi_hint"))
     lds_grid = QGridLayout()
     lds_grid.setHorizontalSpacing(12)
     lds_grid.setColumnStretch(1, 1)
@@ -376,15 +351,15 @@ def build_saves_page(win: MainWindow) -> QWidget:
     win.btn_save_export.clicked.connect(lambda: _ludusavi_pick(win, export=True))
     win.btn_save_dedup = QPushButton(tr("saves.btn_dedup"))
     win.btn_save_dedup.clicked.connect(lambda: _remove_import_duplicates(win))
-    _action_row(lds_grid, 0, win.btn_save_import, tr("saves.import_hint"))
-    _action_row(lds_grid, 1, win.btn_save_import_one, tr("saves.import_one_hint"))
-    _action_row(lds_grid, 2, win.btn_save_export, tr("saves.export_hint"))
-    _action_row(lds_grid, 3, win.btn_save_dedup, tr("saves.btn_dedup_tip"))
+    action_row(lds_grid, 0, win.btn_save_import, tr("saves.import_hint"))
+    action_row(lds_grid, 1, win.btn_save_import_one, tr("saves.import_one_hint"))
+    action_row(lds_grid, 2, win.btn_save_export, tr("saves.export_hint"))
+    action_row(lds_grid, 3, win.btn_save_dedup, tr("saves.btn_dedup_tip"))
     lds_layout.addLayout(lds_grid)
     layout.addWidget(lds_card)
 
     # 4. What happens on its own.
-    auto_card, auto_layout, _top = _section(tr("saves.section_auto"))
+    auto_card, auto_layout, _top = section_card(tr("saves.section_auto"))
     chk_auto = QCheckBox(tr("save_sync.auto_snapshot"))
     chk_auto.setChecked(_setting_bool(win.settings, AUTO_SNAPSHOT_KEY, True))
     chk_auto.toggled.connect(lambda on: win.settings.setValue(AUTO_SNAPSHOT_KEY, bool(on)))

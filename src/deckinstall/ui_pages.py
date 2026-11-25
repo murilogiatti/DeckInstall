@@ -40,7 +40,11 @@ from .standalone import (
 from .ui_cards import (
     DropZoneFrame,
     FlowLayout,
+    ShownWhenEnabledButton,
     _make_card,
+    action_grid,
+    action_row,
+    section_card,
     shortcut_target_button,
 )
 from .ui_dialogs import (
@@ -74,6 +78,10 @@ def build_extract_page(win: MainWindow) -> QWidget:
     src_lbl = QLabel(tr("install.source_title"))
     src_lbl.setObjectName("SectionTitle")
     drop_layout.addWidget(src_lbl)
+    src_hint = QLabel(tr("install.source_hint"))
+    src_hint.setObjectName("MutedText")
+    src_hint.setWordWrap(True)
+    drop_layout.addWidget(src_hint)
 
     src_row = QHBoxLayout()
     win.extract_src = QLineEdit()
@@ -101,10 +109,10 @@ def build_extract_page(win: MainWindow) -> QWidget:
     win.btn_extract = QPushButton(tr("install.btn_extract"))
     win.btn_extract.setObjectName("primaryBtn")
     win.btn_extract.clicked.connect(win._start_extract)
-    win.btn_cancel_extract = QPushButton(tr("install.btn_cancel"))
+    win.btn_cancel_extract = ShownWhenEnabledButton(tr("install.btn_cancel"))
     win.btn_cancel_extract.setEnabled(False)
     win.btn_cancel_extract.clicked.connect(win._cancel_extract)
-    win.btn_use_extracted = QPushButton(tr("install.btn_continue_add"))
+    win.btn_use_extracted = ShownWhenEnabledButton(tr("install.btn_continue_add"))
     win.btn_use_extracted.setEnabled(False)
     win.btn_use_extracted.clicked.connect(win._send_extracted_to_add_tab)
     btn_row.addWidget(win.btn_extract)
@@ -185,7 +193,7 @@ def build_add_page(win: MainWindow) -> QWidget:
     )
     list_layout.addWidget(win.games_list, 1)
 
-    # Step 2 (Game): exe, name, Steam match, where/how to install and the shortcuts, all in one place.
+    # Step 2 (Game): which folder and exe, its name, the Steam match and the cover preview.
     cfg_split = QSplitter(Qt.Orientation.Horizontal)
     cfg_split.setChildrenCollapsible(False)
 
@@ -231,19 +239,23 @@ def build_add_page(win: MainWindow) -> QWidget:
     art_row.addWidget(btn_search)
     form.addRow(tr("add.steam_store_label"), art_row)
 
+    # Step 3 (where and how it runs) has its own card: library, mode, presets, shortcuts.
+    run_form = QFormLayout()
+    run_form.setSpacing(10)
+
     win.add_library_combo = QComboBox()
     win.add_library_combo.setToolTip(tr("add.library_tooltip"))
     win.add_library_combo.currentIndexChanged.connect(win._remember_library_choice)
-    form.addRow(tr("add.library"), win.add_library_combo)
+    run_form.addRow(tr("add.library"), win.add_library_combo)
     if not uses_library_layout():
         win.add_library_combo.setVisible(False)
-        label_item = form.labelForField(win.add_library_combo)
+        label_item = run_form.labelForField(win.add_library_combo)
         if label_item is not None:
             label_item.setVisible(False)
 
     win.chk_keep_in_place = QCheckBox(tr("add.keep_in_place"))
     win.chk_keep_in_place.setChecked(False)
-    form.addRow("", win.chk_keep_in_place)
+    run_form.addRow("", win.chk_keep_in_place)
 
     # Who runs the game: Steam (Steam mode) or DeckInstall itself (Standalone mode).
     mode_row = QHBoxLayout()
@@ -269,7 +281,7 @@ def build_add_page(win: MainWindow) -> QWidget:
     mode_col.setSpacing(4)
     mode_col.addLayout(mode_row)
     mode_col.addWidget(win.lbl_mode_note)
-    form.addRow(tr("mode.label"), mode_box)
+    run_form.addRow(tr("mode.label"), mode_box)
 
     win._add_launch_options = ""
     win._add_winedlloverrides = ""
@@ -283,7 +295,7 @@ def build_add_page(win: MainWindow) -> QWidget:
     win.lbl_add_presets.setWordWrap(True)
     launch_row.addWidget(win.btn_add_launch_adv)
     launch_row.addWidget(win.lbl_add_presets, 1)
-    form.addRow(tr("add.presets_label"), launch_row)
+    run_form.addRow(tr("add.presets_label"), launch_row)
 
     # Standalone mode: where to find the game besides the Library.
     targets_row = FlowLayout(spacing=8)
@@ -303,12 +315,12 @@ def build_add_page(win: MainWindow) -> QWidget:
     targets_col.setSpacing(4)
     targets_col.addLayout(targets_row)
     targets_col.addWidget(win.lbl_shortcuts_note)
-    form.addRow(tr("add.shortcuts_label"), targets_box)
+    run_form.addRow(tr("add.shortcuts_label"), targets_box)
     # Steam mode: Steam closes to write the shortcut.
     win.chk_restart = QCheckBox(tr("add.reopen_steam"))
     win.chk_restart.setChecked(True)
     win.chk_restart.setToolTip(tr("add.reopen_steam_tooltip"))
-    form.addRow("", win.chk_restart)
+    run_form.addRow("", win.chk_restart)
 
     cfg_split.addWidget(form_widget)
 
@@ -327,7 +339,10 @@ def build_add_page(win: MainWindow) -> QWidget:
     cfg_split.setStretchFactor(1, 0)
     cfg_split.setSizes([700, 240])
     list_layout.addWidget(cfg_split)
+    layout.addWidget(list_card)
 
+    run_card, run_layout, _top = section_card(tr("install.run_title"))
+    run_layout.addLayout(run_form)
     actions_row = FlowLayout(spacing=8)
     win.btn_install = QPushButton(tr("install.btn_install"))
     win.btn_install.setObjectName("primaryBtn")
@@ -341,8 +356,8 @@ def build_add_page(win: MainWindow) -> QWidget:
     win.btn_remove_existing.clicked.connect(win._remove_existing_from_add)
     win.btn_remove_existing.setVisible(False)
     actions_row.addWidget(win.btn_remove_existing)
-    list_layout.addLayout(actions_row)
-    layout.addWidget(list_card)
+    run_layout.addLayout(actions_row)
+    layout.addWidget(run_card)
     win._reset_add_launch_options()
     win._apply_install_mode_ui(follow_default=True)
 
@@ -408,23 +423,16 @@ def build_library_page(win: MainWindow) -> QWidget:
     my_lib_layout.addWidget(sub)
 
 
-    lib_card, lib_layout = _make_card()
-    top = QHBoxLayout()
-    lbl = QLabel(tr("library.shortcuts_title"))
-    lbl.setObjectName("SectionTitle")
-    win.btn_reload = QPushButton(tr("install.btn_rescan"))
+    # 1. The games: pick one, then act on it (the everyday part).
+    lib_card, lib_layout, top = section_card(tr("library.shortcuts_title"))
+    win.btn_reload = QPushButton(tr("save_sync.btn_refresh"))
+    win.btn_reload.setToolTip(tr("library.btn_reload_tip"))
     win.btn_reload.clicked.connect(win._refresh_shortcuts)
+    top.addWidget(win.btn_reload)
     win.btn_lib_sub_add = QPushButton(tr("library.subtab_add"))
     win.btn_lib_sub_add.clicked.connect(lambda: win._switch_library_subview(1))
     win.btn_adopt_games = QPushButton(tr("adopt.btn_open"))
-    win.btn_adopt_games.setToolTip(tr("adopt.btn_open_tip"))
     win.btn_adopt_games.clicked.connect(win._open_adopt_wizard)
-    top.addWidget(lbl)
-    top.addStretch()
-    top.addWidget(win.btn_adopt_games)
-    top.addWidget(win.btn_lib_sub_add)
-    top.addWidget(win.btn_reload)
-    lib_layout.addLayout(top)
 
     win.vdf_error_banner = QLabel()
     win.vdf_error_banner.setWordWrap(True)
@@ -583,39 +591,42 @@ def build_library_page(win: MainWindow) -> QWidget:
     win.btn_bulk_proton.setToolTip(tr("library.btn_bulk_proton_tip"))
     win.btn_bulk_proton.clicked.connect(lambda: bulk_proton_dialog(win))
     win.btn_migrate_legacy = QPushButton(tr("maint.btn_migrate_legacy"))
-    win.btn_migrate_legacy.setToolTip(tr("maint.migrate_legacy_tooltip"))
     win.btn_migrate_legacy.clicked.connect(lambda: win._start_legacy_migration())
+    from .ui_library_art import fetch_missing_art, fetch_selected_art
+
+    win.btn_game_art = QPushButton(tr("art.btn_selected"))
+    win.btn_game_art.setToolTip(tr("art.btn_selected_tip"))
+    win.btn_game_art.clicked.connect(lambda: fetch_selected_art(win))
     footer = QHBoxLayout()
-    footer.setSpacing(24)
-    for group_text, group_btns in (
-        (tr("library.group_play"), (win.btn_play_game,)),
-        (
-            tr("library.group_configure"),
-            (win.btn_configure_game, win.btn_move_game, win.btn_favorite, win.btn_protondb),
-        ),
-        (tr("library.group_uninstall"), (win.btn_remove_game,)),
+    for btn in (
+        win.btn_play_game, win.btn_configure_game, win.btn_move_game, win.btn_game_art, win.btn_favorite,
+        win.btn_protondb,
     ):
-        col = QVBoxLayout()
-        col.setSpacing(4)
-        group_lbl = QLabel(group_text)
-        group_lbl.setObjectName("MutedText")
-        col.addWidget(group_lbl)
-        btn_row = QHBoxLayout()
-        for group_btn in group_btns:
-            btn_row.addWidget(group_btn)
-        col.addLayout(btn_row)
-        footer.addLayout(col)
-        if win.btn_configure_game in group_btns:
-            footer.addStretch()
+        footer.addWidget(btn)
+    footer.addStretch()
+    footer.addWidget(win.btn_remove_game)
     lib_layout.addLayout(footer)
-    batch_lbl = QLabel(tr("library.group_batch"))
-    batch_lbl.setObjectName("MutedText")
-    lib_layout.addWidget(batch_lbl)
-    batch_flow = FlowLayout(spacing=8)
-    for batch_btn in (win.btn_migrate_legacy,):
-        batch_flow.addWidget(batch_btn)
-    lib_layout.addLayout(batch_flow)
+    win.shortcuts_list.setMinimumHeight(420)
+    win.library_grid.setMinimumHeight(420)
+
+    # 2. Bring in games: install one, or adopt what is already on the computer.
+    add_card, add_layout, _top = section_card(tr("library.section_add"))
+    add_grid = action_grid()
+    action_row(add_grid, 0, win.btn_lib_sub_add, tr("library.add_hint"))
+    action_row(add_grid, 1, win.btn_adopt_games, tr("adopt.btn_open_tip"))
+    add_layout.addLayout(add_grid)
+
+    # 3. Every game at once.
+    all_card, all_layout, _top = section_card(tr("library.section_all"))
+    win.btn_all_art = QPushButton(tr("art.btn_missing"))
+    win.btn_all_art.clicked.connect(lambda: fetch_missing_art(win))
+    all_grid = action_grid()
+    action_row(all_grid, 0, win.btn_all_art, tr("art.btn_missing_hint"))
+    action_row(all_grid, 1, win.btn_migrate_legacy, tr("maint.migrate_legacy_tooltip"))
+    all_layout.addLayout(all_grid)
     my_lib_layout.addWidget(lib_card, 1)
+    my_lib_layout.addWidget(add_card)
+    my_lib_layout.addWidget(all_card)
     layout.addWidget(my_lib_page, 1)
     return page
 
@@ -635,6 +646,13 @@ def _card_with_title(title: str) -> tuple[QWidget, QVBoxLayout]:
     head.setObjectName("SectionTitle")
     layout.addWidget(head)
     return card, layout
+
+
+def update_sgdb_state(win: MainWindow) -> None:
+    """Say whether a SteamGridDB key is saved (the key itself is never shown)."""
+    from .steamgriddb import api_key
+
+    win.lbl_sgdb_state.setText(tr("sgdb.state_set") if api_key() else tr("sgdb.state_unset"))
 
 
 def build_settings_page(win: MainWindow) -> QWidget:
@@ -694,40 +712,37 @@ def build_settings_page(win: MainWindow) -> QWidget:
 
     # Steam
     steam, steam_layout = _card_with_title(tr("settings.steam_title"))
-    steam_row = QHBoxLayout()
     win.steam_status_lbl = QLabel(win._format_steam_status_text())
     win.steam_status_lbl.setWordWrap(True)
+    steam_layout.addWidget(win.steam_status_lbl)
     win.btn_redetect_steam = QPushButton(tr("sidebar.redetect_steam"))
     win.btn_redetect_steam.clicked.connect(win._redetect_steam)
-    steam_row.addWidget(win.steam_status_lbl, 1)
-    steam_row.addWidget(win.btn_redetect_steam)
-    steam_layout.addLayout(steam_row)
-    sgdb_row = QHBoxLayout()
-    sgdb_note = QLabel(tr("sgdb.tip"))
-    sgdb_note.setObjectName("MutedText")
-    sgdb_note.setWordWrap(True)
     btn_sgdb = QPushButton(tr("sgdb.btn"))
     btn_sgdb.clicked.connect(win._set_steamgriddb_key)
-    sgdb_row.addWidget(sgdb_note, 1)
-    sgdb_row.addWidget(btn_sgdb)
-    steam_layout.addLayout(sgdb_row)
+    steam_grid = action_grid()
+    action_row(steam_grid, 0, win.btn_redetect_steam, tr("settings.redetect_hint"))
+    action_row(steam_grid, 1, btn_sgdb, tr("sgdb.tip"))
+    win.lbl_sgdb_state = QLabel()
+    win.lbl_sgdb_state.setObjectName("MutedText")
+    steam_grid.addWidget(win.lbl_sgdb_state, 2, 1)
+    steam_layout.addLayout(steam_grid)
+    update_sgdb_state(win)
     layout.addWidget(steam)
 
     # The app
     app_card, app_layout = _card_with_title(tr("settings.app_title"))
-    actions = FlowLayout(spacing=8)
     btn_about = QPushButton(tr("header.about"))
     btn_about.clicked.connect(win._show_about_dialog)
     win.btn_copy_diag = QPushButton(tr("maint.copy_diagnostics"))
-    win.btn_copy_diag.setToolTip(tr("maint.copy_diagnostics_tip"))
     win.btn_copy_diag.clicked.connect(win._copy_diagnostics)
     btn_remove_all = QPushButton(tr("remove_all.open_btn"))
     btn_remove_all.setObjectName("dangerBtn")
-    btn_remove_all.setToolTip(tr("remove_all.open_tip"))
     btn_remove_all.clicked.connect(win._remove_everything)
-    for btn in (btn_about, win.btn_copy_diag, btn_remove_all):
-        actions.addWidget(btn)
-    app_layout.addLayout(actions)
+    app_grid = action_grid()
+    action_row(app_grid, 0, btn_about, tr("settings.about_hint"))
+    action_row(app_grid, 1, win.btn_copy_diag, tr("maint.copy_diagnostics_tip"))
+    action_row(app_grid, 2, btn_remove_all, tr("remove_all.open_tip"))
+    app_layout.addLayout(app_grid)
     layout.addWidget(app_card)
     layout.addStretch(1)
     win._update_steam_status_style()

@@ -165,6 +165,9 @@ def set_steamgriddb_key(win: MainWindow) -> None:
         QMessageBox.warning(_dialog_parent(win), __app_name__, str(exc))
         return
     win.status_label.setText(tr("sgdb.saved") if text.strip() else tr("sgdb.removed"))
+    from .ui_pages import update_sgdb_state
+
+    update_sgdb_state(win)
 
 
 def show_welcome(win: MainWindow) -> None:

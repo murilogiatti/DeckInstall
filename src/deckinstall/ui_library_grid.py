@@ -2,8 +2,9 @@
 
 The table stays the model: the grid shows its visible rows in its order, and picking a cover
 selects that row, so every Library action (Play, Configure, Uninstall...) works unchanged.
-Covers come from files already on disk (Steam's grid folder, Steam's library cache); a game
-without one gets a tile with its initials. Nothing is downloaded here.
+Covers come from files already on disk (Steam's grid folder, Steam's library cache, covers the
+Library fetched from SteamGridDB); a game without one gets a tile with its initials. Nothing is
+downloaded here.
 """
 
 from __future__ import annotations
@@ -25,9 +26,14 @@ _KEY_ROLE = Qt.ItemDataRole.UserRole + 1  # same role the table uses for the row
 _cache: dict[tuple[str, int], QPixmap] = {}
 
 
-def cover_path(kind: str, obj: object, paths: SteamPaths | None) -> Path | None:
+def cover_path(kind: str, obj: object, paths: SteamPaths | None, key: str = "") -> Path | None:
     """A portrait cover already on disk for this Library row, if any."""
+    from .library_art import cover_file_id, covers_dir
+
     candidates: list[Path] = []
+    if key and kind in ("standalone", "external"):  # fetched from SteamGridDB by the Library
+        own = covers_dir() / str(cover_file_id(key))
+        candidates += [own.with_name(own.name + "p.jpg"), own.with_name(own.name + "p.png")]
     if paths is not None:
         appid_u32 = getattr(obj, "appid_u32", None) if kind == "steam" else None
         if isinstance(appid_u32, int):
@@ -154,7 +160,8 @@ def rebuild_grid(win: MainWindow) -> None:
         data = cell.data(Qt.ItemDataRole.UserRole)
         kind, obj = data if isinstance(data, tuple) and len(data) == 2 else ("", None)
         name = cell.text()
-        item = QListWidgetItem(QIcon(_cover_pixmap(cover_path(kind, obj, win.paths), name)), name)
+        cover = cover_path(kind, obj, win.paths, str(cell.data(_KEY_ROLE) or ""))
+        item = QListWidgetItem(QIcon(_cover_pixmap(cover, name)), name)
         item.setData(_KEY_ROLE, cell.data(_KEY_ROLE))
         item.setToolTip(cell.toolTip())
         item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)

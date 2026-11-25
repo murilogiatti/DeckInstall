@@ -86,6 +86,10 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     clean_top.addWidget(win.btn_maint_scan)
     clean_top.addWidget(win.btn_maint_revalidate)
     clean_layout.addLayout(clean_top)
+    clean_hint = QLabel(tr("maint.cleanup_hint"))
+    clean_hint.setObjectName("MutedText")
+    clean_hint.setWordWrap(True)
+    clean_layout.addWidget(clean_hint)
     win.lbl_maint_disk = QLabel()  # where the space goes, filled by the runtime health check
     win.lbl_maint_disk.setObjectName("MutedText")
     win.lbl_maint_disk.setWordWrap(True)

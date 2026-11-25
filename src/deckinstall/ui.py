@@ -321,6 +321,9 @@ class MainWindow(QMainWindow):
     btn_extract: QPushButton
     btn_install: QPushButton
     btn_lib_sub_add: QPushButton
+    btn_game_art: QPushButton
+    lbl_sgdb_state: QLabel
+    btn_all_art: QPushButton
     btn_mode_standalone: QPushButton
     btn_mode_steam: QPushButton
     btn_move_game: QPushButton
@@ -2575,6 +2578,7 @@ class MainWindow(QMainWindow):
         self._update_play_button(sel)
         row_key = self._selected_row_key()
         self.btn_favorite.setEnabled(bool(row_key))
+        self.btn_game_art.setEnabled(bool(row_key) and not self._steam_busy)
         self.btn_favorite.setChecked(bool(row_key) and row_key in library_extras.favorites(self.settings))
         self.btn_protondb.setEnabled(bool(library_extras.protondb_url(self._selected_store_appid())))
         managed = self._managed_library_game(sel[1]) if sel is not None else None
@@ -3444,6 +3448,7 @@ class MainWindow(QMainWindow):
             self.btn_save_dedup,
             self.btn_save_refresh,
             self.btn_adopt_games,
+            self.btn_all_art,
             self.btn_bulk_optiscaler,
             self.btn_bulk_proton,
             self.btn_maint_scan,

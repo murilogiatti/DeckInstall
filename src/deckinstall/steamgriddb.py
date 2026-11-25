@@ -107,12 +107,17 @@ def fill_missing_artwork(
     name: str,
     steam_appid: int | None = None,
     key: str | None = None,
+    kinds: tuple[str, ...] | None = None,
 ) -> dict[str, Path]:
-    """Download from SteamGridDB the grid images the shortcut does not have yet."""
+    """Download from SteamGridDB the grid images the shortcut does not have yet.
+
+    kinds: which of capsule/header/hero/logo to look for (default: all).
+    """
     key = api_key() if key is None else key
     if not key or grid_dir.is_symlink():
         return {}
-    missing = {k: v for k, v in _KINDS.items() if not _existing(grid_dir, shortcut_appid_u32, v[2])}
+    wanted = {k: v for k, v in _KINDS.items() if kinds is None or k in kinds}
+    missing = {k: v for k, v in wanted.items() if not _existing(grid_dir, shortcut_appid_u32, v[2])}
     if not missing:
         return {}
     try:
@@ -125,6 +130,8 @@ def fill_missing_artwork(
             owner = f"game/{gid}"
     except (requests.RequestException, ValueError) as exc:
         logging.info("SteamGridDB lookup failed for %s: %s", name, exc)
+        if isinstance(exc, requests.HTTPError) and getattr(exc.response, "status_code", 0) in (401, 403):
+            raise  # a wrong key fails every game the same way: let the caller say so once
         return {}
     grid_dir.mkdir(parents=True, exist_ok=True)
     saved: dict[str, Path] = {}
@@ -133,6 +140,8 @@ def fill_missing_artwork(
             url = _first_image_url(collection, owner, key, params)
         except (requests.RequestException, ValueError) as exc:
             logging.info("SteamGridDB %s failed for %s: %s", kind, name, exc)
+            if isinstance(exc, requests.HTTPError) and getattr(exc.response, "status_code", 0) in (401, 403):
+                raise
             continue
         if not url:
             continue

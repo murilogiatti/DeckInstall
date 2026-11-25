@@ -8,6 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from PySide6.QtCore import (
+    QEvent,
     QPoint,
     QRect,
     QSettings,
@@ -28,6 +29,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLayout,
@@ -526,6 +528,50 @@ def _make_card() -> tuple[QFrame, QVBoxLayout]:
     layout.setContentsMargins(16, 14, 16, 14)
     layout.setSpacing(10)
     return card, layout
+
+
+def section_card(title_text: str, hint_text: str = "") -> tuple[QWidget, QVBoxLayout, QHBoxLayout]:
+    """A card with a section title (and room on its right), plus an optional one-line hint."""
+    card, layout = _make_card()
+    top = QHBoxLayout()
+    title = QLabel(title_text)
+    title.setObjectName("SectionTitle")
+    top.addWidget(title)
+    top.addStretch()
+    layout.addLayout(top)
+    if hint_text:
+        hint = QLabel(hint_text)
+        hint.setObjectName("MutedText")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+    return card, layout, top
+
+
+def action_row(layout: QGridLayout, row: int, button: QPushButton, hint_text: str) -> None:
+    """A button with what it does next to it: the user picks by purpose, not by guessing."""
+    hint = QLabel(hint_text)
+    hint.setObjectName("MutedText")
+    hint.setWordWrap(True)
+    layout.addWidget(button, row, 0)
+    layout.addWidget(hint, row, 1)
+
+
+class ShownWhenEnabledButton(QPushButton):
+    """A button that is only on screen while it can be used (Cancel while running, Continue when done)."""
+
+    def changeEvent(self, event: QEvent) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.EnabledChange:
+            # Only its own setEnabled() counts: a busy page disabling its parent must not hide it.
+            self.setHidden(self.testAttribute(Qt.WidgetAttribute.WA_ForceDisabled))
+
+
+def action_grid() -> QGridLayout:
+    """Rows of action_row(): buttons on the left, what they do on the right."""
+    grid = QGridLayout()
+    grid.setHorizontalSpacing(12)
+    grid.setColumnStretch(1, 1)
+    return grid
 
 
 def _parse_launch_preset_state(opts: str) -> dict[str, object]:
