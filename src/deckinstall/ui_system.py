@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -164,3 +165,28 @@ def set_steamgriddb_key(win: MainWindow) -> None:
         QMessageBox.warning(_dialog_parent(win), __app_name__, str(exc))
         return
     win.status_label.setText(tr("sgdb.saved") if text.strip() else tr("sgdb.removed"))
+
+
+def show_welcome(win: MainWindow) -> None:
+    """First start only (no settings saved yet): a short welcome in the message bar with the two
+    things a new user needs first. Never a modal box; the daily update check waits for the next start."""
+    if win._closing_pending or os.environ.get("DECKINSTALL_NO_WELCOME", "").strip() == "1":
+        return
+    from .ui import PAGE_RUNTIMES, PAGE_SETTINGS
+    from .ui_updates import check_updates
+
+    def _updates() -> None:
+        win._show_page(PAGE_RUNTIMES)
+        check_updates(win)
+
+    win.settings.setValue("onboarding/welcomed", True)
+    win.message_bar.show_message(
+        tr("welcome.text"),
+        "info",
+        actions=(
+            (tr("welcome.btn_runtimes"), _updates),
+            (tr("welcome.btn_settings"), lambda: win._show_page(PAGE_SETTINGS)),
+        ),
+        key="welcome",
+    )
+

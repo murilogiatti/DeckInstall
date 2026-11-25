@@ -1059,5 +1059,8 @@
   "settings.steam_title": "Steam",
   "settings.app_title": "DeckInstall",
   "library.view_list": "Lista",
-  "library.view_grid": "Capas"
+  "library.view_grid": "Capas",
+  "welcome.text": "Bem-vindo ao DeckInstall! Instale um jogo a partir de uma pasta ou arquivo compactado na aba Instalar jogo. Em Runtimes ficam o Proton, o umu-run e as atualizações do próprio DeckInstall; em Configurações, o tema, o idioma e uma interface maior para o Deck.",
+  "welcome.btn_runtimes": "Verificar runtimes e atualizações",
+  "welcome.btn_settings": "Configurações"
 }

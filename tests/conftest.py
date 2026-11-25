@@ -92,6 +92,7 @@ def _isolated_libraries(tmp_path_factory: pytest.TempPathFactory, monkeypatch: p
     monkeypatch.delenv("STEAM_EXTRA_COMPAT_TOOLS_PATHS", raising=False)
     # A window open for more than a few seconds must not ask GitHub for updates by itself.
     monkeypatch.setenv("DECKINSTALL_NO_UPDATE_CHECK", "1")
+    monkeypatch.setenv("DECKINSTALL_NO_WELCOME", "1")
     monkeypatch.setenv("XDG_DATA_DIRS", str(base / "system-data"))
     monkeypatch.setenv("XDG_CONFIG_DIRS", str(base / "system-config"))
     for variable in (

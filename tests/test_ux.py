@@ -277,3 +277,24 @@ def test_cover_tile_without_art_shows_initials() -> None:
     _app()
     pix = ui_library_grid._cover_pixmap(None, "★ Hollow Knight")
     assert pix.size() == ui_library_grid.COVER and not pix.isNull()
+
+
+def test_welcome_only_on_a_first_start(monkeypatch) -> None:
+    from deckinstall import ui_system
+
+    app = _app()
+    monkeypatch.delenv("DECKINSTALL_NO_WELCOME")
+    with tempfile.TemporaryDirectory() as tmp:
+        win = _window(app, tmp)
+        try:
+            assert win._first_run  # nothing saved yet
+            ui_system.show_welcome(win)
+            assert not win.message_bar.isHidden() and win.message_bar.key == "welcome"
+            assert win.settings.value("onboarding/welcomed") in (True, "true")
+        finally:
+            _close(app, win)
+        win = _window(app, tmp)  # same settings file: not a first start any more
+        try:
+            assert not win._first_run
+        finally:
+            _close(app, win)

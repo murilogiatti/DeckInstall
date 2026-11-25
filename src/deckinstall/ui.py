@@ -433,6 +433,7 @@ class MainWindow(QMainWindow):
         self._smoke = smoke
         self._mount_search_roots: list[Path] | None = [] if smoke else None
         self.settings = QSettings(__app_name__, __app_name__)
+        self._first_run = not self.settings.allKeys()  # before anything is saved
         _install_qt_translator(app, set_language(str(self.settings.value("language", "auto"))))
         self.paths: SteamPaths | None = None
         self._steam_root_found = False
@@ -491,7 +492,11 @@ class MainWindow(QMainWindow):
         self._apply_saved_theme()
         self._refresh_games()
         self._redetect_steam()
-        if not smoke:
+        if not smoke and self._first_run:
+            from .ui_system import show_welcome
+
+            QTimer.singleShot(800, self, lambda: show_welcome(self))
+        elif not smoke:
             from .ui_updates import AUTO_CHECK_DELAY_MS, auto_check_updates
 
             QTimer.singleShot(AUTO_CHECK_DELAY_MS, self, lambda: auto_check_updates(self))

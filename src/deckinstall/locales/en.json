@@ -1059,5 +1059,8 @@
   "settings.steam_title": "Steam",
   "settings.app_title": "DeckInstall",
   "library.view_list": "List",
-  "library.view_grid": "Covers"
+  "library.view_grid": "Covers",
+  "welcome.text": "Welcome to DeckInstall! Install a game from a folder or archive on the Install tab. Runtimes keeps Proton, umu-run and DeckInstall itself up to date; Settings has the theme, language and a bigger interface for the Deck.",
+  "welcome.btn_runtimes": "Check runtimes and updates",
+  "welcome.btn_settings": "Settings"
 }
