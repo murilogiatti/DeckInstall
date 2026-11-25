@@ -14,6 +14,7 @@ from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -242,8 +243,35 @@ def _snapshots_of(slug: str) -> list[SaveArchiveEntry]:
     ]
 
 
+def _section(title_text: str, hint_text: str = "") -> tuple[QWidget, QVBoxLayout, QHBoxLayout]:
+    """A card with a section title (and room on its right), plus an optional one-line hint."""
+    card, layout = _make_card()
+    top = QHBoxLayout()
+    title = QLabel(title_text)
+    title.setObjectName("SectionTitle")
+    top.addWidget(title)
+    top.addStretch()
+    layout.addLayout(top)
+    if hint_text:
+        hint = QLabel(hint_text)
+        hint.setObjectName("MutedText")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+    return card, layout, top
+
+
+def _action_row(layout: QGridLayout, row: int, button: QPushButton, hint_text: str) -> None:
+    """A button with what it does next to it: the user picks by purpose, not by guessing."""
+    hint = QLabel(hint_text)
+    hint.setObjectName("MutedText")
+    hint.setWordWrap(True)
+    layout.addWidget(button, row, 0)
+    layout.addWidget(hint, row, 1)
+
+
 def build_saves_page(win: MainWindow) -> QWidget:
-    """The Backup/Sync page: settings, full backups, per-game snapshots and Ludusavi import/export."""
+    """The Saves page, by purpose: per-game copies first, then whole backups and sync, then
+    Ludusavi, then the automatic-copy settings."""
     page = QWidget()
     layout = QVBoxLayout(page)
     layout.setContentsMargins(0, 0, 0, 0)
@@ -257,47 +285,11 @@ def build_saves_page(win: MainWindow) -> QWidget:
     layout.addWidget(title)
     layout.addWidget(subtitle)
 
-    card, card_layout = _make_card()
-    folder_label = QLabel(tr("saves.default_folder", path=DEFAULT_SAVES_DIR))
-    folder_label.setWordWrap(True)
-    card_layout.addWidget(folder_label)
-
-    chk_auto = QCheckBox(tr("save_sync.auto_snapshot"))
-    chk_auto.setChecked(_setting_bool(win.settings, AUTO_SNAPSHOT_KEY, True))
-    chk_auto.toggled.connect(lambda on: win.settings.setValue(AUTO_SNAPSHOT_KEY, bool(on)))
-    chk_play = QCheckBox(tr("saves.after_play"))
-    chk_play.setChecked(_setting_bool(win.settings, AFTER_PLAY_KEY, True))
-    chk_play.toggled.connect(lambda on: win.settings.setValue(AFTER_PLAY_KEY, bool(on)))
-    card_layout.addWidget(chk_auto)
-    card_layout.addWidget(chk_play)
-    keep_row = QHBoxLayout()
-    keep_row.addWidget(QLabel(tr("saves.keep_label")))
-    spin_keep = QSpinBox()
-    spin_keep.setRange(1, 50)
-    spin_keep.setValue(snapshot_keep(win.settings))
-    spin_keep.valueChanged.connect(lambda v: win.settings.setValue(KEEP_KEY, int(v)))
-    keep_row.addWidget(spin_keep)
-    keep_row.addStretch()
-    card_layout.addLayout(keep_row)
-    win.spin_save_keep = spin_keep
-
-    buttons = QHBoxLayout()
-    win.btn_save_backup = QPushButton(tr("library.btn_backup_saves"))
-    win.btn_save_backup.clicked.connect(win._backup_all_saves)
-    win.btn_save_restore = QPushButton(tr("library.btn_restore_saves"))
-    win.btn_save_restore.clicked.connect(win._restore_saves_backup)
-    win.btn_save_sync = QPushButton(tr("saves.btn_sync"))
-    win.btn_save_sync.clicked.connect(win._open_save_sync_dialog)
+    # 1. Copies of each game: the everyday part.
+    card, card_layout, top = _section(tr("saves.section_games"), tr("saves.section_games_hint"))
     win.btn_save_refresh = QPushButton(tr("save_sync.btn_refresh"))
     win.btn_save_refresh.clicked.connect(lambda: refresh_saves_page(win))
-    win.btn_save_dedup = QPushButton(tr("saves.btn_dedup"))
-    win.btn_save_dedup.setToolTip(tr("saves.btn_dedup_tip"))
-    win.btn_save_dedup.clicked.connect(lambda: _remove_import_duplicates(win))
-    for b in (win.btn_save_backup, win.btn_save_restore, win.btn_save_sync, win.btn_save_dedup):
-        buttons.addWidget(b)
-    buttons.addStretch()
-    buttons.addWidget(win.btn_save_refresh)
-    card_layout.addLayout(buttons)
+    top.addWidget(win.btn_save_refresh)
 
     table = QTableWidget(0, 6)
     table.setHorizontalHeaderLabels(
@@ -321,7 +313,7 @@ def build_saves_page(win: MainWindow) -> QWidget:
     if now_header is not None:
         now_header.setToolTip(tr("saves.column_now_tip"))
     table.setSortingEnabled(True)
-    table.setMinimumHeight(220)
+    table.setMinimumHeight(330)
     table.currentCellChanged.connect(lambda *_a: update_saves_action_states(win))
     win.saves_list = table
     card_layout.addWidget(table, 1)
@@ -331,7 +323,7 @@ def build_saves_page(win: MainWindow) -> QWidget:
     win.lbl_saves_empty.setWordWrap(True)
     card_layout.addWidget(win.lbl_saves_empty)
 
-    footer = QHBoxLayout()
+    row_actions = QHBoxLayout()
     win.btn_save_snapshot_now = QPushButton(tr("saves.btn_snapshot_now"))
     win.btn_save_snapshot_now.setObjectName("primaryBtn")
     win.btn_save_snapshot_now.clicked.connect(lambda: _snapshot_now(win))
@@ -339,21 +331,75 @@ def build_saves_page(win: MainWindow) -> QWidget:
     win.btn_save_restore_selected.clicked.connect(lambda: _restore_selected(win))
     win.btn_save_open_folder = QPushButton(tr("saves.btn_open_folder"))
     win.btn_save_open_folder.clicked.connect(lambda: _open_folder(win))
-    win.btn_save_export = QPushButton(tr("saves.btn_export"))
-    win.btn_save_export.clicked.connect(lambda: _ludusavi_pick(win, export=True))
+    for b in (win.btn_save_snapshot_now, win.btn_save_restore_selected, win.btn_save_open_folder):
+        row_actions.addWidget(b)
+    row_actions.addStretch()
+    card_layout.addLayout(row_actions)
+    layout.addWidget(card, 1)
+
+    # 2. Every game at once: a .zip to keep elsewhere, or a folder kept in step (Syncthing, SD card).
+    all_card, all_layout, _top = _section(tr("saves.section_all"))
+    grid = QGridLayout()
+    grid.setHorizontalSpacing(12)
+    grid.setColumnStretch(1, 1)
+    win.btn_save_backup = QPushButton(tr("library.btn_backup_saves"))
+    win.btn_save_backup.clicked.connect(win._backup_all_saves)
+    win.btn_save_restore = QPushButton(tr("library.btn_restore_saves"))
+    win.btn_save_restore.clicked.connect(win._restore_saves_backup)
+    win.btn_save_sync = QPushButton(tr("saves.btn_sync"))
+    win.btn_save_sync.clicked.connect(win._open_save_sync_dialog)
+    _action_row(grid, 0, win.btn_save_backup, tr("saves.backup_hint"))
+    _action_row(grid, 1, win.btn_save_restore, tr("saves.restore_hint"))
+    _action_row(grid, 2, win.btn_save_sync, tr("saves.sync_hint"))
+    all_layout.addLayout(grid)
+    layout.addWidget(all_card)
+
+    # 3. Ludusavi: only for people who already use it.
+    lds_card, lds_layout, _top = _section(tr("saves.section_ludusavi"), tr("saves.section_ludusavi_hint"))
+    lds_grid = QGridLayout()
+    lds_grid.setHorizontalSpacing(12)
+    lds_grid.setColumnStretch(1, 1)
     win.btn_save_import = QPushButton(tr("saves.btn_import"))
     win.btn_save_import.clicked.connect(lambda: _ludusavi_pick(win, export=False))
     win.btn_save_import_one = QPushButton(tr("saves.btn_import_one"))
     win.btn_save_import_one.clicked.connect(lambda: _ludusavi_pick(win, export=False, one=True))
-    for b in (win.btn_save_snapshot_now, win.btn_save_restore_selected, win.btn_save_open_folder):
-        footer.addWidget(b)
-    footer.addStretch()
-    footer.addWidget(win.btn_save_export)
-    footer.addWidget(win.btn_save_import_one)
-    footer.addWidget(win.btn_save_import)
-    card_layout.addLayout(footer)
+    win.btn_save_export = QPushButton(tr("saves.btn_export"))
+    win.btn_save_export.clicked.connect(lambda: _ludusavi_pick(win, export=True))
+    win.btn_save_dedup = QPushButton(tr("saves.btn_dedup"))
+    win.btn_save_dedup.clicked.connect(lambda: _remove_import_duplicates(win))
+    _action_row(lds_grid, 0, win.btn_save_import, tr("saves.import_hint"))
+    _action_row(lds_grid, 1, win.btn_save_import_one, tr("saves.import_one_hint"))
+    _action_row(lds_grid, 2, win.btn_save_export, tr("saves.export_hint"))
+    _action_row(lds_grid, 3, win.btn_save_dedup, tr("saves.btn_dedup_tip"))
+    lds_layout.addLayout(lds_grid)
+    layout.addWidget(lds_card)
 
-    layout.addWidget(card, 1)
+    # 4. What happens on its own.
+    auto_card, auto_layout, _top = _section(tr("saves.section_auto"))
+    chk_auto = QCheckBox(tr("save_sync.auto_snapshot"))
+    chk_auto.setChecked(_setting_bool(win.settings, AUTO_SNAPSHOT_KEY, True))
+    chk_auto.toggled.connect(lambda on: win.settings.setValue(AUTO_SNAPSHOT_KEY, bool(on)))
+    chk_play = QCheckBox(tr("saves.after_play"))
+    chk_play.setChecked(_setting_bool(win.settings, AFTER_PLAY_KEY, True))
+    chk_play.toggled.connect(lambda on: win.settings.setValue(AFTER_PLAY_KEY, bool(on)))
+    auto_layout.addWidget(chk_auto)
+    auto_layout.addWidget(chk_play)
+    keep_row = QHBoxLayout()
+    keep_row.addWidget(QLabel(tr("saves.keep_label")))
+    spin_keep = QSpinBox()
+    spin_keep.setRange(1, 50)
+    spin_keep.setValue(snapshot_keep(win.settings))
+    spin_keep.valueChanged.connect(lambda v: win.settings.setValue(KEEP_KEY, int(v)))
+    keep_row.addWidget(spin_keep)
+    keep_row.addStretch()
+    auto_layout.addLayout(keep_row)
+    win.spin_save_keep = spin_keep
+    folder_label = QLabel(tr("saves.default_folder", path=DEFAULT_SAVES_DIR))
+    folder_label.setObjectName("MutedText")
+    folder_label.setWordWrap(True)
+    auto_layout.addWidget(folder_label)
+    layout.addWidget(auto_card)
+
     # Steam/Nexus sources and save sizes are looked up when the tab is opened, not at startup.
     refresh_saves_page(win, scan_sources=False)
     return page
