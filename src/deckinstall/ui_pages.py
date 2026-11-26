@@ -291,7 +291,11 @@ def build_add_page(win: MainWindow) -> QWidget:
     win.lbl_add_presets = QLabel()
     win.lbl_add_presets.setObjectName("MutedText")
     win.lbl_add_presets.setWordWrap(True)
+    btn_add_rec = QPushButton(tr("rec.btn"))
+    btn_add_rec.setToolTip(tr("rec.btn_tip"))
+    btn_add_rec.clicked.connect(win._open_add_recommendations)
     launch_row.addWidget(win.btn_add_launch_adv)
+    launch_row.addWidget(btn_add_rec)
     launch_row.addWidget(win.lbl_add_presets, 1)
     run_form.addRow(tr("add.presets_label"), launch_row)
 
@@ -633,7 +637,8 @@ def update_sgdb_state(win: MainWindow) -> None:
 
 
 def build_settings_page(win: MainWindow) -> QWidget:
-    """Settings > General: appearance, Steam, game artwork and the app itself."""
+    """Settings > General: appearance, new games, this computer, Steam, artwork and the app itself."""
+    from .ui import DEFAULT_FPS_KEY  # ui imports this module
     from .ui_scale import SCALE_KEY
 
     page, layout = page_layout(tr("settings.section_general"), tr("settings.page_subtitle"))
@@ -673,6 +678,32 @@ def build_settings_page(win: MainWindow) -> QWidget:
     look_form.addRow(note_label(tr("settings.scale_tip")))  # the whole width: it is a sentence
     look_layout.addLayout(look_form)
     layout.addWidget(look)
+
+    # New games: the frame cap they start with (the presets of each game can change it later).
+    games_card, games_layout, _top = section_card(tr("settings.games_title"))
+    win.default_fps_combo = QComboBox()
+    for label, data in (
+        (tr("settings.fps_last"), "last"),
+        (tr("launch.mangohud_fps_unlimited"), "0"),
+        (tr("settings.fps_half"), "half"),
+        (tr("settings.fps_full"), "full"),
+        *((tr("launch.mangohud_fps_value", fps=fps), str(fps)) for fps in (30, 40, 45, 60)),
+    ):
+        win.default_fps_combo.addItem(label, data)
+    fidx = win.default_fps_combo.findData(str(win.settings.value(DEFAULT_FPS_KEY, "last") or "last"))
+    win.default_fps_combo.setCurrentIndex(max(0, fidx))
+
+    def _on_default_fps(_idx: int) -> None:
+        win.settings.setValue(DEFAULT_FPS_KEY, win.default_fps_combo.currentData())
+        win._reset_add_launch_options()
+
+    win.default_fps_combo.currentIndexChanged.connect(_on_default_fps)
+    games_form = QFormLayout()
+    games_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+    games_form.addRow(tr("launch.frame_rate_label"), win.default_fps_combo)
+    games_form.addRow(note_label(tr("settings.fps_hint")))
+    games_layout.addLayout(games_form)
+    layout.addWidget(games_card)
 
     # This computer: what was detected and what it means for games.
     from .ui_hardware import build_hardware_card, refresh_hardware_card

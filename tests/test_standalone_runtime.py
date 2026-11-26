@@ -673,3 +673,20 @@ class StandaloneAndVdfTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_bundled_winetricks_and_cabextract_when_the_system_has_none(tmp_path, monkeypatch) -> None:
+    """SteamOS has neither and loses what is installed at updates: the AppImage carries them."""
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    for name in ("winetricks", "cabextract"):
+        (tools / name).write_text("#!/bin/sh\n")
+        (tools / name).chmod(0o755)
+    monkeypatch.setenv("APPDIR", str(tmp_path))
+    monkeypatch.setattr(runtime_manager.shutil, "which", lambda name, path=None: None)
+    assert runtime_manager.find_winetricks() == str(tools / "winetricks")
+    env = runtime_manager.with_bundled_tools({"PATH": "/usr/bin", "DISPLAY": ":0"})
+    assert env["PATH"] == f"{tools}:/usr/bin" and env["DISPLAY"] == ":0"
+    monkeypatch.setattr(runtime_manager.shutil, "which", lambda name, path=None: f"/usr/bin/{name}")
+    assert runtime_manager.find_winetricks() == "/usr/bin/winetricks"  # the system's first
+    assert runtime_manager.with_bundled_tools({"PATH": "/usr/bin"})["PATH"] == "/usr/bin"

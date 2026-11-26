@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shutil
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -46,6 +45,7 @@ from ..runtime_manager import (
     WINE_TOOLS,
     WINETRICKS_PRESETS,
     find_system_umu_run,
+    find_winetricks,
     get_system_package_install_cmd,
     get_umu_run_path,
     install_system_package,
@@ -150,7 +150,7 @@ def run_exe_in_prefix_dialog(
 
 
 def open_winetricks_dialog(
-    win: MainWindow, kind: str | None = None, obj: object | None = None
+    win: MainWindow, kind: str | None = None, obj: object | None = None, preset_verbs: list[str] | None = None
 ) -> None:
     """Open Winetricks verbs/presets installer dialog for the selected game's prefix."""
     if kind is None or obj is None:
@@ -191,7 +191,7 @@ def open_winetricks_dialog(
     warn_lay.addWidget(note_label(tr("winetricks.missing_warn"), "WarningText"), 1)
     btn_install_wt = QPushButton(tr("launch.btn_install_bin", bin="winetricks"))
     warn_lay.addWidget(btn_install_wt)
-    has_winetricks = shutil.which("winetricks") is not None
+    has_winetricks = find_winetricks() is not None
     warn_row.setVisible(not has_winetricks)
     lay.addWidget(warn_row)
 
@@ -243,10 +243,15 @@ def open_winetricks_dialog(
         chk = QCheckBox(desc)
         chk.setToolTip(verb)
         preset_checks[verb] = chk
+        chk.setChecked(verb in (preset_verbs or ()))
         checks_grid.addWidget(chk, i // 2, i % 2)
     deps_lay.addLayout(checks_grid)
     custom_edit = QLineEdit()
     custom_edit.setPlaceholderText(tr("winetricks.custom_placeholder"))
+    for verb in preset_verbs or ():  # from the recommendations: tick the known ones, list the rest
+        if verb in WINETRICKS_PRESETS:
+            continue
+        custom_edit.setText((custom_edit.text() + " " + verb).strip())
     deps_form_extra = QFormLayout()
     deps_form_extra.addRow(tr("winetricks.custom_label"), custom_edit)
     deps_lay.addLayout(deps_form_extra)
@@ -336,7 +341,7 @@ def open_winetricks_dialog(
         winver_combo.setEnabled(not running)
         for btn_tool in tool_buttons:
             btn_tool.setEnabled(not running)
-        btn_install.setEnabled((not running) and (shutil.which("winetricks") is not None))
+        btn_install.setEnabled((not running) and (find_winetricks() is not None))
         btn_cancel.setEnabled(running)
         btn_close.setEnabled(not running)
 

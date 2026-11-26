@@ -17,6 +17,7 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import threading
@@ -2677,6 +2678,35 @@ def resolve_game_prefix(
     raise ValueError(f"Unsupported game kind: {kind!r}")
 
 
+def bundled_tools_dir() -> Path | None:
+    """The AppImage's tools/ folder (winetricks and cabextract travel with the app, so they work on
+    SteamOS, whose read-only system has neither and loses anything installed at the next update)."""
+    roots = [os.environ.get("APPDIR", ""), str(Path(sys.executable).resolve().parent)]
+    for root in roots:
+        if root and (Path(root) / "tools").is_dir():
+            return Path(root) / "tools"
+    return None
+
+
+def find_winetricks() -> str | None:
+    """The system's winetricks, else the one bundled with DeckInstall."""
+    found = shutil.which("winetricks")
+    if found:
+        return found
+    tools = bundled_tools_dir()
+    script = tools / "winetricks" if tools is not None else None
+    return str(script) if script is not None and script.is_file() else None
+
+
+def with_bundled_tools(env: dict[str, str]) -> dict[str, str]:
+    """Put the bundled cabextract on PATH when the system has none (winetricks needs it for most
+    DirectX and Visual C++ packages)."""
+    tools = bundled_tools_dir()
+    if tools is not None and (tools / "cabextract").is_file() and not shutil.which("cabextract", path=env.get("PATH")):
+        env["PATH"] = f"{tools}:{env.get('PATH', '/usr/bin:/bin')}"
+    return env
+
+
 def run_winetricks_verbs(
     prefix_dir: Path,
     verbs: list[str],
@@ -2693,7 +2723,7 @@ def run_winetricks_verbs(
         if not _WINETRICKS_VERB_RE.fullmatch(verb):
             raise ValueError(f"Invalid winetricks verb: {verb!r}")
 
-    winetricks = shutil.which("winetricks")
+    winetricks = find_winetricks()
     if winetricks is None:
         raise RuntimeError("winetricks is not installed or not found in PATH.")
 
@@ -2713,7 +2743,7 @@ def run_winetricks_verbs(
                 on_log(f"Warning: prefix snapshot failed ({exc}); continuing winetricks.")
 
     prefix_dir.mkdir(parents=True, exist_ok=True)
-    env = clean_child_env()
+    env = with_bundled_tools(clean_child_env())  # keeps DISPLAY/XAUTHORITY: installers open windows
     env["WINEPREFIX"] = str(prefix_dir)
     if proton_dir is not None:
         for rel in ("files/bin/wine", "dist/bin/wine"):

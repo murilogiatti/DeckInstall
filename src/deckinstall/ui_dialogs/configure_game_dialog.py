@@ -612,6 +612,62 @@ def open_configure_game_dialog(win: MainWindow) -> None:
 
     btn_view_log.clicked.connect(_on_view_log)
     action_row(launch_grid, 2, btn_view_log, tr("configure.view_log_hint"))
+
+    btn_rec = QPushButton(tr("rec.btn"))
+    btn_rec.setEnabled(is_steam or is_standalone or is_external)
+
+    def _on_recommendations() -> None:
+        if win._steam_busy:
+            return
+        from ..proton_policy import newest_ge_proton
+        from ..steam_paths import find_proton_binary, resolve_proton_dir
+        from ..steam_vdf import get_shortcut_proton
+        from ..ui_recommendations import Target, open_recommendations_dialog
+        from .launch_presets_dialog import game_proton, launch_options_of, save_launch_options
+
+        steam_root = win.paths.steam_root if win.paths is not None else None
+        proton_dir: Path | None = None
+        if isinstance(obj, ShortcutEntry) and win.paths is not None:
+            try:
+                tool = get_shortcut_proton(win.paths.config_vdf, obj.appid_u32)
+            except Exception:
+                tool = ""
+            proton_bin = find_proton_binary(win.paths.steam_root)
+            proton_dir = resolve_proton_dir(tool, steam_root) if tool else (proton_bin.parent if proton_bin else None)
+        elif sa_obj is not None:
+            proton_dir = resolve_proton_dir(sa_obj.proton_name, steam_root) if sa_obj.proton_name else None
+            proton_dir = proton_dir or newest_ge_proton()
+        try:
+            prefix, _ = resolve_game_prefix(kind, obj, win.paths)
+            prefix_ready = prefix is not None and prefix.is_dir()
+        except Exception:
+            prefix_ready = False
+        opts_now, dll_now = launch_options_of(obj)
+        target = Target(
+            title=title_name,
+            steam_appid=sa_obj.steam_appid if sa_obj is not None else None,
+            game_dir=sa_obj.game_dir if sa_obj is not None else Path(dir_str),
+            mode="steam" if is_steam else ("standalone" if is_standalone else "external"),
+            proton=game_proton(win, kind, obj),
+            proton_dir=proton_dir,
+            opts=opts_now,
+            winedll=dll_now,
+            prefix_ready=prefix_ready,
+            store=obj.store if isinstance(obj, ExternalLauncherGame) else "",
+            codename=obj.game_id if isinstance(obj, ExternalLauncherGame) else "",
+            dll_in_opts=not is_standalone,
+            exe=sa_obj.exe_path if sa_obj is not None else (Path(exe_str) if exe_str else None),
+        )
+
+        def _apply(new_opts: str, new_dll: str, verbs: list[str]) -> None:
+            save_launch_options(win, (kind, obj), new_opts, new_dll, parent=dlg, on_saved=_save_displayed_opts)
+            if verbs and dlg_alive():
+                win._open_winetricks_dialog(kind, obj, preset_verbs=verbs)
+
+        open_recommendations_dialog(win, target, _apply, parent=dlg)
+
+    btn_rec.clicked.connect(_on_recommendations)
+    action_row(launch_grid, 3, btn_rec, tr("rec.btn_hint"))
     launch_lay.addLayout(launch_grid)
     run_tab_lay.addWidget(launch_card)
     run_tab_lay.addStretch()

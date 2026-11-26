@@ -243,6 +243,7 @@ class LaunchPresetState(TypedDict):
     winedll: str
 
 
+DEFAULT_FPS_KEY = "install/default_fps"  # Settings: the frame cap new games start with
 INSTALL_MODE_KEY = "install/mode"  # the mode chosen last, offered first on the next install
 _VDF_WATCH_MS = 5000  # how often queued Steam edits check whether Steam has closed
 
@@ -332,6 +333,7 @@ class MainWindow(QMainWindow):
     btn_remove_game: QPushButton
     btn_scan: QPushButton
     btn_scan_folders: QPushButton
+    default_fps_combo: QComboBox
     lbl_hardware: QLabel
     lbl_hardware_notes: QLabel
     btn_shortcut_desktop: QCheckBox
@@ -1699,7 +1701,7 @@ class MainWindow(QMainWindow):
     def _load_last_launch_prefs(self) -> tuple[str, str]:
         """The presets chosen last (empty on a first install)."""
         if not _setting_bool(self.settings, "last_launch_opts/has_saved", False):
-            return "", ""
+            return self._with_default_fps(""), ""
         saved = self.settings.value("last_launch_opts/presets", None)
         if saved is not None:
             try:
@@ -1718,7 +1720,21 @@ class MainWindow(QMainWindow):
             except ValueError:
                 opts = ""
         winedll = str(self.settings.value("last_launch_opts/winedll", "") or "").strip()
-        return opts, winedll
+        return self._with_default_fps(opts), winedll
+
+    def _with_default_fps(self, opts: str) -> str:
+        """The frame cap chosen in Settings for new games ("last": whatever the last install used)."""
+        choice = str(self.settings.value(DEFAULT_FPS_KEY, "last") or "last")
+        if choice == "last":
+            return opts
+        from .ui_dialogs.launch_presets_dialog import half_rate, screen_refresh_hz
+
+        hz = screen_refresh_hz(self)
+        value = {"half": half_rate(hz) if hz else 30, "full": hz}.get(choice, int(choice) if choice.isdigit() else 0)
+        try:
+            return apply_presets(opts, winedlloverrides="", frame_rate=value)
+        except ValueError:
+            return opts
 
     def _reset_add_launch_options(self) -> None:
         opts, winedll = self._load_last_launch_prefs()
@@ -1738,6 +1754,9 @@ class MainWindow(QMainWindow):
             "no_esync": tr("presets.short_no_esync"),
             "no_fsync": tr("presets.short_no_fsync"),
             "debug_log": tr("presets.short_debug_log"),
+            "fsr3_upgrade": tr("presets.short_fsr3"),
+            "disable_nvapi": tr("presets.short_disable_nvapi"),
+            "no_ntsync": tr("presets.short_no_ntsync"),
             "fsr4_upgrade": tr("presets.short_fsr4"),
             "fsr4_rdna3": tr("presets.short_fsr4"),
             "xess_upgrade": tr("presets.short_xess"),
@@ -1769,6 +1788,37 @@ class MainWindow(QMainWindow):
             merged_opts = self._add_launch_options.strip()
         winedll = "" if is_native else self._add_winedlloverrides.strip()
         return merged_opts, winedll
+
+    def _open_add_recommendations(self) -> None:
+        """Recommendations for the game being installed: they change its launch options here
+        (winetricks waits for the first Play, which creates the prefix)."""
+        from .proton_policy import newest_ge_proton
+        from .steam_paths import find_proton_binary
+        from .ui_recommendations import Target, open_recommendations_dialog
+
+        opts, winedll = self._resolve_add_launch_options()
+        exe = Path(self.add_exe_combo.currentText().strip())
+        standalone = self._selected_install_mode() == STANDALONE
+        proton_bin = find_proton_binary(self.paths.steam_root) if self.paths is not None else None
+        target = Target(
+            title=self.add_name.text().strip() or tr("add.page_title"),
+            steam_appid=self._resolve_selected_steam_appid(),
+            game_dir=exe.parent if exe.name else None,
+            mode="standalone" if standalone else "steam",
+            proton="ge" if standalone else "",
+            proton_dir=newest_ge_proton() if standalone else (proton_bin.parent if proton_bin else None),
+            opts=opts,
+            winedll=winedll,
+            prefix_ready=False,
+            exe=exe if exe.name else None,
+        )
+
+        def _apply(new_opts: str, new_dll: str, _verbs: list[str]) -> None:
+            self._add_launch_options = new_opts
+            self._add_winedlloverrides = new_dll
+            self._update_add_presets_summary()
+
+        open_recommendations_dialog(self, target, _apply)
 
     def _open_add_launch_advanced(self) -> None:
         cur_opts, cur_winedll = self._resolve_add_launch_options()
@@ -3618,9 +3668,9 @@ class MainWindow(QMainWindow):
         edit_launch_options_presets(self, sel=sel, parent=parent, on_saved=on_saved)
 
     def _open_winetricks_dialog(
-        self, kind: str | None = None, obj: object | None = None
+        self, kind: str | None = None, obj: object | None = None, preset_verbs: list[str] | None = None
     ) -> None:
-        open_winetricks_dialog(self, kind=kind, obj=obj)
+        open_winetricks_dialog(self, kind=kind, obj=obj, preset_verbs=preset_verbs)
 
     def _open_optiscaler_dialog(
         self, kind: str | None = None, obj: object | None = None, *,

@@ -180,7 +180,7 @@ def test_winetricks_busy_escape_and_explicit_cancel(
     window: ui.MainWindow, game: StandaloneGame, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(prefix_tools_dialogs, "resolve_game_prefix", lambda *_: (game.prefix_dir, None))
-    monkeypatch.setattr(prefix_tools_dialogs.shutil, "which", lambda _: "/bin/winetricks")
+    monkeypatch.setattr(prefix_tools_dialogs, "find_winetricks", lambda: "/bin/winetricks")
     monkeypatch.setattr(window, "_make_pre_snapshot_fn", lambda: None)
     release = Event()
     recorded: list[object] = []

@@ -1,4 +1,7 @@
-"""Launch presets (MangoHud, gamemode, upscaler upgrades, NVAPI, PRIME, HDR, Wayland, wined3d, ...).
+"""Launch presets (MangoHud, gamemode, frame cap, upscaler upgrades, PRIME, Wayland, wined3d, ...).
+
+Checked against what Valve's Proton 11 and GE-Proton 11 really read (their `proton` scripts and
+the DXVK/VKD3D-Proton DLLs), not against older guides.
 
 One place to read the presets out of a launch-options string, re-apply them after a change
 and describe them; the single presets dialog and every caller go through here.
@@ -32,29 +35,50 @@ MANGOHUD_LEVELS = (1, 2, 3, 4)
 @dataclass(frozen=True)
 class Toggle:
     """An on/off preset that is just environment variables (exact tokens, so a custom value the
-    user typed, e.g. PROTON_FSR4_UPGRADE=4.0.1, is left alone and the box shows off)."""
+    user typed, e.g. PROTON_FSR4_UPGRADE=4.0.1, is left alone and the box shows off), or one entry
+    of DXVK_CONFIG (`dxvk`), which shares one variable with the frame cap and the user's own entries."""
 
     key: str
     tokens: tuple[str, ...]
     section: str  # "gpu", "upscaler" or "compat"
+    dxvk: str = ""
 
 
 # Data, not code: one line per preset.
 TOGGLES: tuple[Toggle, ...] = (
+    Toggle("fsr3_upgrade", ("PROTON_FSR3_UPGRADE=1",), "upscaler"),
     Toggle("fsr4_upgrade", ("PROTON_FSR4_UPGRADE=1",), "upscaler"),
-    Toggle("fsr4_rdna3", ("PROTON_FSR4_RDNA3_UPGRADE=1",), "upscaler"),
     Toggle("xess_upgrade", ("PROTON_XESS_UPGRADE=1",), "upscaler"),
-    Toggle("hdr", ("PROTON_ENABLE_HDR=1",), "gpu"),
-    Toggle("vendor_amd", ("DXVK_CONFIG=dxgi.customVendorId=1002",), "gpu"),
+    Toggle("vendor_amd", (), "gpu", dxvk="dxgi.customVendorId=1002"),
     Toggle("descriptor_heap", ("VKD3D_CONFIG=descriptor_heap",), "gpu"),
+    Toggle("disable_nvapi", ("PROTON_DISABLE_NVAPI=1",), "gpu"),
     Toggle("large_address", ("PROTON_FORCE_LARGE_ADDRESS_AWARE=1",), "compat"),
     Toggle("prefer_sdl", ("PROTON_PREFER_SDL=1",), "compat"),
+    Toggle("no_ntsync", ("PROTON_NO_NTSYNC=1",), "compat"),
+    # No Proton reads these any more (kept so a game that has them can turn them off).
+    Toggle("fsr4_rdna3", ("PROTON_FSR4_RDNA3_UPGRADE=1",), "upscaler"),
+    Toggle("hdr", ("PROTON_ENABLE_HDR=1",), "gpu"),
 )
 TOGGLE_TOKENS = frozenset(tok for toggle in TOGGLES for tok in toggle.tokens)
-# Frame cap without MangoHud (works in Steam mode too): DXVK (D3D8-11) and VKD3D-Proton (D3D12).
+# Old presets: shown only while on, never offered or recommended. NVAPI is on by default in both
+# Protons; esync is gone from Valve's and unused with NTSYNC in GE; RDNA3 FSR 4 and HDR flags are gone.
+LEGACY = frozenset({"nvapi", "no_esync", "fsr4_rdna3", "hdr"})
+# Frame cap (works in Steam mode too): DXVK reads it from DXVK_CONFIG (DXVK_FRAME_RATE is gone,
+# checked in Proton 11 and GE-Proton 11), VKD3D-Proton from VKD3D_FRAME_RATE.
 FRAME_RATES = (30, 40, 45, 60, 90, 120, 144)
-_FRAME_RATE_KEYS = ("DXVK_FRAME_RATE", "VKD3D_FRAME_RATE")
+_DXVK_FRAME_KEYS = ("dxgi.maxFrameRate", "d3d9.maxFrameRate")
+_DXVK_MANAGED = frozenset((*_DXVK_FRAME_KEYS, *(t.dxvk.split("=", 1)[0] for t in TOGGLES if t.dxvk)))
+_MANAGED_KEYS = ("DXVK_CONFIG", "VKD3D_FRAME_RATE", "DXVK_FRAME_RATE")
 FLAGS = FLAGS + tuple(toggle.key for toggle in TOGGLES)
+
+
+def _dxvk_entries(tokens: list[str]) -> list[str]:
+    """The `key=value` entries of every DXVK_CONFIG in the options, in order."""
+    entries: list[str] = []
+    for tok in tokens:
+        if tok.startswith("DXVK_CONFIG="):
+            entries += [e.strip().replace(" ", "") for e in tok.split("=", 1)[1].split(";") if e.strip()]
+    return entries
 
 
 @dataclass(frozen=True)
@@ -72,19 +96,22 @@ class Need:
     ge_proton: bool = False  # GE-Proton / Proton-CachyOS variables; Valve's Proton ignores them
     hybrid: bool = False
     wayland: bool = False  # a Wayland or gamescope session
+    legacy: bool = False  # no Proton reads it any more: hidden unless already on
 
 
 NEEDS: dict[str, Need] = {
-    "nvapi": Need(vendor="nvidia", proprietary_nvidia=True),
     "dlss_upgrade": Need(vendor="nvidia", generations=("rtx",), proprietary_nvidia=True, ge_proton=True),
     "descriptor_heap": Need(vendor="nvidia", proprietary_nvidia=True, min_nvidia=595),
+    "disable_nvapi": Need(vendor="nvidia"),
+    "fsr3_upgrade": Need(ge_proton=True),
     "fsr4_upgrade": Need(vendor="amd", generations=("rdna4",), ge_proton=True),
-    "fsr4_rdna3": Need(vendor="amd", generations=("rdna3",), ge_proton=True),
     "xess_upgrade": Need(ge_proton=True),
     "vendor_amd": Need(vendor="intel"),
     "prime": Need(hybrid=True),
-    "wayland": Need(wayland=True),
-    "hdr": Need(wayland=True),
+    "wayland": Need(wayland=True, ge_proton=True),
+    "prefer_sdl": Need(ge_proton=True),
+    "no_ntsync": Need(ge_proton=True),
+    **{key: Need(legacy=True) for key in LEGACY},
 }
 
 OK, HIDE, OFF = "ok", "hide", "off"
@@ -105,12 +132,14 @@ def proton_kind(name: str) -> str:
 def availability(key: str, gpu: Any, profile: Any, proton: str = "") -> tuple[str, str]:
     """(OK, "") or (HIDE | OFF, reason) for a preset on the game's GPU (a hardware.Gpu) and Proton.
 
-    Reasons: "need_nvidia_driver", "need_rtx", "need_rdna4", "need_rdna3", "need_nvidia_595",
+    Reasons: "need_nvidia_driver", "need_rtx", "need_rdna4", "need_nvidia_595",
     "need_ge", "need_wayland". Unknown hardware or Proton never blocks.
     """
     need = NEEDS.get(key)
     if need is None:
         return OK, ""
+    if need.legacy:
+        return HIDE, ""
     if need.hybrid and profile is not None and not profile.is_hybrid:
         return HIDE, ""
     if gpu is not None:
@@ -132,9 +161,9 @@ def availability(key: str, gpu: Any, profile: Any, proton: str = "") -> tuple[st
 def recommend(profile: Any, proton: str = "", frame_rate: int = 0) -> dict[str, Any]:
     """The presets this computer benefits from, as changes to apply (never turns anything off).
 
-    Hybrid laptop: the game goes to the dedicated GPU. NVIDIA: NVAPI (+ DLSS upgrade on RTX);
-    AMD RDNA4: FSR 4; Intel: newest XeSS; handheld: a 40 FPS cap (battery) when none is set.
-    Each one only when `availability` allows it on the GPU the game will run on.
+    Hybrid laptop: the game goes to the dedicated GPU. RTX: DLSS upgrade; AMD RDNA4: FSR 4;
+    Intel: newest XeSS. Each one only when `availability` allows it on the GPU the game will run
+    on. The frame cap is the user's choice (it depends on the screen and the battery), never here.
     """
     changes: dict[str, Any] = {}
     dedicated = profile.dedicated if profile is not None else None
@@ -147,16 +176,12 @@ def recommend(profile: Any, proton: str = "", frame_rate: int = 0) -> dict[str, 
             changes[key] = True
 
     if gpu is not None:
-        if gpu.vendor == "nvidia":
-            want("nvapi")
-            if gpu.generation == "rtx":
-                want("dlss_upgrade")
+        if gpu.vendor == "nvidia" and gpu.generation == "rtx":
+            want("dlss_upgrade")
         elif gpu.vendor == "amd" and gpu.generation == "rdna4":
             want("fsr4_upgrade")
         elif gpu.vendor == "intel":
             want("xess_upgrade")
-    if profile is not None and profile.device and not frame_rate:
-        changes["frame_rate"] = 40
     return changes
 
 
@@ -209,16 +234,27 @@ def parse_presets(opts: str) -> dict[str, Any]:
                         pass
 
     winedll_from_tokens = ""
-    frame_rate = 0
+    frame_rates: dict[str, int] = {}
+    dxvk = _dxvk_entries(tokens_list)
     for tok in tokens_list:
-        if tok.startswith("WINEDLLOVERRIDES="):
-            winedll_from_tokens = tok.split("=", 1)[1]
-        elif tok.startswith("DXVK_FRAME_RATE="):
-            try:
-                frame_rate = max(0, int(tok.split("=", 1)[1]))
-            except ValueError:
-                pass
-    toggles = {toggle.key: all(tok in tokens_now for tok in toggle.tokens) for toggle in TOGGLES}
+        key, _, value = tok.partition("=")
+        if key == "WINEDLLOVERRIDES":
+            winedll_from_tokens = value
+        elif key in ("VKD3D_FRAME_RATE", "DXVK_FRAME_RATE") and value.isdigit():
+            frame_rates[key] = int(value)
+    for entry in dxvk:
+        key, _, value = entry.partition("=")
+        if key == "dxgi.maxFrameRate" and value.isdigit():
+            frame_rates["dxvk"] = int(value)
+    # The cap, wherever it is written (DXVK_FRAME_RATE and MangoHud's fps_limit: older versions).
+    frame_rate = next(
+        (frame_rates[k] for k in ("dxvk", "VKD3D_FRAME_RATE", "DXVK_FRAME_RATE") if frame_rates.get(k)),
+        mh_fps_limit,
+    )
+    toggles = {
+        toggle.key: (toggle.dxvk in dxvk) if toggle.dxvk else all(tok in tokens_now for tok in toggle.tokens)
+        for toggle in TOGGLES
+    }
 
     return {
         "tokens_list": tokens_list,
@@ -242,6 +278,7 @@ def parse_presets(opts: str) -> dict[str, Any]:
         "debug_log": "UMU_LOG=1" in tokens_now or "PROTON_LOG=1" in tokens_now,
         "winedll": winedll_from_tokens,
         "frame_rate": frame_rate,
+        "dxvk_custom": [e for e in dxvk if e.partition("=")[0] not in _DXVK_MANAGED],
         **toggles,
     }
 
@@ -266,11 +303,19 @@ def apply_presets(
         return bool(merged.get(key))
 
     level = merged.get("mh_level")
-    fps = merged.get("mh_fps_limit")
     frame = merged.get("frame_rate")
+    frame = frame if isinstance(frame, int) and frame > 0 else 0
     extra = [tok for toggle in TOGGLES if windows and flag(toggle.key) for tok in toggle.tokens]
-    if windows and isinstance(frame, int) and frame > 0:
-        extra += [f"{key}={frame}" for key in _FRAME_RATE_KEYS]
+    # One DXVK_CONFIG: the user's own entries (always from `opts`), then the cap and DXVK toggles.
+    dxvk = list(parse_presets(opts)["dxvk_custom"])
+    if windows:
+        if frame:
+            dxvk += [f"{key}={frame}" for key in _DXVK_FRAME_KEYS]
+        dxvk += [toggle.dxvk for toggle in TOGGLES if toggle.dxvk and flag(toggle.key)]
+    if dxvk:
+        extra.append("DXVK_CONFIG=" + ";".join(dxvk))
+    if windows and frame:
+        extra.append(f"VKD3D_FRAME_RATE={frame}")
     return apply_launch_presets(
         opts,
         gamemode=flag("gamemode"),
@@ -285,13 +330,27 @@ def apply_presets(
         prime_offload=flag("prime"),
         proton_wayland=windows and flag("wayland"),
         mangohud_position=str(merged.get("mh_position") or ""),
-        mangohud_fps_limit=fps if isinstance(fps, int) and fps > 0 else None,
+        mangohud_fps_limit=frame or None,  # one cap: MangoHud also covers Vulkan/OpenGL games
         prime_vendor=prime_vendor(),
         debug_log=flag("debug_log"),
         extra_envs=extra,
         managed_tokens=TOGGLE_TOKENS,
-        managed_keys=_FRAME_RATE_KEYS,
+        managed_keys=_MANAGED_KEYS,
     )
+
+
+_OBSOLETE = ("PROTON_ENABLE_NVAPI=1", "DXVK_ENABLE_NVAPI=1", "DXVK_FRAME_RATE=")
+
+
+def migrate_launch_options(opts: str) -> str:
+    """Rewrite options saved by older versions: drop the NVAPI flags (on by default now) and move
+    the frame cap from DXVK_FRAME_RATE (no longer read) to DXVK_CONFIG. Anything else is kept."""
+    if not any(old in opts for old in _OBSOLETE):
+        return opts
+    try:
+        return apply_presets(opts, nvapi=False)
+    except ValueError:
+        return opts
 
 
 def prime_vendor() -> str:

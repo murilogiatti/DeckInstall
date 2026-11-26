@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import shiboken6
 from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLayout,
     QLineEdit,
@@ -76,6 +78,23 @@ from ..vdf_queue import QueuedVdfEdit
 
 if TYPE_CHECKING:
     from ..ui import MainWindow
+
+
+def screen_refresh_hz(widget: QWidget | None) -> int:
+    """The refresh rate of the screen the window is on (120.21 -> 120), 0 when unknown."""
+    screen = widget.screen() if widget is not None else None
+    if screen is None:
+        screen = QGuiApplication.primaryScreen()
+    rate = screen.refreshRate() if screen is not None else 0.0
+    return int(round(rate)) if rate >= 20 else 0
+
+
+def half_rate(hz: int) -> int:
+    """A cap that divides the screen's rate evenly, about half of it (90 -> 45, 60 -> 30, 165 -> 55)."""
+    for divisor in (2, 3, 4):
+        if hz % divisor == 0 and hz // divisor >= 30:
+            return hz // divisor
+    return max(30, hz // 2)
 
 
 def game_proton(win: MainWindow, kind: str, obj: object | None) -> str:
@@ -146,10 +165,18 @@ def open_launch_presets_dialog(
     lbl_game_gpu = note_label()
     btn_recommend = QPushButton(tr("launch.btn_recommend"))
     btn_recommend.setToolTip(tr("launch.recommend_tip"))
+    btn_battery = QPushButton(tr("launch.btn_battery"))
+    btn_battery.setToolTip(tr("launch.battery_tip"))
+    btn_performance = QPushButton(tr("launch.btn_performance"))
+    btn_performance.setToolTip(tr("launch.performance_tip"))
     top_row = QHBoxLayout()
     top_row.addWidget(lbl_game_gpu, 1)
-    top_row.addWidget(btn_recommend)
+    quick_row = QHBoxLayout()
+    for button in (btn_recommend, btn_battery, btn_performance):
+        quick_row.addWidget(button)
+    quick_row.addStretch()
     dlg_lay.addLayout(top_row)
+    dlg_lay.addLayout(quick_row)
 
     # One tab per group, so every setting of the game (upscaler included) is in this one window.
     tabs = QTabWidget()
@@ -220,21 +247,8 @@ def open_launch_presets_dialog(
         mh_pos_combo.setCurrentIndex(pos_idx)
     mh_pos_combo.setEnabled(chk_mh.isChecked())
 
-    mh_fps_lbl = QLabel(tr("launch.mangohud_fps_limit_label"))
-    mh_fps_combo = QComboBox()
-    mh_fps_combo.addItem(tr("launch.mangohud_fps_unlimited"), 0)
-    for fps_val in (30, 40, 60, 90, 120, 144):
-        mh_fps_combo.addItem(tr("launch.mangohud_fps_value", fps=fps_val), fps_val)
-    fps_idx = mh_fps_combo.findData(st.get("mh_fps_limit", 0))
-    if fps_idx >= 0:
-        mh_fps_combo.setCurrentIndex(fps_idx)
-    mh_fps_combo.setEnabled(chk_mh.isChecked())
-
     mh_extra_row.addWidget(mh_pos_lbl)
     mh_extra_row.addWidget(mh_pos_combo, 1)
-    mh_extra_row.addSpacing(8)
-    mh_extra_row.addWidget(mh_fps_lbl)
-    mh_extra_row.addWidget(mh_fps_combo)
 
     mh_opts_col = QVBoxLayout()
     mh_opts_col.setContentsMargins(0, 0, 0, 0)
@@ -279,21 +293,48 @@ def open_launch_presets_dialog(
         "large_address": (tr("launch.large_address"), tr("launch.large_address_hint")),
         "prefer_sdl": (tr("launch.prefer_sdl"), tr("launch.prefer_sdl_hint")),
         "descriptor_heap": (tr("launch.descriptor_heap"), tr("launch.descriptor_heap_hint")),
+        "fsr3_upgrade": (tr("launch.fsr3_upgrade"), tr("launch.fsr3_upgrade_hint")),
+        "disable_nvapi": (tr("launch.disable_nvapi"), tr("launch.disable_nvapi_hint")),
+        "no_ntsync": (tr("launch.no_ntsync"), tr("launch.no_ntsync_hint")),
     }
     toggle_checks: dict[str, QCheckBox] = {}
     for toggle in TOGGLES:
         chk = QCheckBox(toggle_texts[toggle.key][0])
         chk.setChecked(bool(st_all.get(toggle.key)))
         toggle_checks[toggle.key] = chk
+    # Frame cap: one field for every API (DXVK, VKD3D-Proton and MangoHud), with the values of this
+    # screen first (Qt knows its refresh rate on X11, Wayland and gamescope alike).
+    screen_hz = screen_refresh_hz(parent if parent is not None else win)
     frame_combo = QComboBox()
     frame_combo.addItem(tr("launch.mangohud_fps_unlimited"), 0)
+    if screen_hz:
+        frame_combo.addItem(tr("launch.fps_half_screen", fps=half_rate(screen_hz)), half_rate(screen_hz))
+        frame_combo.addItem(tr("launch.fps_full_screen", fps=screen_hz), screen_hz)
     for fps_val in FRAME_RATES:
         frame_combo.addItem(tr("launch.mangohud_fps_value", fps=fps_val), fps_val)
-    frame_idx = frame_combo.findData(int(st_all.get("frame_rate") or 0))
+    frame_combo.addItem(tr("launch.fps_other"), -1)
+    current_rate = int(st_all.get("frame_rate") or 0)
+    frame_idx = frame_combo.findData(current_rate)
     if frame_idx < 0:  # a value typed by hand: keep it selectable
-        frame_combo.addItem(tr("launch.mangohud_fps_value", fps=st_all.get("frame_rate")), st_all.get("frame_rate"))
-        frame_idx = frame_combo.count() - 1
+        frame_combo.insertItem(frame_combo.count() - 1, tr("launch.mangohud_fps_value", fps=current_rate), current_rate)
+        frame_idx = frame_combo.findData(current_rate)
     frame_combo.setCurrentIndex(frame_idx)
+    last_frame = {"idx": frame_idx}
+
+    def _on_frame_picked(idx: int) -> None:
+        if frame_combo.itemData(idx) != -1:
+            last_frame["idx"] = idx
+            return
+        value, ok = QInputDialog.getInt(dlg, tr("launch.frame_rate_label"), tr("launch.fps_other_prompt"), 60, 10, 500)
+        if not ok:
+            frame_combo.setCurrentIndex(last_frame["idx"])
+            return
+        found = frame_combo.findData(value)
+        if found < 0:
+            frame_combo.insertItem(frame_combo.count() - 1, tr("launch.mangohud_fps_value", fps=value), value)
+            found = frame_combo.findData(value)
+        frame_combo.setCurrentIndex(found)
+        last_frame["idx"] = found
 
     winedll_lbl = QLabel(tr("launch.winedlloverrides_label"))
     winedll_edit = QLineEdit(winedll_now)
@@ -348,7 +389,6 @@ def open_launch_presets_dialog(
         mh_enabled = chk_mh.isChecked()
         mh_level_combo.setEnabled(mh_enabled)
         mh_pos_combo.setEnabled(mh_enabled)
-        mh_fps_combo.setEnabled(mh_enabled)
         if syncing["active"]:
             return
         syncing["active"] = True
@@ -373,8 +413,7 @@ def open_launch_presets_dialog(
                     "debug_log": chk_debug.isChecked(),
                     "mh_level": mh_level_combo.currentData(),
                     "mh_position": str(mh_pos_combo.currentData() or ""),
-                    "mh_fps_limit": mh_fps_combo.currentData(),
-                    "frame_rate": frame_combo.currentData(),
+                    "frame_rate": max(0, int(frame_combo.currentData() or 0)),
                     **{key: chk.isChecked() for key, chk in toggle_checks.items()},
                 },
                 winedlloverrides=dll_val,
@@ -555,15 +594,14 @@ def open_launch_presets_dialog(
     _add_tool_preset(chk_mh, tr("launch.mangohud_hint"), "mangohud", extra_row=mh_opts_col, blocked_note=mangohud_note)
     mh_level_combo.currentIndexChanged.connect(_sync_preview)
     mh_pos_combo.currentIndexChanged.connect(_sync_preview)
-    mh_fps_combo.currentIndexChanged.connect(_sync_preview)
-    if not is_native_linux:
-        frame_row = QHBoxLayout()
-        frame_row.addWidget(QLabel(tr("launch.frame_rate_label")))
-        frame_row.addWidget(frame_combo)
-        frame_row.addStretch()
-        current["lay"].addLayout(frame_row)
-        _add(_muted_hint(tr("launch.frame_rate_hint")))
-        frame_combo.currentIndexChanged.connect(_sync_preview)
+    frame_row = QHBoxLayout()
+    frame_row.addWidget(QLabel(tr("launch.frame_rate_label")))
+    frame_row.addWidget(frame_combo)
+    frame_row.addStretch()
+    current["lay"].addLayout(frame_row)
+    _add(_muted_hint(tr("launch.frame_rate_hint")))
+    frame_combo.activated.connect(_on_frame_picked)
+    frame_combo.currentIndexChanged.connect(_sync_preview)
 
     # Options that depend on the hardware or the Proton: shown, greyed out with the reason, or
     # hidden (another GPU vendor), always judged for the GPU the game runs on.
@@ -572,7 +610,6 @@ def open_launch_presets_dialog(
         "need_nvidia_driver": tr("launch.need_nvidia_driver"),
         "need_rtx": tr("launch.need_rtx"),
         "need_rdna4": tr("launch.need_rdna4"),
-        "need_rdna3": tr("launch.need_rdna3"),
         "need_nvidia_595": tr("launch.need_nvidia_595"),
         "need_ge": tr("launch.need_ge"),
         "need_wayland": tr("launch.need_wayland"),
@@ -649,17 +686,13 @@ def open_launch_presets_dialog(
     if not is_native_linux:
         for chk, hint in (
             (chk_w3d, tr("launch.wined3d_hint")),
-            (chk_esync, tr("launch.no_esync_hint")),
             (chk_fsync, tr("launch.no_fsync_hint")),
         ):
             chk.toggled.connect(_sync_preview)
             _add(chk)
             _add(_muted_hint(hint))
-        for toggle in TOGGLES:
-            if toggle.section == "compat":
-                toggle_checks[toggle.key].toggled.connect(_sync_preview)
-                _add(toggle_checks[toggle.key])
-                _add(_muted_hint(toggle_texts[toggle.key][1]))
+        _ruled("no_esync", chk_esync, tr("launch.no_esync_hint"))
+        _add_toggles("compat")
         chk_dxgi.toggled.connect(_on_dxgi_toggled)
         _add(chk_dxgi)
         _add(_muted_hint(tr("launch.dxgi_hint")))
@@ -699,26 +732,45 @@ def open_launch_presets_dialog(
     dlg_lay.addWidget(tabs, 1)
 
     def _apply_recommended() -> None:
-        changes = recommend(profile, proton, int(frame_combo.currentData() or 0))
+        changes = recommend(profile, proton)
         if changes.pop("prime", False) and chk_prime.isEnabled():
             chk_prime.setChecked(True)  # first: the rest is judged for the dedicated GPU
         if shutil.which("gamemoderun"):
             chk_gm.setChecked(True)
-        checks = {"nvapi": chk_nvapi, "dlss_upgrade": chk_dlss, **toggle_checks}
+        checks = {"dlss_upgrade": chk_dlss, **toggle_checks}
         for key, value in changes.items():
-            if key == "frame_rate":
-                idx = frame_combo.findData(value)
-                if idx >= 0:
-                    frame_combo.setCurrentIndex(idx)
-            elif key in checks and checks[key].isEnabled():
+            if key in checks and checks[key].isEnabled():
                 checks[key].setChecked(bool(value))
         game_gpu = profile.game_gpu(chk_prime.isChecked())
         lbl_game_gpu.setText(
             tr("launch.recommended_done", name=_gpu_label(game_gpu) if game_gpu else "-")
         )
 
+    def _set_frame(value: int) -> None:
+        idx = frame_combo.findData(value)
+        if idx >= 0:
+            frame_combo.setCurrentIndex(idx)
+            last_frame["idx"] = idx
+
+    def _apply_battery() -> None:
+        """Manual: half the screen's rate, no GameMode, the integrated GPU on a hybrid."""
+        _set_frame(half_rate(screen_hz) if screen_hz else 30)
+        chk_gm.setChecked(False)
+        if chk_prime.isEnabled():
+            chk_prime.setChecked(False)
+
+    def _apply_performance() -> None:
+        """Manual: no cap, GameMode when installed, the dedicated GPU on a hybrid."""
+        _set_frame(0)
+        if shutil.which("gamemoderun"):
+            chk_gm.setChecked(True)
+        if chk_prime.isEnabled() and profile.dedicated is not None:
+            chk_prime.setChecked(True)
+
     btn_recommend.clicked.connect(_apply_recommended)
     btn_recommend.setVisible(not is_native_linux)
+    btn_battery.clicked.connect(_apply_battery)
+    btn_performance.clicked.connect(_apply_performance)
     _refresh_rules()
 
     # The result, always in sight: the line the game starts with (editable by hand).
@@ -804,7 +856,41 @@ def edit_launch_options_presets(
     )
     if res is None:
         return
-    new_opts, new_dll = res
+    save_launch_options(win, (kind, obj), res[0], res[1], parent=parent, on_saved=on_saved)
+
+
+def launch_options_of(obj: object) -> tuple[str, str]:
+    """(launch options, WINEDLLOVERRIDES) a game has now."""
+    if isinstance(obj, StandaloneGame):
+        return obj.launch_options or "", obj.winedlloverrides or ""
+    if isinstance(obj, ExternalLauncherGame):
+        opts = load_external_launch_presets(obj)
+    elif isinstance(obj, ShortcutEntry):
+        opts = obj.launch_options or ""
+    else:
+        return "", ""
+    return opts, str(_parse_launch_preset_state(opts)["winedll"])
+
+
+def save_launch_options(
+    win: MainWindow,
+    sel: tuple[str, object],
+    new_opts: str,
+    new_dll: str,
+    parent: QWidget | None = None,
+    on_saved: Callable[[str], None] | None = None,
+) -> None:
+    """Store a game's new launch options where its mode keeps them (manifest + launch.sh, the
+    external launcher, or Steam's shortcut: right away, or queued in Gaming Mode)."""
+    kind, obj = sel
+
+    def box_parent() -> QWidget:
+        if parent is not None and shiboken6.isValid(parent):
+            return parent
+        return _dialog_parent(win)
+
+    title_name = obj.app_name if isinstance(obj, ShortcutEntry) else str(getattr(obj, "name", ""))
+    opts_now = launch_options_of(obj)[0]
 
     if isinstance(obj, ExternalLauncherGame):
         try:
@@ -844,6 +930,8 @@ def edit_launch_options_presets(
     if not win.paths:
         return
     paths = win.paths
+    if not isinstance(obj, ShortcutEntry):
+        return
     entry = obj
     managed_game = win._managed_library_game(entry)
 

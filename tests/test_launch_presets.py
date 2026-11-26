@@ -152,9 +152,12 @@ def test_presets_are_judged_for_the_game_gpu_and_its_proton() -> None:
     assert availability("prime", vega, laptop, "") == (OK, "")
     old_driver = HardwareProfile("amd", "", "", (rtx, vega), "x11", "580.1")
     assert availability("descriptor_heap", rtx, old_driver, "") == (OFF, "need_nvidia_595")
-    assert availability("hdr", rtx, old_driver, "") == (OFF, "need_wayland")
+    assert availability("wayland", rtx, old_driver, "ge") == (OFF, "need_wayland")
+    assert availability("wayland", rtx, laptop, "valve") == (OFF, "need_ge")  # Valve's Proton has no switch
     nouveau = Gpu("nvidia", "nouveau", "0000:01:00.0", "GTX 1060", False, True, "gtx")
-    assert availability("nvapi", nouveau, None, "") == (OFF, "need_nvidia_driver")
+    assert availability("dlss_upgrade", nouveau, None, "ge") == (OFF, "need_nvidia_driver")
+    for gone in ("nvapi", "no_esync", "hdr", "fsr4_rdna3"):  # no Proton reads them any more
+        assert availability(gone, rtx, laptop, "ge")[0] == HIDE
     deck = HardwareProfile("amd", "AMD Custom APU 0932", "Steam Deck", (vega,), "gamescope")
     assert availability("prime", vega, deck, "")[0] == HIDE  # one GPU: nothing to send elsewhere
     assert availability("vendor_amd", vega, deck, "")[0] == HIDE
@@ -171,12 +174,11 @@ def test_recommended_for_this_pc() -> None:
     vega = Gpu("amd", "amdgpu", "a", "Vega", True, True, "gcn", 512)
     rtx = Gpu("nvidia", "nvidia", "b", "RTX 3050", False, False, "rtx")
     laptop = HardwareProfile("amd", "", "", (rtx, vega), "wayland", "595.99")
-    assert recommend(laptop, "ge") == {"prime": True, "nvapi": True, "dlss_upgrade": True}
-    assert recommend(laptop, "valve") == {"prime": True, "nvapi": True}  # DLSS upgrade needs GE-Proton
+    assert recommend(laptop, "ge") == {"prime": True, "dlss_upgrade": True}  # NVAPI is on by default
+    assert recommend(laptop, "valve") == {"prime": True}  # DLSS upgrade needs GE-Proton
     deck_gpu = Gpu("amd", "amdgpu", "c", "Custom GPU 0405", True, True, "rdna2", 1024)
     deck = HardwareProfile("amd", "AMD Custom APU 0932", "Steam Deck", (deck_gpu,), "gamescope")
-    assert recommend(deck, "ge") == {"frame_rate": 40}
-    assert recommend(deck, "ge", frame_rate=60) == {}  # a cap the user chose stays
+    assert recommend(deck, "ge") == {}  # the frame cap is the user's choice, never recommended
     rdna4 = HardwareProfile("amd", "", "", (Gpu("amd", "amdgpu", "d", "RX 9070", False, True, "rdna4", 16384),), "x11")
     assert recommend(rdna4, "ge") == {"fsr4_upgrade": True}
     arc = Gpu("intel", "xe", "0000:03:00.0", "Arc B580", False, True, "arc")
@@ -224,3 +226,29 @@ def test_presets_window_follows_the_gpu_the_game_runs_on() -> None:
     finally:
         parent.deleteLater()
         app.processEvents()
+
+
+def test_frame_cap_uses_what_proton_reads_and_one_dxvk_config() -> None:
+    from deckinstall.launch_presets import apply_presets, migrate_launch_options, parse_presets
+
+    mine = "DXVK_CONFIG='dxgi.syncInterval=0' %command% -dx11"
+    opts = apply_presets(mine, {}, winedlloverrides="", frame_rate=45, vendor_amd=True)
+    assert opts == (
+        "DXVK_CONFIG='dxgi.syncInterval=0;dxgi.maxFrameRate=45;d3d9.maxFrameRate=45;dxgi.customVendorId=1002' "
+        "VKD3D_FRAME_RATE=45 %command% -dx11"
+    )  # DXVK_FRAME_RATE is gone from DXVK: Proton 11 and GE-Proton 11 read only DXVK_CONFIG
+    state = parse_presets(opts)
+    assert state["frame_rate"] == 45 and state["vendor_amd"] and state["dxvk_custom"] == ["dxgi.syncInterval=0"]
+    assert apply_presets(opts, frame_rate=0, vendor_amd=False) == "DXVK_CONFIG=dxgi.syncInterval=0 %command% -dx11"
+    assert "fps_limit=60" in apply_presets("MANGOHUD=1 %command%", frame_rate=60)  # one cap, MangoHud too
+    old = "PROTON_ENABLE_NVAPI=1 DXVK_ENABLE_NVAPI=1 DXVK_FRAME_RATE=40 gamemoderun %command% -x"
+    assert migrate_launch_options(old) == (
+        "DXVK_CONFIG='dxgi.maxFrameRate=40;d3d9.maxFrameRate=40' VKD3D_FRAME_RATE=40 gamemoderun %command% -x"
+    )
+    assert migrate_launch_options("gamemoderun %command%") == "gamemoderun %command%"
+
+
+def test_half_the_screen_divides_its_rate() -> None:
+    from deckinstall.ui_dialogs.launch_presets_dialog import half_rate
+
+    assert [half_rate(hz) for hz in (60, 90, 120, 144, 165)] == [30, 45, 60, 72, 55]
