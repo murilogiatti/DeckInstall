@@ -8,7 +8,9 @@ reader returns what it could read. Only the apps asked for are decoded; the rest
 from __future__ import annotations
 
 import logging
+import mmap
 import struct
+import threading
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -27,15 +29,24 @@ _T_MAP, _T_STR, _T_INT32, _T_FLOAT, _T_PTR, _T_WSTR, _T_COLOR, _T_UINT64, _T_END
 _FIXED = {_T_INT32: "<i", _T_FLOAT: "<f", _T_PTR: "<i", _T_COLOR: "<i", _T_UINT64: "<Q", _T_INT64: "<q"}
 
 
+_CACHE_LOCK = threading.Lock()
+_APPINFO_CACHE: tuple[tuple[str, int, int], dict[int, str]] | None = None
+
+
 class _Reader:
-    def __init__(self, data: bytes, strings: list[str] | None) -> None:
+    def __init__(self, data: bytes | memoryview | mmap.mmap, strings: list[str] | None) -> None:
         self.data = data
         self.pos = 0
         self.strings = strings
 
     def cstring(self) -> str:
-        end = self.data.index(b"\0", self.pos)
-        text = self.data[self.pos:end].decode("utf-8", "replace")
+        if isinstance(self.data, (bytes, mmap.mmap)):
+            end = self.data.find(b"\0", self.pos)
+        else:
+            end = bytes(self.data).index(b"\0", self.pos)
+        if end < 0:
+            raise ValueError("Unterminated cstring")
+        text = bytes(self.data[self.pos:end]).decode("utf-8", "replace")
         self.pos = end + 1
         return text
 
@@ -67,7 +78,7 @@ class _Reader:
                 end = self.pos
                 while self.data[end:end + 2] != b"\0\0":
                     end += 2
-                out[name] = self.data[self.pos:end].decode("utf-16-le", "replace")
+                out[name] = bytes(self.data[self.pos:end]).decode("utf-16-le", "replace")
                 self.pos = end + 2
             elif kind in _FIXED:
                 out[name] = self.unpack(_FIXED[kind])
@@ -75,22 +86,14 @@ class _Reader:
                 raise ValueError(f"Unknown KeyValues type {kind:#x}")
 
 
-def _string_table(data: bytes, offset: int) -> list[str]:
+def _string_table(data: bytes | mmap.mmap, offset: int) -> list[str]:
     reader = _Reader(data, None)
     reader.pos = offset
     count = reader.unpack("<I")
     return [reader.cstring() for _ in range(count)]
 
 
-def read_app_names(path: Path, appids: Iterable[int] | None = None) -> dict[int, str]:
-    """{appid: name} for the apps in appinfo.vdf (only `appids` when given)."""
-    wanted = set(appids) if appids is not None else None
-    if wanted is not None and not wanted:
-        return {}
-    try:
-        data = path.read_bytes()
-    except OSError:
-        return {}
+def _parse_all_app_names(data: bytes | mmap.mmap) -> dict[int, str]:
     names: dict[int, str] = {}
     try:
         magic, _universe = struct.unpack_from("<II", data, 0)
@@ -116,8 +119,6 @@ def read_app_names(path: Path, appids: Iterable[int] | None = None) -> dict[int,
             pos = next_pos
             if next_pos > end_of_apps or size < head:
                 break
-            if wanted is not None and appid not in wanted:
-                continue
             reader = _Reader(data[body_start + head:next_pos], strings)
             try:
                 kv = reader.kv_map()
@@ -131,6 +132,39 @@ def read_app_names(path: Path, appids: Iterable[int] | None = None) -> dict[int,
     except (ValueError, IndexError, struct.error) as exc:
         logging.info("appinfo.vdf partly unreadable (%s); using %d names", exc, len(names))
     return names
+
+
+def read_app_names(path: Path, appids: Iterable[int] | None = None) -> dict[int, str]:
+    """{appid: name} for the apps in appinfo.vdf (only `appids` when given), cached by file stat."""
+    global _APPINFO_CACHE
+    wanted = set(appids) if appids is not None else None
+    if wanted is not None and not wanted:
+        return {}
+    try:
+        st = path.stat()
+    except OSError:
+        return {}
+    if st.st_size < 8:
+        return {}
+    cache_key = (str(path.resolve()), st.st_mtime_ns, st.st_size)
+    with _CACHE_LOCK:
+        cached = _APPINFO_CACHE
+    if cached is not None and cached[0] == cache_key:
+        all_names = cached[1]
+    else:
+        try:
+            with path.open("rb") as fh, mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                all_names = _parse_all_app_names(mm)
+        except (OSError, ValueError):
+            try:
+                all_names = _parse_all_app_names(path.read_bytes())
+            except OSError:
+                return {}
+        with _CACHE_LOCK:
+            _APPINFO_CACHE = (cache_key, all_names)
+    if wanted is None:
+        return dict(all_names)
+    return {aid: all_names[aid] for aid in wanted if aid in all_names}
 
 
 def steam_app_names(steam_root: Path, appids: Iterable[int]) -> dict[int, str]:

@@ -293,7 +293,9 @@ def _show(
     op_state = {"busy": False}
     dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: op_state["busy"])
     dlg.setWindowTitle(tr("optiscaler_bulk.title"))
-    dlg.resize(1100, 560)
+    from ..ui_cards import clamp_dialog_size
+
+    clamp_dialog_size(dlg, 960, 560, dlg.parentWidget())
     dlg_alive = _dialog_guard(dlg)
     lay = QVBoxLayout(dlg)
     hint = QLabel(tr("optiscaler_bulk.hint"))

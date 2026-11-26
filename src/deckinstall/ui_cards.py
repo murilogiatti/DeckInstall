@@ -115,6 +115,21 @@ def get_game_log_path(game_name: str) -> Path:
     return Path.home() / ".local" / "share" / "DeckInstall" / "logs" / f"{safe}.log"
 
 
+def clamp_dialog_size(
+    dialog: QDialog, width: int, height: int, parent: QWidget | None = None
+) -> None:
+    """Resize dialog to (width, height), clamping to the available screen geometry (e.g. 1024x640 on Deck)."""
+    screen = parent.screen() if parent is not None else QGuiApplication.primaryScreen()
+    if screen is not None:
+        avail = screen.availableGeometry()
+        max_w = max(320, int(avail.width() * 0.96))
+        max_h = max(240, int(avail.height() * 0.92))
+        dialog.setMaximumSize(max_w, max_h)
+        dialog.resize(min(width, max_w), min(height, max_h))
+    else:
+        dialog.resize(width, height)
+
+
 def show_text_dialog(parent: QWidget | None, title: str, summary: str, details: str) -> QDialog:
     """Non-blocking dialog sized to the screen: a summary on top and a scrollable, wrapped text below."""
     parent = _dialog_parent(parent) if parent is not None else None
@@ -470,7 +485,7 @@ class MessageBar(QFrame):
         self._actions = QHBoxLayout()
         self._actions.setSpacing(8)
         self._close = QPushButton("✕")
-        self._close.setAccessibleName("Close")
+        self._close.setAccessibleName(tr("proton_mgr.btn_close"))
         self._close.setFixedWidth(40)
         self._close.clicked.connect(self.dismiss)
         self._icon.setStyleSheet("font-size: 16px; font-weight: 700;")

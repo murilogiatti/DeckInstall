@@ -40,7 +40,15 @@ from . import library as _lib
 from . import save_sync
 from .external_actions import import_prefix_saves
 from .extractor import _SYSTEM_DIRS, DRIVE_C_GAME_PARENTS, find_games_in_drive_c
-from .fsutil import atomic_write_bytes, is_within, move_dir_safely, remove_path_or_tree, sanitize_dir_name, unique_dir
+from .fsutil import (
+    atomic_copy_file,
+    atomic_write_bytes,
+    is_within,
+    move_dir_safely,
+    remove_path_or_tree,
+    sanitize_dir_name,
+    unique_dir,
+)
 from .launcher_scan import ExternalLauncherGame, scan_external_launcher_games
 from .manifest import MANIFEST_V1, MANIFEST_V2, encode_path, find_manifest, new_uid
 from .scanner import _BIN_DIR_NAMES, clean_game_name, is_native_linux_exe, scan_game_folder
@@ -1075,7 +1083,7 @@ def _move_entry(src: Path, dst: Path) -> None:
     if src.is_symlink():
         dst.symlink_to(os.readlink(src))
     else:
-        shutil.copy2(src, dst, follow_symlinks=False)
+        atomic_copy_file(src, dst)
     src.unlink()
 
 

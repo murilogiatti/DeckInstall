@@ -24,7 +24,7 @@ from .standalone import (
     set_game_launcher,
 )
 from .steam_paths import SteamPaths
-from .steam_vdf import load_shortcuts, remove_shortcut
+from .steam_vdf import _other_steam_user_has_shortcut, load_shortcuts, remove_shortcut
 
 
 def _reload(game: StandaloneGame) -> StandaloneGame:
@@ -44,15 +44,44 @@ def switch_to_steam(paths: SteamPaths, game: StandaloneGame) -> StandaloneGame:
     """Steam runs the game from now on: add its shortcut, then drop the menu/Desktop launchers."""
     _require_managed(game)
     had = {where: bool(found) for where, found in find_game_launchers(game).items()}
+    prev_meta = dict(game.meta)
     add_installed_game_to_steam(paths, game.game_dir, game.uid)
-    game = _reload(game)
-    # Remembered so switching back recreates the same launchers.
-    game.meta["standalone_launchers"] = {"menu": had.get("menu", False), "desktop": had.get("desktop", False)}
-    for where in ("menu", "desktop"):
-        game = set_game_launcher(game, where, False)
-    game.meta["mode"] = STEAM
-    _write_manifest(game)
-    return game
+    try:
+        game = _reload(game)
+        # Remembered so switching back recreates the same launchers.
+        game.meta["standalone_launchers"] = {"menu": had.get("menu", False), "desktop": had.get("desktop", False)}
+        for where in ("menu", "desktop"):
+            game = set_game_launcher(game, where, False)
+        game.meta["mode"] = STEAM
+        _write_manifest(game)
+        return game
+    except BaseException:
+        # Roll back the Steam shortcut, compatdata link and launchers on mid-switch failure.
+        try:
+            current = _reload(game)
+        except Exception:
+            current = game
+        try:
+            if paths.shortcuts_vdf.is_file():
+                entries = load_shortcuts(paths.shortcuts_vdf, strict=False)
+                for appid in match_owned_shortcuts(entries, [current], paths.user_id):
+                    remove_shortcut(paths, appid)
+        except Exception as rb_exc:
+            logging.warning("Rollback failed removing Steam shortcut for %s: %s", game.name, rb_exc)
+        try:
+            _unlink_steam_compatdata(current)
+            _restore_compatdata_backup(current)
+        except Exception as rb_exc:
+            logging.warning("Rollback failed restoring compatdata for %s: %s", game.name, rb_exc)
+        try:
+            current.meta = prev_meta
+            _write_manifest(current)
+            for where, was_present in had.items():
+                if was_present:
+                    current = set_game_launcher(current, where, True)
+        except Exception as rb_exc:
+            logging.warning("Rollback failed restoring launchers for %s: %s", game.name, rb_exc)
+        raise
 
 
 def _restore_compatdata_backup(game: StandaloneGame) -> None:
@@ -85,12 +114,18 @@ def switch_to_standalone(
     _require_managed(game)
     if desktop is None:
         desktop = bool((game.meta.get("standalone_launchers") or {}).get("desktop"))
+    removed_appids: list[int] = []
     if paths is not None and paths.shortcuts_vdf.is_file():
         entries = load_shortcuts(paths.shortcuts_vdf, strict=True)
         for appid in match_owned_shortcuts(entries, [game], paths.user_id):
             remove_shortcut(paths, appid)
-    _unlink_steam_compatdata(game)
-    _restore_compatdata_backup(game)
+            removed_appids.append(appid)
+    shared_with_other_account = paths is not None and any(
+        _other_steam_user_has_shortcut(paths, aid) is not False for aid in removed_appids
+    )
+    if not shared_with_other_account:
+        _unlink_steam_compatdata(game)
+        _restore_compatdata_backup(game)
     game.meta.pop("steam", None)
     game.meta.pop("standalone_launchers", None)
     game.meta["mode"] = STANDALONE

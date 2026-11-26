@@ -282,6 +282,7 @@ class SteamDetectWorker(QThread):
 class ShortcutsRefreshWorker(QThread):
     """Reload Steam shortcuts, standalone games, and external launcher games."""
 
+    read_only = True
     ready = Signal(int, list, list, list, str, object)
     failed = Signal(str)
 

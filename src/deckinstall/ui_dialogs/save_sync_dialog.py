@@ -1168,7 +1168,9 @@ def open_save_sync_dialog(win: MainWindow) -> None:
 
     dlg = _BusySyncDialog(_dialog_parent(win))
     dlg.setWindowTitle(tr("save_sync.title"))
-    dlg.resize(640, 520)
+    from ..ui_cards import clamp_dialog_size
+
+    clamp_dialog_size(dlg, 640, 520, dlg.parentWidget())
     lay = QVBoxLayout(dlg)
 
     def _on_finished(_r: int) -> None:

@@ -157,7 +157,9 @@ def open_launch_presets_dialog(
     dlg = QDialog(parent if parent is not None else _dialog_parent(win))
     dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
     dlg.setWindowTitle(tr("launch.title", name=title))
-    dlg.resize(640, 640)
+    from ..ui_cards import clamp_dialog_size
+
+    clamp_dialog_size(dlg, 640, 580, parent)
     dlg_lay = QVBoxLayout(dlg)
 
     # Which GPU the game runs on (the options below are judged for it), and one click for the

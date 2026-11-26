@@ -81,7 +81,9 @@ def open_proton_manager_dialog(win: MainWindow) -> None:
     busy_state = {"active": False}
     dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: busy_state["active"])
     dlg.setWindowTitle(tr("proton_mgr.title"))
-    dlg.resize(680, 640)
+    from ..ui_cards import clamp_dialog_size
+
+    clamp_dialog_size(dlg, 680, 580, dlg.parentWidget())
     lay = QVBoxLayout(dlg)
     lay.setSpacing(12)
     dlg_alive = {"open": True}

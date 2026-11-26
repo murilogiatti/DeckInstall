@@ -19,6 +19,7 @@ from typing import Any
 from . import library as _lib
 from .extractor import check_disk_space
 from .fsutil import (
+    atomic_copy_file,
     atomic_write_bytes,
     atomic_write_text,
     copy_or_move_dir_contents,
@@ -52,6 +53,7 @@ from .manifest import (
     new_uid,
     now_iso,
     read_manifest_fields,
+    sanitize_uid,
     write_manifest_v2,
 )
 from .scanner import detect_steam_appid, detect_steam_emulator, gog_product_id
@@ -1303,13 +1305,24 @@ def _startup_wm_class(game: StandaloneGame) -> str:
     return "steam_app_0"
 
 
+def _is_safe_desktop_target(path: Path, allowed_dir: Path) -> bool:
+    """True when path is a non-symlink .desktop file strictly inside allowed_dir."""
+    if path.is_symlink() or path.suffix.lower() != ".desktop":
+        return False
+    return is_within(path, allowed_dir, strict=True)
+
+
 def refresh_integration_files(game: StandaloneGame) -> None:
     """Rewrite launch.sh and the existing .desktop launchers after the game's paths changed."""
     _write_game_launcher(game)
-    targets = [(game.desktop_file, False)]
+    targets: list[tuple[Path, Path, bool]] = [(game.desktop_file, get_applications_dir(), False)]
     if game.desktop_shortcut is not None:
-        targets.append((game.desktop_shortcut, True))
-    existing = [(p, ex) for p, ex in targets if p.is_file() and not p.is_symlink()]
+        targets.append((game.desktop_shortcut, get_desktop_dir(), True))
+    existing = [
+        (p, ex)
+        for p, allowed_dir, ex in targets
+        if p.is_file() and _is_safe_desktop_target(p, allowed_dir)
+    ]
     if not existing:
         return
     icon = resolve_game_icon(game.exe_path, game.game_dir, steam_appid=game.steam_appid)
@@ -1732,9 +1745,21 @@ def _load_manifest(manifest_path: Path) -> StandaloneGame | None:
         if prefix_dir.is_symlink() or not any(is_within(prefix_dir, r) for r in prefix_roots):
             logging.warning("Manifest prefix_dir %s is invalid or out of bounds", prefix_dir)
             return None
-        desktop_file = fields["desktop_file"] or (
-            get_applications_dir() / f"deckinstall-{slugify(name)}.desktop"
-        )
+        default_desktop = get_applications_dir() / f"deckinstall-{slugify(name)}.desktop"
+        cand_desktop = fields["desktop_file"]
+        if cand_desktop is not None and _is_safe_desktop_target(cand_desktop, get_applications_dir()):
+            desktop_file = cand_desktop
+        else:
+            if cand_desktop is not None:
+                logging.warning("Manifest desktop_file %s is invalid or out of bounds", cand_desktop)
+            desktop_file = default_desktop
+        cand_shortcut = fields["desktop_shortcut"]
+        desktop_shortcut: Path | None = None
+        if cand_shortcut is not None:
+            if _is_safe_desktop_target(cand_shortcut, get_desktop_dir()):
+                desktop_shortcut = cand_shortcut
+            else:
+                logging.warning("Manifest desktop_shortcut %s is invalid or out of bounds", cand_shortcut)
         cache_dir: Path | None = None
         cand_cache = fields["cache_dir"]
         if cand_cache is not None:
@@ -1743,6 +1768,7 @@ def _load_manifest(manifest_path: Path) -> StandaloneGame | None:
                 cache_dir = cand_cache
             else:
                 logging.warning("Manifest cache_dir %s is invalid or out of bounds", cand_cache)
+        safe_uid = sanitize_uid(str(fields["uid"]))
         return StandaloneGame(
             name=name,
             game_dir=game_dir,
@@ -1754,10 +1780,10 @@ def _load_manifest(manifest_path: Path) -> StandaloneGame | None:
             launch_options=str(fields["launch_options"]),
             launch_script=launch_script,
             desktop_file=desktop_file,
-            desktop_shortcut=fields["desktop_shortcut"],
+            desktop_shortcut=desktop_shortcut,
             native_linux=bool(fields["native_linux"]),
             cache_dir=cache_dir,
-            uid=str(fields["uid"]),
+            uid=safe_uid,
             schema=int(fields["schema"]),
             meta=dict(fields["meta"]),
         )
@@ -2302,22 +2328,66 @@ def _adopt_steam_prefix(src_compat: Path, prefix_dir: Path) -> None:
     inner = src_compat / "pfx"
     real_inner = inner.is_dir() and not inner.is_symlink()
     top_items = [item for item in src_compat.iterdir() if item.name != "pfx"]
-    incoming = [*top_items, *(inner.iterdir() if real_inner else ())]
+    inner_items = list(inner.iterdir()) if real_inner else []
+    incoming = [*top_items, *inner_items]
     seen: set[str] = set()
     for item in incoming:
         target = prefix_dir / item.name
         if item.name in seen or target.exists() or target.is_symlink():
             raise FileExistsError(f"Cannot adopt Steam prefix because {target} already exists")
         seen.add(item.name)
-    if real_inner:
-        copy_or_move_dir_contents(inner, prefix_dir, move=True)
-        inner.rmdir()
-    for item in top_items:
-        shutil.move(str(item), str(prefix_dir / item.name))
-    remaining = list(src_compat.iterdir())
-    if remaining:
-        raise RuntimeError(f"Could not fully adopt {src_compat}: {[p.name for p in remaining]}")
-    src_compat.rmdir()
+
+    moved: list[tuple[Path, Path]] = []
+
+    def _move_one(src: Path, dst: Path) -> None:
+        if src.is_dir() and not src.is_symlink():
+            move_dir_safely(src, dst)
+        elif src.is_symlink():
+            try:
+                os.rename(src, dst)
+            except OSError:
+                dst.symlink_to(os.readlink(src))
+                src.unlink()
+        else:
+            try:
+                os.rename(src, dst)
+            except OSError:
+                atomic_copy_file(src, dst)
+                src.unlink()
+        moved.append((src, dst))
+
+    try:
+        for item in inner_items:
+            _move_one(item, prefix_dir / item.name)
+        if real_inner:
+            inner.rmdir()
+        for item in top_items:
+            _move_one(item, prefix_dir / item.name)
+        remaining = list(src_compat.iterdir())
+        if remaining:
+            raise RuntimeError(f"Could not fully adopt {src_compat}: {[p.name for p in remaining]}")
+        src_compat.rmdir()
+    except BaseException:
+        if real_inner and not inner.exists():
+            try:
+                inner.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+        for orig_src, cur_dst in reversed(moved):
+            try:
+                if cur_dst.is_dir() and not cur_dst.is_symlink():
+                    move_dir_safely(cur_dst, orig_src)
+                elif cur_dst.is_symlink():
+                    os.rename(cur_dst, orig_src)
+                elif cur_dst.exists():
+                    try:
+                        os.rename(cur_dst, orig_src)
+                    except OSError:
+                        atomic_copy_file(cur_dst, orig_src)
+                        cur_dst.unlink()
+            except OSError as rb_exc:
+                logging.warning("Rollback failed moving %s back to %s: %s", cur_dst, orig_src, rb_exc)
+        raise
 
 
 def _compatdata_backup_path(compat: Path) -> Path:

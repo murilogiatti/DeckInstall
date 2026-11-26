@@ -300,7 +300,9 @@ def _show(
     busy_state = {"active": False}
     dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: busy_state["active"])
     dlg.setWindowTitle(tr("proton_bulk.title"))
-    dlg.resize(900, 580)
+    from ..ui_cards import clamp_dialog_size
+
+    clamp_dialog_size(dlg, 900, 580, dlg.parentWidget())
     dlg_alive = _dialog_guard(dlg)
     lay = QVBoxLayout(dlg)
     hint = QLabel(tr("proton_bulk.hint"))

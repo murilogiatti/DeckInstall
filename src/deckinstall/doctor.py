@@ -171,7 +171,7 @@ def _steam() -> list[dict[str, str]]:
         find_steam_roots,
         is_gamescope_session,
         is_steam_running,
-        list_steam_users,
+        list_steam_accounts,
         steam_variant,
     )
 
@@ -182,8 +182,12 @@ def _steam() -> list[dict[str, str]]:
     out = []
     for root in roots:
         mark = " [in use]" if root == active else ""
-        users = len(list_steam_users(root))
-        out.append(_check("steam", OK, f"{steam_variant(root)}: {root} ({users} user(s)){mark}"))
+        accounts = list_steam_accounts(root)
+        detail = f"{steam_variant(root)}: {root} ({len(accounts)} user(s)){mark}"
+        if len(accounts) > 1:
+            labels = ", ".join(a.display_label for a in accounts[:5])
+            detail += f" — {labels}"
+        out.append(_check("steam", OK, detail))
     if len(roots) > 1:
         out.append(_check("steam_choice", INFO, f"several Steams; choose one with {STEAM_ROOT_ENV}=<path>"))
     out.append(_check("steam_running", INFO, "yes" if is_steam_running() else "no"))

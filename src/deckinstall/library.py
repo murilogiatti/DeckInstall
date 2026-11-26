@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .fsutil import atomic_write_text, is_within
+from .fsutil import atomic_write_text, file_lock, is_within
 from .manifest import new_uid, now_iso
 
 LIBRARY_DIRNAME = "DeckInstall"
@@ -205,21 +205,33 @@ def read_library_file(root: Path) -> dict[str, Any] | None:
     return data
 
 
+def _library_lock(root: Path):
+    return file_lock(root / ".library.lock")
+
+
+def _registry_lock():
+    return file_lock(registry_path().with_suffix(".lock"))
+
+
 def ensure_library(root: Path, label: str = "", internal: bool = False) -> Library:
     """Create (or open) the library at root with its Games/Prefixes/Caches folders."""
     if root.is_symlink():
         raise OSError(f"Library folder cannot be a symlink: {root}")
-    data = read_library_file(root)
-    if data is None:
-        root.mkdir(parents=True, exist_ok=True)
-        data = {
-            "schema": 1,
-            "id": new_uid(),
-            "label": label or ("Internal" if internal else root.parent.name),
-            "created_at": now_iso(),
-            "games": [],
-        }
-        _write_json(root / LIBRARY_FILE, data)
+    root.mkdir(parents=True, exist_ok=True)
+    with _library_lock(root):
+        lib_file = root / LIBRARY_FILE
+        data = read_library_file(root)
+        if data is None:
+            if lib_file.exists() or lib_file.is_symlink():
+                raise OSError(f"Library file is unreadable or corrupt: {lib_file}")
+            data = {
+                "schema": 1,
+                "id": new_uid(),
+                "label": label or ("Internal" if internal else root.parent.name),
+                "created_at": now_iso(),
+                "games": [],
+            }
+            _write_json(lib_file, data)
     fstype = fs_type_of(root)
     lib = Library(
         id=str(data["id"]),
@@ -243,19 +255,20 @@ def _load_registry() -> dict[str, Any]:
 
 def _remember(lib: Library, data: dict[str, Any]) -> None:
     """Store/refresh a library (and its game list) in the registry."""
-    reg = _load_registry()
-    games = data.get("games") if isinstance(data.get("games"), list) else []
-    entry = {
-        "root": str(lib.root),
-        "label": lib.label,
-        "internal": lib.internal,
-        "games": games,
-    }
-    if reg["libraries"].get(lib.id) == entry:
-        return
-    reg["libraries"][lib.id] = entry
     try:
-        _write_json(registry_path(), reg)
+        with _registry_lock():
+            reg = _load_registry()
+            games = data.get("games") if isinstance(data.get("games"), list) else []
+            entry = {
+                "root": str(lib.root),
+                "label": lib.label,
+                "internal": lib.internal,
+                "games": games,
+            }
+            if reg["libraries"].get(lib.id) == entry:
+                return
+            reg["libraries"][lib.id] = entry
+            _write_json(registry_path(), reg)
     except OSError as exc:
         logging.warning("Could not update library registry: %s", exc)
 
@@ -364,15 +377,18 @@ def library_for_path(path: Path) -> Library | None:
 
 def record_game(lib_root: Path, uid: str, name: str, game_dir: Path) -> None:
     """Add/refresh a game in the library's game list (used to show it while the disk is absent)."""
-    data = read_library_file(lib_root)
-    if data is None or not uid:
+    if not uid or not lib_root.is_dir():
         return
-    rel = game_dir.resolve().relative_to(lib_root.resolve()).as_posix()
-    games = [g for g in data.get("games") or [] if isinstance(g, dict) and g.get("id") != uid]
-    games.append({"id": uid, "name": name, "dir": rel})
-    games.sort(key=lambda g: str(g.get("name", "")).lower())
-    data["games"] = games
-    _write_json(lib_root / LIBRARY_FILE, data)
+    with _library_lock(lib_root):
+        data = read_library_file(lib_root)
+        if data is None:
+            return
+        rel = game_dir.resolve().relative_to(lib_root.resolve()).as_posix()
+        games = [g for g in data.get("games") or [] if isinstance(g, dict) and g.get("id") != uid]
+        games.append({"id": uid, "name": name, "dir": rel})
+        games.sort(key=lambda g: str(g.get("name", "")).lower())
+        data["games"] = games
+        _write_json(lib_root / LIBRARY_FILE, data)
     lib = library_for_path(game_dir)
     if lib is not None:
         _remember(lib, data)
@@ -380,22 +396,26 @@ def record_game(lib_root: Path, uid: str, name: str, game_dir: Path) -> None:
 
 def forget_game(lib_root: Path, uid: str) -> None:
     """Remove a game from the library's game list."""
-    data = read_library_file(lib_root)
-    if data is None or not uid:
+    if not uid or not lib_root.is_dir():
         return
-    games = [g for g in data.get("games") or [] if isinstance(g, dict) and g.get("id") != uid]
-    if len(games) == len(data.get("games") or []):
-        return
-    data["games"] = games
-    _write_json(lib_root / LIBRARY_FILE, data)
-    reg = _load_registry()
-    entry = reg["libraries"].get(str(data["id"]))
-    if isinstance(entry, dict):
-        entry["games"] = games
-        try:
-            _write_json(registry_path(), reg)
-        except OSError as exc:
-            logging.warning("Could not update library registry: %s", exc)
+    with _library_lock(lib_root):
+        data = read_library_file(lib_root)
+        if data is None:
+            return
+        games = [g for g in data.get("games") or [] if isinstance(g, dict) and g.get("id") != uid]
+        if len(games) == len(data.get("games") or []):
+            return
+        data["games"] = games
+        _write_json(lib_root / LIBRARY_FILE, data)
+    try:
+        with _registry_lock():
+            reg = _load_registry()
+            entry = reg["libraries"].get(str(data["id"]))
+            if isinstance(entry, dict):
+                entry["games"] = games
+                _write_json(registry_path(), reg)
+    except OSError as exc:
+        logging.warning("Could not update library registry: %s", exc)
 
 
 def list_unavailable_games(libraries: list[Library] | None = None) -> list[dict[str, str]]:

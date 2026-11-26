@@ -10,7 +10,10 @@ import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import NoReturn, TypedDict, cast
+from typing import TYPE_CHECKING, NoReturn, TypedDict, cast
+
+if TYPE_CHECKING:
+    from .ui_library_grid import LibraryGridView
 
 from PySide6.QtCore import (
     QCoreApplication,
@@ -45,7 +48,6 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
-    QListWidget,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -363,6 +365,8 @@ class MainWindow(QMainWindow):
     steam_match_combo: QComboBox
     steam_search_input: QLineEdit
     steam_status_lbl: QLabel
+    steam_account_row: QWidget
+    steam_account_combo: QComboBox
     theme_combo: QComboBox
     unavailable_banner: QLabel
     vdf_error_banner: QLabel
@@ -388,10 +392,12 @@ class MainWindow(QMainWindow):
     btn_update_runtimes: QPushButton
     btn_uninstall_runtimes: QPushButton
     library_empty_state: QWidget
+    library_no_results_state: QWidget
     message_bar: MessageBar
     scale_combo: QComboBox
     busy_bar: QProgressBar
-    library_grid: QListWidget
+    library_grid: LibraryGridView
+    _library_search_timer: QTimer
     btn_view_list: QPushButton
     btn_view_grid: QPushButton
     # Updates card (ui_updates.build_updates_card)
@@ -583,8 +589,11 @@ class MainWindow(QMainWindow):
         if ans == QMessageBox.StandardButton.Yes:
             for w in list(self._active_workers):
                 if w.isRunning():
-                    w.terminate()
-                    w.wait(500)
+                    if hasattr(w, "cancel") and callable(w.cancel):
+                        w.cancel()
+                    else:
+                        w.requestInterruption()
+                    w.wait(250)
             self._force_closing = True
             self._closing_pending = False
             self.close()
@@ -690,6 +699,15 @@ class MainWindow(QMainWindow):
             self._close_force_timer.stop()
         self._auto_art_timer.stop()
         self._vdf_watch_timer.stop()
+        mount_timer = getattr(self, "_mount_refresh_timer", None)
+        if mount_timer is not None:
+            mount_timer.stop()
+        updates_cd = getattr(self, "_updates_cooldown", None)
+        if updates_cd is not None:
+            updates_cd.stop()
+        search_timer = getattr(self, "_library_search_timer", None)
+        if search_timer is not None:
+            search_timer.stop()
         self._play.release()  # stop following running games; they keep running
         self._closed = True
         super().closeEvent(event)
@@ -889,6 +907,7 @@ class MainWindow(QMainWindow):
             self._on_vdf_queue_paths_ready()
             status_text = self._format_steam_status_text()
             self.steam_status_lbl.setText(status_text)
+            self._refresh_steam_account_selector()
             self._update_steam_status_style()
             self._update_steam_mode_ui()
             self.status_label.setText(status_text)
@@ -902,10 +921,15 @@ class MainWindow(QMainWindow):
                     runner_labels=runner_labels,
                 )
 
+        preferred_uid = str(self.settings.value("steam/user_id", "") or "").strip() or None
+
+        def _resolve_paths() -> SteamPaths | None:
+            return resolve_steam_paths(user_id=preferred_uid)
+
         worker = SteamDetectWorker(
             req_id,
             shortcuts_req_id,
-            resolve_steam_paths_fn=resolve_steam_paths,
+            resolve_steam_paths_fn=_resolve_paths,
             find_steam_root_fn=find_steam_root,
             load_shortcuts_fn=load_shortcuts,
             list_standalone_games_fn=(
@@ -917,6 +941,42 @@ class MainWindow(QMainWindow):
         worker.ready.connect(_on_detected)
         worker.failed.connect(self._on_background_failed)
         worker.start()
+
+    def _refresh_steam_account_selector(self) -> None:
+        """Populate and show the Steam account selector when multiple accounts exist in userdata/."""
+        if not hasattr(self, "steam_account_combo"):
+            return
+        from .steam_paths import list_steam_accounts
+
+        root = self.paths.steam_root if self.paths is not None else find_steam_root()
+        accounts = list_steam_accounts(root) if root is not None else []
+        show = len(accounts) > 1
+        self.steam_account_row.setVisible(show)
+        if not show:
+            return
+        saved_uid = str(self.settings.value("steam/user_id", "") or "").strip()
+        combo = self.steam_account_combo
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            combo.addItem(tr("settings.steam_account_auto"), "")
+            selected_idx = 0
+            for idx, acct in enumerate(accounts, start=1):
+                combo.addItem(acct.display_label, acct.user_id)
+                if acct.user_id == saved_uid:
+                    selected_idx = idx
+            combo.setCurrentIndex(selected_idx)
+        finally:
+            combo.blockSignals(False)
+
+    def _on_steam_account_changed(self, index: int) -> None:
+        if not hasattr(self, "steam_account_combo") or index < 0:
+            return
+        uid = str(self.steam_account_combo.itemData(index) or "").strip()
+        if str(self.settings.value("steam/user_id", "") or "").strip() == uid:
+            return
+        self.settings.setValue("steam/user_id", uid)
+        self._redetect_steam()
 
     def _update_steam_mode_ui(self) -> None:
         """Adapt Add/Extract/Library/Maintenance controls for Steam vs Standalone-only mode."""
@@ -2382,7 +2442,7 @@ class MainWindow(QMainWindow):
                 cell.setToolTip(tr("library.size_hint"))
                 table.setItem(row, 5, cell)
             table.setSortingEnabled(True)
-            self._filter_library_list()
+            self._filter_library_list(skip_grid=True)
 
         worker.finished_ok.connect(_finish)
         worker.failed.connect(lambda _err: _finish({}))
@@ -2597,44 +2657,64 @@ class MainWindow(QMainWindow):
                 )
             )
 
-    def _filter_library_list(self) -> None:
+    def _filter_library_list(self, *, skip_grid: bool = False) -> None:
         """Filter Steam, Standalone, and External library items live and update the count label."""
         source_filter = getattr(self, "_library_source_filter", "all")
         favs = library_extras.favorites(self.settings) if source_filter == "favorites" else set()
         query = self.library_search_input.text().strip().lower()
         total = 0
         shown = 0
-        for i in range(self.shortcuts_list.rowCount()):
-            item = self.shortcuts_list.item(i, 0)
-            if item is None:
-                continue
-            total += 1
-            data = item.data(Qt.ItemDataRole.UserRole)
-            kind = data[0] if isinstance(data, tuple) and len(data) == 2 else ""
-            if source_filter == "favorites":
-                source_ok = item.data(Qt.ItemDataRole.UserRole + 1) in favs
-            else:
-                source_ok = source_filter == "all" or kind == source_filter
-            query_ok = not query or any(
-                query in cell.text().lower()
-                for column in range(self.shortcuts_list.columnCount())
-                if (cell := self.shortcuts_list.item(i, column)) is not None
-            )
-            visible = source_ok and query_ok
-            self.shortcuts_list.setRowHidden(i, not visible)
-            if visible:
-                shown += 1
-        cur_row = self.shortcuts_list.currentRow()
-        if cur_row >= 0 and self.shortcuts_list.isRowHidden(cur_row):
-            self.shortcuts_list.clearSelection()
-            self.shortcuts_list.setCurrentCell(-1, -1)
+        table = self.shortcuts_list
+        table.setUpdatesEnabled(False)
+        try:
+            col_count = table.columnCount()
+            for i in range(table.rowCount()):
+                item = table.item(i, 0)
+                if item is None:
+                    continue
+                total += 1
+                data = item.data(Qt.ItemDataRole.UserRole)
+                kind = data[0] if isinstance(data, tuple) and len(data) == 2 else ""
+                if source_filter == "favorites":
+                    source_ok = item.data(Qt.ItemDataRole.UserRole + 1) in favs
+                else:
+                    source_ok = source_filter == "all" or kind == source_filter
+                query_ok = not query or any(
+                    query in cell.text().lower()
+                    for column in range(col_count)
+                    if (cell := table.item(i, column)) is not None
+                )
+                visible = source_ok and query_ok
+                table.setRowHidden(i, not visible)
+                if visible:
+                    shown += 1
+        finally:
+            table.setUpdatesEnabled(True)
+        cur_row = table.currentRow()
+        if cur_row >= 0 and table.isRowHidden(cur_row):
+            table.clearSelection()
+            table.setCurrentCell(-1, -1)
         self._update_library_action_states()
         self.lbl_library_count.setText(tr("library.count_summary", shown=shown, total=total))
         empty = total == 0 and self._library_loaded  # not while the first detection still runs
+        no_results = not empty and total > 0 and shown == 0
         self.library_empty_state.setVisible(empty)
+        self.library_no_results_state.setVisible(no_results)
         from .ui_library_grid import sync_views
 
-        sync_views(self, empty)
+        sync_views(self, empty or no_results, skip_grid=skip_grid)
+
+    def _clear_library_filters(self) -> None:
+        """Reset search text and source filter back to All."""
+        self.library_search_input.blockSignals(True)
+        self.library_search_input.clear()
+        self.library_search_input.blockSignals(False)
+        self._library_search_timer.stop()
+        self._library_source_filter = "all"
+        buttons = self._lib_filter_group.buttons()
+        if buttons:
+            buttons[0].setChecked(True)
+        self._filter_library_list()
 
     def _selected_library_item(
         self,

@@ -27,8 +27,10 @@ INTENTIONAL_RESIDUE = (
     "DeckInstall/Prefixes",
     "DeckInstall/Caches",
     "DeckInstall/library.json",
+    "DeckInstall/.library.lock",
     "data",
     "data/libraries.json",
+    "data/libraries.lock",
     # Steam's own files: the shortcut entry is removed, the files (and their backups) stay.
     "Steam/**",
     # The XDG menu folder and the logs root are shared with other games.

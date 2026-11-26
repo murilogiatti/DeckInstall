@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -28,6 +29,18 @@ SCHEMA_VERSION = 2
 # How the game runs: "steam" (Steam runs it) or "standalone" (umu-run). Absent in older manifests.
 RUN_MODES = ("steam", "standalone")
 _MAX_MANIFEST_BYTES = 1024 * 1024
+_SAFE_UID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def sanitize_uid(raw: str) -> str:
+    """Return raw if it is a safe single-segment identifier, else empty string."""
+    val = raw.strip()
+    if not val:
+        return ""
+    if _SAFE_UID_RE.fullmatch(val):
+        return val
+    logging.warning("Ignoring unsafe manifest uid: %r", raw)
+    return ""
 
 
 def new_uid() -> str:
@@ -199,7 +212,7 @@ def _v2_fields(raw: dict[str, Any], game_dir: Path) -> dict[str, Any]:
 
     return {
         "schema": SCHEMA_VERSION,
-        "uid": _str(raw.get("id")),
+        "uid": sanitize_uid(_str(raw.get("id"))),
         "name": _str(raw.get("name")) or game_dir.name,
         "game_dir": game_dir,
         "exe_path": game_dir.joinpath(*exe_rel.parts),

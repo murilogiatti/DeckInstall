@@ -66,7 +66,7 @@ MANGOHUD_RELEASES_API = (
 UPDATE_CACHE_TTL_SECONDS = 24 * 60 * 60
 USER_AGENT = f"DeckInstall/{__version__}"
 _GE_PROTON_TAG_RE = re.compile(r"^GE-Proton(\d+)([A-Za-z0-9._-]*)$")
-_WINETRICKS_VERB_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+_WINETRICKS_VERB_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _ALLOWED_URL_HOSTS = frozenset(
     {
         "api.github.com",
@@ -971,10 +971,11 @@ def _request_with_validated_redirects(
 ) -> requests.Response:
     """Perform a GET request validating every redirect hop against allowed_hosts."""
     current_url = _validate_allowed_url(url, allowed_hosts, label=label)
+    req_headers = dict(headers)
     for _ in range(max_redirects + 1):
         resp = requests.get(
             current_url,
-            headers=headers,
+            headers=req_headers,
             timeout=timeout,
             stream=stream,
             allow_redirects=False,
@@ -988,11 +989,22 @@ def _request_with_validated_redirects(
             resp.close()
             if not location:
                 raise RuntimeError("Redirect response missing Location header.")
-            current_url = _validate_allowed_url(
+            prev_parsed = urllib.parse.urlparse(current_url)
+            next_url = _validate_allowed_url(
                 urllib.parse.urljoin(current_url, location),
                 allowed_hosts,
                 label=label,
             )
+            next_parsed = urllib.parse.urlparse(next_url)
+            if (prev_parsed.scheme, prev_parsed.hostname, prev_parsed.port) != (
+                next_parsed.scheme,
+                next_parsed.hostname,
+                next_parsed.port,
+            ):
+                for k in list(req_headers):
+                    if k.lower() == "authorization":
+                        req_headers.pop(k, None)
+            current_url = next_url
             continue
         return resp
     raise RuntimeError(f"Too many redirects while fetching {label}.")
@@ -1120,12 +1132,16 @@ def _fetch_json(url: str, timeout: int = 20) -> Any:
     raise last_exc
 
 
+_MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024 * 1024
+
+
 def _download_file(
     url: str,
     dest: Path,
     label: str,
     progress_cb: ProgressCallback | None = None,
     timeout: int = 60,
+    max_bytes: int = _MAX_DOWNLOAD_BYTES,
 ) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     with _request_github_with_validated_redirects(
@@ -1137,6 +1153,8 @@ def _download_file(
         resp.raise_for_status()
         total_raw = resp.headers.get("Content-Length")
         total = int(total_raw) if total_raw and total_raw.isdigit() else 0
+        if total > max_bytes:
+            raise RuntimeError(f"Download for {label} exceeds maximum size limit ({max_bytes} bytes).")
         downloaded = 0
         last_pct = -1
         _emit_progress(progress_cb, f"Downloading {label}...", 0)
@@ -1144,8 +1162,10 @@ def _download_file(
             for chunk in resp.iter_content(chunk_size=65536):
                 if not chunk:
                     continue
-                handle.write(chunk)
                 downloaded += len(chunk)
+                if downloaded > max_bytes:
+                    raise RuntimeError(f"Download for {label} exceeds maximum size limit ({max_bytes} bytes).")
+                handle.write(chunk)
                 if total > 0:
                     pct = min(99, int((downloaded * 100) / total))
                     if pct != last_pct:
@@ -2480,15 +2500,26 @@ BWRAP_PROFILE = "/etc/apparmor.d/bwrap"
 _BWRAP_MARKER = "# Written by DeckInstall"
 
 
+_SYSTEM_BWRAP_CANDIDATES = ("/usr/bin/bwrap", "/bin/bwrap")
+
+
 def _bwrap_binary_path() -> str:
-    """The real bwrap binary (AppArmor matches the resolved path), /usr/bin/bwrap by default."""
-    found = shutil.which("bwrap")
-    if not found:
-        return "/usr/bin/bwrap"
-    try:
-        return str(Path(found).resolve())
-    except OSError:
-        return found
+    """Return the root-owned system bwrap binary path for AppArmor, defaulting to /usr/bin/bwrap."""
+    for cand in _SYSTEM_BWRAP_CANDIDATES:
+        p = Path(cand)
+        try:
+            resolved = p.resolve(strict=True)
+            st = resolved.stat()
+        except OSError:
+            continue
+        if (
+            stat.S_ISREG(st.st_mode)
+            and st.st_uid == 0
+            and (st.st_mode & 0o022) == 0
+            and str(resolved) in _SYSTEM_BWRAP_CANDIDATES
+        ):
+            return str(resolved)
+    return "/usr/bin/bwrap"
 
 
 def kill_proc_group(proc: subprocess.Popen[bytes], sig: int) -> None:
@@ -2522,6 +2553,9 @@ def _emit_buffered_lines(buf: str, on_line: Callable[[str], None]) -> str:
     return buf
 
 
+_STDLIB_SELECT = select.select
+
+
 def drain_stream_lines(
     proc: subprocess.Popen[bytes],
     cancel_flag: Callable[[], bool] | None,
@@ -2538,11 +2572,20 @@ def drain_stream_lines(
         if cancel_flag and cancel_flag():
             raise RuntimeError(cancel_msg)
 
+    use_poll = select.select is _STDLIB_SELECT and hasattr(select, "poll")
+    poller = select.poll() if use_poll else None
+    if poller is not None:
+        poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+
     try:
         os.set_blocking(fd, False)
         while True:
             check_cancelled()
-            ready, _, _ = select.select([fd], [], [], 0.2)
+            if poller is not None:
+                ready = bool(poller.poll(200))
+            else:
+                rlist, _, _ = select.select([fd], [], [], 0.2)
+                ready = bool(rlist)
             if ready:
                 try:
                     chunk = os.read(fd, 4096)

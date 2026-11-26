@@ -30,7 +30,7 @@ Repository = "https://github.com/murilogiatti/DeckInstall"
 Issues = "https://github.com/murilogiatti/DeckInstall/issues"
 
 [project.scripts]
-deckinstall = "deckinstall.ui:run"
+deckinstall = "deckinstall.cli:run"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -43,6 +43,7 @@ deckinstall = ["locales/*.json", "locales/qt/*.qm", "assets/icon.png"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 filterwarnings = [
     "error::ResourceWarning",
     "error::pytest.PytestUnraisableExceptionWarning",

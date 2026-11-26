@@ -9,6 +9,7 @@ no process of ours and are only followed through /proc.
 
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import time
@@ -473,6 +474,13 @@ class PlayMonitor(QObject):
         old_exe_pids = self.exe_pids(exe_name)
         if watch and old_exe_pids:
             old_exe_pids &= self.scan(watch)
+        prev = self._runs.get(key)
+        if prev is not None and prev.proc is not None and prev.proc is not proc:
+            old_proc = prev.proc
+            if old_proc.state() == QProcess.ProcessState.NotRunning:
+                old_proc.deleteLater()
+            else:
+                old_proc.finished.connect(old_proc.deleteLater)
         self._runs[key] = _Run(
             name, LOADING, self.clock(), watch, log_path or log_file, proc, exe_name=exe_name,
             old_exe_pids=old_exe_pids,
@@ -686,8 +694,13 @@ class PlayMonitor(QObject):
                 self._tick_run(key, run, now)
             return
         if self._proc_poll is not None and self._proc_poll.done():
-            self._proc_snapshot = self._proc_poll.result()
+            poll = self._proc_poll
             self._proc_poll = None
+            try:
+                self._proc_snapshot = poll.result()
+            except Exception as exc:
+                logging.getLogger(__name__).warning("Background process scan failed: %s", exc)
+                self._proc_snapshot = None
         try:
             for key, run in runs.items():
                 needs_proc = not run.preparing and run.state != ERROR and (

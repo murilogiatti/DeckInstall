@@ -505,8 +505,14 @@ def copy_or_move_dir_contents(src_dir: Path, dst_dir: Path, move: bool) -> None:
 
 _APPIMAGE_ENV_KEYS = ("APPIMAGE", "APPDIR", "ARGV0", "OWD")
 _PATH_ENV_KEYS = ("PATH", "LD_LIBRARY_PATH", "QT_PLUGIN_PATH")
-# Set for DeckInstall's own interpreter/Qt; a game, installer or Steam must never inherit them.
-_APP_ONLY_ENV_KEYS = ("PYTHONHOME", "PYTHONPATH", "PYTHONNOUSERSITE")
+# Set for DeckInstall's own interpreter/Qt or API tokens; a game, installer or Steam must never inherit them.
+_APP_ONLY_ENV_KEYS = (
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PYTHONNOUSERSITE",
+    "DECKINSTALL_STEAMGRIDDB_KEY",
+    "DECKINSTALL_GITHUB_TOKEN",
+)
 
 
 def clean_child_env(base: dict[str, str] | None = None) -> dict[str, str]:

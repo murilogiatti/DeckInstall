@@ -50,6 +50,9 @@ QTabBar::tab:selected {
     background-color: $bg_surface;
     border-bottom: 2px solid $focus_border;
 }
+QTabBar::tab:focus {
+    border: 2px solid $focus_border;
+}
 QLabel {
     color: $fg_text;
 }
@@ -67,7 +70,7 @@ QLabel#SectionTitle {
     font-weight: 600;
     color: $section_fg;
 }
-QLineEdit, QComboBox, QListWidget, QTableWidget, QTextEdit {
+QLineEdit, QComboBox, QListWidget, QListView, QTableWidget, QTextEdit {
     background-color: $bg_input;
     border: 1px solid $input_border;
     border-radius: 8px;
@@ -78,18 +81,18 @@ QLineEdit, QComboBox, QListWidget, QTableWidget, QTextEdit {
 QLineEdit, QComboBox {
     min-height: 20px;
 }
-QLineEdit:focus, QComboBox:focus, QListWidget:focus, QTableWidget:focus, QTextEdit:focus {
+QLineEdit:focus, QComboBox:focus, QListWidget:focus, QListView:focus, QTableWidget:focus, QTextEdit:focus {
     border: 2px solid $focus_border;
 }
-QListWidget::item, QTableWidget::item {
+QListWidget::item, QListView::item, QTableWidget::item {
     padding: 8px 10px;
     border-radius: 6px;
 }
-QListWidget::item:selected, QTableWidget::item:selected {
+QListWidget::item:selected, QListView::item:selected, QTableWidget::item:selected {
     background-color: #1d6fa5;
     color: #ffffff;
 }
-QListWidget::item:focus, QTableWidget::item:focus {
+QListWidget::item:focus, QListView::item:focus, QTableWidget::item:focus {
     border: 1px solid $focus_border;
 }
 QHeaderView::section {

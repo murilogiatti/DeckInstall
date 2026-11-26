@@ -248,8 +248,25 @@ def _safe_iterdir(directory: Path) -> list[Path]:
         return []
 
 
-def _parse_loginusers_priority(steam_root: Path) -> dict[str, tuple[int, int]]:
-    """Return {steam3_id: (most_recent_flag, timestamp)} from config/loginusers.vdf."""
+@dataclass(frozen=True)
+class SteamAccount:
+    """One Steam account inside <steam_root>/userdata/<user_id>."""
+
+    user_id: str
+    account_name: str = ""
+    persona_name: str = ""
+    most_recent: bool = False
+    allow_auto_login: bool = False
+    timestamp: int = 0
+
+    @property
+    def display_label(self) -> str:
+        name = self.persona_name or self.account_name
+        return f"{name} ({self.user_id})" if name else self.user_id
+
+
+def _parse_loginusers(steam_root: Path) -> dict[str, SteamAccount]:
+    """Return {steam3_id: SteamAccount} parsed from config/loginusers.vdf."""
     loginusers = steam_root / "config" / "loginusers.vdf"
     if not loginusers.is_file():
         return {}
@@ -262,7 +279,7 @@ def _parse_loginusers_priority(steam_root: Path) -> dict[str, tuple[int, int]]:
     users_map = data.get("users")
     if not isinstance(users_map, dict):
         return {}
-    priority: dict[str, tuple[int, int]] = {}
+    accounts: dict[str, SteamAccount] = {}
     for steam64_str, info in users_map.items():
         s64 = str(steam64_str)
         if not isinstance(info, dict) or not (s64.isascii() and s64.isdigit()):
@@ -270,35 +287,49 @@ def _parse_loginusers_priority(steam_root: Path) -> dict[str, tuple[int, int]]:
         account_id = int(s64) - 76561197960265728
         if account_id <= 0:
             continue
-        most_recent = 1 if str(info.get("MostRecent", "0")) == "1" else 0
+        uid = str(account_id)
+        most_recent = str(info.get("MostRecent", "0")) == "1"
+        allow_auto = str(info.get("AllowAutoLogin", "0")) == "1"
         ts_str = str(info.get("Timestamp", "0"))
         ts = int(ts_str) if (ts_str.isascii() and ts_str.isdigit()) else 0
-        priority[str(account_id)] = (most_recent, ts)
-    return priority
+        accounts[uid] = SteamAccount(
+            user_id=uid,
+            account_name=str(info.get("AccountName") or "").strip(),
+            persona_name=str(info.get("PersonaName") or "").strip(),
+            most_recent=most_recent,
+            allow_auto_login=allow_auto,
+            timestamp=ts,
+        )
+    return accounts
 
 
-def list_steam_users(steam_root: Path) -> list[str]:
-    """Return numeric Steam3 userdata IDs, prioritizing loginusers.vdf MostRecent/Timestamp."""
+def list_steam_accounts(steam_root: Path) -> list[SteamAccount]:
+    """Return SteamAccount objects for userdata dirs, prioritized by loginusers.vdf."""
     userdata = steam_root / "userdata"
     if not userdata.is_dir():
         return []
-    users = [
+    dirs = [
         p
         for p in _safe_iterdir(userdata)
         if p.is_dir() and p.name.isascii() and p.name.isdigit() and p.name != "0"
     ]
-    login_prio = _parse_loginusers_priority(steam_root)
-
-    def _sort_key(p: Path) -> tuple[int, int, float]:
-        mr, ts = login_prio.get(p.name, (0, 0))
+    login_info = _parse_loginusers(steam_root)
+    ranked: list[tuple[tuple[int, int, int, float], SteamAccount]] = []
+    for p in dirs:
+        acct = login_info.get(p.name) or SteamAccount(user_id=p.name)
         try:
             mtime = p.stat().st_mtime
         except OSError:
             mtime = 0.0
-        return (mr, ts, mtime)
+        key = (1 if acct.most_recent else 0, 1 if acct.allow_auto_login else 0, acct.timestamp, mtime)
+        ranked.append((key, acct))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [acct for _, acct in ranked]
 
-    users.sort(key=_sort_key, reverse=True)
-    return [u.name for u in users]
+
+def list_steam_users(steam_root: Path) -> list[str]:
+    """Return numeric Steam3 userdata IDs, prioritizing loginusers.vdf MostRecent/AllowAutoLogin/Timestamp."""
+    return [acct.user_id for acct in list_steam_accounts(steam_root)]
 
 
 def resolve_steam_paths(user_id: str | None = None) -> SteamPaths | None:

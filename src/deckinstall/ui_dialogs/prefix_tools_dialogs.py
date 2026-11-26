@@ -177,7 +177,9 @@ def open_winetricks_dialog(
     active_worker: dict[str, WinetricksWorker | None] = {"w": None}
     dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: active_worker["w"] is not None)
     dlg.setWindowTitle(tr("winetricks.title", name=title_name))
-    dlg.resize(620, 640)
+    from ..ui_cards import clamp_dialog_size
+
+    clamp_dialog_size(dlg, 620, 580, dlg.parentWidget())
     lay = QVBoxLayout(dlg)
     lay.setSpacing(12)
     lay.addWidget(note_label(tr("winetricks.prefix_label", path=str(prefix_dir))))

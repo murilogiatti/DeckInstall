@@ -18,7 +18,7 @@ from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
 from . import library, runtime_manager
-from .fsutil import _safe_chmod, clean_child_env, copy_dir_no_symlinks, move_dir_safely
+from .fsutil import _safe_chmod, atomic_copy_file, clean_child_env, copy_dir_no_symlinks, move_dir_safely
 from .scanner import clean_game_name
 from .steam_paths import find_proton_binary, find_steam_root
 
@@ -679,7 +679,8 @@ def _move_file_replace(src_f: Path, dst_f: Path) -> None:
         os.replace(src_f, dst_f)
     except OSError as exc:
         if exc.errno == errno.EXDEV:
-            shutil.move(str(src_f), str(dst_f))
+            atomic_copy_file(src_f, dst_f)
+            src_f.unlink()
         else:
             raise
 
@@ -734,8 +735,12 @@ def _unwrap_single_folder(temp_dir: Path, final_dir: Path) -> None:
                 # File/folder type clash: never delete existing user data, rename it aside.
                 _set_aside(dest)
             else:
-                dest.unlink()
-        shutil.move(str(item), str(dest))
+                _move_file_replace(item, dest)
+                continue
+        if item.is_dir():
+            move_dir_safely(item, dest)
+        else:
+            _move_file_replace(item, dest)
 
 
 def _drain_stream_lines(

@@ -372,7 +372,9 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     operation = {"migrating": False}
     dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: operation["migrating"])
     dlg.setWindowTitle(tr("configure.title", name=title_name))
-    dlg.resize(740, 560)
+    from ..ui_cards import clamp_dialog_size
+
+    clamp_dialog_size(dlg, 740, 560, dlg.parentWidget())
     dlg_alive = _dialog_guard(dlg)
     root_lay = QVBoxLayout(dlg)
 

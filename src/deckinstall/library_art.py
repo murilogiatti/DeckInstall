@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import zlib
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -82,17 +83,19 @@ def fetch_artwork(
     Raises requests.HTTPError when the key is refused.
     """
     key = steamgriddb.api_key() if key is None else key
+    job_list = list(jobs)
     games = files = 0
     nothing: list[str] = []
-    for job in jobs:
+
+    def _process(job: ArtJob) -> tuple[int, int, str | None]:
         if cancelled is not None and cancelled():
-            break
+            return 0, 0, None
         if replace:
             try:
                 _remove_existing(job)
             except OSError as exc:
                 logging.warning("Could not set aside the art of %s: %s", job.name, exc)
-                continue
+                return 0, 0, None
         try:
             saved = steamgriddb.fill_missing_artwork(
                 job.file_id, job.grid_dir, name=job.name, steam_appid=job.steam_appid, key=key, kinds=job.kinds
@@ -103,10 +106,21 @@ def fetch_artwork(
             logging.info("SteamGridDB failed for %s: %s", job.name, exc)
             saved = {}
         if saved:
-            games += 1
-            files += len(saved)
-        elif replace or _missing(job):
-            nothing.append(job.name)
+            return 1, len(saved), None
+        if replace or _missing(job):
+            return 0, 0, job.name
+        return 0, 0, None
+
+    if len(job_list) <= 1:
+        results = [_process(j) for j in job_list]
+    else:
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="deckinstall-art") as pool:
+            results = list(pool.map(_process, job_list))
+    for g_inc, f_inc, miss in results:
+        games += g_inc
+        files += f_inc
+        if miss is not None:
+            nothing.append(miss)
     return games, files, nothing
 
 

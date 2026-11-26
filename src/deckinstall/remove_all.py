@@ -61,9 +61,12 @@ def state_dir() -> Path:
 _OWN_DATA_ENTRIES = (
     "logs",
     "runtime",
+    "covers",
     "libraries.json",
+    "libraries.lock",
     "vdf_queue.json",
     "vdf_queue.lock",
+    "vdf_queue.apply.lock",
     "cleanup.lock",
     "restore.lock",
     "deckinstall.log",

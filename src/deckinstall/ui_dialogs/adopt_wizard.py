@@ -163,7 +163,9 @@ class AdoptWizard(QDialog):
         self._steam_linked = False
         self._snapshot_fn = snapshot_fn
         self.setWindowTitle(tr("adopt.title"))
-        self.resize(900, 620)
+        from ..ui_cards import clamp_dialog_size
+
+        clamp_dialog_size(self, 900, 580, parent)
         self._paths = paths
         self._libraries = libraries or []
         self._steam_writable = steam_writable
@@ -958,6 +960,9 @@ class AdoptWizard(QDialog):
 
     def _shutdown(self) -> None:
         self._closed = True
+        for worker in list(_LIVE_WORKERS):
+            if worker.isRunning():
+                worker.requestInterruption()
 
     def reject(self) -> None:
         if self._running:

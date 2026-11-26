@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
-from .fsutil import FileIdentity, atomic_write_bytes, file_identity, file_sha256, is_within, open_regular_fd
+from .fsutil import FileIdentity, atomic_write_bytes, file_identity, file_lock, file_sha256, is_within, open_regular_fd
 from .steam_vdf import (
     _RESTORE_MAX_ENTRIES,
     _RESTORE_MAX_FILE_BYTES,
@@ -123,7 +123,7 @@ class SyncDryRunPreview:
 
 
 def _slugify(value: str, fallback: str = "game") -> str:
-    """Return a filesystem-safe lowercase slug."""
+    """Return a filesystem-safe lowercase slug (legacy ASCII behavior for reason tags/compat)."""
     stripped = value.strip()
     if not stripped:
         return fallback
@@ -136,6 +136,38 @@ def _slugify(value: str, fallback: str = "game") -> str:
     if not stripped.isascii():
         return f"{cleaned.lower()}-{digest}"
     return cleaned.lower()
+
+
+def _game_slug_hashed(game_name: str, fallback: str = "game") -> str:
+    """Collision-free game slug: appends an 8-char SHA-256 suffix whenever punctuation could collide."""
+    stripped = game_name.strip()
+    if not stripped:
+        return fallback
+    base = _slugify(stripped, fallback=fallback)
+    digest = hashlib.sha256(stripped.encode("utf-8")).hexdigest()[:8]
+    if base.endswith(f"-{digest}"):
+        return base
+    # Plain alphanumeric words separated by single spaces map bijectively (case-insensitively)
+    # to hyphen-joined lowercase, so they never collide with punctuated names (which get -<hash8>).
+    if re.fullmatch(r"[A-Za-z0-9]+(?: [A-Za-z0-9]+)*", stripped):
+        return base
+    return f"{base}-{digest}"
+
+
+def _resolve_game_slug_dir(root: Path, game_name: str, *, meta_file: str, name_key: str) -> tuple[str, Path]:
+    """Resolve a game's folder under root without ASCII slug collisions, preserving legacy folders."""
+    hashed = _game_slug_hashed(game_name)
+    hashed_dir = root / hashed
+    legacy = _slugify(game_name)
+    if legacy == hashed or hashed_dir.exists():
+        return hashed, hashed_dir
+    legacy_dir = root / legacy
+    if legacy_dir.is_dir() and not legacy_dir.is_symlink():
+        meta = _read_sync_meta(legacy_dir / meta_file)
+        recorded = str(meta.get(name_key) or "").strip() if meta else ""
+        if not recorded or recorded == game_name.strip():
+            return legacy, legacy_dir
+    return hashed, hashed_dir
 
 
 _PREFIX_SYSTEM_PREFIXES = ("/usr", "/bin", "/sbin", "/opt", "/etc", "/lib", "/lib64", "/boot", "/proc", "/sys", "/dev")
@@ -1053,7 +1085,9 @@ def _collect_prefix_save_entries(
     return entries
 
 
-_PROTECTED_SNAPSHOT_RE = re.compile(r"-(?:pre-restore|pre-import|ludusavi-import)(?:-\d+)?\.zip$")
+_PROTECTED_SNAPSHOT_RE = re.compile(
+    r"-(?:pre-restore|pre-import|pre-sync-pull|ludusavi-import)(?:-\d+)?\.zip$"
+)
 
 
 def _rotate_snapshots(snap_dir: Path, max_keep: int) -> None:
@@ -1173,7 +1207,15 @@ def _snapshot_dir_lock(snap_dir: Path) -> Iterator[None]:
     lock_path = snap_dir.parent / f".{snap_dir.name}.lock"
     with entry.lock:
         if entry.depth == 0:
-            fh = open(lock_path, "a+", encoding="utf-8")
+            lfd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            try:
+                st = os.fstat(lfd)
+                if not stat.S_ISREG(st.st_mode):
+                    raise OSError(f"Refusing non-regular lock file: {lock_path}")
+                fh = os.fdopen(lfd, "r+", encoding="utf-8")
+            except Exception:
+                os.close(lfd)
+                raise
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
             except Exception:
@@ -1212,7 +1254,9 @@ def _reserve_snapshot_zip(snap_dir: Path, stem_prefix: str) -> Path:
 
 def snapshot_dir_for(game_name: str, dest_root: Path | None = None) -> Path:
     """The folder holding a game's save snapshots."""
-    return (dest_root or DEFAULT_SNAPSHOTS_DIR) / _slugify(game_name)
+    root = dest_root or DEFAULT_SNAPSHOTS_DIR
+    _, path = _resolve_game_slug_dir(root, game_name, meta_file=_SNAPSHOT_INDEX, name_key="name")
+    return path
 
 
 def _read_snapshot_index(snap_dir: Path) -> dict[str, object]:
@@ -1971,101 +2015,108 @@ def push_game_saves(
     if not entries and not reg_bytes:
         return None
 
-    slug = _slugify(game_name)
-    game_sync_dir = sync_root / slug
+    slug, game_sync_dir = _resolve_game_slug_dir(sync_root, game_name, meta_file="meta.json", name_key="game_name")
     latest_zip = game_sync_dir / "latest.zip"
     game_sync_dir.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{latest_zip.stem}-", suffix=".zip.tmp", dir=str(game_sync_dir)
-    )
-    os.close(fd)
-    tmp_zip = Path(tmp_name)
+    with file_lock(game_sync_dir / ".sync.lock"):
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{latest_zip.stem}-", suffix=".zip.tmp", dir=str(game_sync_dir)
+        )
+        os.close(fd)
+        tmp_zip = Path(tmp_name)
 
-    h = hashlib.sha256()
-    file_count = 0
-    total_uncompressed = 0
-    try:
-        with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for section, src_file, rel_path in entries:
+        h = hashlib.sha256()
+        file_count = 0
+        total_uncompressed = 0
+        try:
+            with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for section, src_file, rel_path in entries:
+                    try:
+                        sfd = open_regular_fd(src_file)
+                    except OSError:
+                        continue
+                    try:
+                        st = os.fstat(sfd)
+                        before_id = file_identity(st)
+                    except OSError:
+                        os.close(sfd)
+                        continue
+                    fsize = st.st_size
+                    if file_count + 1 > _RESTORE_MAX_ENTRIES:
+                        os.close(sfd)
+                        raise RuntimeError(
+                            f"Backup exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})"
+                        )
+                    if (
+                        fsize > _RESTORE_MAX_FILE_BYTES
+                        or total_uncompressed + fsize > _RESTORE_MAX_TOTAL_BYTES
+                    ):
+                        os.close(sfd)
+                        raise RuntimeError(f"Backup size limit exceeded on {src_file.name}")
+                    arcname = f"save/{section}/{rel_path.as_posix()}"
+                    h.update(f"{section}/{rel_path.as_posix()}\0{fsize}\0".encode())
+                    file_bytes = 0
+                    with os.fdopen(sfd, "rb") as fh, zf.open(arcname, "w") as zout:
+                        while chunk := fh.read(65536):
+                            file_bytes += len(chunk)
+                            if (
+                                file_bytes > _RESTORE_MAX_FILE_BYTES
+                                or total_uncompressed + file_bytes > _RESTORE_MAX_TOTAL_BYTES
+                            ):
+                                raise RuntimeError(f"Backup size limit exceeded on {src_file.name}")
+                            h.update(chunk)
+                            zout.write(chunk)
+                        after_id = file_identity(os.fstat(fh.fileno()))
+                        if after_id != before_id or file_bytes != fsize:
+                            raise RuntimeError(
+                                f"Save file changed while syncing (is the game running?): {src_file.name}"
+                            )
+                    total_uncompressed += file_bytes
+                    file_count += 1
+
+                if reg_bytes:
+                    if file_count + 1 > _RESTORE_MAX_ENTRIES:
+                        raise RuntimeError(
+                            f"Backup exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})"
+                        )
+                    if (
+                        len(reg_bytes) > _RESTORE_MAX_FILE_BYTES
+                        or total_uncompressed + len(reg_bytes) > _RESTORE_MAX_TOTAL_BYTES
+                    ):
+                        raise RuntimeError("Backup size limit exceeded on registry.json")
+                    h.update(f"registry/registry.json\0{len(reg_bytes)}\0".encode())
+                    h.update(reg_bytes)
+                    zf.writestr("save/registry/registry.json", reg_bytes)
+                    total_uncompressed += len(reg_bytes)
+                    file_count += 1
+
+            if file_count == 0:
                 try:
-                    st = src_file.stat()
+                    tmp_zip.unlink()
                 except OSError:
-                    continue
-                fsize = st.st_size
-                if fsize == 0:
-                    continue
-                if file_count + 1 > _RESTORE_MAX_ENTRIES:
-                    raise RuntimeError(
-                        f"Backup exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})"
-                    )
-                if (
-                    fsize > _RESTORE_MAX_FILE_BYTES
-                    or total_uncompressed + fsize > _RESTORE_MAX_TOTAL_BYTES
-                ):
-                    raise RuntimeError(f"Backup size limit exceeded on {src_file.name}")
-                try:
-                    sfd = os.open(str(src_file), os.O_RDONLY | os.O_NOFOLLOW)
-                except OSError:
-                    continue
-                arcname = f"save/{section}/{rel_path.as_posix()}"
-                h.update(f"{section}/{rel_path.as_posix()}\0{fsize}\0".encode())
-                file_bytes = 0
-                with os.fdopen(sfd, "rb") as fh, zf.open(arcname, "w") as zout:
-                    while chunk := fh.read(65536):
-                        file_bytes += len(chunk)
-                        if (
-                            file_bytes > _RESTORE_MAX_FILE_BYTES
-                            or total_uncompressed + file_bytes > _RESTORE_MAX_TOTAL_BYTES
-                        ):
-                            raise RuntimeError(f"Backup size limit exceeded on {src_file.name}")
-                        h.update(chunk)
-                        zout.write(chunk)
-                total_uncompressed += file_bytes
-                file_count += 1
-
-            if reg_bytes:
-                if file_count + 1 > _RESTORE_MAX_ENTRIES:
-                    raise RuntimeError(
-                        f"Backup exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})"
-                    )
-                if (
-                    len(reg_bytes) > _RESTORE_MAX_FILE_BYTES
-                    or total_uncompressed + len(reg_bytes) > _RESTORE_MAX_TOTAL_BYTES
-                ):
-                    raise RuntimeError("Backup size limit exceeded on registry.json")
-                h.update(f"registry/registry.json\0{len(reg_bytes)}\0".encode())
-                h.update(reg_bytes)
-                zf.writestr("save/registry/registry.json", reg_bytes)
-                total_uncompressed += len(reg_bytes)
-                file_count += 1
-
-        if file_count == 0:
+                    pass
+                return None
+            os.replace(tmp_zip, latest_zip)
+        except Exception:
             try:
                 tmp_zip.unlink()
             except OSError:
                 pass
-            return None
-        os.replace(tmp_zip, latest_zip)
-    except Exception:
-        try:
-            tmp_zip.unlink()
-        except OSError:
-            pass
-        raise
+            raise
 
-    meta = {
-        "game_name": game_name,
-        "slug": slug,
-        "updated_at": time.time(),
-        "sha256": file_sha256(latest_zip),
-        "file_count": file_count,
-        "fingerprint_digest": h.hexdigest(),
-    }
-    meta_bytes = json.dumps(meta, indent=2, ensure_ascii=False).encode("utf-8")
-    atomic_write_bytes(game_sync_dir / "meta.json", meta_bytes)
-    if prefix_dir.is_dir():
-        _record_sync_base(prefix_dir, sync_root, slug, str(meta["fingerprint_digest"]))
-    return latest_zip
+        meta = {
+            "game_name": game_name,
+            "slug": slug,
+            "updated_at": time.time(),
+            "sha256": file_sha256(latest_zip),
+            "file_count": file_count,
+            "fingerprint_digest": h.hexdigest(),
+        }
+        meta_bytes = json.dumps(meta, indent=2, ensure_ascii=False).encode("utf-8")
+        atomic_write_bytes(game_sync_dir / "meta.json", meta_bytes)
+        if prefix_dir.is_dir():
+            _record_sync_base(prefix_dir, sync_root, slug, str(meta["fingerprint_digest"]))
+        return latest_zip
 
 
 def _resolve_drive_c_target(prefix_dir: Path) -> Path:
@@ -2124,12 +2175,12 @@ def pull_game_saves(
     extra_dirs: ExtraDirs | None = None,
 ) -> tuple[int, Path | None]:
     """Snapshot local saves, then safely extract synced saves into prefix drive_c."""
-    slug = _slugify(game_name)
-    latest_zip = sync_root / slug / "latest.zip"
+    slug, game_sync_dir = _resolve_game_slug_dir(sync_root, game_name, meta_file="meta.json", name_key="game_name")
+    latest_zip = game_sync_dir / "latest.zip"
     if latest_zip.is_symlink() or not latest_zip.is_file():
         return 0, None
 
-    meta = _read_sync_meta(sync_root / slug / "meta.json")
+    meta = _read_sync_meta(game_sync_dir / "meta.json")
     expected_sha = meta.get("sha256") if meta is not None else None
     if isinstance(expected_sha, str) and expected_sha.strip():
         actual_sha = file_sha256(latest_zip)
@@ -2568,8 +2619,7 @@ def plan_sync_all(
             item_extra = extra_dirs
             item_source = "deckinstall"
 
-        slug = _slugify(game_name)
-        game_sync_dir = sync_root / slug
+        slug, game_sync_dir = _resolve_game_slug_dir(sync_root, game_name, meta_file="meta.json", name_key="game_name")
         latest_zip = game_sync_dir / "latest.zip"
         has_remote = not latest_zip.is_symlink() and latest_zip.is_file()
         local_fp = None
@@ -2662,7 +2712,7 @@ def preview_sync_operation(
     extra_dirs: ExtraDirs | None = None,
 ) -> SyncDryRunPreview:
     """Build a dry-run preview of files and registry entries for a sync operation."""
-    slug = _slugify(game_name)
+    slug, _ = _resolve_game_slug_dir(sync_root, game_name, meta_file="meta.json", name_key="game_name")
     if action:
         effective_action = action.strip().upper()
         reason = f"Requested {effective_action}"

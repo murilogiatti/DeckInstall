@@ -846,7 +846,7 @@ def install_optiscaler_for_game(
         if path.is_symlink():
             saved.symlink_to(path.readlink())
         elif path.is_file():
-            shutil.copy2(path, saved)
+            atomic_copy_file(path, saved)
         elif path.exists():
             raise OSError(f"OptiScaler expected a file: {path}")
         else:

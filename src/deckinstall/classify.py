@@ -75,26 +75,42 @@ def _read_head(path: Path, limit: int = _HEAD_BYTES) -> bytes:
         return b""
 
 
+def _is_inno_head(head: bytes) -> bool:
+    return head[:2] == b"MZ" and (b"Inno Setup" in head or b"InnoSetupLdrWindow" in head)
+
+
+def _is_nsis_head(head: bytes) -> bool:
+    stub = head[:_STUB_BYTES]
+    return stub[:2] == b"MZ" and (
+        b"NullsoftInst" in stub or b"Nullsoft.NSIS" in stub or b"Nullsoft Install System" in stub
+    )
+
+
+def _is_installshield_head(head: bytes) -> bool:
+    stub = head[:_STUB_BYTES]
+    return stub[:2] == b"MZ" and b"InstallShield" in stub and (
+        b"ISSetup" in stub or b"Setup Launcher" in stub or b"InstallShield Wizard" in stub
+    )
+
+
+def _is_any_known_installer_exe(path: Path) -> bool:
+    head = _read_head(path)
+    return _is_inno_head(head) or _is_nsis_head(head) or _is_installshield_head(head)
+
+
 def is_inno_setup(path: Path) -> bool:
     """True when an .exe is an Inno Setup installer (the format GOG uses)."""
-    head = _read_head(path)
-    return head[:2] == b"MZ" and (b"Inno Setup" in head or b"InnoSetupLdrWindow" in head)
+    return _is_inno_head(_read_head(path))
 
 
 def is_nsis_installer(path: Path) -> bool:
     """True when an .exe is a Nullsoft Scriptable Install System (NSIS) installer."""
-    head = _read_head(path, _STUB_BYTES)  # the NSIS stub sits at the start; a game exe may merely mention it
-    return head[:2] == b"MZ" and (
-        b"NullsoftInst" in head or b"Nullsoft.NSIS" in head or b"Nullsoft Install System" in head
-    )
+    return _is_nsis_head(_read_head(path, _STUB_BYTES))
 
 
 def is_installshield_installer(path: Path) -> bool:
     """True when an .exe's own stub (not just a string somewhere in it) is an InstallShield launcher."""
-    head = _read_head(path, _STUB_BYTES)
-    return head[:2] == b"MZ" and b"InstallShield" in head and (
-        b"ISSetup" in head or b"Setup Launcher" in head or b"InstallShield Wizard" in head
-    )
+    return _is_installshield_head(_read_head(path, _STUB_BYTES))
 
 
 def is_installshield_folder(folder: Path) -> bool:
@@ -298,7 +314,7 @@ def classify_source(path: Path) -> SourceInfo:
                     if p.is_file()
                     and not p.is_symlink()
                     and not _skip_name(p.name)
-                    and (is_inno_setup(p) or is_nsis_installer(p) or is_installshield_installer(p))
+                    and _is_any_known_installer_exe(p)
                 ]
                 if len(top_installers) == 1:
                     setup = top_installers[0]

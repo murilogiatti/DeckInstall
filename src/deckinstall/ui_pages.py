@@ -412,6 +412,35 @@ def _build_library_empty_state(win: MainWindow) -> QWidget:
     return box
 
 
+def _build_library_no_results_state(win: MainWindow) -> QWidget:
+    """Shown when games exist in the library but the active search/filter hides all of them."""
+    box = QWidget()
+    box.setObjectName("LibraryNoResultsState")
+    lay = QVBoxLayout(box)
+    lay.addStretch(1)
+    title = QLabel(tr("library.no_results_title"))
+    title.setObjectName("SectionTitle")
+    title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    body = QLabel(tr("library.no_results_body"))
+    body.setObjectName("MutedText")
+    body.setWordWrap(True)
+    body.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    row = QHBoxLayout()
+    row.addStretch(1)
+    clear_btn = QPushButton(tr("library.btn_clear_filters"))
+    clear_btn.setObjectName("primaryBtn")
+    clear_btn.clicked.connect(win._clear_library_filters)
+    row.addWidget(clear_btn)
+    row.addStretch(1)
+    lay.addWidget(title)
+    lay.addWidget(body)
+    lay.addLayout(row)
+    lay.addStretch(1)
+    box.setVisible(False)
+    win.library_no_results_state = box
+    return box
+
+
 def build_library_page(win: MainWindow) -> QWidget:
     page = QWidget()
     layout = QVBoxLayout(page)
@@ -492,7 +521,20 @@ def build_library_page(win: MainWindow) -> QWidget:
     win.library_search_input = QLineEdit()
     win.library_search_input.setPlaceholderText(tr("library.search_placeholder"))
     win.library_search_input.setClearButtonEnabled(True)
-    win.library_search_input.textChanged.connect(win._filter_library_list)
+    win._library_search_timer = QTimer(win)
+    win._library_search_timer.setSingleShot(True)
+    win._library_search_timer.setInterval(150)
+    win._library_search_timer.timeout.connect(win._filter_library_list)
+
+    def _on_search_changed(_text: str = "") -> None:
+        # Instant filtering for small libraries & tests; debounced for 150+ games.
+        if win.shortcuts_list.rowCount() >= 150:
+            win._library_search_timer.start()
+        else:
+            win._library_search_timer.stop()
+            win._filter_library_list()
+
+    win.library_search_input.textChanged.connect(_on_search_changed)
     win.lbl_library_count = QLabel()
     win.lbl_library_count.setObjectName("MutedText")
     filter_row.addWidget(win.library_search_input, 1)
@@ -524,22 +566,13 @@ def build_library_page(win: MainWindow) -> QWidget:
     win.shortcuts_list.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
     win.shortcuts_list.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
     win.shortcuts_list.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-    win.shortcuts_list.horizontalHeader().setSectionResizeMode(
-        0, QHeaderView.ResizeMode.ResizeToContents
-    )
-    win.shortcuts_list.horizontalHeader().setSectionResizeMode(
-        1, QHeaderView.ResizeMode.ResizeToContents
-    )
-    win.shortcuts_list.horizontalHeader().setSectionResizeMode(
-        2, QHeaderView.ResizeMode.ResizeToContents
-    )
-    for column in (3, 4, 5):
-        win.shortcuts_list.horizontalHeader().setSectionResizeMode(
-            column, QHeaderView.ResizeMode.ResizeToContents
-        )
-    win.shortcuts_list.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
-    win.shortcuts_list.horizontalHeader().setStretchLastSection(True)
-    win.shortcuts_list.horizontalHeader().setSectionsClickable(True)
+    header = win.shortcuts_list.horizontalHeader()
+    for col, width in ((0, 210), (1, 105), (2, 130), (3, 90), (4, 110), (5, 80)):
+        header.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+        win.shortcuts_list.setColumnWidth(col, width)
+    header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+    header.setStretchLastSection(True)
+    header.setSectionsClickable(True)
     win.shortcuts_list.setSortingEnabled(True)
     win.shortcuts_list.horizontalHeader().sortIndicatorChanged.connect(
         lambda *_args: QTimer.singleShot(0, win, win._filter_library_list)
@@ -554,6 +587,7 @@ def build_library_page(win: MainWindow) -> QWidget:
 
     lib_layout.addWidget(build_library_grid(win), 1)
     lib_layout.addWidget(_build_library_empty_state(win), 1)
+    lib_layout.addWidget(_build_library_no_results_state(win), 1)
 
     win.btn_play_game = QPushButton(tr("library.btn_play"))
     win.btn_play_game.setObjectName("primaryBtn")
@@ -595,14 +629,17 @@ def build_library_page(win: MainWindow) -> QWidget:
     win.btn_game_art = QPushButton(tr("art.btn_selected"))
     win.btn_game_art.setToolTip(tr("art.btn_selected_tip"))
     win.btn_game_art.clicked.connect(lambda: fetch_selected_art(win))
-    footer = QHBoxLayout()
+    footer = FlowLayout(spacing=8)
     for btn in (
-        win.btn_play_game, win.btn_configure_game, win.btn_move_game, win.btn_game_art, win.btn_favorite,
+        win.btn_play_game,
+        win.btn_configure_game,
+        win.btn_move_game,
+        win.btn_game_art,
+        win.btn_favorite,
         win.btn_protondb,
+        win.btn_remove_game,
     ):
         footer.addWidget(btn)
-    footer.addStretch()
-    footer.addWidget(win.btn_remove_game)
     lib_layout.addLayout(footer)
     win.shortcuts_list.setMinimumHeight(420)
     win.library_grid.setMinimumHeight(420)
@@ -719,6 +756,15 @@ def build_settings_page(win: MainWindow) -> QWidget:
     win.steam_status_lbl = QLabel(win._format_steam_status_text())
     win.steam_status_lbl.setWordWrap(True)
     steam_layout.addWidget(win.steam_status_lbl)
+    win.steam_account_row = QWidget()
+    acct_lay = QFormLayout(win.steam_account_row)
+    acct_lay.setContentsMargins(0, 4, 0, 0)
+    win.steam_account_combo = QComboBox()
+    win.steam_account_combo.setToolTip(tr("settings.steam_account_hint"))
+    win.steam_account_combo.currentIndexChanged.connect(win._on_steam_account_changed)
+    acct_lay.addRow(tr("settings.steam_account_label"), win.steam_account_combo)
+    win.steam_account_row.setVisible(False)
+    steam_layout.addWidget(win.steam_account_row)
     steam_layout.addWidget(note_label(tr("settings.redetect_hint")))
     layout.addWidget(steam)
 
