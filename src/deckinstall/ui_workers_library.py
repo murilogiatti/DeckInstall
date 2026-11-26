@@ -13,7 +13,7 @@ from .external_actions import (
     import_external_saves_to_target,
 )
 from .extractor import sanitize_folder_name
-from .fsutil import clean_child_env
+from .fsutil import clean_child_env, sleep_inhibit_problem
 from .gameinfo import detect_game_tech
 from .i18n import tr
 from .launcher_scan import ExternalLauncherGame, scan_external_launcher_games
@@ -341,6 +341,8 @@ class LaunchPrepWorker(QThread):
     """Prepare launch command, working directory, and environment for a game."""
 
     ready = Signal(str, str, list, object, object)
+    # The game starts anyway; this says why the PC may sleep or dim while it runs.
+    inhibit_unavailable = Signal(str)
 
     def __init__(
         self,
@@ -382,6 +384,9 @@ class LaunchPrepWorker(QThread):
                 if is_win32_prefix(obj.prefix_dir):
                     self.ready.emit("win32", "", [], None, None)
                     return
+                problem = sleep_inhibit_problem()
+                if problem:
+                    self.inhibit_unavailable.emit(problem)
                 _, fallback_name_opt = resolve_standalone_proton_fallback(obj)
                 fallback_name = fallback_name_opt or ""
                 if fallback_name:

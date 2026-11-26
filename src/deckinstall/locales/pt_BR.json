@@ -499,6 +499,7 @@
   "vdf_queue.btn_apply": "Aplicar agora",
   "vdf_queue.btn_apply_exit": "Aplicar e sair",
   "vdf_queue.btn_clear": "Descartar",
+  "play.inhibit_unavailable": "\"{name}\" vai abrir normalmente, mas o DeckInstall não conseguiu impedir que a tela apague ou o PC suspenda enquanto o jogo roda.\nMotivo: {reason}\nSe isso atrapalhar, aumente o tempo de suspensão nas configurações de energia do sistema ou use o modo Steam.",
   "vdf_queue.cleared": "Alterações pendentes descartadas.",
   "vdf_queue.save_failed": "Não foi possível guardar a alteração de \"{name}\" para a Steam. Ela NÃO ficou pendente; nada foi alterado.\n\nMotivo: {err}\n\nVerifique o espaço livre e as permissões da pasta pessoal e tente de novo.",
   "vdf_queue.clear_failed": "Não foi possível descartar as alterações pendentes; elas continuam guardadas.\n\nMotivo: {err}",

@@ -515,6 +515,33 @@ _APP_ONLY_ENV_KEYS = (
 )
 
 
+def sleep_inhibit_problem(timeout: float = 5.0) -> str:
+    """Why the PC cannot be kept awake while a game runs ("" when systemd-inhibit works).
+
+    Runs the same request the game launcher makes, around a no-op command, so the answer
+    matches what will happen when the game starts.
+    """
+    import shutil
+    import subprocess
+
+    exe = shutil.which("systemd-inhibit")
+    if exe is None:
+        return "systemd-inhibit is not installed"
+    try:
+        proc = subprocess.run(
+            [exe, "--what=idle", "--mode=block", "--who=DeckInstall", "--why=check", "true"],
+            capture_output=True, text=True, timeout=timeout, check=False, env=clean_child_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return f"systemd-inhibit did not answer within {timeout:g} s"
+    except OSError as exc:
+        return str(exc)
+    if proc.returncode == 0:
+        return ""
+    text = (proc.stderr or proc.stdout or "").strip()
+    return text.splitlines()[0][:300] if text else f"systemd-inhibit exited with code {proc.returncode}"
+
+
 def clean_child_env(base: dict[str, str] | None = None) -> dict[str, str]:
     """Environment for programs DeckInstall starts (games, installers, Steam, the new AppImage).
 

@@ -56,15 +56,15 @@ def test_windows_launcher_logs_and_keeps_args(tmp_path: Path) -> None:
     standalone.update_standalone_launch_options(game.game_dir, launch_options="%command% -dx11")
     script = game.launch_script.read_text(encoding="utf-8")
     assert subprocess.run(["bash", "-n", str(game.launch_script)]).returncode == 0
-    run_line = next(line for line in script.splitlines() if "umu-run" in line and "|| rc=" in line)
-    assert run_line.endswith("-dx11 || rc=$?") and not run_line.startswith("exec ")
+    run_lines = [line for line in script.splitlines() if "umu-run" in line and "|| rc=" in line]
+    assert run_lines and all(not line.lstrip().startswith("exec ") for line in run_lines)
+    assert all("-dx11" in line for line in run_lines)
     # The run log starts with the exact command and the environment umu-run gets.
     assert "== DeckInstall: command: " in script and "-dx11" in script.split("command: ", 1)[1].splitlines()[0]
     assert "export STEAM_COMPAT_LIBRARY_PATHS=" in script
     assert f"export PROTON_LOG_DIR={standalone.game_log_dir(game)}" in script
     assert "export UMU_RUNTIME_UPDATE=0" in script  # only once the weekly check stamp is fresh
-    assert 'INHIBIT=(systemd-inhibit --what=idle' in script
-    assert run_line.startswith('${INHIBIT[@]+"${INHIBIT[@]}"} ')
+    assert "systemd-inhibit --what=idle --mode=block --who=DeckInstall" in script
     assert script.rstrip().endswith('exit "$rc"')
 
 
@@ -94,7 +94,7 @@ def test_before_and_after_commands_run_around_the_game(tmp_path: Path) -> None:
     data = json.loads((game.game_dir / MANIFEST_V2).read_text(encoding="utf-8"))
     assert data["runtime"]["hooks"] == {"pre": f"echo before >> {marker}; false", "post": f"echo after >> {marker}"}
     standalone.set_launch_hooks(game, "", "")
-    assert "bash -c" not in game.launch_script.read_text(encoding="utf-8")
+    assert "the command before the game failed" not in game.launch_script.read_text(encoding="utf-8")
     try:
         standalone.set_launch_hooks(game, "a\nb", "")
     except ValueError:

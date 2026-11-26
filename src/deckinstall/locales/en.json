@@ -506,6 +506,7 @@
   "vdf_queue.load_future": "The queue of Steam changes was made by a newer DeckInstall and was not used. The file was kept at:\n{kept}\nUpdate DeckInstall to apply it.",
   "vdf_queue.load_partial": "The queue of Steam changes had invalid items: {kept_count} are still pending and {dropped} were left out. The complete original file was kept at:\n{kept}",
   "vdf_queue.load_not_kept": "(a copy could not be kept)",
+  "play.inhibit_unavailable": "\"{name}\" will start normally, but DeckInstall could not stop the screen from dimming or the PC from sleeping while the game runs.\nReason: {reason}\nIf that gets in the way, raise the sleep timeout in the system power settings or use Steam mode.",
   "vdf_queue.cleared": "Pending changes discarded.",
   "vdf_queue.close_prompt": "{count} change(s) are waiting to go to Steam. Apply them before exiting? Steam will close and reopen.",
   "vdf_queue.enqueued": "Change to \"{name}\" saved. It goes to Steam when you use Desktop Mode.",

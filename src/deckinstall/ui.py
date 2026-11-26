@@ -3616,6 +3616,15 @@ class MainWindow(QMainWindow):
         worker = LaunchPrepWorker(kind, obj, paths_snap)
         self._track_worker(worker)
         worker.ready.connect(_on_prep_ready)
+
+        def _on_inhibit_unavailable(reason: str) -> None:
+            if self._closing_pending:
+                return
+            msg = tr("play.inhibit_unavailable", name=title_name, reason=reason)
+            logging.warning("%s", msg)
+            self.notify(msg, "warning")
+
+        worker.inhibit_unavailable.connect(_on_inhibit_unavailable)
         worker.start()
 
     def _move_selected_game(self) -> None:

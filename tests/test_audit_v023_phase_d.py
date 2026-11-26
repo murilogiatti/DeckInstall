@@ -51,8 +51,11 @@ def test_launch_script_round_trips_quoted_arguments_and_merges_dll_overrides(tmp
     script = launch.read_text(encoding="utf-8").splitlines()
     assert "export DXVK_CONFIG='custom config'" in script
     assert "export WINEDLLOVERRIDES='dxgi=b;d3d11=n,b'" in script
-    assert shlex.split(script[-1])[-2:] == ["some arg", ";"]
-    assert script[-1].endswith(" ';'")
+    runs = [line for line in script if line.strip().endswith("|| rc=$?")]
+    assert len(runs) == 3  # under systemd-inhibit, its fallback, and without it
+    for line in runs:
+        assert shlex.split(line.strip().removesuffix("|| rc=$?"))[-2:] == ["some arg", ";"]
+    assert script[-1] == 'exit "$rc"'
     assert os.access(launch, os.X_OK)
 
 
