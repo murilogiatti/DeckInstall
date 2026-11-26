@@ -108,7 +108,24 @@ def _gpu() -> list[dict[str, str]]:
     if gpu.has_nvidia:
         detail += "; NVIDIA driver " + ("loaded" if gpu.nvidia_driver_present else "NOT loaded")
     status = WARN if gpu.has_nvidia and not gpu.nvidia_driver_present else INFO
-    return [_check("gpu", status, detail)]
+    checks = [_check("gpu", status, detail)]
+    from .hardware import detect_hardware
+
+    profile = detect_hardware()
+    for card in profile.gpus:
+        role = "primary" if card is profile.primary else "other"
+        kind = "integrated" if card.integrated else "dedicated"
+        driver = card.driver
+        if card.proprietary_nvidia and profile.nvidia_driver:
+            driver += f" {profile.nvidia_driver}"
+        checks.append(_check(
+            f"gpu {card.pci}",
+            WARN if card.driver == "nouveau" else INFO,
+            f"{card.name or card.vendor} ({role}, {kind}, {card.generation or '?'}, driver {driver or '?'})",
+        ))
+    if profile.device:
+        checks.append(_check("device", INFO, profile.device))
+    return checks
 
 
 def _userns() -> list[dict[str, str]]:

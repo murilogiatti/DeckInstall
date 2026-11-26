@@ -24,8 +24,9 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __app_name__
+from ..hardware import hardware
 from ..i18n import tr
-from ..launch_presets import apply_presets
+from ..launch_presets import apply_presets, parse_presets, recommended_upscaler
 from ..optiscaler import (
     OPTISCALER_BACKENDS,
     OPTISCALER_FG_MODES,
@@ -563,6 +564,13 @@ def open_optiscaler_dialog(
             if r_idx >= 0:
                 combo_proxy.setCurrentIndex(r_idx)
                 combo_proxy.setToolTip(tr("optiscaler.proxy_recommended", proxy=f"{recommended}.dll"))
+            # Not installed yet: start from the upscaler that suits the GPU this game runs on.
+            game_gpu = hardware().game_gpu(bool(parse_presets(_current_opts()).get("prime")))
+            b_idx = combo_backend.findData(recommended_upscaler(game_gpu))
+            if b_idx >= 0 and combo_backend.currentData() == "auto":
+                combo_backend.setCurrentIndex(b_idx)
+                if game_gpu is not None:
+                    combo_backend.setToolTip(tr("optiscaler.backend_for_gpu", name=game_gpu.name or game_gpu.vendor))
 
     def _refresh_state_ui() -> None:
         game_exe = exe_path
@@ -601,6 +609,16 @@ def open_optiscaler_dialog(
         else:
             lbl_progress.setVisible(False)
             _refresh_state_ui()
+
+    def _current_opts() -> str:
+        if isinstance(obj, StandaloneGame):
+            return str(obj.launch_options or "")
+        if kind == "external":
+            from ..external_actions import load_external_launch_presets
+            from ..launcher_scan import ExternalLauncherGame
+
+            return load_external_launch_presets(obj) if isinstance(obj, ExternalLauncherGame) else ""
+        return current_steam_opts
 
     def _current_winedll() -> str:
         if kind == "standalone":

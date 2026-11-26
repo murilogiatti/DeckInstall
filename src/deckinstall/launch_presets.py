@@ -32,25 +32,21 @@ MANGOHUD_LEVELS = (1, 2, 3, 4)
 @dataclass(frozen=True)
 class Toggle:
     """An on/off preset that is just environment variables (exact tokens, so a custom value the
-    user typed, e.g. PROTON_FSR4_UPGRADE=4.0.1, is left alone and the box shows off).
-
-    gpu: when the dialog offers it: "" always, "amd"/"intel"/"nvidia" with that GPU, "wayland" in
-    a Wayland session; it is always shown while it is on.
-    """
+    user typed, e.g. PROTON_FSR4_UPGRADE=4.0.1, is left alone and the box shows off)."""
 
     key: str
     tokens: tuple[str, ...]
     section: str  # "gpu", "upscaler" or "compat"
-    gpu: str = ""
 
 
-# Data, not code: one line per preset. Upscaler upgrades need GE-Proton (or Proton-CachyOS).
+# Data, not code: one line per preset.
 TOGGLES: tuple[Toggle, ...] = (
-    Toggle("fsr4_upgrade", ("PROTON_FSR4_UPGRADE=1",), "upscaler", "amd"),
-    Toggle("fsr4_rdna3", ("PROTON_FSR4_RDNA3_UPGRADE=1",), "upscaler", "amd"),
+    Toggle("fsr4_upgrade", ("PROTON_FSR4_UPGRADE=1",), "upscaler"),
+    Toggle("fsr4_rdna3", ("PROTON_FSR4_RDNA3_UPGRADE=1",), "upscaler"),
     Toggle("xess_upgrade", ("PROTON_XESS_UPGRADE=1",), "upscaler"),
-    Toggle("hdr", ("PROTON_ENABLE_HDR=1",), "gpu", "wayland"),
-    Toggle("vendor_amd", ("DXVK_CONFIG=dxgi.customVendorId=1002",), "gpu", "intel"),
+    Toggle("hdr", ("PROTON_ENABLE_HDR=1",), "gpu"),
+    Toggle("vendor_amd", ("DXVK_CONFIG=dxgi.customVendorId=1002",), "gpu"),
+    Toggle("descriptor_heap", ("VKD3D_CONFIG=descriptor_heap",), "gpu"),
     Toggle("large_address", ("PROTON_FORCE_LARGE_ADDRESS_AWARE=1",), "compat"),
     Toggle("prefer_sdl", ("PROTON_PREFER_SDL=1",), "compat"),
 )
@@ -61,11 +57,119 @@ _FRAME_RATE_KEYS = ("DXVK_FRAME_RATE", "VKD3D_FRAME_RATE")
 FLAGS = FLAGS + tuple(toggle.key for toggle in TOGGLES)
 
 
-def toggle_offered(toggle: Toggle, gpu: Any, active: bool) -> bool:
-    """Whether the dialog shows this toggle on this machine (always while it is on)."""
-    if active or not toggle.gpu:
-        return True
-    return bool(getattr(gpu, {"wayland": "is_wayland"}.get(toggle.gpu, f"has_{toggle.gpu}"), False))
+@dataclass(frozen=True)
+class Need:
+    """What a preset needs, checked against the GPU the game runs on and its Proton.
+
+    vendor: another vendor hides the preset (nothing to say); everything else greys it out with
+    the reason, so the user knows why and what would make it work.
+    """
+
+    vendor: str = ""
+    generations: tuple[str, ...] = ()
+    proprietary_nvidia: bool = False
+    min_nvidia: int = 0
+    ge_proton: bool = False  # GE-Proton / Proton-CachyOS variables; Valve's Proton ignores them
+    hybrid: bool = False
+    wayland: bool = False  # a Wayland or gamescope session
+
+
+NEEDS: dict[str, Need] = {
+    "nvapi": Need(vendor="nvidia", proprietary_nvidia=True),
+    "dlss_upgrade": Need(vendor="nvidia", generations=("rtx",), proprietary_nvidia=True, ge_proton=True),
+    "descriptor_heap": Need(vendor="nvidia", proprietary_nvidia=True, min_nvidia=595),
+    "fsr4_upgrade": Need(vendor="amd", generations=("rdna4",), ge_proton=True),
+    "fsr4_rdna3": Need(vendor="amd", generations=("rdna3",), ge_proton=True),
+    "xess_upgrade": Need(ge_proton=True),
+    "vendor_amd": Need(vendor="intel"),
+    "prime": Need(hybrid=True),
+    "wayland": Need(wayland=True),
+    "hdr": Need(wayland=True),
+}
+
+OK, HIDE, OFF = "ok", "hide", "off"
+
+
+def proton_kind(name: str) -> str:
+    """"ge", "cachyos", "valve" or "" (unknown) from a compatibility tool name or id."""
+    low = name.lower()
+    if "cachyos" in low:
+        return "cachyos"
+    if "ge-proton" in low or low.startswith("ge_") or "proton-ge" in low:
+        return "ge"
+    if "proton" in low:
+        return "valve"
+    return ""
+
+
+def availability(key: str, gpu: Any, profile: Any, proton: str = "") -> tuple[str, str]:
+    """(OK, "") or (HIDE | OFF, reason) for a preset on the game's GPU (a hardware.Gpu) and Proton.
+
+    Reasons: "need_nvidia_driver", "need_rtx", "need_rdna4", "need_rdna3", "need_nvidia_595",
+    "need_ge", "need_wayland". Unknown hardware or Proton never blocks.
+    """
+    need = NEEDS.get(key)
+    if need is None:
+        return OK, ""
+    if need.hybrid and profile is not None and not profile.is_hybrid:
+        return HIDE, ""
+    if gpu is not None:
+        if need.vendor and gpu.vendor != need.vendor:
+            return HIDE, ""
+        if need.proprietary_nvidia and gpu.driver != "nvidia":
+            return OFF, "need_nvidia_driver"
+        if need.generations and gpu.generation and gpu.generation not in need.generations:
+            return OFF, f"need_{need.generations[0]}"
+        if need.min_nvidia and profile is not None and 0 < profile.nvidia_major < need.min_nvidia:
+            return OFF, "need_nvidia_595"
+    if need.ge_proton and proton == "valve":
+        return OFF, "need_ge"
+    if need.wayland and profile is not None and profile.session == "x11":
+        return OFF, "need_wayland"
+    return OK, ""
+
+
+def recommend(profile: Any, proton: str = "", frame_rate: int = 0) -> dict[str, Any]:
+    """The presets this computer benefits from, as changes to apply (never turns anything off).
+
+    Hybrid laptop: the game goes to the dedicated GPU. NVIDIA: NVAPI (+ DLSS upgrade on RTX);
+    AMD RDNA4: FSR 4; Intel: newest XeSS; handheld: a 40 FPS cap (battery) when none is set.
+    Each one only when `availability` allows it on the GPU the game will run on.
+    """
+    changes: dict[str, Any] = {}
+    dedicated = profile.dedicated if profile is not None else None
+    if dedicated is not None and not dedicated.integrated:
+        changes["prime"] = True
+    gpu = profile.game_gpu(bool(changes.get("prime"))) if profile is not None else None
+
+    def want(key: str) -> None:
+        if availability(key, gpu, profile, proton)[0] == OK:
+            changes[key] = True
+
+    if gpu is not None:
+        if gpu.vendor == "nvidia":
+            want("nvapi")
+            if gpu.generation == "rtx":
+                want("dlss_upgrade")
+        elif gpu.vendor == "amd" and gpu.generation == "rdna4":
+            want("fsr4_upgrade")
+        elif gpu.vendor == "intel":
+            want("xess_upgrade")
+    if profile is not None and profile.device and not frame_rate:
+        changes["frame_rate"] = 40
+    return changes
+
+
+def recommended_upscaler(gpu: Any) -> str:
+    """OptiScaler backend for a GPU: DLSS on RTX, XeSS on Intel, FSR 3.1 elsewhere (cheap on
+    weak GPUs such as the Steam Deck's; XeSS without Intel hardware costs more); unknown: auto."""
+    if gpu is None:
+        return "auto"
+    if gpu.vendor == "nvidia" and gpu.generation == "rtx" and gpu.driver == "nvidia":
+        return "dlss"
+    if gpu.vendor == "intel":
+        return "xess"
+    return "fsr3"
 
 
 def parse_presets(opts: str) -> dict[str, Any]:

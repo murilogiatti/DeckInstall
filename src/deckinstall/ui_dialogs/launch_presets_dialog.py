@@ -29,8 +29,20 @@ from PySide6.QtWidgets import (
 
 from .. import __app_name__
 from ..external_actions import load_external_launch_presets, save_external_launch_presets
+from ..hardware import Gpu, hardware
 from ..i18n import tr
-from ..launch_presets import FRAME_RATES, TOGGLES, apply_presets, parse_presets, toggle_offered
+from ..launch_presets import (
+    FRAME_RATES,
+    HIDE,
+    OFF,
+    OK,
+    TOGGLES,
+    apply_presets,
+    availability,
+    parse_presets,
+    proton_kind,
+    recommend,
+)
 from ..launcher_scan import ExternalLauncherGame
 from ..modes import feature_note, mode_of_kind
 from ..optiscaler import inspect_optiscaler_state
@@ -44,6 +56,7 @@ from ..runtime_manager import (
 from ..standalone import StandaloneGame, update_standalone_launch_options
 from ..steam_vdf import (
     ShortcutEntry,
+    get_shortcut_proton,
     merge_winedlloverride,
     remove_winedlloverride,
     update_shortcut_launch_options,
@@ -65,6 +78,30 @@ if TYPE_CHECKING:
     from ..ui import MainWindow
 
 
+def game_proton(win: MainWindow, kind: str, obj: object | None) -> str:
+    """The Proton kind a game runs on ("ge", "cachyos", "valve" or "" when unknown)."""
+    if isinstance(obj, StandaloneGame):
+        return proton_kind(obj.proton_name or "GE-Proton")  # default: newest GE (or the system CachyOS)
+    if isinstance(obj, ExternalLauncherGame):
+        return proton_kind(obj.runtime)
+    if isinstance(obj, ShortcutEntry) and win.paths is not None:
+        try:
+            tool = get_shortcut_proton(win.paths.config_vdf, obj.appid_u32)
+        except Exception:  # an unreadable config.vdf only means "unknown"
+            tool = ""
+        if isinstance(tool, str) and tool:
+            return proton_kind(tool)
+        managed = win._managed_library_game(obj)
+        return proton_kind(managed.proton_name) if isinstance(managed, StandaloneGame) else ""
+    return "ge" if kind == "standalone" else ""
+
+
+def _gpu_label(gpu: Gpu) -> str:
+    """'NVIDIA GeForce RTX 3050 Laptop GPU (dedicated)' for the dialog."""
+    kind = tr("hw.integrated") if gpu.integrated else tr("hw.dedicated")
+    return f"{gpu.name or gpu.vendor.upper()} ({kind})"
+
+
 def open_launch_presets_dialog(
     win: MainWindow,
     title: str,
@@ -75,8 +112,12 @@ def open_launch_presets_dialog(
     is_native_linux: bool = False,
     parent: QWidget | None = None,
     mode: str | None = None,
+    proton: str = "",
 ) -> tuple[str, str] | None:
     """Open launch options presets dialog and return (launch_opts, winedll) or None.
+
+    proton: the game's Proton kind ("ge", "cachyos", "valve" or "" unknown): presets that only
+    GE-Proton reads are greyed out for Valve's Proton.
 
     parent: the dialog that asked (e.g. Configure game), so the child stays above it under gamescope/Wayland.
     mode: Steam or Standalone (default: from kind). Options a mode does not use are shown greyed out
@@ -99,6 +140,16 @@ def open_launch_presets_dialog(
     dlg.setWindowTitle(tr("launch.title", name=title))
     dlg.resize(640, 640)
     dlg_lay = QVBoxLayout(dlg)
+
+    # Which GPU the game runs on (the options below are judged for it), and one click for the
+    # presets this computer benefits from.
+    lbl_game_gpu = note_label()
+    btn_recommend = QPushButton(tr("launch.btn_recommend"))
+    btn_recommend.setToolTip(tr("launch.recommend_tip"))
+    top_row = QHBoxLayout()
+    top_row.addWidget(lbl_game_gpu, 1)
+    top_row.addWidget(btn_recommend)
+    dlg_lay.addLayout(top_row)
 
     # One tab per group, so every setting of the game (upscaler included) is in this one window.
     tabs = QTabWidget()
@@ -191,7 +242,7 @@ def open_launch_presets_dialog(
     mh_opts_col.addLayout(mh_level_row)
     mh_opts_col.addLayout(mh_extra_row)
 
-    gpu = win._get_gpu_profile()
+    profile = hardware()
     nvapi_active = bool(st["nvapi"])
     prime_active = bool(st["prime"])
     wayland_active = bool(st["wayland"])
@@ -227,6 +278,7 @@ def open_launch_presets_dialog(
         "vendor_amd": (tr("launch.vendor_amd"), tr("launch.vendor_amd_hint")),
         "large_address": (tr("launch.large_address"), tr("launch.large_address_hint")),
         "prefer_sdl": (tr("launch.prefer_sdl"), tr("launch.prefer_sdl_hint")),
+        "descriptor_heap": (tr("launch.descriptor_heap"), tr("launch.descriptor_heap_hint")),
     }
     toggle_checks: dict[str, QCheckBox] = {}
     for toggle in TOGGLES:
@@ -494,6 +546,8 @@ def open_launch_presets_dialog(
         btn_opti.setEnabled(usable)
         if not usable:
             card_lay.addWidget(note_label(tr("launch.optiscaler_after_install")))
+        if proton == "cachyos":
+            card_lay.addWidget(note_label(tr("launch.optiscaler_cachyos")))
         btn_opti.clicked.connect(lambda: win._open_optiscaler_dialog(kind, target, on_saved=_on_opti_saved))
 
     _section(tr("launch.section_performance"))
@@ -511,73 +565,86 @@ def open_launch_presets_dialog(
         _add(_muted_hint(tr("launch.frame_rate_hint")))
         frame_combo.currentIndexChanged.connect(_sync_preview)
 
+    # Options that depend on the hardware or the Proton: shown, greyed out with the reason, or
+    # hidden (another GPU vendor), always judged for the GPU the game runs on.
+    ruled: dict[str, tuple[QCheckBox, QLabel, str]] = {}
+    reasons = {
+        "need_nvidia_driver": tr("launch.need_nvidia_driver"),
+        "need_rtx": tr("launch.need_rtx"),
+        "need_rdna4": tr("launch.need_rdna4"),
+        "need_rdna3": tr("launch.need_rdna3"),
+        "need_nvidia_595": tr("launch.need_nvidia_595"),
+        "need_ge": tr("launch.need_ge"),
+        "need_wayland": tr("launch.need_wayland"),
+    }
+
+    def _ruled(key: str, chk: QCheckBox, hint_text: str) -> None:
+        chk.toggled.connect(_sync_preview)
+        hint = _muted_hint(hint_text)
+        _add(chk)
+        _add(hint)
+        ruled[key] = (chk, hint, hint_text)
+
     def _add_toggles(section: str) -> None:
         for toggle in TOGGLES:
-            chk = toggle_checks[toggle.key]
-            if toggle.section != section:
-                continue
-            if is_native_linux or not toggle_offered(toggle, gpu, chk.isChecked()):
-                chk.setVisible(False)
-                continue
-            chk.toggled.connect(_sync_preview)
-            _add(chk)
-            _add(_muted_hint(toggle_texts[toggle.key][1]))
+            if toggle.section == section:
+                _ruled(toggle.key, toggle_checks[toggle.key], toggle_texts[toggle.key][1])
 
-    def _offered(section: str) -> bool:
-        return not is_native_linux and any(
-            t.section == section and toggle_offered(t, gpu, toggle_checks[t.key].isChecked()) for t in TOGGLES
+    def _refresh_rules() -> None:
+        game_gpu = profile.game_gpu(chk_prime.isChecked())
+        for key, (chk, hint, normal) in ruled.items():
+            state, reason = availability(key, game_gpu, profile, proton)
+            on = chk.isChecked()  # an option already on stays usable, so it can be turned off
+            chk.setVisible(state != HIDE or on)
+            hint.setVisible(state != HIDE or on)
+            chk.setEnabled(state == OK or on)
+            hint.setText(reasons.get(reason, normal) if state == OFF else normal)
+        lbl_game_gpu.setText(
+            tr("launch.game_gpu", name=_gpu_label(game_gpu)) if game_gpu is not None else tr("launch.game_gpu_unknown")
         )
 
-    gpu_rows = (
-        ((not is_native_linux) and (gpu.has_nvidia or nvapi_active))
-        or (gpu.is_hybrid or prime_active)
-        or _offered("gpu")
-    )
-    if gpu_rows:
+    if not is_native_linux:
         _section(tr("launch.section_gpu"))
-    if (not is_native_linux) and (gpu.has_nvidia or nvapi_active):
-        chk_nvapi.toggled.connect(_sync_preview)
-        _add(chk_nvapi)
-        _add(_muted_hint(tr("launch.nvidia_nvapi_hint")))
-    else:
-        chk_nvapi.setVisible(False)
-        chk_nvapi.setEnabled(False)
-    if gpu.is_hybrid or prime_active:
-        if not gpu.has_nvidia:
-            chk_prime.setText(tr("launch.prime_offload_mesa"))
-        chk_prime.toggled.connect(_sync_preview)
-        _add(chk_prime)
-        prime_hint = tr("launch.prime_offload_hint") if gpu.has_nvidia else tr("launch.prime_offload_mesa_hint")
-        _add(_muted_hint(prime_hint))
-    if gpu_rows:
+        _ruled("nvapi", chk_nvapi, tr("launch.nvidia_nvapi_hint"))
+        dedicated = profile.dedicated
+        if dedicated is not None:
+            chk_prime.setText(tr("launch.prime_on_gpu", name=dedicated.name or dedicated.vendor.upper()))
+        prime_hint = (
+            tr("launch.prime_offload_hint")
+            if dedicated is not None and dedicated.vendor == "nvidia"
+            else tr("launch.prime_offload_mesa_hint")
+        )
+        _ruled("prime", chk_prime, prime_hint)
+        chk_prime.toggled.connect(lambda _on: _refresh_rules())
         _add_toggles("gpu")
 
-    # Upscaler: Proton's own upgrades, then OptiScaler (files in the game folder) for this game.
-    if not is_native_linux:
+        # Upscaler: Proton's own upgrades, then OptiScaler (files in the game folder) for this game.
         _section(tr("launch.section_upscaler"))
-        if gpu.has_nvidia or bool(st["dlss_upgrade"]):
-            chk_dlss.toggled.connect(_sync_preview)
-            _add(chk_dlss)
-            _add(_muted_hint(tr("launch.dlss_hint")))
-        else:
-            chk_dlss.setVisible(False)
-            chk_dlss.setEnabled(False)
+        _ruled("dlss_upgrade", chk_dlss, tr("launch.dlss_hint"))
         _add_toggles("upscaler")
         _add(note_label(tr("launch.upscaler_needs_ge")))
         _add_optiscaler_card()
-    else:
-        chk_dlss.setVisible(False)
-        chk_dlss.setEnabled(False)
 
-    if not is_native_linux:
         _section(tr("launch.section_compat"))
-    if (not is_native_linux) and (gpu.is_wayland or wayland_active):
-        chk_wayland.toggled.connect(_sync_preview)
-        _add(chk_wayland)
-        _add(_muted_hint(tr("launch.proton_wayland_hint")))
+        _ruled("wayland", chk_wayland, tr("launch.proton_wayland_hint"))
     else:
-        chk_wayland.setVisible(False)
-        chk_wayland.setEnabled(False)
+        for chk in (chk_nvapi, chk_dlss, chk_wayland, *toggle_checks.values()):
+            chk.setVisible(False)
+            chk.setEnabled(False)
+        if profile.dedicated is not None or chk_prime.isChecked():  # native games use the dGPU too
+            _section(tr("launch.section_gpu"))
+            if profile.dedicated is not None:
+                dgpu_name = profile.dedicated.name or profile.dedicated.vendor.upper()
+                chk_prime.setText(tr("launch.prime_on_gpu", name=dgpu_name))
+            nvidia_dgpu = profile.dedicated is not None and profile.dedicated.vendor == "nvidia"
+            _ruled(
+                "prime",
+                chk_prime,
+                tr("launch.prime_offload_hint") if nvidia_dgpu else tr("launch.prime_offload_mesa_hint"),
+            )
+        else:
+            chk_prime.setVisible(False)
+            chk_prime.setEnabled(False)
 
     if not is_native_linux:
         for chk, hint in (
@@ -588,7 +655,11 @@ def open_launch_presets_dialog(
             chk.toggled.connect(_sync_preview)
             _add(chk)
             _add(_muted_hint(hint))
-        _add_toggles("compat")
+        for toggle in TOGGLES:
+            if toggle.section == "compat":
+                toggle_checks[toggle.key].toggled.connect(_sync_preview)
+                _add(toggle_checks[toggle.key])
+                _add(_muted_hint(toggle_texts[toggle.key][1]))
         chk_dxgi.toggled.connect(_on_dxgi_toggled)
         _add(chk_dxgi)
         _add(_muted_hint(tr("launch.dxgi_hint")))
@@ -626,6 +697,29 @@ def open_launch_presets_dialog(
         _sync_preview()  # drop MangoHud from options a Steam-mode game keeps from before
 
     dlg_lay.addWidget(tabs, 1)
+
+    def _apply_recommended() -> None:
+        changes = recommend(profile, proton, int(frame_combo.currentData() or 0))
+        if changes.pop("prime", False) and chk_prime.isEnabled():
+            chk_prime.setChecked(True)  # first: the rest is judged for the dedicated GPU
+        if shutil.which("gamemoderun"):
+            chk_gm.setChecked(True)
+        checks = {"nvapi": chk_nvapi, "dlss_upgrade": chk_dlss, **toggle_checks}
+        for key, value in changes.items():
+            if key == "frame_rate":
+                idx = frame_combo.findData(value)
+                if idx >= 0:
+                    frame_combo.setCurrentIndex(idx)
+            elif key in checks and checks[key].isEnabled():
+                checks[key].setChecked(bool(value))
+        game_gpu = profile.game_gpu(chk_prime.isChecked())
+        lbl_game_gpu.setText(
+            tr("launch.recommended_done", name=_gpu_label(game_gpu) if game_gpu else "-")
+        )
+
+    btn_recommend.clicked.connect(_apply_recommended)
+    btn_recommend.setVisible(not is_native_linux)
+    _refresh_rules()
 
     # The result, always in sight: the line the game starts with (editable by hand).
     result_card, result_lay, _top = section_card(tr("launch.raw_label"))
@@ -706,6 +800,7 @@ def edit_launch_options_presets(
         game_obj=obj,
         is_native_linux=_is_native_linux_game(kind, obj),
         parent=parent,
+        proton=game_proton(win, kind, obj),
     )
     if res is None:
         return

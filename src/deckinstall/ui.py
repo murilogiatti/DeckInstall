@@ -332,6 +332,8 @@ class MainWindow(QMainWindow):
     btn_remove_game: QPushButton
     btn_scan: QPushButton
     btn_scan_folders: QPushButton
+    lbl_hardware: QLabel
+    lbl_hardware_notes: QLabel
     btn_shortcut_desktop: QCheckBox
     btn_shortcut_menu: QCheckBox
     btn_shortcut_steam: QCheckBox
@@ -1779,6 +1781,7 @@ class MainWindow(QMainWindow):
             game_obj=None,
             is_native_linux=self._is_add_exe_native(),
             mode=self._selected_install_mode(),
+            proton="ge" if self._selected_install_mode() == STANDALONE else "",  # Steam: its own choice
         )
         if res is None:
             return
@@ -3591,6 +3594,7 @@ class MainWindow(QMainWindow):
         is_native_linux: bool = False,
         parent: QWidget | None = None,
         mode: str | None = None,
+        proton: str = "",
     ) -> tuple[str, str] | None:
         return open_launch_presets_dialog(
             self,
@@ -3602,6 +3606,7 @@ class MainWindow(QMainWindow):
             is_native_linux=is_native_linux,
             parent=parent,
             mode=mode,
+            proton=proton,
         )
 
     def _edit_launch_options_presets(

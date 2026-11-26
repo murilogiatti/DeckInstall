@@ -137,15 +137,90 @@ def test_toggle_presets_round_trip_and_keep_custom_values() -> None:
     assert native == ""  # Proton-only presets never reach a native Linux game
 
 
-def test_toggles_are_offered_by_gpu_and_always_while_on() -> None:
-    from types import SimpleNamespace
+def test_presets_are_judged_for_the_game_gpu_and_its_proton() -> None:
+    from deckinstall.hardware import Gpu, HardwareProfile
+    from deckinstall.launch_presets import HIDE, OFF, OK, availability, proton_kind
 
-    from deckinstall.launch_presets import TOGGLES, toggle_offered
+    vega = Gpu("amd", "amdgpu", "0000:06:00.0", "Vega", True, True, "gcn", 512)
+    rtx = Gpu("nvidia", "nvidia", "0000:01:00.0", "RTX 3050", False, False, "rtx")
+    laptop = HardwareProfile("amd", "Ryzen 5 5600H with Radeon Graphics", "", (rtx, vega), "wayland", "595.99")
+    assert availability("fsr4_upgrade", vega, laptop, "ge") == (OFF, "need_rdna4")  # Vega is not RDNA 4
+    assert availability("dlss_upgrade", vega, laptop, "ge")[0] == HIDE  # an NVIDIA option on the AMD GPU
+    assert availability("dlss_upgrade", rtx, laptop, "ge") == (OK, "")
+    assert availability("dlss_upgrade", rtx, laptop, "valve") == (OFF, "need_ge")
+    assert availability("descriptor_heap", rtx, laptop, "") == (OK, "")
+    assert availability("prime", vega, laptop, "") == (OK, "")
+    old_driver = HardwareProfile("amd", "", "", (rtx, vega), "x11", "580.1")
+    assert availability("descriptor_heap", rtx, old_driver, "") == (OFF, "need_nvidia_595")
+    assert availability("hdr", rtx, old_driver, "") == (OFF, "need_wayland")
+    nouveau = Gpu("nvidia", "nouveau", "0000:01:00.0", "GTX 1060", False, True, "gtx")
+    assert availability("nvapi", nouveau, None, "") == (OFF, "need_nvidia_driver")
+    deck = HardwareProfile("amd", "AMD Custom APU 0932", "Steam Deck", (vega,), "gamescope")
+    assert availability("prime", vega, deck, "")[0] == HIDE  # one GPU: nothing to send elsewhere
+    assert availability("vendor_amd", vega, deck, "")[0] == HIDE
+    assert availability("xess_upgrade", None, None, "") == (OK, "")  # unknown hardware never blocks
+    assert [proton_kind(n) for n in ("GE-Proton11-14", "proton-cachyos-11", "proton_experimental", "")] == [
+        "ge", "cachyos", "valve", ""
+    ]
 
-    by_key = {toggle.key: toggle for toggle in TOGGLES}
-    intel = SimpleNamespace(has_amd=False, has_intel=True, has_nvidia=False, is_wayland=False)
-    assert toggle_offered(by_key["vendor_amd"], intel, False)
-    assert not toggle_offered(by_key["fsr4_upgrade"], intel, False)
-    assert toggle_offered(by_key["fsr4_upgrade"], intel, True)  # on: shown so it can be turned off
-    assert toggle_offered(by_key["xess_upgrade"], intel, False)
-    assert not toggle_offered(by_key["hdr"], intel, False)
+
+def test_recommended_for_this_pc() -> None:
+    from deckinstall.hardware import Gpu, HardwareProfile
+    from deckinstall.launch_presets import recommend, recommended_upscaler
+
+    vega = Gpu("amd", "amdgpu", "a", "Vega", True, True, "gcn", 512)
+    rtx = Gpu("nvidia", "nvidia", "b", "RTX 3050", False, False, "rtx")
+    laptop = HardwareProfile("amd", "", "", (rtx, vega), "wayland", "595.99")
+    assert recommend(laptop, "ge") == {"prime": True, "nvapi": True, "dlss_upgrade": True}
+    assert recommend(laptop, "valve") == {"prime": True, "nvapi": True}  # DLSS upgrade needs GE-Proton
+    deck_gpu = Gpu("amd", "amdgpu", "c", "Custom GPU 0405", True, True, "rdna2", 1024)
+    deck = HardwareProfile("amd", "AMD Custom APU 0932", "Steam Deck", (deck_gpu,), "gamescope")
+    assert recommend(deck, "ge") == {"frame_rate": 40}
+    assert recommend(deck, "ge", frame_rate=60) == {}  # a cap the user chose stays
+    rdna4 = HardwareProfile("amd", "", "", (Gpu("amd", "amdgpu", "d", "RX 9070", False, True, "rdna4", 16384),), "x11")
+    assert recommend(rdna4, "ge") == {"fsr4_upgrade": True}
+    arc = Gpu("intel", "xe", "0000:03:00.0", "Arc B580", False, True, "arc")
+    assert recommend(HardwareProfile("intel", "", "", (arc,), "wayland"), "cachyos") == {"xess_upgrade": True}
+    assert [recommended_upscaler(g) for g in (rtx, arc, deck_gpu, None)] == ["dlss", "xess", "fsr3", "auto"]
+
+
+def test_presets_window_follows_the_gpu_the_game_runs_on() -> None:
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication, QCheckBox, QWidget
+
+    from deckinstall.hardware import Gpu, HardwareProfile
+    from deckinstall.i18n import tr
+    from deckinstall.ui_dialogs import launch_presets_dialog as lpd
+
+    app = QApplication.instance() or QApplication([])
+    vega = Gpu("amd", "amdgpu", "a", "Radeon Vega", True, True, "gcn", 512)
+    rtx = Gpu("nvidia", "nvidia", "b", "RTX 3050", False, False, "rtx")
+    laptop = HardwareProfile("amd", "", "", (rtx, vega), "wayland", "595.99")
+    parent = QWidget()
+    seen: dict[str, object] = {}
+
+    def inspect() -> None:
+        dlg = QApplication.activeModalWidget()
+        if dlg is None:
+            QTimer.singleShot(10, inspect)
+            return
+        boxes = {c.text(): c for c in dlg.findChildren(QCheckBox)}
+        fsr4, dlss = boxes[tr("launch.fsr4_upgrade")], boxes[tr("launch.dlss_upgrade")]
+        prime = boxes[tr("launch.prime_on_gpu", name="RTX 3050")]
+        seen["on_vega"] = (not fsr4.isHidden(), fsr4.isEnabled(), not dlss.isHidden())
+        prime.setChecked(True)
+        seen["on_rtx"] = (not fsr4.isHidden(), not dlss.isHidden(), dlss.isEnabled())
+        dlg.reject()
+
+    try:
+        with mock.patch.object(lpd, "hardware", return_value=laptop):
+            QTimer.singleShot(0, inspect)
+            res = lpd.open_launch_presets_dialog(
+                mock.Mock(), "Game", "standalone", "", "", parent=parent, proton="ge"
+            )
+        assert res is None
+        assert seen["on_vega"] == (True, False, False)  # FSR 4: greyed with the reason; DLSS: not for AMD
+        assert seen["on_rtx"] == (False, True, True)  # sent to the RTX: DLSS appears, AMD options go
+    finally:
+        parent.deleteLater()
+        app.processEvents()

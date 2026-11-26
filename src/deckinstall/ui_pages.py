@@ -674,6 +674,12 @@ def build_settings_page(win: MainWindow) -> QWidget:
     look_layout.addLayout(look_form)
     layout.addWidget(look)
 
+    # This computer: what was detected and what it means for games.
+    from .ui_hardware import build_hardware_card, refresh_hardware_card
+
+    layout.addWidget(build_hardware_card(win))
+    refresh_hardware_card(win)
+
     # Steam: which one is in use, and the button to look again (top right, like every status card).
     steam, steam_layout, steam_top = section_card(tr("settings.steam_title"))
     win.btn_redetect_steam = QPushButton(tr("sidebar.redetect_steam"))
