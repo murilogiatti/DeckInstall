@@ -535,8 +535,10 @@ def _show(
                 edit = QueuedVdfEdit(f"bulk_migrate_compat:{tool}:{','.join(map(str, appids))}",
                                      "bulk_migrate_compat", 0, tr("proton_bulk.queue_label", tool=display_tool),
                                      {"appids": appids, "target_tool": tool})
-            win.enqueue_vdf_edit(edit)
-            _reload([*lines, tr("proton_bulk.queued", count=len(appids))])
+            if win.enqueue_vdf_edit(edit):
+                _reload([*lines, tr("proton_bulk.queued", count=len(appids))])
+            else:
+                _reload(lines)
             return
 
         def _write() -> int:

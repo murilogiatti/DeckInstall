@@ -223,7 +223,7 @@ from .ui_workers import (  # noqa: F401
 )
 from .ui_workers_library import compute_library_sizes
 from .uninstall import GAME_FILES, SHORTCUTS, UninstallPlan, UninstallResult, execute_uninstall, plan_uninstall
-from .vdf_queue import BatchApplyResult, QueuedVdfEdit, VdfEditQueue
+from .vdf_queue import BatchApplyResult, QueuedVdfEdit, VdfEditQueue, VdfQueueSaveError
 
 
 class LaunchPresetState(TypedDict):
@@ -2786,8 +2786,12 @@ class MainWindow(QMainWindow):
         """Gaming Mode cannot close Steam: Steam edits wait in the saved queue instead of applying now."""
         return self.paths is not None and is_gamescope_session()
 
-    def enqueue_vdf_edit(self, edit: QueuedVdfEdit, *, trigger_watch: bool = True) -> None:
-        """Enqueue a VDF edit; it is applied once Steam is closed."""
+    def enqueue_vdf_edit(self, edit: QueuedVdfEdit, *, trigger_watch: bool = True) -> bool:
+        """Enqueue a VDF edit; it is applied once Steam is closed.
+
+        Returns False (after telling the user) when the queue could not be saved: the edit is
+        then not pending, so callers must not announce it as waiting.
+        """
         if self.paths is not None:
             payload = dict(edit.payload)
             path_user_id = getattr(self.paths, "user_id", None)
@@ -2798,16 +2802,42 @@ class MainWindow(QMainWindow):
                 payload["steam_root"] = str(path_steam_root)
             if payload != edit.payload:
                 edit = replace(edit, payload=payload)
-        self._vdf_queue.enqueue(edit)
+        try:
+            self._vdf_queue.enqueue(edit)
+        except VdfQueueSaveError as exc:
+            msg = tr("vdf_queue.save_failed", name=edit.label or str(edit.appid_u32), err=str(exc))
+            self.status_label.setText(msg.splitlines()[0])
+            if not self._closing_pending:
+                QMessageBox.warning(_dialog_parent(self), __app_name__, msg)
+            return False
         self._vdf_auto_paused = False
         self._update_vdf_queue_banner()
         if trigger_watch:
             self._vdf_watch_tick()
+        return True
+
+    def _report_vdf_queue_load_problem(self) -> None:
+        """Tell the user once when the saved Steam edit queue could not be read as it was."""
+        problem = self._vdf_queue.load_problem
+        if problem is None:
+            return
+        self._vdf_queue.load_problem = None
+        kept = str(problem.preserved) if problem.preserved is not None else tr("vdf_queue.load_not_kept")
+        if problem.kind == "future_version":
+            msg = tr("vdf_queue.load_future", kept=kept)
+        elif problem.kind == "invalid_entries":
+            msg = tr("vdf_queue.load_partial", kept_count=problem.kept, dropped=problem.dropped, kept=kept)
+        else:
+            msg = tr("vdf_queue.load_unreadable", kept=kept)
+        logging.warning("Steam edit queue: %s", msg)
+        self.status_label.setText(msg.splitlines()[0])
+        self.notify(msg, "warning")
 
     def _on_vdf_queue_paths_ready(self) -> None:
         """Steam was (re)detected: pick up edits saved earlier (e.g. in Gaming Mode) and apply if Steam is closed."""
         if self._busy_count == 0:  # never swap the list under a running apply
             self._vdf_queue.reload()
+        self._report_vdf_queue_load_problem()
         self._vdf_auto_paused = False
         self._update_vdf_queue_banner()
         self._vdf_watch_tick()
@@ -2897,7 +2927,8 @@ class MainWindow(QMainWindow):
         def _apply() -> object:
             if is_steam_running():  # Steam was started again since the poll: keep waiting
                 return None
-            return queue.apply_all(paths)
+            res = queue.apply_all(paths, steam_running=is_steam_running)  # checked again under the locks
+            return None if getattr(res, "steam_running", False) else res
 
         self._vdf_applying = True
         self._begin_busy()
@@ -2916,6 +2947,9 @@ class MainWindow(QMainWindow):
             self._review_queued_game_removals(res)
             applied = getattr(res, "applied", 0)
             errors = list(getattr(res, "errors", []))
+            confirm_error = str(getattr(res, "confirm_error", "") or "")
+            if confirm_error:
+                errors.append(tr("vdf_queue.confirm_failed", err=confirm_error))
             if errors:
                 self._vdf_auto_paused = True  # do not retry failing edits in a loop
                 msg = tr("vdf_queue.applied_errors", applied=applied, errs="\n".join(errors))
@@ -3002,7 +3036,11 @@ class MainWindow(QMainWindow):
         box.open()
 
     def _clear_vdf_queue(self) -> None:
-        self._vdf_queue.clear()
+        try:
+            self._vdf_queue.clear()
+        except VdfQueueSaveError as exc:
+            QMessageBox.warning(_dialog_parent(self), __app_name__, tr("vdf_queue.clear_failed", err=str(exc)))
+            return
         self._update_vdf_queue_banner()
         self.status_label.setText(tr("vdf_queue.cleared"))
 
@@ -4034,9 +4072,9 @@ class MainWindow(QMainWindow):
         ]
 
         def _queue() -> None:
-            for edit in edits:
-                self.enqueue_vdf_edit(edit)
-            self.status_label.setText(tr("add.steam_shortcuts_queued", count=len(edits)))
+            queued = sum(1 for edit in edits if self.enqueue_vdf_edit(edit))
+            if queued:
+                self.status_label.setText(tr("add.steam_shortcuts_queued", count=queued))
             if on_done is not None:
                 on_done()
 

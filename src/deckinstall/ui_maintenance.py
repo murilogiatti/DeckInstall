@@ -762,7 +762,8 @@ def open_uninstall_runtimes_dialog(win: MainWindow, kinds: set[str] | None = Non
                             tr("proton_bulk.queue_label", tool=tr("proton.steam_default_label")),
                             {"appids": affected, "target_tool": ""},
                         )
-                        win.enqueue_vdf_edit(edit)
+                        if not win.enqueue_vdf_edit(edit):
+                            return
                         QMessageBox.information(
                             msg_parent, __app_name__, tr("runtime.uninstall_steam_queued", count=len(affected))
                         )

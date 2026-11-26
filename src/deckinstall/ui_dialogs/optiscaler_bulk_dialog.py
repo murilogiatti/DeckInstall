@@ -474,9 +474,10 @@ def _show(
                 _finish(outcomes, fresh, [tr("add.steam_missing")])
                 return
             if win.should_queue_vdf_edits():
+                queued = 0
                 for source, appid, name, opts in writes:
                     op: VdfEditOp = "set_launch_options" if source == "shortcut" else "set_app_launch_options"
-                    win.enqueue_vdf_edit(
+                    queued += win.enqueue_vdf_edit(
                         QueuedVdfEdit(
                             edit_id=f"{op}:{appid}",
                             op=op,
@@ -485,7 +486,7 @@ def _show(
                             payload={"launch_options": opts},
                         )
                     )
-                _finish(outcomes, fresh, [tr("optiscaler_bulk.queued", count=len(writes))])
+                _finish(outcomes, fresh, [tr("optiscaler_bulk.queued", count=queued)])
                 return
 
             def _go_vdf() -> None:

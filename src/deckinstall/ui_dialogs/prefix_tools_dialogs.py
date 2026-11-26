@@ -708,13 +708,15 @@ def open_optiscaler_dialog(
 
         def _queue_steam_winedll() -> None:
             nonlocal current_steam_opts
-            win.enqueue_vdf_edit(
+            if not win.enqueue_vdf_edit(
                 QueuedVdfEdit(
                     f"set_launch_options:{entry.appid_u32}", "set_launch_options",
                     entry.appid_u32, entry.app_name, {"launch_options": new_opts},
                 ),
                 trigger_watch=win.should_queue_vdf_edits(),
-            )
+            ):
+                _set_busy(False)
+                return
             current_steam_opts = new_opts
             if on_saved is not None:
                 on_saved(new_opts)

@@ -957,7 +957,7 @@ def save_launch_options(
         except Exception as exc:
             QMessageBox.critical(box_parent(), __app_name__, str(exc))
             return
-        win.enqueue_vdf_edit(
+        if not win.enqueue_vdf_edit(
             QueuedVdfEdit(
                 edit_id=f"set_launch_options:{entry.appid_u32}",
                 op="set_launch_options",
@@ -965,7 +965,8 @@ def save_launch_options(
                 label=title_name,
                 payload={"launch_options": new_opts},
             )
-        )
+        ):
+            return
         win._refresh_shortcuts()
         msg = tr("vdf_queue.enqueued", name=title_name)
         win.status_label.setText(msg)

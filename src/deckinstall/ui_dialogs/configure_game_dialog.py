@@ -1047,7 +1047,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                             active_proton_ref[0] = tool_id
                             msg = tr("proton.updated", name=entry.app_name, tool=display_tool)
                             if queued:
-                                win.enqueue_vdf_edit(
+                                if win.enqueue_vdf_edit(
                                     QueuedVdfEdit(
                                         f"set_proton:{entry.appid_u32}",
                                         "set_proton",
@@ -1055,8 +1055,10 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                                         entry.app_name,
                                         {"tool_name": target_steam_tool},
                                     )
-                                )
-                                msg = tr("vdf_queue.enqueued", name=entry.app_name)
+                                ):
+                                    msg = tr("vdf_queue.enqueued", name=entry.app_name)
+                                else:
+                                    msg = tr("vdf_queue.save_failed", name=entry.app_name, err="").split("\n")[0]
                             win._refresh_shortcuts()
                             win.status_label.setText(msg)
                             if dlg_alive():

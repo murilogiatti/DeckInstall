@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
+import time
+from collections.abc import Callable
 from contextlib import ExitStack, nullcontext
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -19,6 +22,7 @@ from .steam_vdf import (
     _vdf_batch_backup_scope,
     add_or_update_shortcut,
     bulk_migrate_compat_tool,
+    load_shortcuts,
     remove_orphan_shortcut_mappings,
     remove_shortcut,
     set_shortcut_proton,
@@ -67,13 +71,38 @@ class QueuedVdfEdit:
     payload: dict[str, Any]
 
 
+class VdfQueueSaveError(OSError):
+    """The queue file could not be written: the edit is NOT pending (nothing was announced)."""
+
+
+@dataclass(frozen=True)
+class QueueLoadProblem:
+    """The saved queue could not be read as is. The original file is kept at ``preserved``."""
+
+    kind: Literal["unreadable", "future_version", "invalid_entries"]
+    preserved: Path | None
+    kept: int
+    dropped: int
+    detail: str = ""
+
+
 @dataclass(frozen=True)
 class BatchApplyResult:
-    """Summary of applying all queued VDF edits."""
+    """Summary of applying all queued VDF edits.
+
+    ``applied`` counts edits whose effect is in Steam's files now (``already_done`` of them were
+    found already in place, e.g. after an interrupted earlier run, and were not written again).
+    ``confirm_error`` is set when Steam's files were changed but the queue file could not be
+    updated: those edits are recognised as done on the next run instead of being repeated.
+    ``steam_running`` means nothing was written because Steam was running when the write began.
+    """
 
     applied: int
     errors: list[str]
     removed_for_review: tuple[tuple[int, str], ...] = ()
+    already_done: int = 0
+    confirm_error: str = ""
+    steam_running: bool = False
 
 
 class VdfEditQueue:
@@ -88,9 +117,18 @@ class VdfEditQueue:
         self._apply_lock = threading.Lock()
         self._queue: list[QueuedVdfEdit] = []
         self._store_path = store_path
+        self.load_problem: QueueLoadProblem | None = None
         if store_path is not None:
             with self._store_lock():
-                self._queue = _load_edits(store_path)
+                self._queue = self._load()
+
+    def _load(self) -> list[QueuedVdfEdit]:
+        """Read the queue file; a bad file is preserved aside and reported (never fatal)."""
+        assert self._store_path is not None
+        edits, problem = load_queue_file(self._store_path)
+        if problem is not None:
+            self.load_problem = problem
+        return edits
 
     def _store_lock(self):
         if self._store_path is None:
@@ -98,6 +136,7 @@ class VdfEditQueue:
         return _file_lock(self._store_path.with_suffix(".lock"))
 
     def _save(self) -> None:
+        """Persist the queue. Raises VdfQueueSaveError when the file cannot be written."""
         if self._store_path is None:
             return
         try:
@@ -108,18 +147,24 @@ class VdfEditQueue:
             atomic_write_text(self._store_path, json.dumps(data, indent=2, ensure_ascii=False, default=str))
         except OSError as exc:
             logging.warning("Could not save the Steam edit queue to %s: %s", self._store_path, exc)
+            raise VdfQueueSaveError(exc.errno or 0, f"Could not save the Steam edit queue: {exc}") from exc
 
     def reload(self) -> None:
         """Re-read the queue file (another DeckInstall instance may have changed it)."""
         if self._store_path is not None:
             with self._lock, self._store_lock():
-                self._queue = _load_edits(self._store_path)
+                self._queue = self._load()
 
     def enqueue(self, edit: QueuedVdfEdit) -> None:
-        """Add an edit to the queue, coalescing set_proton/set_launch_options by (op, appid_u32)."""
+        """Add an edit to the queue, coalescing set_proton/set_launch_options by (op, appid_u32).
+
+        Raises VdfQueueSaveError when the queue file cannot be written; the edit is then not
+        pending and the in-memory queue is left as it was on disk.
+        """
         with self._lock, self._store_lock():
             if self._store_path is not None:
-                self._queue = _load_edits(self._store_path)
+                self._queue = self._load()
+            before = list(self._queue)
             if edit.op in _COALESCIBLE_OPS:
                 key = _coalescing_key(edit)
                 self._queue = [
@@ -130,25 +175,41 @@ class VdfEditQueue:
                     existing for existing in self._queue if existing.edit_id != edit.edit_id
                 ]
             self._queue.append(edit)
-            self._save()
+            try:
+                self._save()
+            except VdfQueueSaveError:
+                self._queue = before
+                raise
 
     def remove(self, edit_id: str) -> bool:
-        """Remove a queued edit by edit_id. Returns True if an entry was removed."""
+        """Remove a queued edit by edit_id. Returns True if an entry was removed.
+
+        Raises VdfQueueSaveError when the removal could not be saved (the edit stays pending).
+        """
         with self._lock, self._store_lock():
             if self._store_path is not None:
-                self._queue = _load_edits(self._store_path)
-            before = len(self._queue)
+                self._queue = self._load()
+            before = list(self._queue)
             self._queue = [edit for edit in self._queue if edit.edit_id != edit_id]
-            removed = len(self._queue) < before
+            removed = len(self._queue) < len(before)
             if removed:
-                self._save()
+                try:
+                    self._save()
+                except VdfQueueSaveError:
+                    self._queue = before
+                    raise
             return removed
 
     def clear(self) -> None:
-        """Discard all pending edits."""
+        """Discard all pending edits. Raises VdfQueueSaveError when the file cannot be removed."""
         with self._lock, self._store_lock():
+            before = list(self._queue)
             self._queue.clear()
-            self._save()
+            try:
+                self._save()
+            except VdfQueueSaveError:
+                self._queue = before
+                raise
 
     def pending_count(self) -> int:
         """Return the number of queued edits."""
@@ -160,17 +221,23 @@ class VdfEditQueue:
         with self._lock:
             return list(self._queue)
 
-    def apply_all(self, paths: SteamPaths) -> BatchApplyResult:
-        """Apply all queued edits under a single transaction lock and single backup pass."""
+    def apply_all(
+        self, paths: SteamPaths, *, steam_running: Callable[[], bool] | None = None
+    ) -> BatchApplyResult:
+        """Apply all queued edits under a single transaction lock and single backup pass.
+
+        ``steam_running`` is checked again once the locks are held, right before the first
+        write: when it returns True nothing is written and ``steam_running`` is set in the result.
+        """
         apply_lock = (
             _file_lock(self._store_path.with_suffix(".apply.lock"))
             if self._store_path is not None
             else self._apply_lock
         )
         with apply_lock:
-            return self._apply_batch(paths)
+            return self._apply_batch(paths, steam_running)
 
-    def _apply_batch(self, paths: SteamPaths) -> BatchApplyResult:
+    def _apply_batch(self, paths: SteamPaths, steam_running: Callable[[], bool] | None = None) -> BatchApplyResult:
         self.reload()
         with self._lock:
             batch = list(self._queue)
@@ -178,6 +245,7 @@ class VdfEditQueue:
             return BatchApplyResult(applied=0, errors=[])
 
         applied = 0
+        already_done = 0
         errors: list[str] = []
         succeeded: list[QueuedVdfEdit] = []
 
@@ -193,6 +261,8 @@ class VdfEditQueue:
         with ExitStack() as locks:
             for anchor in sorted(anchors):
                 locks.enter_context(_steam_transaction_lock(anchor))
+            if steam_running is not None and steam_running():
+                return BatchApplyResult(applied=0, errors=[], steam_running=True)
             locks.enter_context(_vdf_batch_backup_scope())
             _backup_file(paths.shortcuts_vdf)
             _backup_file(paths.config_vdf)
@@ -201,15 +271,17 @@ class VdfEditQueue:
 
             for edit in batch:
                 try:
-                    self._dispatch_edit(paths, edit)
+                    if self._dispatch_edit(paths, edit) is ALREADY_DONE:
+                        already_done += 1
                     applied += 1
                     succeeded.append(edit)
                 except Exception as exc:
                     errors.append(f"{edit.label}: {exc}")
 
+        confirm_error = ""
         with self._lock, self._store_lock():
             if self._store_path is not None:
-                self._queue = _load_edits(self._store_path)
+                self._queue = self._load()
             remaining: list[QueuedVdfEdit] = []
             for current in self._queue:
                 if any(
@@ -222,10 +294,19 @@ class VdfEditQueue:
                     continue
                 remaining.append(current)
             self._queue = remaining
-            self._save()
+            try:
+                self._save()
+            except VdfQueueSaveError as exc:
+                # Steam's files already have the change; the next run finds it in place and only
+                # confirms it (see _dispatch_edit), so nothing is written twice.
+                confirm_error = str(exc)
+                if self._store_path is not None:
+                    self._queue = self._load()
         return BatchApplyResult(
             applied=applied,
             errors=errors,
+            already_done=already_done,
+            confirm_error=confirm_error,
             removed_for_review=tuple(
                 (edit.appid_u32, edit.label) for edit in succeeded
                 if edit.op == "remove_shortcut" and edit.payload.get("review_cleanup") is True
@@ -269,7 +350,8 @@ class VdfEditQueue:
         )
 
     @staticmethod
-    def _dispatch_edit(paths: SteamPaths, edit: QueuedVdfEdit) -> None:
+    def _dispatch_edit(paths: SteamPaths, edit: QueuedVdfEdit) -> object:
+        """Apply one edit. Returns ALREADY_DONE when its effect was already in Steam's files."""
         payload = edit.payload
         if edit.op == "set_proton":
             target_paths = VdfEditQueue._resolve_edit_paths(paths, payload)
@@ -307,6 +389,8 @@ class VdfEditQueue:
         elif edit.op == "remove_shortcut":
             target_paths = VdfEditQueue._resolve_edit_paths(paths, payload)
             if not remove_shortcut(target_paths, edit.appid_u32):
+                if _shortcut_absent(target_paths, edit.appid_u32):
+                    return ALREADY_DONE  # removed by an earlier, interrupted run (or by the user)
                 raise RuntimeError(f"Atalho {edit.appid_u32} não encontrado em shortcuts.vdf")
         elif edit.op == "update_shortcut_paths":
             target_paths = VdfEditQueue._account_paths(paths, payload)
@@ -349,36 +433,114 @@ class VdfEditQueue:
             )
         else:
             raise ValueError(f"Operação VDF desconhecida: {edit.op}")
+        return None
+
+
+ALREADY_DONE = object()
+
+
+def _shortcut_absent(paths: SteamPaths, appid_u32: int) -> bool:
+    """True when the account's shortcuts.vdf is readable (or absent) and has no such shortcut."""
+    if paths.shortcuts_vdf.is_symlink():
+        return False
+    if not paths.shortcuts_vdf.exists():
+        return paths.userdata_dir.is_dir()
+    try:
+        entries = load_shortcuts(paths.shortcuts_vdf, strict=True)
+    except (OSError, ValueError):
+        return False
+    return all(e.appid_u32 != appid_u32 for e in entries)
+
+
+def _preserve_bad_queue(path: Path, tag: str) -> Path | None:
+    """Move a queue file that cannot be used aside (never deleted), next to the original."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for n in range(100):
+        target = path.with_name(f"{path.name}.{tag}-{stamp}{'' if n == 0 else f'-{n}'}")
+        if target.exists():
+            continue
+        try:
+            os.replace(path, target)
+        except OSError as exc:
+            logging.warning("Could not set the bad Steam edit queue %s aside: %s", path, exc)
+            return None
+        return target
+    return None
+
+
+def _parse_edit(item: object) -> QueuedVdfEdit:
+    if not isinstance(item, dict):
+        raise TypeError(f"entry is {type(item).__name__}, not an object")
+    op = str(item["op"])
+    payload = item.get("payload") or {}
+    if op not in _KNOWN_OPS:
+        raise ValueError(f"unknown operation {op!r}")
+    if not isinstance(payload, dict):
+        raise TypeError("payload is not an object")
+    edit_id = item["edit_id"]
+    if not isinstance(edit_id, str) or not edit_id:
+        raise ValueError("missing edit_id")
+    appid = item["appid_u32"]
+    if isinstance(appid, bool) or not isinstance(appid, int) or not (0 <= appid <= 0xFFFFFFFF):
+        raise ValueError(f"bad appid_u32 {appid!r}")
+    return QueuedVdfEdit(
+        edit_id=edit_id, op=cast(VdfEditOp, op), appid_u32=appid,
+        label=str(item.get("label") or ""), payload=payload,
+    )
+
+
+def load_queue_file(path: Path) -> tuple[list[QueuedVdfEdit], QueueLoadProblem | None]:
+    """Read a saved queue. Never raises for bad content.
+
+    An empty or missing file is an empty queue. An unreadable file, one written by a newer
+    DeckInstall, or one with invalid entries is moved aside unchanged (``.invalid-*`` or
+    ``.v<N>-*``) and reported; the valid entries of a partly invalid file are kept.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return [], None
+    except OSError as exc:
+        logging.warning("Cannot read the Steam edit queue %s: %s", path, exc)
+        return [], QueueLoadProblem("unreadable", None, 0, 0, str(exc))
+    if not text.strip():
+        return [], None
+    try:
+        raw = json.loads(text)
+    except ValueError as exc:
+        kept = _preserve_bad_queue(path, "invalid")
+        logging.warning("Unreadable Steam edit queue %s set aside as %s: %s", path, kept, exc)
+        return [], QueueLoadProblem("unreadable", kept, 0, 0, str(exc))
+    version = raw.get("version") if isinstance(raw, dict) else None
+    if isinstance(version, int) and not isinstance(version, bool) and version > QUEUE_FILE_VERSION:
+        kept = _preserve_bad_queue(path, f"v{version}")
+        logging.warning("Steam edit queue %s from a newer DeckInstall (v%s) set aside as %s", path, version, kept)
+        return [], QueueLoadProblem("future_version", kept, 0, 0, f"version {version}")
+    raw_edits = raw.get("edits") if isinstance(raw, dict) else None
+    if version != QUEUE_FILE_VERSION or not isinstance(raw_edits, list):
+        kept = _preserve_bad_queue(path, "invalid")
+        logging.warning("Steam edit queue %s has an unknown layout; set aside as %s", path, kept)
+        return [], QueueLoadProblem("unreadable", kept, 0, 0, "unknown layout")
+    edits: list[QueuedVdfEdit] = []
+    bad: list[str] = []
+    for item in raw_edits:
+        try:
+            edits.append(_parse_edit(item))
+        except (KeyError, TypeError, ValueError) as exc:
+            bad.append(str(exc))
+            logging.warning("Invalid queued Steam edit %r: %s", item, exc)
+    if not bad:
+        return edits, None
+    kept = _preserve_bad_queue(path, "invalid")
+    if kept is not None and edits:
+        try:  # the valid entries stay pending; the original (with the bad ones) is kept aside
+            data = {"version": QUEUE_FILE_VERSION, "edits": [asdict(e) for e in edits]}
+            atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False, default=str))
+        except OSError as exc:
+            logging.warning("Could not rewrite the Steam edit queue %s: %s", path, exc)
+    return edits, QueueLoadProblem("invalid_entries", kept, len(edits), len(bad), "; ".join(bad[:3]))
 
 
 def _load_edits(path: Path) -> list[QueuedVdfEdit]:
-    """Read a saved queue; unreadable files or entries are skipped (and logged), never fatal."""
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return []
-    except (OSError, ValueError) as exc:
-        logging.warning("Ignoring unreadable Steam edit queue %s: %s", path, exc)
-        return []
-    if not isinstance(raw, dict) or raw.get("version") != QUEUE_FILE_VERSION:
-        logging.warning("Ignoring Steam edit queue %s with unknown version", path)
-        return []
-    edits: list[QueuedVdfEdit] = []
-    for item in raw.get("edits") or []:
-        try:
-            op = str(item["op"])
-            payload = item.get("payload") or {}
-            if op not in _KNOWN_OPS or not isinstance(payload, dict):
-                raise ValueError(op)
-            edits.append(
-                QueuedVdfEdit(
-                    edit_id=str(item["edit_id"]),
-                    op=cast(VdfEditOp, op),
-                    appid_u32=int(item["appid_u32"]),
-                    label=str(item.get("label") or ""),
-                    payload=payload,
-                )
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            logging.warning("Skipping invalid queued Steam edit %r: %s", item, exc)
-    return edits
+    """Read a saved queue (bad files are preserved aside and logged), never fatal."""
+    return load_queue_file(path)[0]

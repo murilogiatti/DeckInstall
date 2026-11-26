@@ -55,7 +55,7 @@ def test_edits_wait_while_steam_runs_then_apply_when_closed() -> None:
     applied: list[object] = []
     try:
         win.paths = SimpleNamespace(shortcuts_vdf=Path("/nonexistent"))  # type: ignore[assignment]
-        win._vdf_queue.apply_all = lambda paths: applied.append(paths) or SimpleNamespace(applied=1, errors=[])  # type: ignore[method-assign]
+        win._vdf_queue.apply_all = lambda paths, **_kw: applied.append(paths) or SimpleNamespace(applied=1, errors=[])  # type: ignore[method-assign]
         with (
             mock.patch.object(ui_workers_library, "is_steam_running", side_effect=lambda: running["value"]),
             mock.patch.object(ui, "is_steam_running", side_effect=lambda: running["value"]),
@@ -163,7 +163,7 @@ def test_saved_queue_reloads_on_start_and_applies_when_steam_is_closed() -> None
         assert win._vdf_queue.pending_count() == 1
         assert win.vdf_queue_banner.isHidden()  # no Steam detected: nothing of the queue shows
         win.paths = SimpleNamespace(shortcuts_vdf=Path("/nonexistent"))  # type: ignore[assignment]
-        win._vdf_queue.apply_all = lambda paths: applied.append(paths) or SimpleNamespace(applied=1, errors=[])  # type: ignore[method-assign]
+        win._vdf_queue.apply_all = lambda paths, **_kw: applied.append(paths) or SimpleNamespace(applied=1, errors=[])  # type: ignore[method-assign]
         with (
             mock.patch.object(ui_workers_library, "is_steam_running", return_value=False),
             mock.patch.object(ui, "is_steam_running", return_value=False),
@@ -270,4 +270,44 @@ def test_update_with_pending_edits_offers_apply_update_or_cancel() -> None:
         win._vdf_queue.clear()
         _drain(win, app)
         win._active_workers.clear()
+        win.close()
+
+
+def test_enqueue_that_cannot_be_saved_warns_and_is_not_pending(tmp_path: Path) -> None:
+    from deckinstall.vdf_queue import VdfEditQueue, VdfQueueSaveError
+
+    app = QApplication.instance() or QApplication([])
+    win = _window(app)
+    try:
+        win._vdf_queue = VdfEditQueue(tmp_path / "vdf_queue.json")
+        win.paths = None
+        with (
+            mock.patch.object(win._vdf_queue, "enqueue", side_effect=VdfQueueSaveError(28, "disk full")),
+            mock.patch.object(ui.QMessageBox, "warning") as warn,
+        ):
+            assert win.enqueue_vdf_edit(_edit()) is False
+        warn.assert_called_once()
+        assert "NÃO" in warn.call_args.args[2] or "NOT" in warn.call_args.args[2]
+        assert win._vdf_queue.pending_count() == 0
+    finally:
+        _drain(win, app)
+        win.close()
+
+
+def test_bad_queue_file_is_reported_once(tmp_path: Path) -> None:
+    from deckinstall.vdf_queue import VdfEditQueue
+
+    store = tmp_path / "vdf_queue.json"
+    store.write_text('{"version": 1, "edits": {"bad": 1}}', encoding="utf-8")
+    app = QApplication.instance() or QApplication([])
+    win = _window(app)
+    try:
+        win._vdf_queue = VdfEditQueue(store)
+        with mock.patch.object(win, "notify") as notify:
+            win._report_vdf_queue_load_problem()
+            win._report_vdf_queue_load_problem()
+        notify.assert_called_once()
+        assert str(tmp_path) in notify.call_args.args[0]
+    finally:
+        _drain(win, app)
         win.close()
