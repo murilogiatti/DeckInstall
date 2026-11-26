@@ -49,7 +49,7 @@ def test_only_x86_and_x64_pe_run_with_proton(tmp_path: Path) -> None:
     assert scanner.detect_exe_kind(tmp_path / "le.exe") == "unknown"
 
 
-def test_native_launchers_are_discovered_and_dos_executables_are_skipped(tmp_path: Path) -> None:
+def test_native_launchers_are_not_offered_and_dos_executables_are_skipped(tmp_path: Path) -> None:
     dos = tmp_path / "Alien Carnage"
     _write(dos / "CARNAGE.EXE", b"MZ" + b"\x00" * 64)
     _write(dos / "ac-help.exe", _header(b"LE\x00\x00"))
@@ -60,9 +60,8 @@ def test_native_launchers_are_discovered_and_dos_executables_are_skipped(tmp_pat
     start.chmod(0o755)
     elf = _write(native / "game" / "hollow_knight.x86_64", b"\x7fELF" + b"\x00" * 60)
     elf.chmod(0o755)
-    game = scanner.scan_game_folder(native)
-    assert game is not None and game.executables == [start, elf]
-    assert scanner.is_native_linux_exe(start)
+    assert scanner.scan_game_folder(native) is None  # Windows games only
+    assert scanner.is_native_linux_exe(start) and scanner.is_native_linux_exe(elf)
     assert not scanner.is_native_linux_exe(_write(tmp_path / "w.exe"))
 
     arm = tmp_path / "Arm"
@@ -89,26 +88,6 @@ def test_game_root_from_new_files(tmp_path: Path) -> None:
     assert extractor.game_root_from_new_files(target, {nested, top}) == target
     other = _write(target / "Other" / "x.dll", b"x")
     assert extractor.game_root_from_new_files(target, {nested, other}) == target
-
-
-def test_sh_installer_that_picks_its_own_folder(tmp_path: Path) -> None:
-    gog_games = tmp_path / "home" / "GOG Games"
-    gog_games.mkdir(parents=True)
-    _write(gog_games / "Old Game" / "start.sh", b"#!/bin/sh\n")
-    script = _write(tmp_path / "Downloads" / "installer.sh", b"#!/bin/sh\necho hi\n")
-
-    def fake_popen(_cmd: list[str], **_kw: Any) -> mock.Mock:
-        _write(gog_games / "New Game" / "start.sh", b"#!/bin/sh\n")
-        return mock.Mock()
-
-    with (
-        mock.patch.object(extractor, "_native_install_roots", return_value=[gog_games]),
-        mock.patch.object(extractor.subprocess, "Popen", side_effect=fake_popen),
-        mock.patch.object(extractor, "_drain_stream_lines", return_value=0),
-    ):
-        out = extractor.install_native_sh(script, tmp_path / "Lib" / "Games", "New Game")
-    assert out == gog_games / "New Game"
-    assert not (tmp_path / "Lib" / "Games" / "New Game").exists()
 
 
 def _installed_game(tmp_path: Path) -> standalone.StandaloneGame:

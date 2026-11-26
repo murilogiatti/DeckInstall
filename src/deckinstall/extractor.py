@@ -1299,12 +1299,6 @@ def game_root_from_new_files(target_dir: Path, new_files: set[Path]) -> Path:
     return target_dir
 
 
-def _native_install_roots() -> list[Path]:
-    """Folders where Linux .sh installers usually put games when run without a destination."""
-    home = Path.home()
-    return [home / "GOG Games", home / "Games", home]
-
-
 def _child_dirs(roots: list[Path]) -> set[Path]:
     out: set[Path] = set()
     for root in roots:
@@ -1378,82 +1372,3 @@ def extract_gog_installer(
     if on_progress:
         on_progress(100, f"Completed in {final_dir}")
     return final_dir
-
-
-def _is_gog_linux_installer(script: Path) -> bool:
-    try:
-        with zipfile.ZipFile(script) as archive:
-            return any(name.startswith(("data/noarch/", "data/x86_64/")) for name in archive.namelist())
-    except (OSError, zipfile.BadZipFile):
-        return False
-
-
-def install_native_sh(
-    script: Path,
-    dest_root: Path,
-    game_folder_name: str,
-    on_progress: Callable[[int, str], None] | None = None,
-    cancel_flag: Callable[[], bool] | None = None,
-) -> Path:
-    """Install a Linux .sh installer into dest_root/<name>.
-
-    GOG Linux installers (makeself + MojoSetup) carry a zip with the game under data/noarch:
-    that is unpacked directly, with no GUI. Any other .sh is run with dest_root/<name> as its
-    working directory.
-    """
-    final_dir = dest_root / sanitize_folder_name(game_folder_name)
-    dest_root.mkdir(parents=True, exist_ok=True)
-    if _is_gog_linux_installer(script):
-        check_disk_space(dest_root, script.stat().st_size * 2)
-        with tempfile.TemporaryDirectory(prefix="deckinstall_sh_", dir=str(dest_root)) as tmp:
-            tmp_path = Path(tmp)
-            _extract_zip_safe(script, tmp_path, on_progress=on_progress, cancel_flag=cancel_flag)
-            data = tmp_path / "data"
-            root = data / "noarch"
-            if (data / "x86_64").is_dir():
-                _merge_staging_dir(data / "x86_64", root)
-            if on_progress:
-                on_progress(96, "Organizing files...")
-            _strip_symlinks_and_specials(root)
-            _unwrap_single_folder(root, final_dir)
-        start = final_dir / "start.sh"
-        if start.is_file():
-            _safe_chmod(start, start.stat().st_mode | stat.S_IXUSR)
-        if on_progress:
-            on_progress(100, f"Completed in {final_dir}")
-        return final_dir
-
-    final_dir.mkdir(parents=True, exist_ok=True)
-    roots = _native_install_roots()
-    dirs_before = _child_dirs(roots)
-    if on_progress:
-        on_progress(10, f"Running {script.name}...")
-    proc = subprocess.Popen(
-        ["sh", str(script.resolve())],
-        cwd=str(final_dir),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-
-    def _line(line: str) -> None:
-        if on_progress and line.strip():
-            on_progress(50, line.strip()[:140])
-
-    rc = _drain_stream_lines(proc, cancel_flag, _line, "Installer cancelled by user.")
-    if rc != 0:
-        raise RuntimeError(f"{script.name} exited with code {rc}.")
-    result = final_dir
-    if not _collect_regular_files(final_dir):
-        # The installer chose its own folder (e.g. ~/GOG Games/<game>): find the one it created.
-        created = sorted(_child_dirs(roots) - dirs_before - {final_dir})
-        if len(created) == 1:
-            result = created[0]
-            try:
-                final_dir.rmdir()
-            except OSError:
-                pass
-    if on_progress:
-        on_progress(100, f"Completed in {result}")
-    return result

@@ -5,9 +5,9 @@ Kinds:
   gog_setup    GOG offline installer (Inno Setup)       -> innoextract, fallback: run setup
   repack       folder with fg-*.bin / unarc.dll / ISDone.dll / setup-*.bin -> run its setup.exe
   installer    other Windows setup/installer .exe       -> run it
-  native_sh    Linux .sh installer (MojoSetup / makeself) -> run it
+  native_linux Linux .sh installer or Linux binary       -> not supported (Windows games only)
   ready_folder folder with the game already installed   -> pick the executable
-  exe          a single game .exe or Linux binary       -> pick it
+  exe          a single game .exe                       -> pick it
   unknown      anything else
 """
 
@@ -25,12 +25,12 @@ ARCHIVE = "archive"
 GOG_SETUP = "gog_setup"
 REPACK = "repack"
 INSTALLER = "installer"
-NATIVE_SH = "native_sh"
+NATIVE_LINUX = "native_linux"
 READY_FOLDER = "ready_folder"
 EXE = "exe"
 UNKNOWN = "unknown"
 
-INSTALL_KINDS = frozenset({GOG_SETUP, REPACK, INSTALLER, NATIVE_SH})
+INSTALL_KINDS = frozenset({GOG_SETUP, REPACK, INSTALLER})
 
 _REPACK_MARKERS = ("unarc.dll", "isdone.dll", "isskin.dll", "cls-srep.dll")
 _INSTALLSHIELD_MARKERS = ("data1.cab", "data1.hdr", "setup.inx", "issetup.dll", "_isres.dll")
@@ -237,11 +237,38 @@ def _folder_has_executable(folder: Path) -> bool:
                     continue
                 if not entry.is_file(follow_symlinks=False):
                     continue
-                low = entry.name.lower()
-                if low.endswith((".exe", ".x86_64")):
+                if entry.name.lower().endswith(".exe"):
                     return True
-                if depth <= 2 and (entry.stat(follow_symlinks=False).st_mode & 0o111) and (
-                    low in {"start.sh", "launch.sh", "run.sh"} or _is_elf(Path(entry.path))
+            except OSError:
+                continue
+    return False
+
+
+def _folder_looks_native(folder: Path) -> bool:
+    """A folder without Windows executables that holds a Linux game (start.sh, *.x86_64, ELF)."""
+    queue: deque[tuple[Path, int]] = deque([(folder, 0)])
+    scanned = 0
+    while queue and scanned < _SCAN_LIMIT:
+        cur, depth = queue.popleft()
+        try:
+            with os.scandir(cur) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for entry in entries:
+            scanned += 1
+            try:
+                if entry.is_symlink():
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    if depth < 2 and not entry.name.startswith("."):
+                        queue.append((Path(entry.path), depth + 1))
+                    continue
+                low = entry.name.lower()
+                if low.endswith(".x86_64") or (
+                    entry.is_file(follow_symlinks=False)
+                    and (entry.stat(follow_symlinks=False).st_mode & 0o111)
+                    and (low in {"start.sh", "launch.sh", "run.sh"} or _is_elf(Path(entry.path)))
                 ):
                     return True
             except OSError:
@@ -277,11 +304,6 @@ def _has_other_game_exe(folder: Path, setup: Path) -> bool:
                     p = Path(entry.path)
                     if p != setup and not _skip_name(entry.name):
                         return True
-                elif low.endswith(".x86_64") or (
-                    (entry.stat(follow_symlinks=False).st_mode & 0o111)
-                    and (low in {"start.sh", "launch.sh", "run.sh"} or _is_elf(Path(entry.path)))
-                ):
-                    return True
             except OSError:
                 continue
     return False
@@ -322,6 +344,8 @@ def classify_source(path: Path) -> SourceInfo:
             if only_setup and setup is not None:
                 return SourceInfo(INSTALLER, path, installer=setup)
             return SourceInfo(READY_FOLDER, path)
+        if _folder_looks_native(path):
+            return SourceInfo(NATIVE_LINUX, path)
         setup = find_setup_exe(path)
         if setup is not None:
             return SourceInfo(INSTALLER, path, installer=setup)
@@ -332,10 +356,8 @@ def classify_source(path: Path) -> SourceInfo:
     if is_archive(path):
         return SourceInfo(ARCHIVE, path, installer=path)
     suffix = path.suffix.lower()
-    if suffix == ".sh":
-        if path.stem.lower() in {"start", "launch", "run"}:
-            return SourceInfo(EXE, path)
-        return SourceInfo(NATIVE_SH, path, installer=path)
+    if suffix in (".sh", ".x86_64", ".x86", ".appimage"):
+        return SourceInfo(NATIVE_LINUX, path)
     if suffix == ".msi":
         if _skip_name(path.name):
             return SourceInfo(UNKNOWN, path)
@@ -356,7 +378,7 @@ def classify_source(path: Path) -> SourceInfo:
             return SourceInfo(INSTALLER, path, installer=path)
         return SourceInfo(EXE, path)
     if _is_elf(path):
-        return SourceInfo(EXE, path)
+        return SourceInfo(NATIVE_LINUX, path)
     return SourceInfo(UNKNOWN, path)
 
 

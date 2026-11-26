@@ -24,7 +24,6 @@ from .extractor import (
     ToolMissingError,
     UnarcError,
     extract_gog_installer,
-    install_native_sh,
     run_windows_installer,
     sanitize_folder_name,
 )
@@ -141,14 +140,8 @@ class ExtractWorker(QThread):
                 out = self._run_installer(info.installer, repack=True)
             elif info.kind == classify.INSTALLER and info.installer is not None:
                 out = self._run_installer(info.installer)
-            elif info.kind == classify.NATIVE_SH:
-                out = install_native_sh(
-                    self.source,
-                    self.dest_root,
-                    self.folder_name,
-                    on_progress=on_progress,
-                    cancel_flag=self._is_cancelled,
-                )
+            elif info.kind == classify.NATIVE_LINUX:
+                raise RuntimeError(tr("install.native_not_supported"))
             else:
                 raise RuntimeError(tr("install.unsupported_format", name=self.source.name))
             if self._is_cancelled():
@@ -490,17 +483,15 @@ class StandaloneInstallWorker(QThread):
 
     def run(self) -> None:
         try:
-            is_native = is_native_linux_exe(self.exe_path)
-            if is_native:
-                proton_name = ""
-            else:
-                if self.prepare_standalone_runtime:
-                    self.status.emit(tr("add.preparing_runtime"))
-                    ensure_umu_run(progress_cb=lambda msg, _pct: self.status.emit(msg))
-                    # Best effort: GAMEID/STORE lookups (protonfixes) need the umu-database.
-                    _rm.ensure_umu_database(timeout=15)
-                    ensure_ge_proton11(progress_cb=lambda msg, _pct: self.status.emit(msg))
-                proton_name = ""
+            if is_native_linux_exe(self.exe_path):
+                raise RuntimeError(tr("install.native_not_supported"))
+            if self.prepare_standalone_runtime:
+                self.status.emit(tr("add.preparing_runtime"))
+                ensure_umu_run(progress_cb=lambda msg, _pct: self.status.emit(msg))
+                # Best effort: GAMEID/STORE lookups (protonfixes) need the umu-database.
+                _rm.ensure_umu_database(timeout=15)
+                ensure_ge_proton11(progress_cb=lambda msg, _pct: self.status.emit(msg))
+            proton_name = ""
 
             if self.game_dir is not None:
                 game_dir = self.game_dir
@@ -520,18 +511,17 @@ class StandaloneInstallWorker(QThread):
                 game_dir=game_dir,
                 proton_name=proton_name,
                 steam_appid=self.steam_appid,
-                winedlloverrides="" if is_native else self.winedlloverrides,
+                winedlloverrides=self.winedlloverrides,
                 launch_options=self.launch_options,
                 icon_path=self.icon_path,
                 create_menu_shortcut=self.create_menu_shortcut,
                 create_desktop_shortcut=self.create_desktop_shortcut,
                 keep_in_place=self.keep_in_place,
-                native_linux=is_native,
                 single_exe_only=single_exe_only,
                 source={"kind": "folder", "origin": str(game_dir)},
                 library=self.library,
             )
-            bwrap_warn = "" if is_native else (check_ubuntu_bwrap_userns() or "")
+            bwrap_warn = check_ubuntu_bwrap_userns() or ""
             self.finished_ok.emit(game, bwrap_warn)
         except Exception as exc:
             self.failed.emit(_format_worker_error(exc))

@@ -5,12 +5,11 @@ from __future__ import annotations
 import os
 import shlex
 import stat
-import zipfile
 from pathlib import Path
 
 import pytest
 
-from deckinstall import adopt, extractor, play_monitor, standalone, ui_workers
+from deckinstall import adopt, play_monitor, standalone, ui_workers
 from deckinstall.launcher_scan import scan_external_launcher_games
 from deckinstall.manifest import find_manifest
 
@@ -41,23 +40,6 @@ def test_adopt_infers_game_root_above_launcher_binary_subdirectories() -> None:
     config.write_text(f"game:\n  exe: {exe}\n", encoding="utf-8")
     games = adopt.find_adoption_candidates(home=home, kinds=[adopt.LUTRIS])
     assert [game.game_dir for game in games] == [root]
-
-
-def test_gog_linux_merges_architecture_files_and_restores_safe_execute_bits(tmp_path: Path) -> None:
-    script = tmp_path / "setup.sh"
-    with zipfile.ZipFile(script, "w") as archive:
-        archive.writestr("data/noarch/start.sh", "#!/bin/sh\n")
-        archive.writestr("data/noarch/game/readme.txt", "help")
-        binary = zipfile.ZipInfo("data/x86_64/game/game.x86_64")
-        binary.create_system = 3
-        binary.external_attr = (stat.S_IFREG | 0o6755) << 16
-        archive.writestr(binary, b"\x7fELF")
-
-    out = extractor.install_native_sh(script, tmp_path / "library", "RPG")
-    assert (out / "game" / "readme.txt").read_text(encoding="utf-8") == "help"
-    mode = (out / "game" / "game.x86_64").stat().st_mode
-    assert mode & stat.S_IXUSR
-    assert not mode & (stat.S_ISUID | stat.S_ISGID)
 
 
 def test_launch_script_round_trips_quoted_arguments_and_merges_dll_overrides(tmp_path: Path) -> None:

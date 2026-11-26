@@ -291,4 +291,10 @@ def test_main_window_has_one_adopt_entry(app: QApplication, tmp_path: Path) -> N
             assert isinstance(libs, list) and libs and all(isinstance(p, Path) for _, p in libs)
         finally:
             win.paths = None
+            for _ in range(500):  # let the window's background workers finish before it goes away
+                app.processEvents()
+                if not any(w.isRunning() for w in win._active_workers):
+                    break
+                for w in list(win._active_workers):
+                    w.wait(20)
             win.close()

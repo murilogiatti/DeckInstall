@@ -371,24 +371,26 @@ class LaunchPrepWorker(QThread):
             if self._kind == "standalone":
                 obj = self._obj
                 assert isinstance(obj, StandaloneGame)
+                if obj.native_linux:
+                    self.ready.emit("warn", tr("library.native_not_supported", name=obj.name), [], None, None)
+                    return
                 fallback_name = ""
                 try:
                     refresh_launcher_if_outdated(obj)
                 except Exception as exc:  # the old launcher still works
                     logging.warning("Could not refresh the launcher of %s: %s", obj.name, exc)
-                if not obj.native_linux:
-                    if is_win32_prefix(obj.prefix_dir):
-                        self.ready.emit("win32", "", [], None, None)
-                        return
-                    _, fallback_name_opt = resolve_standalone_proton_fallback(obj)
-                    fallback_name = fallback_name_opt or ""
-                    if fallback_name:
-                        update_standalone_launch_options(
-                            obj.game_dir,
-                            winedlloverrides=obj.winedlloverrides,
-                            launch_options=obj.launch_options,
-                            proton_name=fallback_name,
-                        )
+                if is_win32_prefix(obj.prefix_dir):
+                    self.ready.emit("win32", "", [], None, None)
+                    return
+                _, fallback_name_opt = resolve_standalone_proton_fallback(obj)
+                fallback_name = fallback_name_opt or ""
+                if fallback_name:
+                    update_standalone_launch_options(
+                        obj.game_dir,
+                        winedlloverrides=obj.winedlloverrides,
+                        launch_options=obj.launch_options,
+                        proton_name=fallback_name,
+                    )
                 self.ready.emit(
                     "ok",
                     fallback_name,
@@ -401,11 +403,11 @@ class LaunchPrepWorker(QThread):
             if self._kind == "external":
                 obj = self._obj
                 assert isinstance(obj, ExternalLauncherGame)
+                if obj.runner == "linux":
+                    self.ready.emit("warn", tr("library.native_not_supported", name=obj.name), [], None, None)
+                    return
                 if obj.launch_cmd:
                     self.ready.emit("ok", "", list(obj.launch_cmd), None, clean_child_env())
-                    return
-                if obj.runner == "linux":
-                    self.ready.emit("ok", "", [str(obj.exe_path)], obj.game_dir, clean_child_env())
                     return
                 from .runtime_manager import find_system_umu_run, list_cachyos_proton_dirs
 

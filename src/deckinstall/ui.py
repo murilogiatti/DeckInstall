@@ -1466,6 +1466,14 @@ class MainWindow(QMainWindow):
             if not isinstance(result, tuple):
                 return
             info, is_dir, game = result
+            if info.kind == classify.NATIVE_LINUX:
+                self.extract_src.clear()
+                self.extract_details_box.setVisible(False)
+                self.btn_use_extracted.setEnabled(False)
+                msg = tr("install.native_not_supported")
+                self.status_label.setText(msg)
+                QMessageBox.information(_dialog_parent(self), __app_name__, msg)
+                return
             if info.kind == classify.ARCHIVE:
                 self.extract_src.clear()
                 self.extract_details_box.setVisible(False)
@@ -1494,7 +1502,6 @@ class MainWindow(QMainWindow):
             classify.GOG_SETUP: tr("install.detected_gog"),
             classify.REPACK: tr("install.detected_repack", name=info.installer.name if info.installer else ""),
             classify.INSTALLER: tr("install.detected_installer"),
-            classify.NATIVE_SH: tr("install.detected_native_sh"),
         }
         return texts.get(info.kind, "")
 
@@ -2077,7 +2084,10 @@ class MainWindow(QMainWindow):
         if not app_name or not exe_str or not exe_path.is_file():
             QMessageBox.warning(_dialog_parent(self), __app_name__, tr("add.invalid_input"))
             return None
-        if not (is_proton_exe(exe_path) or is_native_linux_exe(exe_path)):
+        if is_native_linux_exe(exe_path):
+            QMessageBox.warning(_dialog_parent(self), __app_name__, tr("install.native_not_supported"))
+            return None
+        if not is_proton_exe(exe_path):
             QMessageBox.warning(_dialog_parent(self), __app_name__, tr("add.not_proton_exe"))
             return None
         return app_name, exe_path

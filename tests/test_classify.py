@@ -41,7 +41,7 @@ def test_archives_and_single_files(tmp_path: Path) -> None:
     assert classify.classify_source(_write(tmp_path / "Game.exe")).kind == classify.EXE
     assert classify.classify_source(_write(tmp_path / "setup.exe")).kind == classify.INSTALLER
     assert classify.classify_source(_write(tmp_path / "Tool.exe", INNO)).kind == classify.INSTALLER
-    assert classify.classify_source(_write(tmp_path / "game.x86_64", b"\x7fELF")).kind == classify.EXE
+    assert classify.classify_source(_write(tmp_path / "game.x86_64", b"\x7fELF")).kind == classify.NATIVE_LINUX
     assert classify.classify_source(_write(tmp_path / "notes.txt", b"hi")).kind == classify.UNKNOWN
 
 
@@ -96,16 +96,14 @@ def test_ready_folder_and_installer_only_folder(tmp_path: Path) -> None:
     assert classify.suggest_install_name(info) == "Only Setup"
 
 
-def test_native_sh_and_gog_linux_unpack(tmp_path: Path) -> None:
+def test_native_linux_sources_are_not_supported(tmp_path: Path) -> None:
     script = _gog_sh(tmp_path / "hollow_knight_1_5_78.sh")
     info = classify.classify_source(script)
-    assert info.kind == classify.NATIVE_SH
-
-    out = extractor.install_native_sh(script, tmp_path / "Games", "Hollow Knight")
-    assert out == tmp_path / "Games" / "Hollow Knight"
-    assert (out / "game" / "game.x86_64").is_file()
-    assert (out / "start.sh").stat().st_mode & 0o100
-    assert not (out / "scripts").exists()
+    assert info.kind == classify.NATIVE_LINUX and not info.needs_install
+    start = _write(tmp_path / "Native" / "start.sh", b"#!/bin/sh\n")
+    start.chmod(0o755)
+    assert classify.classify_source(tmp_path / "Native").kind == classify.NATIVE_LINUX
+    assert not hasattr(extractor, "install_native_sh")
 
 
 def test_gog_extract_needs_innoextract(tmp_path: Path) -> None:
@@ -205,13 +203,13 @@ def test_nsis_msi_and_installshield_classification(tmp_path: Path) -> None:
     linux_msi_dir = tmp_path / "LinuxPlusMsi"
     _write(linux_msi_dir / "game.x86_64", b"\x7fELF")
     _write(linux_msi_dir / "extra.msi", b"\xd0\xcf\x11\xe0")
-    assert classify.classify_source(linux_msi_dir).kind == classify.READY_FOLDER
+    assert classify.classify_source(linux_msi_dir).kind == classify.NATIVE_LINUX
 
     start_msi_dir = tmp_path / "StartShPlusMsi"
     start_sh = _write(start_msi_dir / "start.sh", b"#!/bin/sh\n")
     start_sh.chmod(0o755)
     _write(start_msi_dir / "Extras.msi", b"\xd0\xcf\x11\xe0")
-    assert classify.classify_source(start_msi_dir).kind == classify.READY_FOLDER
+    assert classify.classify_source(start_msi_dir).kind == classify.NATIVE_LINUX
 
     nsis_msi_dir = tmp_path / "NsisPlusMsi"
     nsis_installer = _write(nsis_msi_dir / "Indie_v1.exe", b"MZ" + b"\x00" * 64 + b"NullsoftInst")

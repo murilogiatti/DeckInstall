@@ -172,7 +172,11 @@ def detect_exe_kind(exe_path: Path) -> str:
 
 
 def is_native_linux_exe(path: Path) -> bool:
-    """True for Linux ELF binaries and shebang scripts (e.g. GOG's start.sh)."""
+    """True for Linux ELF binaries and shebang scripts (e.g. GOG's start.sh).
+
+    DeckInstall supports Windows games only: this only recognizes native games so they can be
+    refused at install time and shown as not supported when an older version added them.
+    """
     if detect_exe_kind(path) == "linux_elf":
         return True
     try:
@@ -310,7 +314,6 @@ def _scan_game_tree_scandir(
     should_stop: polled between folders; when it says True the walk gives up and finds nothing.
     """
     exe_scored: list[tuple[tuple[int, int, int, int, int], Path]] = []
-    native_scored: list[tuple[tuple[int, int, int], Path]] = []
     appid_files: list[Path] = []
     ini_files: dict[str, list[Path]] = {
         "steam_emu.ini": [],
@@ -364,9 +367,6 @@ def _scan_game_tree_scandir(
                             appid_files.append(Path(entry.path))
                         elif low in ini_files:
                             ini_files[low].append(Path(entry.path))
-                    if collect_exes and not exe_scored and _is_native_game_entry(entry):
-                        native_score = (0 if low == "start.sh" else 1, rel_depth, -entry.stat().st_size)
-                        native_scored.append((native_score, Path(entry.path)))
         except OSError:
             continue
 
@@ -375,9 +375,7 @@ def _scan_game_tree_scandir(
             for sub in subdirs:
                 queue.append((sub, dir_depth + 1))
 
-    ranked_exes = (
-        [path for _, path in sorted(exe_scored)] if exe_scored else [path for _, path in sorted(native_scored)]
-    )
+    ranked_exes = [path for _, path in sorted(exe_scored)]  # Windows games only
     steam_appid = _extract_steam_appid(appid_files, ini_files)
     return ranked_exes, steam_appid
 
@@ -428,24 +426,6 @@ _HOME_CONTAINERS = frozenset(
 )
 
 
-def _is_native_game_entry(entry: os.DirEntry[str]) -> bool:
-    name = entry.name.lower()
-    if (
-        name.startswith(".") or name.endswith((".so", ".exe")) or ".so." in name
-        or any(pattern in name for pattern in IGNORED_EXE_PATTERNS)
-    ):
-        return False
-    path = Path(entry.path)
-    try:
-        if not entry.stat(follow_symlinks=False).st_mode & 0o111:
-            return False
-        if name == "start.sh":
-            return is_native_linux_exe(path)
-        return detect_exe_kind(path) == "linux_elf"
-    except OSError:
-        return False
-
-
 def _dir_has_game_exe(path: Path) -> bool:
     """True if the folder directly holds a game executable."""
     try:
@@ -458,8 +438,6 @@ def _dir_has_game_exe(path: Path) -> bool:
                     if low.endswith(".exe") and not any(pat in low for pat in IGNORED_EXE_PATTERNS):
                         if is_proton_exe(Path(entry.path)):
                             return True
-                    elif _is_native_game_entry(entry):
-                        return True
                 except OSError:
                     continue
     except OSError:

@@ -112,7 +112,7 @@ def test_delete_external_no_crash_and_managed_steam_passes_entry(tmp_path: Path)
         win.close()
 
 
-def test_native_elf_validates(tmp_path: Path) -> None:
+def test_native_elf_is_refused(tmp_path: Path) -> None:
     app = QApplication.instance() or QApplication([])
     win = _make_window(tmp_path, app)
     try:
@@ -122,7 +122,9 @@ def test_native_elf_validates(tmp_path: Path) -> None:
 
         win.add_name.setText("Native Game")
         win.add_exe_combo.setEditText(str(elf))
-        assert win._validate_add_inputs() == ("Native Game", elf)
+        with mock.patch.object(QMessageBox, "warning") as warn:
+            assert win._validate_add_inputs() is None
+        warn.assert_called_once()
     finally:
         _drain(win, app)
         win.close()

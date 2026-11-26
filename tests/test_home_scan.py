@@ -101,7 +101,7 @@ def test_home_walk_respects_the_folder_cap_and_safety_depth(tmp_path: Path) -> N
     assert deep / "TooDeep" not in scanner.find_home_game_dirs(home)
 
 
-def test_dir_has_game_exe_detects_proton_pe_and_executable_native_files(tmp_path: Path) -> None:
+def test_dir_has_game_exe_detects_proton_pe_only(tmp_path: Path) -> None:
     cases = {
         "dos": ("GAME.EXE", b"MZ" + b"\x00" * 64),
         "arm64": ("Game.exe", pe_exe_bytes(0xAA64)),
@@ -120,4 +120,4 @@ def test_dir_has_game_exe_detects_proton_pe_and_executable_native_files(tmp_path
     (tmp_path / "gog" / "goggame-1.info").parent.mkdir()
     (tmp_path / "gog" / "goggame-1.info").write_text("{}", encoding="utf-8")
     found = {d.name for d in tmp_path.iterdir() if scanner._dir_has_game_exe(d)}
-    assert found == {"i386", "amd64", "native", "elf"}
+    assert found == {"i386", "amd64"}  # native Linux games are not supported

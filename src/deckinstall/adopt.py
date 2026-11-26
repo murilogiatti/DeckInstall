@@ -115,6 +115,7 @@ B_LIBRARY_UNAVAILABLE = "library_unavailable"
 B_PREFIX_LAYOUT_CONFLICT = "prefix_layout_conflict"
 B_NO_SPACE = "no_space"
 B_ALREADY_MANAGED = "already_managed"
+B_NATIVE_NOT_SUPPORTED = "native_not_supported"  # Windows games only
 
 # adopt() progress steps.
 STEP_SNAPSHOT = "snapshot"
@@ -965,6 +966,8 @@ def plan_adoption(
             blockers.append(B_OVERLAPS_LIBRARY)
 
     native = c.native_linux or (exe.is_file() and exe.suffix.lower() != ".exe" and is_native_linux_exe(exe))
+    if native:
+        blockers.append(B_NATIVE_NOT_SUPPORTED)
     games_root = root / _lib.GAMES
     move_game = (opts.move_game or c.in_drive_c) and not is_within(game_src, games_root, strict=True)
     game_dst = unique_dir(games_root / sanitize_dir_name(name)) if move_game else game_src

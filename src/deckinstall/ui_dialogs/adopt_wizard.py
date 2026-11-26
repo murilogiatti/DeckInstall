@@ -94,6 +94,7 @@ def blocker_text(code: str) -> str:
         ad.B_PREFIX_LAYOUT_CONFLICT: tr("adopt.block_prefix_layout_conflict"),
         ad.B_NO_SPACE: tr("adopt.block_no_space"),
         ad.B_ALREADY_MANAGED: tr("adopt.block_already_managed"),
+        ad.B_NATIVE_NOT_SUPPORTED: tr("install.native_not_supported"),
     }.get(code, code)
 
 
