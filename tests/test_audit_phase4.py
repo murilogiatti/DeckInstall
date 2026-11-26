@@ -214,7 +214,16 @@ def test_bulk_proton_steamos_defaults_no_download_confirm_and_single_row_update(
             dlg.cmb_target.setCurrentIndex(0)  # type: ignore[attr-defined]
             app.processEvents()
             dlg.btn_update.click()  # type: ignore[attr-defined]
-            QTimer.singleShot(150, dlg.accept)
+            tries = [0]
+
+            def _close_when_written() -> None:  # a slow CI runner may take longer than any fixed delay
+                if steam_vdf.get_compat_tool_map(paths.config_vdf) and tries[0] < 200:
+                    tries[0] += 1
+                    QTimer.singleShot(25, _close_when_written)
+                    return
+                dlg.accept()
+
+            QTimer.singleShot(25, _close_when_written)
 
         QTimer.singleShot(50, _drive)
         pbd._show(win, rows, orphans, newest, target_info)  # type: ignore[arg-type]
