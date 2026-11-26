@@ -1,4 +1,4 @@
-"""Flatpak/Snap Steam folder access, the system-changes ledger and duplicate Steam shortcuts."""
+"""Flatpak Steam folder access, the system-changes ledger and duplicate Steam shortcuts."""
 
 from __future__ import annotations
 
@@ -37,14 +37,6 @@ def test_flatpak_permissions_read_from_override_files(tmp_path: Path) -> None:
     override.write_text("[Context]\nfilesystems=~/DeckInstall;/mnt/games:ro;\n", encoding="utf-8")
     with mock.patch.object(steam_sandbox.shutil, "which", return_value=None):
         assert steam_sandbox.flatpak_filesystems(home=tmp_path) == ["~/DeckInstall", "/mnt/games:ro"]
-
-
-def test_snap_coverage() -> None:
-    assert steam_sandbox.snap_can_see(HOME / "DeckInstall", False, home=HOME)
-    assert not steam_sandbox.snap_can_see(HOME / ".local/share/games", True, home=HOME)
-    assert not steam_sandbox.snap_can_see(Path("/run/media/u/SD"), False, home=HOME)
-    assert steam_sandbox.snap_can_see(Path("/run/media/u/SD"), True, home=HOME)
-    assert not steam_sandbox.snap_can_see(Path("/opt/games"), True, home=HOME)
 
 
 def test_native_steam_needs_nothing(tmp_path: Path) -> None:

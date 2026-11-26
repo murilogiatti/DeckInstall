@@ -1,10 +1,8 @@
-"""Can a sandboxed Steam (Flatpak or Snap) see the game folders its shortcuts point at?
+"""Can Flatpak Steam see the game folders its shortcuts point at?
 
 Flatpak Steam only sees its own data folder unless the user grants more with
 `flatpak override --user --filesystem=<dir> com.valvesoftware.Steam` (no root needed; DeckInstall
-asks first and records it). Snap Steam sees the home folder (not hidden folders in it); disks
-under /media, /run/media and /mnt need the removable-media interface, which needs root, so
-DeckInstall only shows the command for that.
+asks first and records it).
 """
 
 from __future__ import annotations
@@ -16,10 +14,9 @@ from collections.abc import Iterable
 from pathlib import Path
 
 from .fsutil import is_within
-from .steam_paths import STEAM_FLATPAK, STEAM_SNAP, steam_variant
+from .steam_paths import STEAM_FLATPAK, steam_variant
 
 FLATPAK_APP_ID = "com.valvesoftware.Steam"
-_REMOVABLE_ROOTS = (Path("/media"), Path("/run/media"), Path("/mnt"), Path("/var/mnt"))
 
 
 def _run(cmd: list[str]) -> str:
@@ -87,29 +84,9 @@ def flatpak_can_see(path: Path, filesystems: Iterable[str], home: Path | None = 
     return any(is_within(path, root) for root in granted)
 
 
-def snap_removable_media_connected() -> bool:
-    """True when Snap Steam's removable-media plug is connected."""
-    for line in _run(["snap", "connections", "steam"]).splitlines():
-        parts = line.split()
-        if len(parts) >= 3 and parts[1] == "steam:removable-media":
-            return parts[2] != "-"
-    return False
-
-
-def snap_can_see(path: Path, removable_connected: bool, home: Path | None = None) -> bool:
-    base = (home if home is not None else Path.home()).resolve()
-    if is_within(path, base):
-        rel = path.relative_to(base) if path != base else Path()
-        return not (rel.parts and rel.parts[0].startswith("."))  # the home plug skips hidden folders
-    if any(is_within(path, root) for root in _REMOVABLE_ROOTS):
-        return removable_connected
-    return False
-
-
 def folders_steam_cannot_see(steam_root: Path, folders: Iterable[Path]) -> list[Path]:
-    """The folders (game library roots) a sandboxed Steam cannot open. Empty for native Steam."""
-    variant = steam_variant(steam_root)
-    if variant not in (STEAM_FLATPAK, STEAM_SNAP):
+    """The folders (game library roots) Flatpak Steam cannot open. Empty for native Steam."""
+    if steam_variant(steam_root) != STEAM_FLATPAK:
         return []
     unique: list[Path] = []
     for folder in folders:
@@ -121,11 +98,8 @@ def folders_steam_cannot_see(steam_root: Path, folders: Iterable[Path]) -> list[
             unique.append(resolved)
     if not unique:
         return []
-    if variant == STEAM_FLATPAK:
-        fs = flatpak_filesystems()
-        return [p for p in unique if not flatpak_can_see(p, fs)]
-    connected = snap_removable_media_connected()
-    return [p for p in unique if not snap_can_see(p, connected)]
+    fs = flatpak_filesystems()
+    return [p for p in unique if not flatpak_can_see(p, fs)]
 
 
 def shortcut_folders(exe_values: Iterable[str]) -> list[Path]:
@@ -169,5 +143,3 @@ def revoke_flatpak_access(folders: Iterable[Path]) -> tuple[bool, str]:
         return False, str(exc)
     return proc.returncode == 0, (proc.stdout + proc.stderr).strip()
 
-
-SNAP_FIX_COMMAND = "sudo snap connect steam:removable-media"

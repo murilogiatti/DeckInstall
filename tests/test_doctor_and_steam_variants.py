@@ -1,4 +1,4 @@
-"""--doctor report and Steam variants (native / Flatpak / Snap, several at once)."""
+"""--doctor report and Steam variants (native / Flatpak, several at once; Snap is unsupported)."""
 
 from __future__ import annotations
 
@@ -30,14 +30,17 @@ def test_variant_of_each_root(home: Path) -> None:
     assert steam_paths.steam_variant(home / ".local/share/Steam") == "native"
     assert steam_paths.steam_variant(home / ".var/app/com.valvesoftware.Steam/.local/share/Steam") == "flatpak"
     assert steam_paths.steam_variant(home / "snap/steam/common/.local/share/Steam") == "snap"
-    assert steam_paths.steam_command(home / "snap/steam/common/.local/share/Steam") == ["snap", "run", "steam"]
     assert steam_paths.steam_command(home / ".var/app/com.valvesoftware.Steam/.steam/steam")[:2] == ["flatpak", "run"]
 
 
-def test_snap_steam_is_found(home: Path) -> None:
+def test_snap_steam_is_not_used_but_reported(home: Path) -> None:
     snap = _make_steam(home, "snap/steam/common/.local/share/Steam")
-    assert steam_paths.find_steam_roots() == [snap]
-    assert steam_paths.find_steam_root() == snap
+    assert steam_paths.find_steam_roots() == []
+    assert steam_paths.find_steam_root() is None
+    assert steam_paths.unsupported_snap_steam() == snap
+    checks = {c["name"]: c for c in doctor._steam()}
+    assert checks["steam_snap"]["status"] == doctor.WARN
+    assert "not supported" in checks["steam_snap"]["detail"]
 
 
 def test_all_steams_listed_once(home: Path) -> None:

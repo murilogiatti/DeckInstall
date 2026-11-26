@@ -35,7 +35,6 @@ _TOOLS: dict[str, str] = {
     "fusermount3": "mount the AppImage",
     "fusermount": "mount the AppImage",
     "flatpak": "Flatpak Steam",
-    "snap": "Snap Steam",
     "systemd-inhibit": "keep the PC awake while a game runs",
 }
 
@@ -173,13 +172,18 @@ def _steam() -> list[dict[str, str]]:
         is_steam_running,
         list_steam_accounts,
         steam_variant,
+        unsupported_snap_steam,
     )
 
+    out: list[dict[str, str]] = []
+    snap = unsupported_snap_steam()
+    if snap is not None:
+        msg = f"Snap Steam found at {snap}: not supported; use the native or Flatpak Steam"
+        out.append(_check("steam_snap", WARN, msg))
     roots = find_steam_roots()
     if not roots:
-        return [_check("steam", INFO, "no Steam installation found: only Standalone mode")]
+        return [*out, _check("steam", INFO, "no Steam installation found: only Standalone mode")]
     active = find_steam_root()
-    out = []
     for root in roots:
         mark = " [in use]" if root == active else ""
         accounts = list_steam_accounts(root)

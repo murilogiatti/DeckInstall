@@ -952,7 +952,6 @@
   "launch.debug_log_hint": "Writes a much longer log for troubleshooting: umu-run's messages go to the game's run log and Proton's log goes to the game's log folder (Steam games: steam-<AppID>.log in your home). Turn it off afterwards; it can slow the game down.",
   "presets.short_debug_log": "Detailed log",
   "steam_sandbox.flatpak_body": "Steam is installed as a Flatpak and cannot open these game folders, so their shortcuts will not start:\n\n{folders}\n\nLet Flatpak Steam open them? DeckInstall runs \"flatpak override --user --filesystem=…\" (no password needed) and records it so it can be undone. Restart Steam afterwards.",
-  "steam_sandbox.snap_body": "Steam is installed as a Snap and cannot open these game folders, so their shortcuts will not start:\n\n{folders}\n\nFor disks under /media, /run/media or /mnt, run in a terminal:\n{cmd}\n\nFolders hidden in your home (starting with a dot) cannot be opened by Snap Steam; move the library elsewhere.",
   "steam_sandbox.granted": "Done. Restart Steam so it can open the game folders.",
   "steam_sandbox.failed": "Could not change the Flatpak Steam permissions:\n{err}",
   "library.ext_steam_duplicate": "Steam already has a shortcut that starts {name}: {existing}.\n\nAdd another one?",

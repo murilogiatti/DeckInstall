@@ -45,9 +45,9 @@ def copy_diagnostics(win: MainWindow) -> None:
 
 
 def offer_steam_sandbox_access(win: MainWindow, steam_root: Path, folders: list[Path]) -> None:
-    """Flatpak/Snap Steam cannot open these game folders: offer the fix once per folder."""
+    """Flatpak Steam cannot open these game folders: offer the fix once per folder."""
     from .steam_paths import STEAM_FLATPAK, steam_variant
-    from .steam_sandbox import SNAP_FIX_COMMAND, grant_flatpak_access
+    from .steam_sandbox import grant_flatpak_access
 
     raw = win.settings.value("steam_sandbox/asked", [])
     # QSettings hands back a one-item list as a plain string.
@@ -58,10 +58,6 @@ def offer_steam_sandbox_access(win: MainWindow, steam_root: Path, folders: list[
     win.settings.setValue("steam_sandbox/asked", sorted(asked | {str(p) for p in new}))
     listing = "\n".join(f"• {p}" for p in new)
     if steam_variant(steam_root) != STEAM_FLATPAK:
-        QMessageBox.information(
-            _dialog_parent(win), __app_name__,
-            tr("steam_sandbox.snap_body", folders=listing, cmd=SNAP_FIX_COMMAND),
-        )
         return
     win._sandbox_prompt_open = True
     try:

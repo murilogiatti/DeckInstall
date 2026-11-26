@@ -107,7 +107,9 @@ def _has_active_steam_profile(candidate: Path) -> bool:
 # The order is the search order when no Steam is running and none was chosen.
 STEAM_NATIVE = "native"
 STEAM_FLATPAK = "flatpak"
+# Snap Steam is not supported (only detected, so --doctor can say so).
 STEAM_SNAP = "snap"
+SNAP_STEAM_ROOTS = ("snap/steam/common/.local/share/Steam", "snap/steam/common/.steam/steam")
 STEAM_VARIANTS: dict[str, dict[str, Any]] = {
     STEAM_NATIVE: {
         "roots": (".local/share/Steam", ".steam/steam", ".steam/root"),
@@ -120,17 +122,13 @@ STEAM_VARIANTS: dict[str, dict[str, Any]] = {
         ),
         "command": ("flatpak", "run", "com.valvesoftware.Steam"),
     },
-    STEAM_SNAP: {
-        "roots": ("snap/steam/common/.local/share/Steam", "snap/steam/common/.steam/steam"),
-        "command": ("snap", "run", "steam"),
-    },
 }
 # Env override for machines with more than one Steam: the root to use.
 STEAM_ROOT_ENV = "DECKINSTALL_STEAM_ROOT"
 
 
 def steam_variant(steam_root: Path) -> str:
-    """Which Steam package owns steam_root: "native", "flatpak" or "snap"."""
+    """Which Steam package owns steam_root: "native", "flatpak" or "snap" (unsupported)."""
     parts = steam_root.parts
     if "com.valvesoftware.Steam" in parts:
         return STEAM_FLATPAK
@@ -142,13 +140,13 @@ def steam_variant(steam_root: Path) -> str:
 def steam_command(steam_root: Path | None) -> list[str]:
     """Command that starts (or talks to) the Steam client that owns steam_root."""
     variant = steam_variant(steam_root) if steam_root is not None else STEAM_NATIVE
-    if variant == STEAM_NATIVE:
+    if variant not in STEAM_VARIANTS or variant == STEAM_NATIVE:
         return [shutil.which("steam") or "/usr/bin/steam"]
     return list(STEAM_VARIANTS[variant]["command"])
 
 
 def find_steam_roots(home: Path | None = None) -> list[Path]:
-    """Every Steam installation of this user (native, Flatpak, Snap), each once, with userdata."""
+    """Every supported Steam installation of this user (native, Flatpak), each once, with userdata."""
     base = home if home is not None else Path.home()
     roots: list[Path] = []
     seen: set[Path] = set()
@@ -187,8 +185,8 @@ def _running_steam_root(roots: list[Path], proc_root: Path | None = None) -> Pat
         if not exe.endswith(("/steam", "/steam.sh", "steamwebhelper")):
             continue
         if "/snap/steam/" in exe:
-            running.add(STEAM_SNAP)
-        elif exe.startswith("/app/") or "com.valvesoftware.Steam" in exe:
+            continue  # Snap Steam is not supported
+        if exe.startswith("/app/") or "com.valvesoftware.Steam" in exe:
             running.add(STEAM_FLATPAK)
         else:
             running.add(STEAM_NATIVE)
@@ -201,10 +199,19 @@ def _running_steam_root(roots: list[Path], proc_root: Path | None = None) -> Pat
     return None
 
 
+def unsupported_snap_steam(home: Path | None = None) -> Path | None:
+    """The Snap Steam data folder when one exists: DeckInstall does not support it."""
+    base = home if home is not None else Path.home()
+    for rel in SNAP_STEAM_ROOTS:
+        if (base / rel / "userdata").is_dir():
+            return base / rel
+    return None
+
+
 def find_steam_root() -> Path | None:
     """Return the Steam installation to work with, if present.
 
-    With several Steams (native + Flatpak + Snap): DECKINSTALL_STEAM_ROOT when it points at one,
+    With several Steams (native + Flatpak): DECKINSTALL_STEAM_ROOT when it points at one,
     else the one running now, else the first with a logged-in profile, in STEAM_VARIANTS order.
     """
     roots = find_steam_roots()

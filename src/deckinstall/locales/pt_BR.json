@@ -952,7 +952,6 @@
   "launch.debug_log_hint": "Grava um log bem maior para investigar problemas: as mensagens do umu-run vão para o log de execução do jogo e o log do Proton vai para a pasta de logs do jogo (jogos da Steam: steam-<AppID>.log na sua pasta pessoal). Desligue depois; pode deixar o jogo mais lento.",
   "presets.short_debug_log": "Log detalhado",
   "steam_sandbox.flatpak_body": "A Steam está instalada como Flatpak e não consegue abrir estas pastas de jogos, então os atalhos delas não vão iniciar:\n\n{folders}\n\nPermitir que a Steam Flatpak abra essas pastas? O DeckInstall roda \"flatpak override --user --filesystem=…\" (sem senha) e registra a mudança para poder desfazer. Reinicie a Steam depois.",
-  "steam_sandbox.snap_body": "A Steam está instalada como Snap e não consegue abrir estas pastas de jogos, então os atalhos delas não vão iniciar:\n\n{folders}\n\nPara discos em /media, /run/media ou /mnt, rode no terminal:\n{cmd}\n\nPastas ocultas da sua pasta pessoal (que começam com ponto) não podem ser abertas pela Steam Snap; mova a biblioteca para outro lugar.",
   "steam_sandbox.granted": "Pronto. Reinicie a Steam para ela abrir as pastas dos jogos.",
   "steam_sandbox.failed": "Não foi possível mudar as permissões da Steam Flatpak:\n{err}",
   "library.ext_steam_duplicate": "A Steam já tem um atalho que inicia {name}: {existing}.\n\nAdicionar outro?",
