@@ -1215,6 +1215,9 @@ def open_save_sync_dialog(win: MainWindow) -> None:
     plan_top.addWidget(QLabel(tr("save_sync.plan_label")))
     plan_top.addStretch()
     btn_refresh = QPushButton(tr("save_sync.btn_refresh"))
+    btn_cleanup = QPushButton(tr("save_sync.btn_cleanup"))
+    btn_cleanup.setToolTip(tr("save_sync.cleanup_tip"))
+    plan_top.addWidget(btn_cleanup)
     plan_top.addWidget(btn_refresh)
     lay.addLayout(plan_top)
 
@@ -1640,6 +1643,62 @@ def open_save_sync_dialog(win: MainWindow) -> None:
 
     btn_browse.clicked.connect(_on_browse)
     btn_refresh.clicked.connect(_refresh_plan)
+
+    def _cleanup_old_versions() -> None:
+        """Show what a cleanup of old shared versions frees, and do it only when confirmed."""
+        from .. import save_sync_repo as repo
+
+        if syncing["active"] or win._closing_pending:
+            return
+        root = _current_sync_root()
+
+        def _plan() -> object:
+            try:
+                games = sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
+            except OSError:
+                games = []
+            plans = [repo.plan_cleanup(g) for g in games]
+            used = sum(
+                r.stored_bytes for g in games for r in repo.scan_game_folder(g).revisions.values() if not r.legacy
+            )
+            return used, [pl for pl in plans if pl.remove]
+
+        def _planned(result: object) -> None:
+            if not dlg_alive["open"] or not isinstance(result, tuple):
+                return
+            used, plans = result
+            freed = sum(pl.freed_bytes for pl in plans)
+            count = sum(len(pl.remove) for pl in plans)
+            if not count:
+                QMessageBox.information(
+                    dlg, __app_name__, tr("save_sync.cleanup_nothing", used=format_size_bytes(used))
+                )
+                return
+            ans = QMessageBox.question(
+                dlg, __app_name__,
+                tr("save_sync.cleanup_confirm", used=format_size_bytes(used), count=count,
+                   games=len(plans), freed=format_size_bytes(freed), keep=repo.KEEP_ANCESTORS),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+            worker2 = SteamOpWorker(lambda: sum(repo.apply_cleanup(pl) for pl in plans))
+            win._track_worker(worker2)
+            worker2.finished_ok.connect(
+                lambda n: lbl_status.setText(tr("save_sync.cleanup_done", freed=format_size_bytes(int(n))))
+                if dlg_alive["open"] else None
+            )
+            worker2.failed.connect(lambda err: lbl_status.setText(tr("worker.failed", err=err)))
+            worker2.start()
+
+        worker = SteamOpWorker(_plan)
+        win._track_worker(worker)
+        worker.finished_ok.connect(_planned)
+        worker.failed.connect(lambda err: lbl_status.setText(tr("worker.failed", err=err)))
+        worker.start()
+
+    btn_cleanup.clicked.connect(_cleanup_old_versions)
     btn_preview.clicked.connect(_on_preview)
     btn_sync.clicked.connect(_on_sync_now)
     sync_dir_edit.editingFinished.connect(_refresh_plan)

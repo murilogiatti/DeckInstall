@@ -77,6 +77,7 @@ class Revision:
     app_version: str = ""
     legacy: bool = False
     stored_bytes: int = 0
+    pruned: bool = False  # only its manifest is left (the saves were cleaned up to free space)
 
 
 @dataclass
@@ -360,6 +361,11 @@ def scan_game_folder(game_dir: Path) -> RepoState:
     except OSError:
         return state
     for entry in entries:
+        if entry.name.endswith(PRUNED_SUFFIX) and not entry.name.startswith("."):
+            pruned = _read_pruned(Path(entry.path))
+            if pruned is not None:
+                state.revisions.setdefault(pruned.rev_id, pruned)
+            continue
         if _ignored_name(entry.name) or not entry.name.endswith(".zip"):
             continue
         path = Path(entry.path)
@@ -369,8 +375,100 @@ def scan_game_folder(game_dir: Path) -> RepoState:
             logging.info("Sync revision %s not usable yet: %s", path.name, exc)
             state.waiting.append(path)
             continue
-        state.revisions[rev.rev_id] = rev
+        state.revisions[rev.rev_id] = rev  # a full copy wins over its pruned marker
     return state
+
+
+# --- cleaning up old revisions (only when the user asks) -------------------------------------
+
+PRUNED_SUFFIX = ".pruned.json"
+KEEP_ANCESTORS = 2
+
+
+def _read_pruned(path: Path) -> Revision | None:
+    try:
+        if path.is_symlink() or path.stat().st_size > _MANIFEST_MAX:
+            return None
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        rev = _revision_from_manifest(raw, path.with_name(path.name[: -len(PRUNED_SUFFIX)] + ".zip"))
+    except (OSError, ValueError, RevisionInvalid):
+        return None
+    return Revision(**{**rev.__dict__, "pruned": True, "stored_bytes": 0})
+
+
+@dataclass(frozen=True)
+class CleanupPlan:
+    game_dir: Path
+    remove: tuple[Revision, ...]
+    kept: int
+    freed_bytes: int
+
+
+def plan_cleanup(game_dir: Path, keep_ancestors: int = KEEP_ANCESTORS) -> CleanupPlan:
+    """Old revisions whose saves can go: never a head, never one of the last keep_ancestors
+    versions before each head, never a legacy archive and never a file not verified as complete."""
+    state = scan_game_folder(game_dir)
+    keep: set[str] = set()
+    frontier = [h.rev_id for h in state.heads()]
+    keep.update(frontier)
+    for _ in range(keep_ancestors):
+        nxt: list[str] = []
+        for rid in frontier:
+            rev = state.revisions.get(rid)
+            for parent in rev.parents if rev is not None else ():
+                if parent not in keep:
+                    keep.add(parent)
+                    nxt.append(parent)
+        frontier = nxt
+    remove = tuple(
+        r for r in state.revisions.values()
+        if r.rev_id not in keep and not r.legacy and not r.pruned and r.path.is_file()
+    )
+    full = [r for r in state.revisions.values() if not r.pruned and not r.legacy]
+    return CleanupPlan(game_dir, remove, len(full) - len(remove), sum(r.stored_bytes for r in remove))
+
+
+def apply_cleanup(plan: CleanupPlan) -> int:
+    """Replace each planned revision by its manifest only. Returns the bytes freed.
+
+    The marker is written before the ZIP is deleted, so the history (which revision replaced
+    which) survives; a device that synced one of these versions still recognises its base.
+    """
+    freed = 0
+    with game_lock(plan.game_dir):
+        current = plan_cleanup(plan.game_dir)
+        allowed = {r.rev_id for r in current.remove}
+        for rev in plan.remove:
+            if rev.rev_id not in allowed:
+                continue  # it became current again (e.g. a branch arrived meanwhile)
+            try:
+                with zipfile.ZipFile(rev.path) as zf:
+                    manifest = zf.read(REV_MANIFEST)
+                marker = rev.path.with_name(rev.rev_id + PRUNED_SUFFIX)
+                atomic_write_bytes(marker, manifest)
+                if _read_pruned(marker) is None:
+                    marker.unlink(missing_ok=True)
+                    continue
+                size = rev.path.stat().st_size
+                rev.path.unlink()
+                freed += size
+            except (OSError, KeyError, zipfile.BadZipFile, zlib.error) as exc:
+                logging.warning("Could not clean up sync revision %s: %s", rev.path, exc)
+    return freed
+
+
+def folder_usage(sync_root: Path) -> tuple[int, int]:
+    """(bytes used by revisions, bytes a cleanup would free) for the whole sync folder."""
+    used = freed = 0
+    try:
+        games = [Path(e.path) for e in os.scandir(sync_root) if e.is_dir() and not e.name.startswith(".")]
+    except OSError:
+        return 0, 0
+    for game_dir in games:
+        state = scan_game_folder(game_dir)
+        used += sum(r.stored_bytes for r in state.revisions.values() if not r.legacy)
+        freed += plan_cleanup(game_dir).freed_bytes
+    return used, freed
 
 
 # --- verifying a copy ------------------------------------------------------------------------

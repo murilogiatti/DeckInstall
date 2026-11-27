@@ -340,3 +340,44 @@ def test_a_lost_legacy_parent_is_not_reported_as_still_arriving(tmp_path: Path) 
     assert save_sync._ancestry_still_arriving(state, ["f" * 32])
     action, reason = save_sync._plan_action(state, state.distinct_heads(), True, None, tmp_path, tmp_path, "g")
     assert action == "CONFLICT" and "still arriving" not in reason
+
+
+def test_cleanup_keeps_heads_recent_ancestors_and_history(two: dict[str, Path]) -> None:
+    _start_both(two)  # B synced v1 and stays offline from now on
+    for i in range(2, 8):
+        _save(two["a"], f"v{i}".encode())
+        push_game_saves(GAME, two["a"], two["a_root"])
+    game_dir = next(two["a_root"].glob("*/revs")).parent
+    before = repo.scan_game_folder(game_dir)
+    head = before.heads()[0]
+    plan = repo.plan_cleanup(game_dir)
+    assert len(plan.remove) == 7 - 1 - repo.KEEP_ANCESTORS  # v1..v4 go; v5, v6 and the head v7 stay
+    assert head.rev_id not in {r.rev_id for r in plan.remove}
+    freed = repo.apply_cleanup(plan)
+    assert freed == plan.freed_bytes > 0
+    after = repo.scan_game_folder(game_dir)
+    assert set(after.revisions) == set(before.revisions)  # history kept (manifests of removed ones)
+    assert sum(1 for r in after.revisions.values() if r.pruned) == len(plan.remove)
+    assert [h.rev_id for h in after.heads()] == [head.rev_id]
+    assert repo.plan_cleanup(game_dir).remove == ()  # nothing more to do
+
+    # B comes back: its base (v1) was cleaned up, but the history proves v7 continues it
+    _transport(two["a_root"], two["b_root"])
+    for stale in two["b_root"].rglob("revs/*.zip"):
+        if (stale.with_name(stale.stem + repo.PRUNED_SUFFIX)).exists():
+            stale.unlink()  # the transport propagates the deletion
+    assert _action(two["b"], two["b_root"]).action == "PULL"
+    pull_game_saves(GAME, two["b"], two["b_root"], snapshots_root=two["snaps"])
+    assert (two["b"] / REL).read_bytes() == b"v7"
+
+
+def test_cleanup_never_touches_conflicting_branches(two: dict[str, Path]) -> None:
+    _start_both(two)
+    _save(two["a"], b"A")
+    _save(two["b"], b"B")
+    push_game_saves(GAME, two["a"], two["a_root"])
+    push_game_saves(GAME, two["b"], two["b_root"])
+    _transport(two["b_root"], two["a_root"])
+    game_dir = next(two["a_root"].glob("*/revs")).parent
+    assert repo.plan_cleanup(game_dir).remove == ()  # two heads + their shared parent
+    assert _action(two["a"], two["a_root"]).action == "CONFLICT"
