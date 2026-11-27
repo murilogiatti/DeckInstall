@@ -138,3 +138,29 @@ def test_remove_everything_keeps_games_and_foreign_files(tmp_path: Path, monkeyp
     assert (data / "migrations").is_dir() and (data / "my-backup").is_dir() and games.is_dir()
     # The root change is still in the ledger so it can be undone later.
     assert [c["kind"] for c in system_changes.list_changes()] == [system_changes.KIND_APPARMOR]
+
+
+def test_remove_everything_also_covers_the_fixed_local_share_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from deckinstall import remove_all
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "custom-data"))
+    fixed = home / ".local" / "share" / "DeckInstall"
+    (fixed / "logs" / "g").mkdir(parents=True)
+    (fixed / "vdf_queue.json").write_text("{}", encoding="utf-8")
+    (fixed / "my-notes.txt").write_text("mine", encoding="utf-8")  # not written by DeckInstall
+    (tmp_path / "custom-data" / "DeckInstall").mkdir(parents=True)
+    (tmp_path / "custom-data" / "DeckInstall" / "deckinstall.log").write_text("x", encoding="utf-8")
+    monkeypatch.setattr("deckinstall.runtime_uninstall.list_runtimes", lambda: [])
+    monkeypatch.setattr("deckinstall.system_changes.list_changes", lambda: [])
+    parts = remove_all.plan()
+    app = next(p for p in parts if p.key == remove_all.APP_DATA)
+    assert fixed / "logs" in app.paths and fixed / "vdf_queue.json" in app.paths
+    assert tmp_path / "custom-data" / "DeckInstall" / "deckinstall.log" in app.paths
+    assert fixed / "my-notes.txt" in remove_all.unknown_data_entries()
+    remove_all.execute([app])
+    assert not (fixed / "logs").exists() and not (fixed / "vdf_queue.json").exists()
+    assert (fixed / "my-notes.txt").read_text(encoding="utf-8") == "mine"

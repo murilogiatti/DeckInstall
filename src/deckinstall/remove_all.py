@@ -44,6 +44,16 @@ def data_dir() -> Path:
     return _xdg("XDG_DATA_HOME", Path.home() / ".local" / "share") / "DeckInstall"
 
 
+def data_dirs() -> list[Path]:
+    """The data folder, plus ~/.local/share/DeckInstall when XDG_DATA_HOME points elsewhere: the
+    Steam edit queue, run logs and runtimes are always kept there."""
+    dirs = [data_dir()]
+    fixed = Path.home() / ".local" / "share" / "DeckInstall"
+    if fixed != dirs[0]:
+        dirs.append(fixed)
+    return dirs
+
+
 def config_dir() -> Path:
     return _xdg("XDG_CONFIG_HOME", Path.home() / ".config") / "DeckInstall"
 
@@ -79,12 +89,14 @@ _LEDGER_ENTRIES = ("system-changes.json", "system-changes.json.lock")
 
 def unknown_data_entries() -> list[Path]:
     """Files in DeckInstall's data folder that "Remove everything" keeps because it did not write them."""
-    data = data_dir()
     known = {*_OWN_DATA_ENTRIES, *_LEDGER_ENTRIES, "migrations"}
-    try:
-        return sorted(p for p in data.iterdir() if p.name not in known)
-    except OSError:
-        return []
+    out: list[Path] = []
+    for data in data_dirs():
+        try:
+            out += [p for p in data.iterdir() if p.name not in known]
+        except OSError:
+            continue
+    return sorted(out)
 
 
 def plan() -> list[RemovalPart]:
@@ -97,7 +109,9 @@ def plan() -> list[RemovalPart]:
     if runtimes:
         parts.append(RemovalPart(RUNTIMES, runtimes))
     data = data_dir()
-    app_paths = [data / name for name in _OWN_DATA_ENTRIES if (data / name).exists() or (data / name).is_symlink()]
+    app_paths = [
+        d / name for d in data_dirs() for name in _OWN_DATA_ENTRIES if (d / name).exists() or (d / name).is_symlink()
+    ]
     app_paths += [p for p in (config_dir(), cache_dir(), state_dir()) if p.exists()]
     if app_paths:
         parts.append(RemovalPart(APP_DATA, app_paths))
@@ -147,16 +161,16 @@ def execute(parts: list[RemovalPart]) -> RemovalResult:
                 result.removed.append(str(path))
             except OSError as exc:
                 result.errors.append(f"{path}: {exc}")
-    data = data_dir()
     if APP_DATA in keys and not result.root_commands and not result.errors:
         ledger = ledger_path()
         for leftover in (ledger, ledger.with_name(_LEDGER_ENTRIES[1])):
             leftover.unlink(missing_ok=True)
-    try:
-        if data.is_dir() and not any(data.iterdir()):
-            data.rmdir()
-    except OSError:
-        pass
+    for data in data_dirs():
+        try:
+            if data.is_dir() and not any(data.iterdir()):
+                data.rmdir()
+        except OSError:
+            pass
     logging.info("Remove everything: %d removed, %d errors", len(result.removed), len(result.errors))
     return result
 
