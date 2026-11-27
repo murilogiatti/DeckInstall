@@ -169,3 +169,14 @@ def test_run_log_is_capped_without_blocking_the_game(tmp_path: Path, monkeypatch
     assert size < 64 * 1024 + 4096
     assert "log truncated" in log
     assert log.rstrip().splitlines()[-1].startswith("== DeckInstall: exit code 5")
+
+
+def test_uninstall_also_removes_the_kept_previous_launcher(tmp_path: Path) -> None:
+    from deckinstall import uninstall
+
+    game = _game(tmp_path)
+    prev = game.launch_script.with_name("launch.sh.prev")
+    prev.write_text("#!/bin/sh\n", encoding="utf-8")
+    plan = uninstall.plan_uninstall(game)
+    shortcuts = next(i for i in plan.items if i.id == uninstall.SHORTCUTS)
+    assert prev in shortcuts.paths and game.launch_script in shortcuts.paths

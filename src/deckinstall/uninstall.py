@@ -162,7 +162,10 @@ def plan_uninstall(game: StandaloneGame) -> UninstallPlan:
     """List what removing game would touch, with sizes and what must be kept (and why)."""
     items: list[UninstallItem] = []
 
-    shortcut_paths = [p for p in (game.desktop_file, game.desktop_shortcut, game.launch_script) if p is not None]
+    previous_launcher = game.launch_script.with_name(game.launch_script.name + ".prev")  # kept when it was upgraded
+    shortcut_paths = [
+        p for p in (game.desktop_file, game.desktop_shortcut, game.launch_script, previous_launcher) if p is not None
+    ]
     items.append(
         UninstallItem(
             SHORTCUTS,
