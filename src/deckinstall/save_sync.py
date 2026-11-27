@@ -14,7 +14,7 @@ import threading
 import time
 import zipfile
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -1116,7 +1116,7 @@ def _rotate_snapshots(snap_dir: Path, max_keep: int) -> None:
 
 def _write_saves_zip_atomic(
     prefix_dir: Path,
-    target_zip: Path,
+    target_zip: Path | None,
     key_prefix: str,
     game_name: str = "",
     game_dir: Path | None = None,
@@ -1124,7 +1124,10 @@ def _write_saves_zip_atomic(
     extra_dirs: ExtraDirs | None = None,
     home_files: tuple[str, ...] = (),
 ) -> tuple[int, str]:
-    """Write and fingerprint the same save bytes in one pass."""
+    """Write and fingerprint the same save bytes in one pass.
+
+    With target_zip None nothing is written: only (count, digest) are computed, the same way.
+    """
     entries = _collect_prefix_save_entries(
         prefix_dir, game_name, game_dir, steam_appid, extra_dirs, home_files, strict=True,
     )
@@ -1133,11 +1136,15 @@ def _write_saves_zip_atomic(
     total_bytes = 0
     has_content = False
     digest = hashlib.sha256()
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{target_zip.stem}-", suffix=".zip.tmp", dir=target_zip.parent)
-    os.close(fd)
-    tmp_zip = Path(tmp_name)
+    if target_zip is not None:
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{target_zip.stem}-", suffix=".zip.tmp", dir=target_zip.parent)
+        os.close(fd)
+        tmp_zip: Path | None = Path(tmp_name)
+    else:
+        tmp_zip = None
     try:
-        with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        with (zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) if tmp_zip is not None
+              else nullcontext(None)) as zf:
             seen: set[str] = set()
             for section, src_file, rel_path in entries:
                 name = f"{section}/{rel_path.as_posix()}"
@@ -1154,12 +1161,13 @@ def _write_saves_zip_atomic(
                         digest.update(f"{name}\0{size}\0".encode())
                         has_content = True
                     copied = 0
-                    with zf.open(f"{key_prefix}/{name}", "w") as dest:
+                    with (zf.open(f"{key_prefix}/{name}", "w") if zf is not None else nullcontext(None)) as dest:
                         while chunk := source.read(65536):
                             copied += len(chunk)
                             if copied > size:
                                 raise RuntimeError(f"Save changed during snapshot: {src_file}")
-                            dest.write(chunk)
+                            if dest is not None:
+                                dest.write(chunk)
                             digest.update(chunk)
                     if copied != size or file_identity(os.fstat(source.fileno())) != file_identity(before):
                         raise RuntimeError(f"Save changed during snapshot: {src_file}")
@@ -1173,14 +1181,16 @@ def _write_saves_zip_atomic(
                     raise RuntimeError("Snapshot size limit exceeded on registry.json")
                 digest.update(f"registry/registry.json\0{len(reg_bytes)}\0".encode())
                 digest.update(reg_bytes)
-                zf.writestr(f"{key_prefix}/registry/registry.json", reg_bytes)
+                if zf is not None:
+                    zf.writestr(f"{key_prefix}/registry/registry.json", reg_bytes)
                 written += 1
                 has_content = True
-        if written:
+        if written and tmp_zip is not None and target_zip is not None:
             os.replace(tmp_zip, target_zip)
         return written, digest.hexdigest() if has_content else ""
     finally:
-        tmp_zip.unlink(missing_ok=True)
+        if tmp_zip is not None:
+            tmp_zip.unlink(missing_ok=True)
 
 
 @dataclass
@@ -1422,6 +1432,18 @@ def snapshot_prefix_saves(
         home_files = snapshot_home_files(snap_dir)
         if not prefix_dir.is_dir() and not extra_dirs and not home_files and not (game_dir and game_dir.is_dir()):
             return None
+        if dedup:
+            # Compare first, write only when something changed (no rewrite of an unchanged
+            # snapshot on a microSD card or a slow disk).
+            index = _read_snapshot_index(snap_dir)
+            last_zip = snap_dir / Path(str(index.get("zip") or "")).name
+            if last_zip.suffix == ".zip" and last_zip.is_file() and not last_zip.is_symlink() and index.get("digest"):
+                count, pre_digest = _write_saves_zip_atomic(
+                    prefix_dir, None, key_prefix, game_name=game_name,
+                    game_dir=game_dir, steam_appid=steam_appid, extra_dirs=extra_dirs, home_files=home_files,
+                )
+                if count and pre_digest == index.get("digest"):
+                    return last_zip
         safe_reason = _slugify(reason, fallback="op")
         stamp = time.strftime("%Y%m%d-%H%M%S")
         target_zip = _reserve_snapshot_zip(snap_dir, f"{stamp}-{safe_reason}")

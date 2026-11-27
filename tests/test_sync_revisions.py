@@ -429,3 +429,16 @@ def test_linked_history_does_not_follow_a_replaced_folder(tmp_path: Path) -> Non
     push_game_saves(GAME, other, root)
     assert _action(a, root).action == "CONFLICT"
     assert "different save history" in _action(a, root).reason
+
+
+def test_unchanged_auto_snapshot_writes_nothing(tmp_path: Path) -> None:
+    prefix = tmp_path / "pfx"
+    _save(prefix, b"slot" * 10_000)
+    snaps = tmp_path / "snaps"
+    first = save_sync.auto_snapshot(prefix, GAME, "after-play", dest_root=snaps)
+    assert first is not None
+    with mock.patch.object(save_sync.tempfile, "mkstemp", side_effect=AssertionError("wrote a temp file")):
+        assert save_sync.auto_snapshot(prefix, GAME, "after-play", dest_root=snaps) == first
+    _save(prefix, b"changed")
+    second = save_sync.auto_snapshot(prefix, GAME, "after-play", dest_root=snaps)
+    assert second is not None and second != first and len(list(snaps.rglob("*.zip"))) == 2
