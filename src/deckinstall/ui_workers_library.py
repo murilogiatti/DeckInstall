@@ -298,6 +298,9 @@ class ShortcutsRefreshWorker(QThread):
         super().__init__()
         self._req_id = req_id
         self._paths = paths
+        self.owned: dict[int, StandaloneGame] | None = None
+        self.primary: dict[Path, ShortcutEntry] | None = None
+        self.repairs: list[tuple[ShortcutEntry, StandaloneGame]] | None = None
         self._load_shortcuts = load_shortcuts_fn or load_shortcuts
         self._list_standalone_games = list_standalone_games_fn or list_standalone_games
         self._scan_external_launcher_games = (
@@ -323,6 +326,13 @@ class ShortcutsRefreshWorker(QThread):
         runner_labels = compute_library_runner_labels(
             self._paths, entries, standalone_games, external_games
         )
+        # Matching shortcuts to games resolves every path on disk: done here, off the UI thread.
+        from .standalone import match_owned_shortcuts, primary_owned_shortcuts, shortcut_path_repairs
+
+        user_id = self._paths.user_id if self._paths is not None else None
+        self.owned = match_owned_shortcuts(entries, standalone_games, user_id)
+        self.primary = primary_owned_shortcuts(entries, self.owned)
+        self.repairs = shortcut_path_repairs(entries, standalone_games, user_id) if self._paths is not None else []
         if self._paths is not None and entries:
             try:
                 from .steam_sandbox import folders_steam_cannot_see, shortcut_folders

@@ -10,7 +10,7 @@ import time
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn, TypedDict, cast
+from typing import TYPE_CHECKING, Any, NoReturn, TypedDict, cast
 
 if TYPE_CHECKING:
     from .ui_library_grid import LibraryGridView
@@ -2321,6 +2321,7 @@ class MainWindow(QMainWindow):
         external_games: list[ExternalLauncherGame],
         vdf_err: str,
         runner_labels: dict[tuple[str, str], str] | None = None,
+        matched: tuple[Any, Any, Any] | None = None,
     ) -> None:
         self._library_loaded = True
         if self._library_size_worker is not None:
@@ -2346,11 +2347,8 @@ class MainWindow(QMainWindow):
         self._standalone_games = standalone_games
         self._external_games = external_games
         self._update_remove_existing_state()
-        refresh_saves_page(
-            self,
-            after_play=False,
-            scan_sources=(self.stack.currentIndex() == PAGE_SAVES),
-        )
+        if self.stack.currentIndex() == PAGE_SAVES:  # otherwise it is rebuilt when the page opens
+            refresh_saves_page(self, after_play=False, scan_sources=True)
         labels = (
             runner_labels
             if runner_labels is not None
@@ -2360,11 +2358,17 @@ class MainWindow(QMainWindow):
         )
         default_runner = tr("proton.default_label")
         # Managed games with a shortcut use the Steam entry for play and configuration.
-        owned = match_owned_shortcuts(entries, standalone_games, paths_snapshot.user_id if paths_snapshot else None)
-        primary = primary_owned_shortcuts(entries, owned)
+        if matched is not None:  # computed by the refresh worker, off the UI thread
+            owned, primary, repairs = matched
+        else:
+            owned = match_owned_shortcuts(entries, standalone_games, paths_snapshot.user_id if paths_snapshot else None)
+            primary = primary_owned_shortcuts(entries, owned)
+            repairs = None
         self._library_steam_games = {entry.appid_u32: owned[entry.appid_u32] for entry in primary.values()}
         standalone_dirs = [os.path.normpath(str(g.game_dir)) for g in standalone_games]
-        self._queue_shortcut_repairs(entries, standalone_games)
+        self._queue_shortcut_repairs(
+            entries, standalone_games, repairs=repairs if self.paths is paths_snapshot else None,
+        )
         rows: list[tuple[str, str, str, str, tuple[str, object], str]] = [
             (
                 owned[entry.appid_u32].name if entry.appid_u32 in owned else entry.app_name,
@@ -2616,6 +2620,7 @@ class MainWindow(QMainWindow):
                 external_games,
                 vdf_err,
                 runner_labels=runner_labels,
+                matched=(worker.owned, worker.primary, worker.repairs) if worker.owned is not None else None,
             )
             if worker.sandbox_blocked and paths_snapshot is not None:
                 self._offer_steam_sandbox_access(paths_snapshot.steam_root, list(worker.sandbox_blocked))
@@ -2639,13 +2644,16 @@ class MainWindow(QMainWindow):
 
         return offer_steam_sandbox_access(self, steam_root, folders)
 
-    def _queue_shortcut_repairs(self, entries: list[ShortcutEntry], games: list[StandaloneGame]) -> None:
+    def _queue_shortcut_repairs(
+        self, entries: list[ShortcutEntry], games: list[StandaloneGame], *, repairs: list[Any] | None = None,
+    ) -> None:
         """Steam shortcuts of adopted/moved games still pointing at the old folder (Steam was open):
         queue the fix, applied as soon as Steam is closed (AppID, artwork and playtime are kept)."""
         if self.paths is None or self._vdf_corrupt or self._vdf_applying:
             return
         pending = {e.edit_id: e for e in self._vdf_queue.list_pending()}
-        for entry, game in shortcut_path_repairs(entries, games, self.paths.user_id):
+        found = repairs if repairs is not None else shortcut_path_repairs(entries, games, self.paths.user_id)
+        for entry, game in found:
             edit_id = f"update_shortcut_paths:{self.paths.user_id}:{entry.appid_u32}"
             exe_str = str(game.exe_path)
             start_str = str(repaired_shortcut_start_dir(entry, game))

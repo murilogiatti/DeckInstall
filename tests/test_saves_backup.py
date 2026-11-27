@@ -383,6 +383,7 @@ def test_backup_sync_page_lists_games_and_snapshots_now(tmp_path: Path) -> None:
             assert win.saves_list.columnCount() == 6
             assert win.spin_save_keep.value() == save_sync.SNAPSHOT_KEEP_DEFAULT
             win._apply_shortcuts_data(None, [], [sa], [], "")
+            win.stack.setCurrentIndex(ui.PAGE_SAVES)  # the page is filled when it opens
             row = next(r for r in range(win.saves_list.rowCount()) if win.saves_list.item(r, 0).text() == "Page Game")
             win.saves_list.setCurrentCell(row, 0)
             assert win.btn_save_snapshot_now.isEnabled()
