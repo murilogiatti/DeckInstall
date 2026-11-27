@@ -1377,14 +1377,13 @@ def _verify_release_asset_integrity(
     tmp_dir: Path,
     *,
     label: str,
-    require_checksum: bool = False,
+    require_checksum: bool = True,
 ) -> None:
-    """Verify downloaded asset against GitHub digest, checksum asset, and reported size.
+    """Verify downloaded asset against GitHub digest or a published checksum file.
 
-    When ``require_checksum`` is False (default), missing checksum metadata logs a
-    warning and falls back to size-only verification so upstream releases without
-    published digests remain installable. When ``require_checksum`` is True, a
-    missing digest/checksum asset raises ``RuntimeError``.
+    A download with no SHA-256/SHA-512 to check against is refused (RuntimeError) and the
+    installed version is kept: the size alone does not show the file is the published one.
+    ``require_checksum=False`` exists only for a manual, explicitly confirmed exception.
     """
     raw_size = asset.get("size")
     if isinstance(raw_size, int) and not isinstance(raw_size, bool) and raw_size > 0:
@@ -1415,10 +1414,11 @@ def _verify_release_asset_integrity(
 
     if require_checksum:
         raise RuntimeError(
-            f"No checksum metadata published for {label} ({downloaded_path.name})."
+            f"No checksum published for {label} ({downloaded_path.name}); not installed, "
+            "the current version is kept."
         )
     logging.warning(
-        "No checksum metadata published for %s (%s); verified size only.",
+        "No checksum metadata published for %s (%s); verified size only (manual exception).",
         label,
         downloaded_path.name,
     )
@@ -2129,10 +2129,9 @@ def install_compat_tool(
             _emit_progress(progress_cb, f"Verifying SHA-256 for {tar_name}...", 92)
             _verify_sha256(tar_path, release.sha256_digest)
         else:
-            logging.warning(
-                "No checksum_url or sha256_digest published for compatibility tool %s (%s); verified size only.",
-                release.tag_name,
-                tar_name,
+            raise RuntimeError(
+                f"No checksum published for {release.tag_name} ({tar_name}); not installed, "
+                "the current version is kept."
             )
 
         _emit_progress(progress_cb, f"Extracting {tar_name}...", 95)

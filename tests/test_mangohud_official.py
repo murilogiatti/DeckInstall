@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import tarfile
@@ -45,7 +46,8 @@ def release(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     _release_tarball(tarball)
     assets = [
         {"name": "MangoHud-v0.8.4-Source-DFSG.tar.xz", "browser_download_url": "https://github.com/x/dfsg"},
-        {"name": tarball.name, "browser_download_url": "https://github.com/x/bin", "size": tarball.stat().st_size},
+        {"name": tarball.name, "browser_download_url": "https://github.com/x/bin", "size": tarball.stat().st_size,
+         "digest": "sha256:" + hashlib.sha256(tarball.read_bytes()).hexdigest()},  # GitHub's asset digest
     ]
     monkeypatch.setattr(rm, "_fetch_json", lambda url, timeout=20: {"tag_name": "v0.8.4", "assets": assets})
     monkeypatch.setattr(rm, "_download_file", lambda url, dest, label, cb=None: dest.write_bytes(tarball.read_bytes()))
@@ -147,3 +149,13 @@ def test_update_runtimes_installs_mangohud_when_missing(release: Path) -> None:
     assert worker._update_mangohud() == "+MangoHud v0.8.4"
     assert rm.official_mangohud_installed()
     assert worker._update_mangohud() == "MangoHud v0.8.4"  # up to date: nothing downloaded
+
+
+def test_release_without_any_checksum_is_refused_and_nothing_installed(
+    release: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assets = [{"name": release.name, "browser_download_url": "https://github.com/x/bin", "size": release.stat().st_size}]
+    monkeypatch.setattr(rm, "_fetch_json", lambda url, timeout=20: {"tag_name": "v0.8.4", "assets": assets})
+    with pytest.raises(RuntimeError, match="No checksum published"):
+        rm.ensure_mangohud()
+    assert not rm.official_mangohud_installed()

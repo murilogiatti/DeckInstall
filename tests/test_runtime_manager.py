@@ -546,7 +546,7 @@ def test_verify_release_asset_integrity_requires_checksum_when_flag_set(tmp_path
     release: dict[str, object] = {"assets": []}
     asset: dict[str, object] = {"name": "asset.tar.gz", "size": len(b"payload")}
 
-    with pytest.raises(RuntimeError, match="No checksum metadata"):
+    with pytest.raises(RuntimeError, match="No checksum published"):
         rm._verify_release_asset_integrity(
             release,
             asset,
