@@ -54,11 +54,16 @@ jobs:
           build=false
           reuse_run=""
 
-          # Latest other run of this workflow on this commit that finished (or is still going) and is usable.
+          # Newest other run of this workflow on this commit that succeeded (or is still going).
+          # Cancelled and failed runs are skipped: a push run cancelled by a manual build of the same
+          # commit must not hide that build (v0.36.0 was compiled again because of this).
           find_run() {
             gh run list --workflow "${{ github.workflow }}" --commit "$GITHUB_SHA" --limit 20 \
-              --json databaseId,status,conclusion,event \
-              --jq "[.[] | select(.databaseId != ${{ github.run_id }}) | select(.event == \"push\" or .event == \"workflow_dispatch\")] | .[0] // empty"
+              --json databaseId,status,conclusion,event,createdAt \
+              --jq "[.[] | select(.databaseId != ${{ github.run_id }})
+                    | select(.event == \"push\" or .event == \"workflow_dispatch\")
+                    | select(.status != \"completed\" or .conclusion == \"success\")]
+                    | sort_by(.createdAt, .databaseId) | reverse | .[0] // empty"
           }
 
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
