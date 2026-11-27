@@ -1966,6 +1966,79 @@ def _read_sync_base_pair(prefix_dir: Path, sync_root: Path, slug: str) -> tuple[
     return "", ""
 
 
+def _link_key(sync_root: Path, game_dir: Path | None, game_name: str) -> str:
+    """Which installation a link belongs to: its game folder when known, else its name."""
+    try:
+        root = str(sync_root.resolve())
+    except OSError:
+        root = str(sync_root)
+    return f"{root}|link|{game_dir if game_dir is not None else game_name}"
+
+
+def _read_sync_link(prefix_dir: Path, sync_root: Path, game_dir: Path | None, game_name: str) -> tuple[str, str]:
+    """(folder slug, save history id) this installation is linked to in sync_root ("" when none)."""
+    state_path = prefix_dir / _SYNC_BASE_FILE
+    try:
+        if state_path.is_symlink() or not state_path.is_file() or state_path.stat().st_size > 1_048_576:
+            return "", ""
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "", ""
+    value = data.get(_link_key(sync_root, game_dir, game_name)) if isinstance(data, dict) else None
+    if not isinstance(value, dict):
+        return "", ""
+    slug, save_id = value.get("slug"), value.get("save_id")
+    return (slug if isinstance(slug, str) else ""), (save_id if isinstance(save_id, str) else "")
+
+
+def _record_sync_link(
+    prefix_dir: Path, sync_root: Path, game_dir: Path | None, game_name: str, slug: str, save_id: str,
+) -> None:
+    """Remember which shared folder and history this installation uses (kept when it is renamed)."""
+    if not save_id or not prefix_dir.is_dir():
+        return
+    state_path = prefix_dir / _SYNC_BASE_FILE
+    try:
+        if state_path.is_symlink():
+            return
+        data: dict[str, object] = {}
+        if state_path.is_file():
+            try:
+                loaded = json.loads(state_path.read_text(encoding="utf-8"))
+                data = loaded if isinstance(loaded, dict) else {}
+            except ValueError:
+                data = {}
+        data[_link_key(sync_root, game_dir, game_name)] = {"slug": slug, "save_id": save_id}
+        atomic_write_bytes(state_path, json.dumps(data, indent=2).encode("utf-8"))
+    except OSError:
+        logging.warning("Could not record the sync link of %s in %s", game_name, prefix_dir, exc_info=True)
+
+
+def _game_sync_folder(
+    sync_root: Path, game_name: str, prefix_dir: Path, game_dir: Path | None,
+) -> tuple[str, Path, str]:
+    """(slug, folder, linked save id): the linked folder when this installation has one (so a
+    renamed game keeps its history), otherwise the folder of its name."""
+    linked_slug, save_id = _read_sync_link(prefix_dir, sync_root, game_dir, game_name)
+    if linked_slug and "/" not in linked_slug and linked_slug not in (".", "..") and (sync_root / linked_slug).is_dir():
+        return linked_slug, sync_root / linked_slug, save_id
+    slug, folder = _resolve_game_slug_dir(sync_root, game_name, meta_file="meta.json", name_key="game_name")
+    return slug, folder, save_id if slug == linked_slug else ""
+
+
+def _identity_problem(
+    heads: Sequence[repo.Revision], linked_save_id: str, steam_appid: int | None,
+) -> str:
+    """Why the shared saves may belong to another game ("" when nothing says so)."""
+    ids = {h.save_id for h in heads if h.save_id}
+    if linked_save_id and ids and linked_save_id not in ids:
+        return "The shared saves belong to a different save history (another game with the same name?)"
+    appids = {h.steam_appid for h in heads if h.steam_appid}
+    if steam_appid and appids and steam_appid not in appids:
+        return f"The shared saves were made for Steam AppID {', '.join(map(str, sorted(appids)))}, not {steam_appid}"
+    return ""
+
+
 def _read_sync_base_rev(prefix_dir: Path, sync_root: Path, slug: str) -> str:
     """The shared revision this device last pushed or restored ("" when none)."""
     state_path = prefix_dir / _SYNC_BASE_FILE
@@ -2038,7 +2111,7 @@ def push_game_saves(
         return None
 
     repo.open_sync_root(sync_root)  # never creates a missing (unmounted) folder
-    slug, game_sync_dir = _resolve_game_slug_dir(sync_root, game_name, meta_file="meta.json", name_key="game_name")
+    slug, game_sync_dir, linked_save_id = _game_sync_folder(sync_root, game_name, prefix_dir, game_dir)
     game_sync_dir.mkdir(exist_ok=True)
     with repo.game_lock(game_sync_dir), file_lock(game_sync_dir / ".sync.lock"):
         tmp_zip = repo.staging_file(game_sync_dir)
@@ -2052,18 +2125,27 @@ def push_game_saves(
                 digest, fp_count, _ = repo.save_entries_digest(zf)
                 # Decide the parents only now, right before publishing (the folder may have changed).
                 state = repo.scan_game_folder(game_sync_dir)
+                if not resolve_heads:
+                    problem = _identity_problem(state.heads(), linked_save_id, steam_appid)
+                    if problem:
+                        raise repo.SyncRemoteChanged(problem)
                 parents, same = _push_parents(state, prefix_dir, sync_root, slug, digest, resolve_heads)
                 if same is not None:  # the shared version already has exactly these saves
                     zf.close()
                     tmp_zip.unlink(missing_ok=True)
                     if prefix_dir.is_dir():
                         _record_sync_base(prefix_dir, sync_root, slug, digest, rev_id=same.rev_id)
+                        _record_sync_link(prefix_dir, sync_root, game_dir, game_name, slug,
+                                          same.save_id or linked_save_id)
                     return same.path
                 rev_id = repo.new_rev_id()
-                save_id = next((state.revisions[p].save_id for p in parents
-                                if p in state.revisions and state.revisions[p].save_id), "") or repo.new_rev_id()
+                save_id = (
+                    next((state.revisions[p].save_id for p in parents
+                          if p in state.revisions and state.revisions[p].save_id), "")
+                    or linked_save_id or repo.new_rev_id()
+                )
                 zf.writestr(repo.REV_MANIFEST, repo.revision_manifest(
-                    rev_id, parents, save_id, digest, fp_count, total_uncompressed, game_name,
+                    rev_id, parents, save_id, digest, fp_count, total_uncompressed, game_name, steam_appid,
                 ))
             final = repo.publish_revision(game_sync_dir, tmp_zip, rev_id)
         except BaseException:
@@ -2071,6 +2153,7 @@ def push_game_saves(
             raise
         if prefix_dir.is_dir():
             _record_sync_base(prefix_dir, sync_root, slug, digest, rev_id=rev_id)
+            _record_sync_link(prefix_dir, sync_root, game_dir, game_name, slug, save_id)
         return final
 
 
@@ -2212,7 +2295,7 @@ def pull_game_saves(
     rev_id picks one version when several conflict; without it there must be exactly one.
     """
     repo.open_sync_root(sync_root)
-    slug, game_sync_dir = _resolve_game_slug_dir(sync_root, game_name, meta_file="meta.json", name_key="game_name")
+    slug, game_sync_dir, _linked = _game_sync_folder(sync_root, game_name, prefix_dir, game_dir)
     if not game_sync_dir.is_dir() or game_sync_dir.is_symlink():
         return 0, None
     with repo.game_lock(game_sync_dir):
@@ -2301,6 +2384,7 @@ def pull_game_saves(
                 local_digest=post_fp.digest or source.content_digest,
                 rev_id=source.rev_id,
             )
+            _record_sync_link(prefix_dir, sync_root, game_dir, game_name, slug, source.save_id)
     return restored_files, snap_path
 
 
@@ -2700,7 +2784,7 @@ def plan_sync_all(
             item_extra = extra_dirs
             item_source = "deckinstall"
 
-        slug, game_sync_dir = _resolve_game_slug_dir(sync_root, game_name, meta_file="meta.json", name_key="game_name")
+        slug, game_sync_dir, linked_save_id = _game_sync_folder(sync_root, game_name, prefix_dir, item_game_dir)
         common = {
             "game_name": game_name,
             "slug": slug,
@@ -2733,6 +2817,9 @@ def plan_sync_all(
                 _extract_manifest_reg_bytes(prefix_dir, game_name, item_appid)
             )
         action, reason = _plan_action(state, distinct, has_local, local_fp, prefix_dir, sync_root, slug)
+        problem = _identity_problem(state.heads(), linked_save_id, item_appid) if distinct else ""
+        if problem and action != "IN_SYNC":  # never pull or push across different games silently
+            action, reason = "CONFLICT", problem
         if state.waiting and action in ("IN_SYNC", "PUSH", "NO_SAVES"):
             reason += f" ({len(state.waiting)} shared file(s) still arriving or damaged; not used)"
         plan.append(SyncPlanItem(action=action, reason=reason, **common))  # type: ignore[arg-type]

@@ -78,6 +78,7 @@ class Revision:
     legacy: bool = False
     stored_bytes: int = 0
     pruned: bool = False  # only its manifest is left (the saves were cleaned up to free space)
+    steam_appid: int | None = None  # a hint of which game these saves belong to
 
 
 @dataclass
@@ -284,7 +285,12 @@ def _revision_from_manifest(raw: dict[str, object], path: Path) -> Revision:
         created_at=float(created), device_id=str(raw.get("device_id") or ""),
         device_label=str(raw.get("device_label") or ""), game_name=str(raw.get("game_name") or ""),
         app_version=str(raw.get("app_version") or ""), stored_bytes=stored,
+        steam_appid=_appid_or_none(raw.get("steam_appid")),
     )
+
+
+def _appid_or_none(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 0xFFFFFFFF else None
 
 
 def _valid_rev_id(rev_id: str) -> bool:
@@ -551,7 +557,7 @@ def new_rev_id() -> str:
 
 def revision_manifest(
     rev_id: str, parents: Iterable[str], save_id: str, content_digest: str, file_count: int,
-    uncompressed_bytes: int, game_name: str,
+    uncompressed_bytes: int, game_name: str, steam_appid: int | None = None,
 ) -> bytes:
     from . import __version__
 
@@ -567,6 +573,7 @@ def revision_manifest(
         "device_id": device_id(),
         "device_label": device_label(),
         "game_name": game_name,
+        "steam_appid": steam_appid,
         "app_version": __version__,
     }, indent=2, ensure_ascii=False).encode("utf-8")
 

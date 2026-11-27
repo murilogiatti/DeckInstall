@@ -381,3 +381,51 @@ def test_cleanup_never_touches_conflicting_branches(two: dict[str, Path]) -> Non
     game_dir = next(two["a_root"].glob("*/revs")).parent
     assert repo.plan_cleanup(game_dir).remove == ()  # two heads + their shared parent
     assert _action(two["a"], two["a_root"]).action == "CONFLICT"
+
+
+def test_renamed_game_keeps_its_shared_history(tmp_path: Path) -> None:
+    root = tmp_path / "sync"
+    prefix = tmp_path / "pfx"
+    game_dir = tmp_path / "Games" / "Game"
+    game_dir.mkdir(parents=True)
+    _save(prefix, b"v1")
+    first = push_game_saves("Old Name", prefix, root, game_dir=game_dir)
+    assert first is not None
+    target = save_sync.SyncGameTarget("New Name", prefix, game_dir=game_dir)
+    item = plan_sync_all([target], root)[0]
+    assert item.action == "IN_SYNC" and item.slug == first.parent.parent.name  # same folder, same history
+    _save(prefix, b"v2")
+    pushed = push_game_saves("New Name", prefix, root, game_dir=game_dir)
+    assert pushed is not None and pushed.parent == first.parent
+
+
+def test_same_name_different_game_is_never_mixed_silently(tmp_path: Path) -> None:
+    root = tmp_path / "sync"
+    a, b = tmp_path / "a", tmp_path / "b"
+    _save(a, b"doom-2016")
+    push_game_saves("Doom", a, root, steam_appid=379720)
+    b.mkdir()
+    item = plan_sync_all([save_sync.SyncGameTarget("Doom", b, steam_appid=2280)], root)[0]
+    assert item.action == "CONFLICT" and "379720" in item.reason  # it used to be PULL (wrong game's saves)
+    _save(b, b"doom-1993")
+    with pytest.raises(repo.SyncRemoteChanged):
+        push_game_saves("Doom", b, root, steam_appid=2280)
+    # the same game on another device (same AppID) follows normally
+    c = tmp_path / "c"
+    c.mkdir()
+    assert plan_sync_all([save_sync.SyncGameTarget("Doom", c, steam_appid=379720)], root)[0].action == "PULL"
+
+
+def test_linked_history_does_not_follow_a_replaced_folder(tmp_path: Path) -> None:
+    root = tmp_path / "sync"
+    a = tmp_path / "a"
+    _save(a, b"mine")
+    pushed = push_game_saves(GAME, a, root)
+    assert pushed is not None
+    game_dir = pushed.parent.parent
+    shutil.rmtree(game_dir)  # someone else's game with this name takes the folder
+    other = tmp_path / "other"
+    _save(other, b"theirs")
+    push_game_saves(GAME, other, root)
+    assert _action(a, root).action == "CONFLICT"
+    assert "different save history" in _action(a, root).reason
