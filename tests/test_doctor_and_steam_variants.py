@@ -179,3 +179,19 @@ def test_shareable_text_uses_the_live_values(monkeypatch: pytest.MonkeyPatch, ho
     report = {"app": [{"name": "home", "status": doctor.INFO, "detail": f"config at {home}/.config"}]}
     out = doctor.shareable_text(report)
     assert str(home) not in out and "~/.config" in out and "masked" in out
+
+
+def test_account_names_are_masked_only_in_the_steam_section(monkeypatch: pytest.MonkeyPatch) -> None:
+    def words(accounts: bool = True) -> list[tuple[str, str]]:
+        base = [("/home/x", "~")]
+        return base + ([("Proton", "<steam account 1>"), ('Bob "the" Dev', "<steam account 2>")] if accounts else [])
+
+    monkeypatch.setattr(doctor, "_private_words", words)
+    report = {
+        "steam": [{"name": "steam", "status": doctor.OK, "detail": 'native: /home/x/S — Proton (1), Bob "the" Dev (2)'}],
+        "runtimes": [{"name": "proton", "status": doctor.OK, "detail": "GE-Proton11-14 in /home/x/.steam"}],
+    }
+    masked = doctor.shareable_report(report)
+    assert masked["steam"][0]["detail"] == "native: ~/S — <steam account 1> (1), <steam account 2> (2)"
+    assert masked["runtimes"][0]["detail"] == "GE-Proton11-14 in ~/.steam"  # "Proton" kept outside Steam
+    assert "Bob" not in json.dumps(masked)  # masked before JSON escaping

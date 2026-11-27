@@ -672,7 +672,11 @@ def _write_launch_script(
             lines.append(f'bash -c {shlex.quote(post)} || echo "== DeckInstall: the command after the game failed"')
         lines.extend([
             # close the capped log pipe, let it finish, then always record how the game ended
-            'if [ -n "${_di_log_pid:-}" ]; then exec >/dev/null 2>&1; wait "$_di_log_pid" 2>/dev/null || true; fi',
+            # Close the log pipe and give it a moment to finish, never waiting for it: a helper the
+            # game left running (wineserver, a crash reporter...) may still hold the pipe open.
+            'if [ -n "${_di_log_pid:-}" ]; then exec >/dev/null 2>&1;'
+            ' for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20;'
+            ' do kill -0 "$_di_log_pid" 2>/dev/null || break; sleep 0.1 2>/dev/null || break; done; fi',
             'echo "== DeckInstall: exit code $rc at $(date -Is)" >>"$LOG_DIR/run.log" 2>/dev/null || true',
             'exit "$rc"',
         ])

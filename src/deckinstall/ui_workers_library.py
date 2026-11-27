@@ -13,7 +13,7 @@ from .external_actions import (
     import_external_saves_to_target,
 )
 from .extractor import sanitize_folder_name
-from .fsutil import clean_child_env, sleep_inhibit_problem
+from .fsutil import clean_child_env, sleep_inhibit_problem_cached
 from .gameinfo import detect_game_tech
 from .i18n import tr
 from .launcher_scan import ExternalLauncherGame, scan_external_launcher_games
@@ -394,7 +394,7 @@ class LaunchPrepWorker(QThread):
                 if is_win32_prefix(obj.prefix_dir):
                     self.ready.emit("win32", "", [], None, None)
                     return
-                problem = sleep_inhibit_problem()
+                problem = sleep_inhibit_problem_cached()
                 if problem:
                     self.inhibit_unavailable.emit(problem)
                 _, fallback_name_opt = resolve_standalone_proton_fallback(obj)

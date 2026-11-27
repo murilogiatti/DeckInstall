@@ -515,6 +515,16 @@ _APP_ONLY_ENV_KEYS = (
 )
 
 
+_INHIBIT_PROBE: list[str] = []  # the answer for this session (it does not change while the app runs)
+
+
+def sleep_inhibit_problem_cached() -> str:
+    """sleep_inhibit_problem(), asked once per session."""
+    if not _INHIBIT_PROBE:
+        _INHIBIT_PROBE.append(sleep_inhibit_problem())
+    return _INHIBIT_PROBE[0]
+
+
 def sleep_inhibit_problem(timeout: float = 5.0) -> str:
     """Why the PC cannot be kept awake while a game runs ("" when systemd-inhibit works).
 

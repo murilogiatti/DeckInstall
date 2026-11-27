@@ -3626,8 +3626,9 @@ class MainWindow(QMainWindow):
         worker.ready.connect(_on_prep_ready)
 
         def _on_inhibit_unavailable(reason: str) -> None:
-            if self._closing_pending:
-                return
+            if self._closing_pending or getattr(self, "_inhibit_warned", False):
+                return  # said once per session: the launcher handles it every time anyway
+            self._inhibit_warned = True
             msg = tr("play.inhibit_unavailable", name=title_name, reason=reason)
             logging.warning("%s", msg)
             self.notify(msg, "warning")

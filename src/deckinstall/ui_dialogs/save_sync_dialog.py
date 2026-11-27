@@ -1459,12 +1459,14 @@ def open_save_sync_dialog(win: MainWindow) -> None:
                     tr("save_sync.conflict_keep_local"), QMessageBox.ButtonRole.AcceptRole
                 )
                 pull_buttons = []
-                heads: list[Any] = list(item.heads)[-3:] or [None]
+                # Every shared version gets a button (the choice replaces all of them), and none when
+                # the shared copy cannot be verified (it is never restored).
+                heads: list[Any] = list(item.heads)
                 for head in heads:
                     label = (
                         tr("save_sync.conflict_use_version", device=head.device_label or "?",
                            date=_format_version_date(head.created_at))
-                        if head is not None and len(heads) > 1 else tr("save_sync.conflict_use_remote")
+                        if len(heads) > 1 else tr("save_sync.conflict_use_remote")
                     )
                     pull_buttons.append((box.addButton(label, QMessageBox.ButtonRole.AcceptRole), head))
                 btn_skip = box.addButton(
@@ -1478,7 +1480,7 @@ def open_save_sync_dialog(win: MainWindow) -> None:
                     ops.append((item, "PUSH_RESOLVE"))
                 for btn, head in pull_buttons:
                     if clicked == btn:
-                        ops.append((item, f"PULL:{head.rev_id}" if head is not None else "PULL"))
+                        ops.append((item, f"PULL:{head.rev_id}"))
 
         if not dlg_alive["open"] or win._closing_pending:
             return

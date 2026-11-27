@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -1005,6 +1006,18 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                             return
 
                         queued = win.should_queue_vdf_edits()  # Gaming Mode: save it for when Steam closes
+                        queued_edit_id = f"set_proton:{entry.appid_u32}"
+                        # Queue first: when the edit cannot be saved nothing else changes (the manifest
+                        # keeps its Proton too); enqueue_vdf_edit already told the user why.
+                        if queued and not win.enqueue_vdf_edit(
+                            QueuedVdfEdit(
+                                queued_edit_id, "set_proton", entry.appid_u32, entry.app_name,
+                                {"tool_name": target_steam_tool},
+                            ),
+                            trigger_watch=False,
+                        ):
+                            _set_proton_controls_enabled(True)
+                            return
                         win._begin_busy()
 
                         def _do_steam() -> StandaloneGame | None:
@@ -1047,18 +1060,8 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                             active_proton_ref[0] = tool_id
                             msg = tr("proton.updated", name=entry.app_name, tool=display_tool)
                             if queued:
-                                if win.enqueue_vdf_edit(
-                                    QueuedVdfEdit(
-                                        f"set_proton:{entry.appid_u32}",
-                                        "set_proton",
-                                        entry.appid_u32,
-                                        entry.app_name,
-                                        {"tool_name": target_steam_tool},
-                                    )
-                                ):
-                                    msg = tr("vdf_queue.enqueued", name=entry.app_name)
-                                else:
-                                    msg = tr("vdf_queue.save_failed", name=entry.app_name, err="").split("\n")[0]
+                                msg = tr("vdf_queue.enqueued", name=entry.app_name)
+                                win._vdf_watch_tick()
                             win._refresh_shortcuts()
                             win.status_label.setText(msg)
                             if dlg_alive():
@@ -1068,6 +1071,12 @@ def open_configure_game_dialog(win: MainWindow) -> None:
 
                         def _st_err(err: str) -> None:
                             win._end_busy()
+                            if queued:  # the game's own setting failed: do not change Steam's alone
+                                try:
+                                    win._vdf_queue.remove(queued_edit_id)
+                                except OSError as exc:
+                                    logging.warning("Could not take back the queued Proton change: %s", exc)
+                                win._update_vdf_queue_banner()
                             if dlg_alive():
                                 _set_proton_controls_enabled(True)
                                 _start_config_loader()

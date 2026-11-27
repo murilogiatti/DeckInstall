@@ -65,7 +65,7 @@ def _run(game: standalone.StandaloneGame, tmp_path: Path, case: str, **env: str)
     if not tools.exists():
         tools.mkdir()
         for name in ("bash", "sh", "mktemp", "rm", "tr", "date", "mkdir", "touch", "find", "cat", "mv",
-                     "ls", "printf", "kill", "dirname", "basename", "env", "tee", "head", "sed", "stat"):
+                     "ls", "printf", "kill", "dirname", "basename", "env", "tee", "head", "sed", "stat", "sleep"):
             for base in ("/usr/bin", "/bin"):
                 if (Path(base) / name).exists():
                     (tools / name).symlink_to(Path(base) / name)
@@ -180,3 +180,35 @@ def test_uninstall_also_removes_the_kept_previous_launcher(tmp_path: Path) -> No
     plan = uninstall.plan_uninstall(game)
     shortcuts = next(i for i in plan.items if i.id == uninstall.SHORTCUTS)
     assert prev in shortcuts.paths and game.launch_script in shortcuts.paths
+
+
+def test_launcher_exits_even_when_a_helper_keeps_the_log_pipe_open(tmp_path: Path) -> None:
+    """wineserver and friends may outlive the game with its stdout: launch.sh must not wait for them."""
+    import time as _time
+
+    src = tmp_path / "Games" / "Helper"
+    src.mkdir(parents=True)
+    exe = src / "start.sh"
+    exe.write_text('#!/bin/sh\necho run >> "$COUNTER"\n(sleep 30; echo late) &\nexit 3\n', encoding="utf-8")
+    exe.chmod(0o755)
+    with mock.patch.object(standalone, "resolve_game_icon", return_value=None):
+        game = standalone.install_standalone_game("Helper", exe, src, native_linux=True)
+    counter = tmp_path / "count-helper"
+    runtime = tmp_path / "runtime-helper"
+    runtime.mkdir()
+    t0 = _time.monotonic()
+    proc = subprocess.Popen(
+        ["bash", str(game.launch_script)],
+        env={"PATH": os.defpath, "HOME": str(tmp_path), "XDG_RUNTIME_DIR": str(runtime), "COUNTER": str(counter)},
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    try:
+        rc = proc.wait(timeout=15)  # used to block until the helper ended
+    finally:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)  # the helper
+        except ProcessLookupError:
+            pass
+    assert rc == 3 and _time.monotonic() - t0 < 15
+    assert len(counter.read_text().splitlines()) == 1
+    assert "exit code 3" in standalone.game_run_logs(game)[0].read_text(encoding="utf-8")

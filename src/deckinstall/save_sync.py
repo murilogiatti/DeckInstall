@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 import zipfile
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -2233,9 +2233,16 @@ def pull_game_saves(
                 rev_id="", path=legacy, parents=(), save_id="", content_digest="", file_count=0,
                 uncompressed_bytes=0, created_at=0.0, legacy=True,
             )
-            copy = repo.local_staging_dir() / f"unverified-{os.getpid()}.zip"
-            copy.parent.mkdir(parents=True, exist_ok=True)
-            shutil_copy(legacy, copy)
+            staging = repo.local_staging_dir()
+            staging.mkdir(parents=True, exist_ok=True)
+            fd, copy_name = tempfile.mkstemp(prefix="unverified-", suffix=".zip", dir=str(staging))
+            os.close(fd)
+            copy = Path(copy_name)
+            try:
+                shutil_copy(legacy, copy)
+            except BaseException:
+                copy.unlink(missing_ok=True)
+                raise
         else:
             if rev_id:
                 source_opt = state.revisions.get(rev_id)
@@ -2732,6 +2739,15 @@ def plan_sync_all(
     return plan
 
 
+def _ancestry_still_arriving(state: repo.RepoState, ids: Iterable[str]) -> bool:
+    """True when a revision names a parent that is not here yet (and can still arrive).
+
+    A legacy parent (an old latest.zip that an older DeckInstall has since rewritten) never
+    comes back, so it is not "arriving".
+    """
+    return any(i not in state.revisions and not i.startswith(repo.LEGACY_PREFIX) for i in ids)
+
+
 def _plan_action(
     state: repo.RepoState,
     distinct: list[repo.Revision],
@@ -2749,7 +2765,7 @@ def _plan_action(
             return "PUSH", "Local saves present; no remote sync archive yet"
         return "NO_SAVES", "No local or remote saves found"
     if len(distinct) > 1:
-        if any(par not in state.revisions for h in distinct for par in h.parents):
+        if _ancestry_still_arriving(state, [p for h in distinct for p in h.parents]):
             return "CONFLICT", "Older shared versions are still arriving; wait for the transfer to finish (or choose)"
         return "CONFLICT", f"{len(distinct)} different shared versions (made offline on different devices)"
     head = distinct[0]
@@ -2777,7 +2793,7 @@ def _plan_action(
         return "CONFLICT", "Both local and remote saves changed since last sync"
     if not base_rev and not base_remote:
         return "CONFLICT", "No previous sync recorded on this device; choose which saves to keep"
-    if any(a not in state.revisions for a in ancestors):
+    if _ancestry_still_arriving(state, ancestors):
         return "CONFLICT", "Older shared versions are still arriving; wait for the transfer to finish (or choose)"
     return "CONFLICT", "The shared saves do not continue the version this device synced last"
 

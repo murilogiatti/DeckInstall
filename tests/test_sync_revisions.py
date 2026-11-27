@@ -327,3 +327,16 @@ def test_legacy_archive_that_does_not_match_its_meta_is_not_trusted(tmp_path: Pa
     with pytest.raises(RuntimeError):
         pull_game_saves(GAME, prefix, tmp_path / "sync")
     assert (prefix / REL).read_bytes() == b"mine"
+
+
+def test_a_lost_legacy_parent_is_not_reported_as_still_arriving(tmp_path: Path) -> None:
+    state = repo.RepoState()
+    rev = repo.Revision(rev_id="a" * 32, path=tmp_path / "x.zip", parents=(repo.LEGACY_PREFIX + "b" * 32,),
+                        save_id="s", content_digest="c" * 64, file_count=1, uncompressed_bytes=1, created_at=1.0)
+    other = repo.Revision(rev_id="d" * 32, path=tmp_path / "y.zip", parents=(), save_id="s",
+                          content_digest="e" * 64, file_count=1, uncompressed_bytes=1, created_at=2.0)
+    state.revisions = {rev.rev_id: rev, other.rev_id: other}
+    assert not save_sync._ancestry_still_arriving(state, rev.parents)
+    assert save_sync._ancestry_still_arriving(state, ["f" * 32])
+    action, reason = save_sync._plan_action(state, state.distinct_heads(), True, None, tmp_path, tmp_path, "g")
+    assert action == "CONFLICT" and "still arriving" not in reason

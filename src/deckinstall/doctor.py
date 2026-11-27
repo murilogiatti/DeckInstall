@@ -282,8 +282,9 @@ def format_text(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _private_words() -> list[tuple[str, str]]:
-    """(text, replacement) pairs that identify this person: home, user name, Steam accounts."""
+def _private_words(accounts: bool = True) -> list[tuple[str, str]]:
+    """(text, replacement) pairs that identify this person: home, user and host names, and (with
+    accounts) the Steam account names and ids."""
     import getpass
     import os
     import socket
@@ -294,6 +295,8 @@ def _private_words() -> list[tuple[str, str]]:
     if home not in ("", "/"):
         pairs.append((home, "~"))
     try:
+        if not accounts:
+            raise LookupError
         from .steam_paths import find_steam_roots, list_steam_accounts
 
         n = 0
@@ -324,9 +327,27 @@ def mask_text(text: str, words: list[tuple[str, str]] | None = None) -> str:
     return re.sub(r"\b7656119\d{10}\b", "<steamid>", text)  # 64-bit Steam IDs
 
 
+def shareable_report(report: dict[str, Any]) -> dict[str, Any]:
+    """A copy of the report with personal data masked in every value.
+
+    Steam account names are masked only in the Steam section, where they are listed: a persona
+    called "Proton" must not turn every "Proton" of the report into a placeholder.
+    """
+    general = _private_words(accounts=False)
+    with_accounts = _private_words(accounts=True)
+    out: dict[str, Any] = {}
+    for section, checks in report.items():
+        words = with_accounts if section == "steam" else general
+        out[section] = [
+            {key: mask_text(value, words) if isinstance(value, str) else value for key, value in check.items()}
+            for check in checks
+        ]
+    return out
+
+
 def shareable_text(report: dict[str, Any]) -> str:
     """What "Copy diagnostics" puts on the clipboard: masked, with a note saying so."""
-    return "(personal paths, user and Steam account names are masked)\n" + mask_text(format_text(report))
+    return "(personal paths, user and Steam account names are masked)\n" + format_text(shareable_report(report))
 
 
 def main(args: list[str]) -> int:
@@ -336,7 +357,7 @@ def main(args: list[str]) -> int:
     """
     report = collect_report()
     if "--share" in args:
-        print(mask_text(json.dumps(report, indent=2, ensure_ascii=False)) if "--json" in args
+        print(json.dumps(shareable_report(report), indent=2, ensure_ascii=False) if "--json" in args
               else shareable_text(report))
     elif "--json" in args:
         print(json.dumps(report, indent=2, ensure_ascii=False))
