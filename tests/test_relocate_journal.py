@@ -32,6 +32,20 @@ def test_finished_and_rolled_back_moves_leave_no_journal(tmp_path: Path) -> None
     assert not list(relocate._journal_dir().glob("*.json"))  # ...so nothing to report
 
 
+def test_move_stops_before_touching_game_when_journal_cannot_be_written(tmp_path: Path) -> None:
+    src, dst = _libs(tmp_path)
+    game = _install_v2_game(src, "Journal Write Failure", with_prefix=True)
+    plan = relocate.plan_relocation(game, dst)
+    with mock.patch.object(relocate, "atomic_write_text", side_effect=OSError("disk full")):
+        with pytest.raises(relocate.RelocateError, match="Could not start the move journal"):
+            relocate.relocate_game(plan)
+
+    assert game.exe_path.is_file()
+    assert game.prefix_dir.is_dir()
+    assert not plan.new_game_dir.exists()
+    assert plan.new_prefix_dir is not None and not plan.new_prefix_dir.exists()
+
+
 def test_an_interrupted_move_is_reported_with_both_places(tmp_path: Path) -> None:
     src, dst = _libs(tmp_path)
     game = _install_v2_game(src, "Cut Game", with_prefix=True)

@@ -82,13 +82,13 @@ def test_infer_game_root_and_protected_dirs_cover_mnt_media_and_deckinstall(
     # Synthetic /mnt and /media paths never collapse to the mountpoint or disk root.
     assert steam_vdf.infer_game_root_from_exe(Path("/mnt/ssd/Games/MyGame/game.exe")) == Path(
         "/mnt/ssd/Games/MyGame"
-    )
+    ).resolve()
     with pytest.raises(ValueError):
         steam_vdf.infer_game_root_from_exe(Path("/mnt/ssd/game.exe"))
 
     assert steam_vdf.infer_game_root_from_exe(Path("/media/user/Disk/Games/MyGame/game.exe")) == Path(
         "/media/user/Disk/Games/MyGame"
-    )
+    ).resolve()
     with pytest.raises(ValueError):
         steam_vdf.infer_game_root_from_exe(Path("/media/user/Disk/game.exe"))
 

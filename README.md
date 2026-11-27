@@ -4,7 +4,7 @@
 
 Game installer for **desktop Linux and SteamOS** (Qt6) with two modes per game: **Steam mode** (Steam runs the game with its own Proton) and **Standalone mode** (DeckInstall runs it with `umu-run` + GE-Proton, no Steam needed). Also a Proton prefix migrator, save manager and official Steam artwork manager.
 
-**Current version:** `0.37.0`
+**Current version:** `0.38.0`
 
 ## Features
 - **Tabs & Library**: Four tabs on top: **Library**, **Install**, **Saves** and **Settings**. Every tab is laid out by purpose: the everyday part first (the Library's game list, the Install steps 1-2-3), then the actions for all games at once, each button with a line saying what it does. Settings has three sections: **General** (appearance, Steam status and *Find Steam again*, game artwork with the SteamGridDB key, *About* and diagnostics), **Updates & runtimes** and **Cleanup**; it reopens on the section used last. Every tab and dialog follows one pattern: a title and one line on what it is for, then cards by purpose; a card's status and its button sit at its top right, independent actions are buttons with a line on what each does, settings are a form, and dialogs end with extra or risky actions on the left and the main action and Close on the right. **Ctrl+Tab** / **Ctrl+Shift+Tab** move to the next / previous tab in a loop. **Interface size** is *Automatic* (125% in Gaming Mode, so text and buttons are readable and touchable on the Deck), 100% or 125%. News that needs no answer (an install or backup finished, edits sent to Steam) shows in a message bar under the tabs instead of a box (an action's message is cleared when you switch tabs; update news stays until closed), and a moving bar next to the status line tells when something runs in the background; a first start shows a short welcome there. The app always opens on the Library, which shows a list or Steam-style **covers** (from the art already on disk; picking a cover selects the game for every action), with a sortable Library with game size, runner, graphics API, engine and executable columns, instant source filter pills (`All`, `Steam`, `Standalone`, `External`), and a **Configure Game** dialog in three tabs by purpose: **Game** (executable, folder, mode and shortcuts), **Launch** (Proton with *Use previous version*, launch options and presets, before/after commands, run log) and **Tools** (Wine prefix, winetricks, running an .exe in the prefix, moving the compatdata to the microSD). The **Play** button works like Steam's: *Loading…* while the game starts, *Stop* while it runs (two games can run together) and an error with the last lines of the log when it fails to start or closes right away; closing DeckInstall never closes a running game. The **Graphics** and **Engine** columns are read from the game files without running anything: DirectX 8-12, Vulkan, OpenGL, DirectDraw and Glide from the import tables, loaded DLL names and per-backend modules (Unreal RHIs, CryEngine, Source 1/2, OGRE), and Unity, Unreal 1-5 (Win64, WinGDK/Game Pass, Test and Linux builds, modular builds), Godot, GameMaker, RPG Maker XP to MZ, Ren'Py, Source 2, RE Engine, Frostbite, Creation/Gamebryo, id Tech, Decima and other engines, with versions where the files carry them.
@@ -30,10 +30,10 @@ Game installer for **desktop Linux and SteamOS** (Qt6) with two modes per game: 
 Download `DeckInstall-<version>-x86_64.AppImage` from [GitHub Releases](https://github.com/murilogiatti/DeckInstall/releases):
 
 ```bash
-chmod +x DeckInstall-0.37.0-x86_64.AppImage
-./DeckInstall-0.37.0-x86_64.AppImage --version
-QT_QPA_PLATFORM=offscreen ./DeckInstall-0.37.0-x86_64.AppImage --smoke-test
-./DeckInstall-0.37.0-x86_64.AppImage
+chmod +x DeckInstall-0.38.0-x86_64.AppImage
+./DeckInstall-0.38.0-x86_64.AppImage --version
+QT_QPA_PLATFORM=offscreen ./DeckInstall-0.38.0-x86_64.AppImage --smoke-test
+./DeckInstall-0.38.0-x86_64.AppImage
 ```
 
 ### Verify the download
@@ -41,14 +41,14 @@ Every release AppImage has a signed build provenance (Sigstore, made by the rele
 
 ```bash
 sha256sum -c SHA256SUMS
-gh attestation verify DeckInstall-0.37.0-x86_64.AppImage --repo murilogiatti/DeckInstall
+gh attestation verify DeckInstall-0.38.0-x86_64.AppImage --repo murilogiatti/DeckInstall
 ```
 
 The in-app updater downloads only from this repository's GitHub Releases over HTTPS and refuses a file whose SHA-256 does not match `SHA256SUMS`. When GitHub cannot be reached or limits the checks, the card shows the last known versions and says so.
 
 ### Troubleshooting
-- **Check the system:** `./DeckInstall-0.37.0-x86_64.AppImage --doctor` prints what DeckInstall sees: OS, FUSE, GPU, whether `bwrap` can create user namespaces (needed by umu-run), every Steam install, runtimes, libraries and tools. Add `--json` for a machine-readable report and `--share` to mask personal data (home folder, user, host and Steam account names) before sharing it. Exit code: 0 all fine, 1 warnings, 2 failures. **Settings > Copy diagnostics** puts the masked report on the clipboard.
-- **The AppImage does not open ("fuse" / "fusermount" error):** install FUSE 3 (`sudo apt install fuse3`, `sudo dnf install fuse3`, `sudo pacman -S fuse3`). Without it, run `./DeckInstall-0.37.0-x86_64.AppImage --appimage-extract-and-run`, which unpacks the app to a temporary folder on every start.
+- **Check the system:** `./DeckInstall-0.38.0-x86_64.AppImage --doctor` prints what DeckInstall sees: OS, FUSE, GPU, whether `bwrap` can create user namespaces (needed by umu-run), every Steam install, runtimes, libraries and tools. Add `--json` for a machine-readable report and `--share` to mask personal data (home folder, user, host and Steam account names) before sharing it. Exit code: 0 all fine, 1 warnings, 2 failures. **Settings > Copy diagnostics** puts the masked report on the clipboard.
+- **The AppImage does not open ("fuse" / "fusermount" error):** install FUSE 3 (`sudo apt install fuse3`, `sudo dnf install fuse3`, `sudo pacman -S fuse3`). Without it, run `./DeckInstall-0.38.0-x86_64.AppImage --appimage-extract-and-run`, which unpacks the app to a temporary folder on every start.
 - **More than one Steam (native, Flatpak; Snap Steam is not supported):** DeckInstall uses the one that is running, else the first one with a logged-in user. To choose, start it with `DECKINSTALL_STEAM_ROOT=~/.var/app/com.valvesoftware.Steam/.local/share/Steam` (or the path `--doctor` lists).
 
 ## Translating DeckInstall
@@ -73,7 +73,7 @@ mypy src
 ```
 
 ## Build AppImage (GitHub Actions)
-A `main` push runs the complete test suite on Python 3.10, 3.11, 3.12 and 3.13 plus lint and types; when the push changes `VERSION` it also compiles the AppImage with Nuitka (no LTO), smoke-tests the packaged `AppDir` and stores `DeckInstall-<version>-x86_64.AppImage` and `SHA256SUMS` as a workflow artifact. Push a semantic tag matching `VERSION` (e.g. `v0.37.0`) to release: the tag run reuses the tested AppImage of the run on the same commit (waiting for it if it is still running), verifies its checksum and attaches it to the GitHub Release; if no such run exists it tests and builds by itself. Pull requests only run the tests, lint and types; a test AppImage can be built from **Actions > Run workflow**.
+A `main` push runs the complete test suite on Python 3.10, 3.11, 3.12 and 3.13 plus lint and types; when the push changes `VERSION` it also compiles the AppImage with Nuitka (no LTO), smoke-tests the packaged `AppDir` and stores `DeckInstall-<version>-x86_64.AppImage` and `SHA256SUMS` as a workflow artifact. Push a semantic tag matching `VERSION` (e.g. `v0.38.0`) to release: the tag run reuses the tested AppImage of the run on the same commit (waiting for it if it is still running), verifies its checksum and attaches it to the GitHub Release; if no such run exists it tests and builds by itself. Pull requests only run the tests, lint and types; a test AppImage can be built from **Actions > Run workflow**.
 
 ## License
 Distributed under the [MIT License](LICENSE).

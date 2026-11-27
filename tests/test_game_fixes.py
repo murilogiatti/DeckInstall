@@ -175,16 +175,18 @@ def test_fixes_go_into_the_launch_options_in_the_right_order() -> None:
 
 def test_protondb_summary_is_cached_and_handles_missing_games(tmp_path: Path) -> None:
     answers = {"1": json.dumps({"tier": "gold", "total": 536, "trendingTier": "platinum"}).encode()}
+    missing_body = io.BytesIO(b"Not Found")
 
     def opener(request, timeout):
         appid = request.full_url.rsplit("/", 1)[1].split(".")[0]
         if appid not in answers:
-            raise urllib.error.HTTPError(request.full_url, 404, "Not Found", None, None)  # type: ignore[arg-type]
+            raise urllib.error.HTTPError(request.full_url, 404, "Not Found", None, missing_body)  # type: ignore[arg-type]
         return _Response(answers[appid])
 
     got = protondb.summary(1, cache=tmp_path, opener=opener, now=100.0)
     assert (got.tier, got.total, got.trending, got.found, got.poor) == ("gold", 536, "platinum", True, False)
     assert not protondb.summary(2, cache=tmp_path, opener=opener, now=100.0).found
+    assert missing_body.closed
 
     def offline(request, timeout):
         raise urllib.error.URLError("offline")

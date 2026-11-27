@@ -63,6 +63,7 @@ def summary(
         result = Summary(tier if tier in TIERS else "", int(data.get("total", 0) or 0),
                          str(data.get("trendingTier", "")).lower())
     except urllib.error.HTTPError as exc:
+        exc.close()
         if exc.code != 404:
             raise OSError(str(exc)) from exc
         result = Summary("")  # ProtonDB has no reports for this game

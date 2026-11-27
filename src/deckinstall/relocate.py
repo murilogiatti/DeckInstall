@@ -287,13 +287,16 @@ def _journal_path(game: StandaloneGame) -> Path:
     return _journal_dir() / f"{key}.json"
 
 
-def _write_journal(path: Path, data: dict[str, Any]) -> None:
+def _write_journal(path: Path, data: dict[str, Any], *, required: bool = False) -> None:
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         import json
 
         atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False))
-    except OSError as exc:  # the move itself does not depend on it
+    except OSError as exc:
+        if required:
+            raise RelocateError(f"Could not start the move journal: {exc}") from exc
+        # The previously written journal already records both locations.
         logging.warning("Could not write the move journal %s: %s", path, exc)
 
 
@@ -393,7 +396,7 @@ def relocate_game(
         "old_prefix": str(game.prefix_dir) if plan.new_prefix_dir is not None else "",
         "new_prefix": str(plan.new_prefix_dir) if plan.new_prefix_dir is not None else "",
     }
-    _write_journal(journal, record)
+    _write_journal(journal, record, required=True)
 
     def step(name: str) -> None:
         say(name)
