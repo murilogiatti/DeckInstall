@@ -217,7 +217,7 @@ jobs:
             --enable-plugin=pyside6 \
             --include-package=deckinstall \
             --include-data-dir=src/deckinstall/locales=locales \
-            --include-data-dir=assets=assets \
+            --include-data-files=assets/icon.png=assets/icon.png \
             --lto=no \
             --python-flag=no_site \
             --jobs=$(nproc) \
