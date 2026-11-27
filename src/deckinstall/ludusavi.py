@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from . import save_sync
-from .fsutil import file_identity, is_within
+from .fsutil import file_identity, is_within, needs_zip64
 from .launcher_scan import _split_yaml_key_value, _strip_yaml_comment, _unquote_yaml_scalar
 from .steam_vdf import (
     _RESTORE_MAX_ENTRIES,
@@ -1002,7 +1002,7 @@ def import_ludusavi_to_snapshot(
                         raise LudusaviError(f"Backup too large: {src.original}")
                     if src.zip_path is not None and src.zip_path not in zips:
                         zips[src.zip_path] = zipfile.ZipFile(src.zip_path)
-                    with out.open("snap/" + "/".join(parts), "w") as dst:
+                    with out.open("snap/" + "/".join(parts), "w", force_zip64=needs_zip64(src.size)) as dst:
                         for chunk in _verified_chunks(src, zips):
                             dst.write(chunk)
             os.replace(tmp, target)

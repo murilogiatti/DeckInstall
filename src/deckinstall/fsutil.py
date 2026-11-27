@@ -518,6 +518,15 @@ _APP_ONLY_ENV_KEYS = (
 _INHIBIT_PROBE: list[str] = []  # the answer for this session (it does not change while the app runs)
 
 
+# zipfile needs ZIP64 records, decided when an entry is opened for writing, for entries of 2 GiB or more.
+ZIP64_ENTRY_BYTES = (1 << 31) - (64 << 20)
+
+
+def needs_zip64(size: int) -> bool:
+    """True when a ZIP entry of this size must be written with ZIP64 records (force_zip64)."""
+    return size >= ZIP64_ENTRY_BYTES
+
+
 def sleep_inhibit_problem_cached() -> str:
     """sleep_inhibit_problem(), asked once per session."""
     if not _INHIBIT_PROBE:

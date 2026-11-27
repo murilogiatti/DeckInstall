@@ -442,3 +442,30 @@ def test_unchanged_auto_snapshot_writes_nothing(tmp_path: Path) -> None:
     _save(prefix, b"changed")
     second = save_sync.auto_snapshot(prefix, GAME, "after-play", dest_root=snaps)
     assert second is not None and second != first and len(list(snaps.rglob("*.zip"))) == 2
+
+
+def test_large_entries_are_written_with_zip64(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shrink zipfile's 2 GiB limit to 1 MiB: a 3 MiB save needs ZIP64 like a 3 GiB one would."""
+    from deckinstall import fsutil
+
+    monkeypatch.setattr(zipfile, "ZIP64_LIMIT", 1 << 20)
+    payload = bytes(range(256)) * (3 * 4096)  # 3 MiB
+    prefix = tmp_path / "pfx"
+    _save(prefix, payload)
+    monkeypatch.setattr(fsutil, "ZIP64_ENTRY_BYTES", (1 << 20) - 1024)
+    for mod in (save_sync,):
+        monkeypatch.setattr(mod, "needs_zip64", fsutil.needs_zip64)
+    snap = save_sync.auto_snapshot(prefix, GAME, "manual", dest_root=tmp_path / "snaps")
+    assert snap is not None
+    root = tmp_path / "sync"
+    pushed = push_game_saves(GAME, prefix, root)
+    assert pushed is not None
+    other = tmp_path / "other"
+    other.mkdir()
+    pull_game_saves(GAME, other, root, snapshots_root=tmp_path / "snaps2")
+    assert (other / REL).read_bytes() == payload
+
+    monkeypatch.setattr(fsutil, "ZIP64_ENTRY_BYTES", 1 << 40)  # as before: no ZIP64 decided up front
+    _save(prefix, payload + b"x")
+    with pytest.raises(Exception, match="force_zip64"):
+        save_sync.auto_snapshot(prefix, GAME, "manual", dest_root=tmp_path / "snaps3")

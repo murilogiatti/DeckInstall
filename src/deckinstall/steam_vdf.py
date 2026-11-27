@@ -27,7 +27,7 @@ from typing import Any
 import vdf
 
 from .extractor import check_disk_space
-from .fsutil import atomic_write_bytes, file_identity, file_sha256, open_regular_fd
+from .fsutil import atomic_write_bytes, file_identity, file_sha256, needs_zip64, open_regular_fd
 from .fsutil import file_lock as _file_lock
 from .library import NON_UNIX_FS, fs_type_of
 from .manifest import read_manifest_fields
@@ -2244,7 +2244,7 @@ def _write_prefix_saves_to_zip(
             arcname = f"{key_prefix}/{subfolder}/{rel.as_posix()}"
             sfd = os.open(str(src_file), os.O_RDONLY | os.O_NOFOLLOW)
             copied = 0
-            with os.fdopen(sfd, "rb") as sfh, zf.open(arcname, "w") as zout:
+            with os.fdopen(sfd, "rb") as sfh, zf.open(arcname, "w", force_zip64=needs_zip64(fsize)) as zout:
                 while chunk := sfh.read(65536):
                     copied += len(chunk)
                     total_uncompressed += len(chunk)

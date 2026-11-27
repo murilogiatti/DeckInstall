@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import IO
 
 from . import save_sync_repo as repo
-from .fsutil import FileIdentity, atomic_write_bytes, file_identity, file_lock, is_within, open_regular_fd
+from .fsutil import FileIdentity, atomic_write_bytes, file_identity, file_lock, is_within, needs_zip64, open_regular_fd
 from .steam_vdf import (
     _RESTORE_MAX_ENTRIES,
     _RESTORE_MAX_FILE_BYTES,
@@ -1161,7 +1161,8 @@ def _write_saves_zip_atomic(
                         digest.update(f"{name}\0{size}\0".encode())
                         has_content = True
                     copied = 0
-                    with (zf.open(f"{key_prefix}/{name}", "w") if zf is not None else nullcontext(None)) as dest:
+                    with (zf.open(f"{key_prefix}/{name}", "w", force_zip64=needs_zip64(size))
+                          if zf is not None else nullcontext(None)) as dest:
                         while chunk := source.read(65536):
                             copied += len(chunk)
                             if copied > size:
@@ -1687,7 +1688,7 @@ def snapshot_prefix_state(
                         continue
                     arcname = f"{kind}/{rel_path.as_posix()}"
                     file_bytes = 0
-                    with os.fdopen(sfd, "rb") as fh, zf.open(arcname, "w") as zout:
+                    with os.fdopen(sfd, "rb") as fh, zf.open(arcname, "w", force_zip64=needs_zip64(fsize)) as zout:
                         while chunk := fh.read(65536):
                             file_bytes += len(chunk)
                             if (
@@ -2231,7 +2232,7 @@ def _write_save_entries(
             raise RuntimeError(f"Backup size limit exceeded on {src_file.name}")
         arcname = f"save/{section}/{rel_path.as_posix()}"
         file_bytes = 0
-        with os.fdopen(sfd, "rb") as fh, zf.open(arcname, "w") as zout:
+        with os.fdopen(sfd, "rb") as fh, zf.open(arcname, "w", force_zip64=needs_zip64(fsize)) as zout:
             while chunk := fh.read(65536):
                 file_bytes += len(chunk)
                 if (
