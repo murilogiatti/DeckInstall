@@ -250,16 +250,16 @@ def bulk_optiscaler_dialog(
     on_close: Callable[[], None] | None = None,
 ) -> None:
     """Scan DeckInstall games in the background, then open the bulk OptiScaler dialog."""
-    if hasattr(win, "btn_bulk_optiscaler"):
-        win.btn_bulk_optiscaler.setEnabled(False)
+    if hasattr(win, "act_bulk_optiscaler"):
+        win.act_bulk_optiscaler.setEnabled(False)
     win.status_label.setText(tr("optiscaler_bulk.scanning"))
     paths = win.paths
     loader = SteamOpWorker(lambda: _scan(paths), need_steam_closed=False)
     win._track_worker(loader)
 
     def _loaded(rows: object) -> None:
-        if hasattr(win, "btn_bulk_optiscaler"):
-            win.btn_bulk_optiscaler.setEnabled(not win._steam_busy)
+        if hasattr(win, "act_bulk_optiscaler"):
+            win.act_bulk_optiscaler.setEnabled(not win._steam_busy)
         win.status_label.setText(tr("status.ready"))
         if win._closing_pending:
             return
@@ -274,8 +274,8 @@ def bulk_optiscaler_dialog(
             on_close()
 
     def _failed(err: str) -> None:
-        if hasattr(win, "btn_bulk_optiscaler"):
-            win.btn_bulk_optiscaler.setEnabled(not win._steam_busy)
+        if hasattr(win, "act_bulk_optiscaler"):
+            win.act_bulk_optiscaler.setEnabled(not win._steam_busy)
         win.status_label.setText(tr("status.ready"))
         if not win._closing_pending:
             QMessageBox.critical(_dialog_parent(win), __app_name__, tr("optiscaler.error", err=err))

@@ -84,7 +84,7 @@ def _make_tool(name: str, *, managed: bool = True) -> Path:
     return tool
 
 
-def test_btn_bulk_proton_visible_without_steam(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_batch_proton_visible_without_steam(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _home(tmp_path, monkeypatch)
     app = QApplication.instance() or QApplication([])
     with (
@@ -102,8 +102,8 @@ def test_btn_bulk_proton_visible_without_steam(tmp_path: Path, monkeypatch: pyte
         try:
             win._update_steam_mode_ui()
             win._apply_shortcuts_data(None, [], [], [], "", None)
-            assert win.btn_bulk_proton.isVisibleTo(win) or not win.btn_bulk_proton.isHidden()
-            assert win.btn_bulk_proton.isEnabled()
+            assert win.act_bulk_proton.isVisible()
+            assert win.act_bulk_proton.isEnabled()
         finally:
             for w in list(win._active_workers):
                 w.wait(100)

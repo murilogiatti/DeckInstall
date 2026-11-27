@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import shutil
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import shiboken6
@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QFrame,
+    QFormLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
-    QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -43,7 +43,6 @@ from ..launch_presets import (
     availability,
     parse_presets,
     proton_kind,
-    recommend,
 )
 from ..launcher_scan import ExternalLauncherGame
 from ..modes import feature_note, mode_of_kind
@@ -67,7 +66,6 @@ from ..ui_cards import (
     _dialog_guard,
     _dialog_parent,
     _is_native_linux_game,
-    _make_card,
     _parse_launch_preset_state,
     _resolve_game_exe_path,
     note_label,
@@ -121,27 +119,34 @@ def _gpu_label(gpu: Gpu) -> str:
     return f"{gpu.name or gpu.vendor.upper()} ({kind})"
 
 
-def open_launch_presets_dialog(
+@dataclass
+class LaunchOptions:
+    widget: QWidget
+    raw: QLineEdit
+    dll: QLineEdit
+    set_options: Callable[[str, str], None]
+    set_proton: Callable[[str], None]
+
+    def values(self) -> tuple[str, str]:
+        return self.raw.text().strip(), self.dll.text().strip()
+
+
+def build_launch_options(
     win: MainWindow,
-    title: str,
+    dlg: QDialog,
     kind: str,
     initial_opts: str,
     initial_winedll: str,
     game_obj: object | None = None,
     is_native_linux: bool = False,
-    parent: QWidget | None = None,
     mode: str | None = None,
     proton: str = "",
-) -> tuple[str, str] | None:
-    """Open launch options presets dialog and return (launch_opts, winedll) or None.
-
-    proton: the game's Proton kind ("ge", "cachyos", "valve" or "" unknown): presets that only
-    GE-Proton reads are greyed out for Valve's Proton.
-
-    parent: the dialog that asked (e.g. Configure game), so the child stays above it under gamescope/Wayland.
-    mode: Steam or Standalone (default: from kind). Options a mode does not use are shown greyed out
-    with the reason (MangoHud in Steam mode: Steam has its own performance overlay).
-    """
+    *,
+    proton_control: QWidget | None = None,
+    extra_options: QWidget | None = None,
+    more: Callable[[QWidget, QVBoxLayout, LaunchOptions], None] | None = None,
+) -> LaunchOptions:
+    """Shared launch controls for a new or installed game."""
     mangohud_note = feature_note("mangohud", mode or mode_of_kind(kind))
     is_native_linux = bool(
         is_native_linux or (game_obj is not None and _is_native_linux_game(kind, game_obj))
@@ -154,53 +159,31 @@ def open_launch_presets_dialog(
         if extracted_dll:
             winedll_now = extracted_dll
 
-    dlg = QDialog(parent if parent is not None else _dialog_parent(win))
-    dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
-    dlg.setWindowTitle(tr("launch.title", name=title))
-    from ..ui_cards import clamp_dialog_size
-
-    clamp_dialog_size(dlg, 640, 580, parent)
-    dlg_lay = QVBoxLayout(dlg)
-
-    # Which GPU the game runs on (the options below are judged for it), and one click for the
-    # presets this computer benefits from.
-    lbl_game_gpu = note_label()
-    btn_recommend = QPushButton(tr("launch.btn_recommend"))
-    btn_recommend.setToolTip(tr("launch.recommend_tip"))
-    btn_battery = QPushButton(tr("launch.btn_battery"))
-    btn_battery.setToolTip(tr("launch.battery_tip"))
-    btn_performance = QPushButton(tr("launch.btn_performance"))
-    btn_performance.setToolTip(tr("launch.performance_tip"))
-    top_row = QHBoxLayout()
-    top_row.addWidget(lbl_game_gpu, 1)
-    quick_row = QHBoxLayout()
-    for button in (btn_recommend, btn_battery, btn_performance):
-        quick_row.addWidget(button)
-    quick_row.addStretch()
-    dlg_lay.addLayout(top_row)
-    dlg_lay.addLayout(quick_row)
-
-    # One tab per group, so every setting of the game (upscaler included) is in this one window.
-    tabs = QTabWidget()
-    bodies: list[QVBoxLayout] = []
-    current: dict[str, QVBoxLayout] = {}  # the card the next options go into
+    pane = QWidget(dlg)
+    layout = QVBoxLayout(pane)
+    layout.setContentsMargins(0, 0, 0, 0)
+    quick = QFormLayout()
+    if proton_control is not None:
+        quick.addRow(tr("configure.lbl_current_proton"), proton_control)
+    layout.addLayout(quick)
+    more_button = QToolButton(pane)
+    more_button.setText(tr("launch.more_options"))
+    more_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+    more_button.setArrowType(Qt.ArrowType.RightArrow)
+    more_button.setCheckable(True)
+    layout.addWidget(more_button)
+    details = QWidget(pane)
+    details_layout = QVBoxLayout(details)
+    details_layout.setContentsMargins(0, 0, 0, 0)
+    details.hide()
+    layout.addWidget(details)
+    current: dict[str, QVBoxLayout] = {}
 
     def _section(text: str) -> None:
-        body = QWidget()
-        body_lay = QVBoxLayout(body)
-        body_lay.setContentsMargins(0, 8, 4, 0)
-        body_lay.setSpacing(12)
-        card, card_lay = _make_card()
+        card, card_lay, _top = section_card(text)
         card_lay.setSpacing(4)
-        body_lay.addWidget(card)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setWidget(body)
-        tabs.addTab(scroll, text)
-        bodies.append(body_lay)
+        details_layout.addWidget(card)
         current["lay"] = card_lay
-        current["body"] = body_lay
 
     def _add(widget: QWidget) -> None:
         current["lay"].addWidget(widget)
@@ -306,7 +289,7 @@ def open_launch_presets_dialog(
         toggle_checks[toggle.key] = chk
     # Frame cap: one field for every API (DXVK, VKD3D-Proton and MangoHud), with the values of this
     # screen first (Qt knows its refresh rate on X11, Wayland and gamescope alike).
-    screen_hz = screen_refresh_hz(parent if parent is not None else win)
+    screen_hz = screen_refresh_hz(dlg)
     frame_combo = QComboBox()
     frame_combo.addItem(tr("launch.mangohud_fps_unlimited"), 0)
     if screen_hz:
@@ -345,6 +328,7 @@ def open_launch_presets_dialog(
     wined3d_warn.setVisible(False)
 
     raw_edit = QLineEdit(opts_now)
+    raw_edit.setObjectName("gameLaunchOptions")
 
     syncing = {"active": False}
 
@@ -387,45 +371,38 @@ def open_launch_presets_dialog(
         worker.ready.connect(_apply_optiscaler_dxgi_guard)
         worker.start()
 
+    checks = {
+        "gamemode": chk_gm, "mangohud": chk_mh, "wined3d": chk_w3d,
+        "no_esync": chk_esync, "no_fsync": chk_fsync, "dlss_upgrade": chk_dlss,
+        "nvapi": chk_nvapi, "prime": chk_prime, "wayland": chk_wayland,
+        "debug_log": chk_debug, **toggle_checks,
+    }
+
+    def _widget_state() -> dict[str, object]:
+        return {
+            **{key: chk.isChecked() for key, chk in checks.items()},
+            "mh_level": mh_level_combo.currentData(),
+            "mh_position": str(mh_pos_combo.currentData() or ""),
+            "frame_rate": max(0, int(frame_combo.currentData() or 0)),
+        }
+
+    previous = _widget_state()
+
     def _sync_preview() -> None:
-        mh_enabled = chk_mh.isChecked()
-        mh_level_combo.setEnabled(mh_enabled)
-        mh_pos_combo.setEnabled(mh_enabled)
+        mh_level_combo.setEnabled(chk_mh.isChecked())
+        mh_pos_combo.setEnabled(chk_mh.isChecked())
         if syncing["active"]:
             return
-        syncing["active"] = True
+        state = _widget_state()
+        changes = {key: value for key, value in state.items() if value != previous[key]}
+        if not changes:
+            return
         try:
-            dll_val = (
-                winedll_edit.text().strip()
-                if (kind in ("steam", "external") and not is_native_linux)
-                else ""
-            )
-            updated = apply_presets(
-                raw_edit.text(),
-                {
-                    "gamemode": chk_gm.isChecked(),
-                    "mangohud": mh_enabled,
-                    "wined3d": chk_w3d.isChecked(),
-                    "no_esync": chk_esync.isChecked(),
-                    "no_fsync": chk_fsync.isChecked(),
-                    "dlss_upgrade": chk_dlss.isChecked(),
-                    "nvapi": chk_nvapi.isChecked(),
-                    "prime": chk_prime.isChecked(),
-                    "wayland": chk_wayland.isChecked(),
-                    "debug_log": chk_debug.isChecked(),
-                    "mh_level": mh_level_combo.currentData(),
-                    "mh_position": str(mh_pos_combo.currentData() or ""),
-                    "frame_rate": max(0, int(frame_combo.currentData() or 0)),
-                    **{key: chk.isChecked() for key, chk in toggle_checks.items()},
-                },
-                winedlloverrides=dll_val,
-                native_linux=is_native_linux,
-            )
-            raw_edit.setText(updated)
+            opts = raw_edit.text()
+            raw_edit.setText(apply_presets(opts, {**parse_presets(opts), **changes}, native_linux=is_native_linux))
         except ValueError:
-            pass
-        finally:
-            syncing["active"] = False
+            return
+        previous.update(state)
         _update_wined3d_warning()
 
     def _on_dxgi_toggled(checked: bool) -> None:
@@ -440,15 +417,18 @@ def open_launch_presets_dialog(
         winedll_edit.setText(new_dll)
 
     def _on_winedll_text_changed(text: str) -> None:
-        if not syncing["active"]:
+        if syncing["active"]:
+            return
+        syncing["active"] = True
+        try:
             has_dxgi = remove_winedlloverride(text, "dxgi") != text
-            if chk_dxgi.isChecked() != has_dxgi:
-                syncing["active"] = True
-                try:
-                    chk_dxgi.setChecked(has_dxgi)
-                finally:
-                    syncing["active"] = False
-        _sync_preview()
+            chk_dxgi.setChecked(has_dxgi)
+            if kind in ("steam", "external") and not is_native_linux:
+                raw_edit.setText(apply_presets(raw_edit.text(), winedlloverrides=text.strip()))
+        except ValueError:
+            pass
+        finally:
+            syncing["active"] = False
 
     def _on_raw_text_changed() -> None:
         _update_wined3d_warning()
@@ -573,7 +553,7 @@ def open_launch_presets_dialog(
 
     def _add_optiscaler_card() -> None:
         card, card_lay, top = section_card(tr("launch.optiscaler_title"), tr("configure.optiscaler_hint"))
-        current["body"].addWidget(card)
+        details_layout.addWidget(card)
         btn_opti = QPushButton(tr("library.btn_optiscaler"))
         top.addWidget(btn_opti)
         target = game_obj
@@ -591,17 +571,35 @@ def open_launch_presets_dialog(
             card_lay.addWidget(note_label(tr("launch.optiscaler_cachyos")))
         btn_opti.clicked.connect(lambda: win._open_optiscaler_dialog(kind, target, on_saved=_on_opti_saved))
 
+    gpu_choice = QComboBox()
+    gpu_choice.setObjectName("gameGpu")
+    primary = profile.primary
+    dedicated = profile.dedicated
+    automatic = tr("launch.gpu_auto", name=_gpu_label(primary)) if primary else tr("launch.gpu_automatic")
+    gpu_choice.addItem(automatic, False)
+    if dedicated is not None or prime_active:
+        gpu_choice.addItem(_gpu_label(dedicated) if dedicated else tr("launch.prime_offload"), True)
+    gpu_choice.setCurrentIndex(gpu_choice.findData(prime_active))
+    gpu_choice.setEnabled(gpu_choice.count() > 1)
+    gpu_row = QHBoxLayout()
+    gpu_row.addWidget(gpu_choice, 1)
+    if dedicated is not None:
+        gpu_name = dedicated.name.removeprefix("NVIDIA GeForce ").removesuffix(" Laptop GPU")
+        use_gpu = QPushButton(tr("launch.use_gpu", name=gpu_name or dedicated.vendor.upper()))
+        use_gpu.clicked.connect(lambda: gpu_choice.setCurrentIndex(gpu_choice.findData(True)))
+        gpu_choice.currentIndexChanged.connect(lambda: use_gpu.setVisible(not bool(gpu_choice.currentData())))
+        use_gpu.setVisible(not prime_active)
+        gpu_row.addWidget(use_gpu)
+    quick.addRow(tr("launch.gpu_label"), gpu_row)
+    frame_combo.setObjectName("gameFps")
+    quick.addRow(tr("launch.frame_rate_label"), frame_combo)
+    gpu_choice.currentIndexChanged.connect(lambda: chk_prime.setChecked(bool(gpu_choice.currentData())))
+
     _section(tr("launch.section_performance"))
     _add_tool_preset(chk_gm, tr("launch.gamemode_hint"), "gamemoderun")
     _add_tool_preset(chk_mh, tr("launch.mangohud_hint"), "mangohud", extra_row=mh_opts_col, blocked_note=mangohud_note)
     mh_level_combo.currentIndexChanged.connect(_sync_preview)
     mh_pos_combo.currentIndexChanged.connect(_sync_preview)
-    frame_row = QHBoxLayout()
-    frame_row.addWidget(QLabel(tr("launch.frame_rate_label")))
-    frame_row.addWidget(frame_combo)
-    frame_row.addStretch()
-    current["lay"].addLayout(frame_row)
-    _add(_muted_hint(tr("launch.frame_rate_hint")))
     frame_combo.activated.connect(_on_frame_picked)
     frame_combo.currentIndexChanged.connect(_sync_preview)
 
@@ -638,26 +636,17 @@ def open_launch_presets_dialog(
             hint.setVisible(state != HIDE or on)
             chk.setEnabled(state == OK or on)
             hint.setText(reasons.get(reason, normal) if state == OFF else normal)
-        lbl_game_gpu.setText(
-            tr("launch.game_gpu", name=_gpu_label(game_gpu)) if game_gpu is not None else tr("launch.game_gpu_unknown")
-        )
 
+    def _gpu_changed() -> None:
+        _sync_preview()
+        _refresh_rules()
+
+    chk_prime.toggled.connect(_gpu_changed)
     if not is_native_linux:
         _section(tr("launch.section_gpu"))
         _ruled("nvapi", chk_nvapi, tr("launch.nvidia_nvapi_hint"))
-        dedicated = profile.dedicated
-        if dedicated is not None:
-            chk_prime.setText(tr("launch.prime_on_gpu", name=dedicated.name or dedicated.vendor.upper()))
-        prime_hint = (
-            tr("launch.prime_offload_hint")
-            if dedicated is not None and dedicated.vendor == "nvidia"
-            else tr("launch.prime_offload_mesa_hint")
-        )
-        _ruled("prime", chk_prime, prime_hint)
-        chk_prime.toggled.connect(lambda _on: _refresh_rules())
         _add_toggles("gpu")
 
-        # Upscaler: Proton's own upgrades, then OptiScaler (files in the game folder) for this game.
         _section(tr("launch.section_upscaler"))
         _ruled("dlss_upgrade", chk_dlss, tr("launch.dlss_hint"))
         _add_toggles("upscaler")
@@ -670,20 +659,6 @@ def open_launch_presets_dialog(
         for chk in (chk_nvapi, chk_dlss, chk_wayland, *toggle_checks.values()):
             chk.setVisible(False)
             chk.setEnabled(False)
-        if profile.dedicated is not None or chk_prime.isChecked():  # native games use the dGPU too
-            _section(tr("launch.section_gpu"))
-            if profile.dedicated is not None:
-                dgpu_name = profile.dedicated.name or profile.dedicated.vendor.upper()
-                chk_prime.setText(tr("launch.prime_on_gpu", name=dgpu_name))
-            nvidia_dgpu = profile.dedicated is not None and profile.dedicated.vendor == "nvidia"
-            _ruled(
-                "prime",
-                chk_prime,
-                tr("launch.prime_offload_hint") if nvidia_dgpu else tr("launch.prime_offload_mesa_hint"),
-            )
-        else:
-            chk_prime.setVisible(False)
-            chk_prime.setEnabled(False)
 
     if not is_native_linux:
         for chk, hint in (
@@ -721,144 +696,174 @@ def open_launch_presets_dialog(
         winedll_lbl.setVisible(False)
         winedll_edit.setVisible(False)
         winedll_edit.setEnabled(False)
-    for body_lay in bodies:
-        body_lay.addStretch(1)
-
     winedll_edit.textChanged.connect(_on_winedll_text_changed)
     raw_edit.textChanged.connect(_on_raw_text_changed)
-    _update_optiscaler_dxgi_guard()
     _update_wined3d_warning()
-    if mangohud_note and st["mangohud"]:
-        _sync_preview()  # drop MangoHud from options a Steam-mode game keeps from before
-
-    dlg_lay.addWidget(tabs, 1)
-
-    def _apply_recommended() -> None:
-        changes = recommend(profile, proton)
-        if changes.pop("prime", False) and chk_prime.isEnabled():
-            chk_prime.setChecked(True)  # first: the rest is judged for the dedicated GPU
-        if shutil.which("gamemoderun"):
-            chk_gm.setChecked(True)
-        checks = {"dlss_upgrade": chk_dlss, **toggle_checks}
-        for key, value in changes.items():
-            if key in checks and checks[key].isEnabled():
-                checks[key].setChecked(bool(value))
-        game_gpu = profile.game_gpu(chk_prime.isChecked())
-        lbl_game_gpu.setText(
-            tr("launch.recommended_done", name=_gpu_label(game_gpu) if game_gpu else "-")
-        )
-
-    def _set_frame(value: int) -> None:
-        idx = frame_combo.findData(value)
-        if idx >= 0:
-            frame_combo.setCurrentIndex(idx)
-            last_frame["idx"] = idx
-
-    def _apply_battery() -> None:
-        """Manual: half the screen's rate, no GameMode, the integrated GPU on a hybrid."""
-        _set_frame(half_rate(screen_hz) if screen_hz else 30)
-        chk_gm.setChecked(False)
-        if chk_prime.isEnabled():
-            chk_prime.setChecked(False)
-
-    def _apply_performance() -> None:
-        """Manual: no cap, GameMode when installed, the dedicated GPU on a hybrid."""
-        _set_frame(0)
-        if shutil.which("gamemoderun"):
-            chk_gm.setChecked(True)
-        if chk_prime.isEnabled() and profile.dedicated is not None:
-            chk_prime.setChecked(True)
-
-    btn_recommend.clicked.connect(_apply_recommended)
-    btn_recommend.setVisible(not is_native_linux)
-    btn_battery.clicked.connect(_apply_battery)
-    btn_performance.clicked.connect(_apply_performance)
     _refresh_rules()
 
-    # The result, always in sight: the line the game starts with (editable by hand).
     result_card, result_lay, _top = section_card(tr("launch.raw_label"))
     result_lay.setSpacing(4)
     result_lay.addWidget(raw_edit)
     result_lay.addWidget(note_label(tr("launch.raw_hint")))
     if kind == "external":
         result_lay.addWidget(note_label(tr("launch.external_nondestructive_note")))
-    dlg_lay.addWidget(result_card)
+    details_layout.addWidget(result_card)
+    if extra_options is not None:
+        details_layout.addWidget(extra_options)
+        extra_options.show()
+
+    def set_options(opts: str, dll: str) -> None:
+        state = parse_presets(opts)
+        syncing["active"] = True
+        try:
+            for key, chk in checks.items():
+                chk.setChecked(bool(state.get(key)))
+            gpu_choice.setCurrentIndex(gpu_choice.findData(chk_prime.isChecked()))
+            rate = int(state.get("frame_rate") or 0)
+            idx = frame_combo.findData(rate)
+            if idx < 0:
+                idx = frame_combo.count() - 1
+                frame_combo.insertItem(idx, tr("launch.mangohud_fps_value", fps=rate), rate)
+            frame_combo.setCurrentIndex(idx)
+            last_frame["idx"] = idx
+            mh_level_combo.setCurrentIndex(max(0, mh_level_combo.findData(state.get("mh_level"))))
+            mh_pos_combo.setCurrentIndex(max(0, mh_pos_combo.findData(state.get("mh_position"))))
+            chk_dxgi.setChecked(remove_winedlloverride(dll, "dxgi") != dll)
+            winedll_edit.setText(dll)
+            raw_edit.setText(opts)
+        finally:
+            syncing["active"] = False
+        previous.update(_widget_state())
+        _refresh_rules()
+        _update_wined3d_warning()
+
+    suggestions: QWidget | None = None
+
+    def set_proton(new_proton: str) -> None:
+        nonlocal proton, suggestions
+        proton = new_proton
+        _refresh_rules()
+        if more_button.isChecked():
+            _load_recommendations()
+        elif suggestions is not None:
+            details_layout.removeWidget(suggestions)
+            suggestions.hide()
+            suggestions.deleteLater()
+            suggestions = None
+
+    def read_raw_edit() -> None:
+        opts = raw_edit.text()
+        dll = (str(parse_presets(opts).get("winedll") or "")
+               if kind in ("steam", "external") else winedll_edit.text())
+        set_options(opts, dll)
+
+    raw_edit.editingFinished.connect(read_raw_edit)
+    editor = LaunchOptions(pane, raw_edit, winedll_edit, set_options, set_proton)
+
+    def _load_recommendations() -> None:
+        nonlocal suggestions
+        if more is None:
+            return
+        if suggestions is not None:
+            details_layout.removeWidget(suggestions)
+            suggestions.hide()
+            suggestions.deleteLater()
+        suggestions = QWidget(details)
+        suggestions_layout = QVBoxLayout(suggestions)
+        suggestions_layout.setContentsMargins(0, 0, 0, 0)
+        details_layout.insertWidget(0, suggestions)
+        more(suggestions, suggestions_layout, editor)
+
+    loaded = False
+    compact_height = dlg.height()
+
+    def _toggle_more(opened: bool) -> None:
+        nonlocal loaded, compact_height
+        if opened:
+            compact_height = dlg.height()
+        details.setVisible(opened)
+        dlg.resize(dlg.width(), max(compact_height, 560) if opened else compact_height)
+        more_button.setArrowType(Qt.ArrowType.DownArrow if opened else Qt.ArrowType.RightArrow)
+        if opened:
+            if not loaded:
+                loaded = True
+                _update_optiscaler_dxgi_guard()
+            if suggestions is None:
+                _load_recommendations()
+
+    more_button.toggled.connect(_toggle_more)
+    return editor
+
+
+def open_launch_presets_dialog(
+    win: MainWindow,
+    title: str,
+    kind: str,
+    initial_opts: str,
+    initial_winedll: str,
+    game_obj: object | None = None,
+    is_native_linux: bool = False,
+    parent: QWidget | None = None,
+    mode: str | None = None,
+    proton: str = "",
+    *,
+    proton_picker: QComboBox | None = None,
+    more: Callable[[QWidget, QVBoxLayout, LaunchOptions], None] | None = None,
+) -> tuple[str, str] | None:
+    """Edit the same launch controls before installing a game."""
+    from ..ui_cards import clamp_dialog_size
+
+    dlg = QDialog(parent if parent is not None else _dialog_parent(win))
+    dlg.setWindowTitle(tr("launch.title", name=title))
+    clamp_dialog_size(dlg, 620, 265, parent)
+    dlg_lay = QVBoxLayout(dlg)
+    scroll = QScrollArea(dlg)
+    scroll.setWidgetResizable(True)
+    body = QWidget(scroll)
+    layout = QVBoxLayout(body)
+    editor = build_launch_options(
+        win, dlg, kind, initial_opts, initial_winedll, game_obj, is_native_linux, mode, proton,
+        proton_control=proton_picker, more=more,
+    )
+    layout.addWidget(editor.widget)
+    layout.addStretch()
+    scroll.setWidget(body)
+    dlg_lay.addWidget(scroll, 1)
+    if proton_picker is not None:
+        proton_picker.currentIndexChanged.connect(
+            lambda: editor.set_proton(proton_kind(str(proton_picker.currentData() or "")) or proton)
+        )
 
     btns = QDialogButtonBox(
-        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel
     )
-    btns.accepted.connect(dlg.accept)
+    apply = btns.button(QDialogButtonBox.StandardButton.Apply)
+    apply.clicked.connect(dlg.accept)
+    original = editor.values()
+    original_proton = proton_picker.currentData() if proton_picker is not None else None
+
+    def update_apply() -> None:
+        apply.setEnabled(
+            editor.values() != original
+            or (proton_picker is not None and proton_picker.currentData() != original_proton)
+        )
+
+    editor.raw.textChanged.connect(update_apply)
+    editor.dll.textChanged.connect(update_apply)
+    if proton_picker is not None:
+        proton_picker.currentIndexChanged.connect(update_apply)
+    update_apply()
     btns.rejected.connect(dlg.reject)
     dlg_lay.addWidget(btns)
 
     try:
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return None
-        new_opts_out = raw_edit.text().strip()
-        new_dll_out = winedll_edit.text().strip()
+        new_opts_out, new_dll_out = editor.values()
         win._save_last_launch_prefs(new_opts_out, new_dll_out)
         return new_opts_out, new_dll_out
     finally:
         dlg.deleteLater()
-
-
-def edit_launch_options_presets(
-    win: MainWindow,
-    sel: tuple[str, object] | None = None,
-    parent: QWidget | None = None,
-    on_saved: Callable[[str], None] | None = None,
-) -> None:
-    """Open launch options presets for a game (default: the selected library game) and save.
-
-    sel/parent come from the Configure dialog so the right game is edited and the child opens above it;
-    on_saved(new_opts) runs once the new options are stored (or queued).
-    """
-    if sel is None:
-        sel = win._selected_library_item()
-
-    def box_parent() -> QWidget:
-        # The Configure dialog may be closed by the time an async save reports back.
-        if parent is not None and shiboken6.isValid(parent):
-            return parent
-        return _dialog_parent(win)
-
-    if not sel:
-        QMessageBox.information(box_parent(), __app_name__, tr("launch.no_game"))
-        return
-    kind, obj = sel
-    if kind not in ("steam", "standalone", "external"):
-        return
-    if isinstance(obj, ShortcutEntry):
-        if not win.paths:
-            QMessageBox.warning(box_parent(), __app_name__, tr("add.steam_missing"))
-            return
-        title_name = obj.app_name
-        opts_now = obj.launch_options or ""
-        winedll_now = str(_parse_launch_preset_state(opts_now)["winedll"])
-    elif isinstance(obj, StandaloneGame):
-        title_name = obj.name
-        opts_now = obj.launch_options or ""
-        winedll_now = obj.winedlloverrides or ""
-    elif isinstance(obj, ExternalLauncherGame):
-        title_name = obj.name
-        opts_now = load_external_launch_presets(obj)
-        winedll_now = str(_parse_launch_preset_state(opts_now)["winedll"])
-    else:
-        return
-
-    res = win._open_launch_presets_dialog(
-        title=title_name,
-        kind=kind,
-        initial_opts=opts_now,
-        initial_winedll=winedll_now,
-        game_obj=obj,
-        is_native_linux=_is_native_linux_game(kind, obj),
-        parent=parent,
-        proton=game_proton(win, kind, obj),
-    )
-    if res is None:
-        return
-    save_launch_options(win, (kind, obj), res[0], res[1], parent=parent, on_saved=on_saved)
 
 
 def launch_options_of(obj: object) -> tuple[str, str]:
@@ -881,10 +886,12 @@ def save_launch_options(
     new_dll: str,
     parent: QWidget | None = None,
     on_saved: Callable[[str], None] | None = None,
+    on_failed: Callable[[], None] | None = None,
 ) -> None:
     """Store a game's new launch options where its mode keeps them (manifest + launch.sh, the
     external launcher, or Steam's shortcut: right away, or queued in Gaming Mode)."""
     kind, obj = sel
+    fail = on_failed or (lambda: None)
 
     def box_parent() -> QWidget:
         if parent is not None and shiboken6.isValid(parent):
@@ -899,12 +906,13 @@ def save_launch_options(
             save_external_launch_presets(obj, new_opts)
         except Exception as exc:
             QMessageBox.critical(box_parent(), __app_name__, str(exc))
+            fail()
             return
         msg = tr("launch.saved", name=title_name)
         win.status_label.setText(msg)
         if on_saved is not None:
             on_saved(new_opts)
-        if not win._closing_pending:
+        if on_failed is None and not win._closing_pending:
             QMessageBox.information(box_parent(), __app_name__, msg)
         return
 
@@ -919,20 +927,23 @@ def save_launch_options(
             obj.winedlloverrides = updated.winedlloverrides
         except Exception as exc:
             QMessageBox.critical(box_parent(), __app_name__, str(exc))
+            fail()
             return
         win._refresh_shortcuts()
         msg = tr("launch.saved", name=title_name)
         win.status_label.setText(msg)
         if on_saved is not None:
             on_saved(new_opts)
-        if not win._closing_pending:
+        if on_failed is None and not win._closing_pending:
             QMessageBox.information(box_parent(), __app_name__, msg)
         return
 
     if not win.paths:
+        fail()
         return
     paths = win.paths
     if not isinstance(obj, ShortcutEntry):
+        fail()
         return
     entry = obj
     managed_game = win._managed_library_game(entry)
@@ -952,10 +963,12 @@ def save_launch_options(
             managed_game.winedlloverrides = result.winedlloverrides
 
     if win.should_queue_vdf_edits():
+        saved_opts = launch_options_of(managed_game) if managed_game is not None else ("", "")
         try:
-            _apply_managed_result(_sync_managed_launch_opts())
+            queued_update = _sync_managed_launch_opts()
         except Exception as exc:
             QMessageBox.critical(box_parent(), __app_name__, str(exc))
+            fail()
             return
         if not win.enqueue_vdf_edit(
             QueuedVdfEdit(
@@ -966,7 +979,16 @@ def save_launch_options(
                 payload={"launch_options": new_opts},
             )
         ):
+            if managed_game is not None:
+                try:
+                    update_standalone_launch_options(
+                        managed_game.game_dir, winedlloverrides=saved_opts[1], launch_options=saved_opts[0],
+                    )
+                except Exception as exc:
+                    QMessageBox.critical(box_parent(), __app_name__, str(exc))
+            fail()
             return
+        _apply_managed_result(queued_update)
         win._refresh_shortcuts()
         msg = tr("vdf_queue.enqueued", name=title_name)
         win.status_label.setText(msg)
@@ -1000,13 +1022,14 @@ def save_launch_options(
             win.status_label.setText(msg)
             if on_saved is not None:
                 on_saved(new_opts)
-            if not win._closing_pending:
+            if on_failed is None and not win._closing_pending:
                 QMessageBox.information(box_parent(), __app_name__, msg)
 
         def _err(err: str) -> None:
             win._end_busy()
             if not win._closing_pending:
                 QMessageBox.critical(box_parent(), __app_name__, err)
+            fail()
 
         worker.finished_ok.connect(_ok)
         worker.failed.connect(_err)
@@ -1014,6 +1037,7 @@ def save_launch_options(
 
     win._confirm_close_steam_async(
         _proceed_update_steam_opts,
+        on_cancelled=fail,
         parent=box_parent(),
         alive_fn=lambda: bool(win and not win._closing_pending),
     )

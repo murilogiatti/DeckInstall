@@ -197,11 +197,9 @@ class UniqueLibraryActionTests(unittest.TestCase):
         ):
             win = ui.MainWindow(app)
             try:
-                self.assertFalse(hasattr(win, "_game_actions_menu"))  # no hidden menus left
                 self.assertFalse(hasattr(win, "_tools_menu"))
-                self.assertEqual(win.btn_remove_game.objectName(), "dangerBtn")
-                self.assertEqual(win.btn_remove_game.text(), tr("library.btn_uninstall"))
-                self.assertIsNone(win.btn_remove_game.menu())
+                self.assertIn(win.act_remove_game, win.btn_game_actions.menu().actions())
+                self.assertEqual(win.act_remove_game.text(), tr("library.btn_uninstall"))
                 self.assertIsNone(win.btn_save_sync.menu())
                 self.assertEqual(win.stack.count(), 6)
                 self.assertFalse(hasattr(win, "_nav_buttons"))  # no sidebar
@@ -235,10 +233,10 @@ class UniqueLibraryActionTests(unittest.TestCase):
                 win._show_page(ui.PAGE_LIBRARY)
                 self.assertEqual(win.nav_tabs.currentIndex(), 0)
                 self.assertFalse(hasattr(win, "_hub_buttons"))
-                self.assertFalse(hasattr(win, "btn_game_actions"))
+                self.assertEqual(win.btn_game_actions.text(), "⋯")
                 self.assertFalse(hasattr(win, "btn_tools_menu"))
                 self.assertNotEqual(win.shortcuts_list.contextMenuPolicy(), Qt.ContextMenuPolicy.CustomContextMenu)
-                labels = [button.text() for button in win.findChildren(QPushButton)]
+                labels = [button.text() for button in win.stack.widget(ui.PAGE_LIBRARY).findChildren(QPushButton)]
                 self.assertEqual(labels.count(tr('library.btn_play')), 1)
                 self.assertEqual(labels.count(tr('library.btn_configure_game')), 1)
             finally:
@@ -595,8 +593,9 @@ class UiUxSimplificationTests(unittest.TestCase):
                     self.assertTrue(win.extract_details_box.isHidden())
                     self.assertTrue(win.stack.widget(0).isAncestorOf(win.add_name))
                     self.assertTrue(win.stack.widget(ui.PAGE_RUNTIMES).isAncestorOf(win.btn_update_runtimes))
-                    self.assertTrue(win.stack.widget(ui.PAGE_RUNTIMES).isAncestorOf(win.btn_bulk_proton))
-                    self.assertTrue(win.stack.widget(ui.PAGE_RUNTIMES).isAncestorOf(win.btn_bulk_optiscaler))
+                    self.assertTrue(win.stack.widget(ui.PAGE_LIBRARY).isAncestorOf(win.btn_bulk_actions))
+                    self.assertIn(win.act_bulk_proton, win.btn_bulk_actions.menu().actions())
+                    self.assertIn(win.act_bulk_optiscaler, win.btn_bulk_actions.menu().actions())
                     self.assertTrue(win.stack.widget(ui.PAGE_RUNTIMES).isAncestorOf(win.btn_updates_check))  # app + runtimes together
 
                     for always_visible in (win.chk_keep_in_place, win.add_library_combo, win.btn_add_launch_adv,
@@ -750,7 +749,7 @@ class UiUxSimplificationTests(unittest.TestCase):
                         QTimer.singleShot(0, _inspect_and_close)
                         configure_game_dialog.open_configure_game_dialog(win)
 
-                    self.assertEqual(observed.get("tabs"), 3)  # Game, Launch, Tools
+                    self.assertEqual(observed.get("tabs"), 0)
                     self.assertGreaterEqual(observed.get("combos", 0), 1)
                 finally:
                     for worker in list(win._active_workers):

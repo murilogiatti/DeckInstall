@@ -1,16 +1,15 @@
-"""Valve's and umu's per-game fixes (read, never run), ProtonDB, and the recommendations window."""
+"""Valve's and umu's per-game fixes (read, never run) and inline suggestions."""
 
 from __future__ import annotations
 
 import io
-import json
 import tarfile
 import urllib.error
 from pathlib import Path
 
 import pytest
 
-from deckinstall import game_fixes, protondb
+from deckinstall import game_fixes
 from deckinstall.game_fixes import Fix, apply_fixes, fix_file, umu_fixes, valve_compat_options
 
 PROTON_SCRIPT = '''
@@ -173,34 +172,10 @@ def test_fixes_go_into_the_launch_options_in_the_right_order() -> None:
     assert apply_fixes("", "", [Fix("arg", "-dx11", "umu")]) == ("%command% -dx11", "")
 
 
-def test_protondb_summary_is_cached_and_handles_missing_games(tmp_path: Path) -> None:
-    answers = {"1": json.dumps({"tier": "gold", "total": 536, "trendingTier": "platinum"}).encode()}
-    missing_body = io.BytesIO(b"Not Found")
-
-    def opener(request, timeout):
-        appid = request.full_url.rsplit("/", 1)[1].split(".")[0]
-        if appid not in answers:
-            raise urllib.error.HTTPError(request.full_url, 404, "Not Found", None, missing_body)  # type: ignore[arg-type]
-        return _Response(answers[appid])
-
-    got = protondb.summary(1, cache=tmp_path, opener=opener, now=100.0)
-    assert (got.tier, got.total, got.trending, got.found, got.poor) == ("gold", 536, "platinum", True, False)
-    assert not protondb.summary(2, cache=tmp_path, opener=opener, now=100.0).found
-    assert missing_body.closed
-
-    def offline(request, timeout):
-        raise urllib.error.URLError("offline")
-
-    assert protondb.summary(1, cache=tmp_path, opener=offline, now=101.0).tier == "gold"  # from the cache
-    with pytest.raises(OSError):
-        protondb.summary(3, cache=tmp_path, opener=offline, now=101.0)
-
-
-def test_recommendations_window_applies_only_what_is_ticked(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_inline_recommendations_change_only_the_selected_setting(monkeypatch: pytest.MonkeyPatch) -> None:
     from unittest import mock
 
-    from PySide6.QtCore import QTimer
-    from PySide6.QtWidgets import QApplication, QCheckBox, QPushButton, QWidget
+    from PySide6.QtWidgets import QApplication, QPushButton, QVBoxLayout, QWidget
 
     from deckinstall import ui_recommendations as rec
     from deckinstall.i18n import tr
@@ -213,30 +188,24 @@ def test_recommendations_window_applies_only_what_is_ticked(monkeypatch: pytest.
         umu_file=True,
     )
     monkeypatch.setattr(rec, "gather", lambda target: found)
-    monkeypatch.setattr(rec, "apply_presets", lambda opts, **changes: opts + (" PRIME" if changes.get("prime") else ""))
-    target = rec.Target("Game", 1, None, "steam", "valve", None, "%command%", "", prefix_ready=False)
-    applied: list[tuple[str, str, list[str]]] = []
-    seen: dict[str, object] = {}
-    win = mock.Mock()
-    win._track_worker.side_effect = lambda worker: None
-
-    def drive() -> None:
-        dlg = QApplication.activeModalWidget()
-        boxes = {b.text(): b for b in dlg.findChildren(QCheckBox)} if dlg else {}
-        if len(boxes) < 4:
-            QTimer.singleShot(20, drive)
-            return
-        seen["winetricks_enabled"] = boxes[tr("rec.fix_winetricks", value="d3dx9")].isEnabled()
-        boxes[tr("rec.fix_arg", value="-dx11")].setChecked(False)
-        next(b for b in dlg.findChildren(QPushButton) if b.text() == tr("rec.apply")).click()
-
+    target = rec.Target("Game", 1, None, "steam", "valve", None, "%command% --custom", "", prefix_ready=False)
     parent = QWidget()
-    QTimer.singleShot(0, drive)
-    rec.open_recommendations_dialog(win, target, lambda o, d, v: applied.append((o, d, v)), parent=parent)
+    layout = QVBoxLayout(parent)
+    win, editor = mock.Mock(), mock.Mock()
+    editor.values.return_value = target.opts, ""
+    rec.add_game_recommendations(win, parent, layout, editor, target)
+    worker = win._track_worker.call_args.args[0]
+    assert worker.wait(3000)
     app.processEvents()
+
+    buttons = {b.text(): b for b in parent.findChildren(QPushButton)}
+    editor.set_options.assert_not_called()
+    assert not buttons[tr("rec.fix_winetricks", value="d3dx9")].isEnabled()
+    assert tr("launch.prime_offload") not in buttons
+    buttons[tr("rec.fix_compat", value="noopwr")].click()
+    editor.set_options.assert_called_once_with("STEAM_COMPAT_CONFIG=noopwr %command% --custom", "")
     parent.deleteLater()
-    assert seen["winetricks_enabled"] is False  # no prefix yet: winetricks waits for the first Play
-    assert applied == [("STEAM_COMPAT_CONFIG=noopwr %command% PRIME", "", [])]
+    app.processEvents()
 
 
 def test_upscaler_upgrades_only_for_upscalers_the_game_ships(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

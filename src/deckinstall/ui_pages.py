@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QProgressBar,
     QPushButton,
     QSplitter,
@@ -283,7 +284,8 @@ def build_add_page(win: MainWindow) -> QWidget:
 
     win._add_launch_options = ""
     win._add_winedlloverrides = ""
-    # One presets dialog for everything; the form only shows what is on.
+    win._add_proton = ("", "")
+    # The installer uses the same launch controls as the Library.
     launch_row = QHBoxLayout()
     launch_row.setSpacing(10)
     win.btn_add_launch_adv = QPushButton(tr("add.btn_launch_presets"))
@@ -291,11 +293,7 @@ def build_add_page(win: MainWindow) -> QWidget:
     win.lbl_add_presets = QLabel()
     win.lbl_add_presets.setObjectName("MutedText")
     win.lbl_add_presets.setWordWrap(True)
-    btn_add_rec = QPushButton(tr("rec.btn"))
-    btn_add_rec.setToolTip(tr("rec.btn_tip"))
-    btn_add_rec.clicked.connect(win._open_add_recommendations)
     launch_row.addWidget(win.btn_add_launch_adv)
-    launch_row.addWidget(btn_add_rec)
     launch_row.addWidget(win.lbl_add_presets, 1)
     run_form.addRow(tr("add.presets_label"), launch_row)
 
@@ -600,45 +598,44 @@ def build_library_page(win: MainWindow) -> QWidget:
     win.act_ext_import_saves.triggered.connect(win._external_import_saves)
     win.btn_configure_game = QPushButton(tr("library.btn_configure_game"))
     win.btn_configure_game.clicked.connect(win._open_configure_game_dialog)
-    win.btn_favorite = QPushButton(tr("library.btn_favorite"))
-    win.btn_favorite.setCheckable(True)
-    win.btn_favorite.setToolTip(tr("library.btn_favorite_tip"))
-    win.btn_favorite.clicked.connect(lambda _=False: win._toggle_favorite())
-    win.btn_protondb = QPushButton("ProtonDB")
-    win.btn_protondb.setToolTip(tr("library.btn_protondb_tip"))
-    win.btn_protondb.clicked.connect(win._open_protondb)
     find_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Find), win)
     find_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
     find_shortcut.activated.connect(win._focus_library_search)
 
-    win.btn_move_game = QPushButton(tr("library.btn_move_disk"))
-    win.btn_move_game.clicked.connect(win._move_selected_game)
-    win.btn_bulk_optiscaler = QPushButton(tr("library.btn_bulk_optiscaler"))
-    win.btn_bulk_optiscaler.clicked.connect(win._open_bulk_optiscaler)
-    win.btn_remove_game = QPushButton(tr("library.btn_uninstall"))
-    win.btn_remove_game.setObjectName("dangerBtn")
-    win.btn_remove_game.clicked.connect(win._remove_selected_shortcut)
+    win.btn_game_actions = QPushButton("⋯")
+    win.btn_game_actions.setAccessibleName(tr("library.game_actions"))
+    win.btn_game_actions.setToolTip(tr("library.game_actions"))
+    game_actions = QMenu(win.btn_game_actions)
+    win.btn_game_actions.setMenu(game_actions)
+    win.act_favorite = game_actions.addAction(tr("library.btn_favorite"))
+    win.act_favorite.setCheckable(True)
+    win.act_favorite.triggered.connect(win._toggle_favorite)
+    win.act_move_game = game_actions.addAction(tr("library.btn_move_disk"))
+    win.act_move_game.triggered.connect(win._move_selected_game)
+    win.act_game_art = game_actions.addAction(tr("art.btn_selected"))
+    win.act_tools = game_actions.addAction(tr("configure.tab_prefix"))
+    win.act_tools.triggered.connect(lambda: win._open_configure_game_dialog(tools_only=True))
+    game_actions.addAction(win.act_ext_to_steam)
+    game_actions.addAction(win.act_ext_import_saves)
+    game_actions.addSeparator()
+    win.act_remove_game = game_actions.addAction(tr("library.btn_uninstall"))
+    win.act_remove_game.triggered.connect(win._remove_selected_shortcut)
 
-    win.btn_bulk_proton = QPushButton(tr("library.btn_bulk_proton"))
-    win.btn_bulk_proton.setToolTip(tr("library.btn_bulk_proton_tip"))
-    win.btn_bulk_proton.clicked.connect(lambda: bulk_proton_dialog(win))
+    win.btn_bulk_actions = QPushButton(tr("library.bulk_actions"))
+    all_actions = QMenu(win.btn_bulk_actions)
+    win.btn_bulk_actions.setMenu(all_actions)
+    win.act_bulk_proton = all_actions.addAction(tr("library.btn_bulk_proton"))
+    win.act_bulk_proton.triggered.connect(lambda: bulk_proton_dialog(win))
+    win.act_bulk_optiscaler = all_actions.addAction(tr("library.btn_bulk_optiscaler"))
+    win.act_bulk_optiscaler.triggered.connect(win._open_bulk_optiscaler)
+
     win.btn_migrate_legacy = QPushButton(tr("maint.btn_migrate_legacy"))
     win.btn_migrate_legacy.clicked.connect(lambda: win._start_legacy_migration())
     from .ui_library_art import fetch_missing_art, fetch_selected_art
 
-    win.btn_game_art = QPushButton(tr("art.btn_selected"))
-    win.btn_game_art.setToolTip(tr("art.btn_selected_tip"))
-    win.btn_game_art.clicked.connect(lambda: fetch_selected_art(win))
+    win.act_game_art.triggered.connect(lambda: fetch_selected_art(win))
     footer = FlowLayout(spacing=8)
-    for btn in (
-        win.btn_play_game,
-        win.btn_configure_game,
-        win.btn_move_game,
-        win.btn_game_art,
-        win.btn_favorite,
-        win.btn_protondb,
-        win.btn_remove_game,
-    ):
+    for btn in (win.btn_play_game, win.btn_configure_game, win.btn_game_actions):
         footer.addWidget(btn)
     lib_layout.addLayout(footer)
     win.shortcuts_list.setMinimumHeight(420)
@@ -652,7 +649,8 @@ def build_library_page(win: MainWindow) -> QWidget:
     add_layout.addLayout(add_grid)
 
     # 3. Every game at once.
-    all_card, all_layout, _top = section_card(tr("library.section_all"))
+    all_card, all_layout, all_top = section_card(tr("library.section_all"))
+    all_top.addWidget(win.btn_bulk_actions)
     win.btn_all_art = QPushButton(tr("art.btn_missing"))
     win.btn_all_art.clicked.connect(lambda: fetch_missing_art(win))
     all_grid = action_grid()

@@ -12,6 +12,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QInputDialog,
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QTableWidget,
+    QToolButton,
 )
 
 from deckinstall import ui, ui_workers
@@ -216,7 +218,7 @@ def test_winetricks_busy_escape_and_explicit_cancel(
     assert recorded == [game.prefix_dir, ["dxvk"], True]
 
 
-def test_configure_opens_its_presets_and_run_exe_uses_active_parent(
+def test_game_tools_run_exe_uses_active_parent(
     window: ui.MainWindow, game: StandaloneGame, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     window._selected_library_item = lambda: ("standalone", game)
@@ -230,20 +232,6 @@ def test_configure_opens_its_presets_and_run_exe_uses_active_parent(
                         (picker_parent.append(parent), picked(str(game.exe_path))))
 
     monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: QMessageBox.StandardButton.Ok)
-    configs: list[QDialog] = []
-
-    def open_presets(dialog: QDialog) -> bool:
-        configs.append(dialog)
-        button = _button(dialog, "configure.btn_edit_launch_opts")
-        QTimer.singleShot(0, button, button.click)
-        return True
-
-    def cancel_presets(dialog: QDialog) -> bool:
-        if dialog is configs[0]:
-            return False
-        assert dialog.parentWidget() is configs[0]
-        return _escape(dialog)
-
     def run_exe(dialog: QDialog) -> bool:
         _button(dialog, "library.btn_run_exe_in_prefix").click()
         return True
@@ -254,8 +242,8 @@ def test_configure_opens_its_presets_and_run_exe_uses_active_parent(
         assert picker_parent == [dialog]
         return _escape(dialog)
 
-    _modal(lambda: configure_game_dialog.open_configure_game_dialog(window),
-           [open_presets, cancel_presets, run_exe, wait_for_run])
+    _modal(lambda: configure_game_dialog.open_configure_game_dialog(window, tools_only=True),
+           [run_exe, wait_for_run])
     runner.assert_called_once_with(game.exe_path, game.prefix_dir, proton_path=None)
 
 
@@ -265,14 +253,120 @@ def test_launch_presets_applies_checkbox_with_real_dialog(
     monkeypatch.setattr(launch_presets_dialog.shutil, "which", lambda _: "/bin/gamemoderun")
 
     def edit(dialog: QDialog) -> bool:
+        apply = dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Apply)
+        assert not apply.isEnabled()
+        assert not dialog.findChild(QLineEdit, "gameLaunchOptions").isVisible()
+        next(b for b in dialog.findChildren(QToolButton) if b.text() == tr("launch.more_options")).click()
         checkbox = next(c for c in dialog.findChildren(QCheckBox) if "GameMode" in c.text())
         checkbox.click()
-        dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok).click()
+        assert apply.isEnabled()
+        apply.click()
         return True
 
     result = _modal(lambda: launch_presets_dialog.open_launch_presets_dialog(window, "Game", "standalone", "", ""),
                     [edit])
     assert isinstance(result, tuple) and "gamemoderun" in result[0]
+
+
+@pytest.mark.parametrize("queued", [False, True])
+def test_configure_applies_proton_and_fps_together_for_steam(
+    window: ui.MainWindow, game: StandaloneGame, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, queued: bool,
+) -> None:
+    from deckinstall import steam_vdf
+    from deckinstall.launch_presets import parse_presets
+
+    window.paths = paths = _paths(tmp_path)
+    appid = steam_vdf.add_or_update_shortcut(
+        paths, game.name, game.exe_path, game.game_dir,
+        enable_proton=True, launch_options="CUSTOM=abc %command% --manual",
+    )
+    entry = steam_vdf.load_shortcuts(paths.shortcuts_vdf)[0]
+    window._selected_library_item = lambda: ("steam", entry)
+    monkeypatch.setattr(window, "_managed_library_game", lambda _: None)
+    monkeypatch.setattr(window, "_vdf_watch_tick", lambda: None)
+    monkeypatch.setattr(window, "should_queue_vdf_edits", lambda: queued)
+    monkeypatch.setattr(ui_workers, "is_steam_running", lambda: False)
+    monkeypatch.setattr(configure_game_dialog, "list_installed_protons", lambda _: [("proton_experimental", "Experimental")])
+    confirm = Mock(side_effect=lambda apply, **_: apply())
+    monkeypatch.setattr(window, "_confirm_close_steam_async", confirm)
+
+    def edit(dialog: QDialog) -> bool:
+        proton = dialog.findChild(QComboBox, "gameProton")
+        if not proton.isEnabled():
+            return False
+        fps = dialog.findChild(QComboBox, "gameFps")
+        apply = _button(dialog, "rec.apply")
+        assert not apply.isEnabled()
+        assert not dialog.findChild(QLineEdit, "gameLaunchOptions").isVisible()
+        more = next(b for b in dialog.findChildren(QToolButton) if b.text() == tr("launch.more_options"))
+        assert more.visibleRegion().boundingRect() == more.rect()
+        proton.setCurrentIndex(proton.findData("proton_experimental"))
+        fps.setCurrentIndex(fps.findData(45))
+        apply.click()
+        return True
+
+    def check(dialog: QDialog) -> bool:
+        if not _button(dialog, "configure.btn_close").isEnabled():
+            return False
+        assert not _button(dialog, "rec.apply").isEnabled()
+        return _escape(dialog)
+
+    _modal(lambda: configure_game_dialog.open_configure_game_dialog(window), [edit, check])
+    if queued:
+        edits = {edit.op: edit.payload for edit in window._vdf_queue.list_pending()}
+        assert edits["set_proton"]["tool_name"] == "proton_experimental"
+        opts = edits["set_launch_options"]["launch_options"]
+        assert steam_vdf.get_shortcut_proton(paths.config_vdf, appid) == ""
+        assert edits["set_launch_options"]["user_id"] == paths.user_id
+    else:
+        confirm.assert_called_once()
+        assert steam_vdf.get_shortcut_proton(paths.config_vdf, appid) == "proton_experimental"
+        opts = steam_vdf.load_shortcuts(paths.shortcuts_vdf)[0].launch_options
+    assert parse_presets(opts)["frame_rate"] == 45
+    assert "CUSTOM=abc" in opts and opts.endswith("%command% --manual")
+
+
+def test_configure_standalone_persists_options_from_one_apply(
+    window: ui.MainWindow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from deckinstall import standalone
+    from deckinstall.launch_presets import parse_presets
+    from tests.conftest import pe_exe_bytes
+
+    source = tmp_path / "Game"
+    source.mkdir()
+    exe = source / "game.exe"
+    exe.write_bytes(pe_exe_bytes())
+    monkeypatch.setattr(standalone, "resolve_game_icon", lambda *a, **kw: None)
+    game = standalone.install_standalone_game(
+        "Game", exe, source, launch_options="CUSTOM=abc %command% --manual", create_menu_shortcut=False,
+    )
+    window._selected_library_item = lambda: ("standalone", game)
+    tool = InstalledCompatTool("GE-Proton11-test", "GE-Proton11-test", tmp_path / "GE-Proton11-test", 0)
+    monkeypatch.setattr(configure_game_dialog, "list_installed_compat_tools", lambda: [tool])
+
+    def edit(dialog: QDialog) -> bool:
+        proton = dialog.findChild(QComboBox, "gameProton")
+        if not proton.isEnabled():
+            return False
+        proton.setCurrentIndex(proton.findData(tool.tool_id))
+        fps = dialog.findChild(QComboBox, "gameFps")
+        fps.setCurrentIndex(fps.findData(60))
+        _button(dialog, "rec.apply").click()
+        return True
+
+    def check(dialog: QDialog) -> bool:
+        if not _button(dialog, "configure.btn_close").isEnabled():
+            return False
+        assert not _button(dialog, "rec.apply").isEnabled()
+        return _escape(dialog)
+
+    _modal(lambda: configure_game_dialog.open_configure_game_dialog(window), [edit, check])
+    saved = standalone._load_manifest(standalone.find_manifest(game.game_dir))
+    assert saved is not None and saved.proton_name == tool.tool_id
+    assert parse_presets(saved.launch_options)["frame_rate"] == 60
+    assert "CUSTOM=abc" in saved.launch_options and saved.launch_options.endswith("%command% --manual")
 
 
 def test_bulk_proton_previous_in_gaming_mode_persists_vdf_edit(

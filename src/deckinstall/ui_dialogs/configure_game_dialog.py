@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -27,14 +28,13 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QTableWidget,
     QTableWidgetItem,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from .. import __app_name__
-from ..external_actions import load_external_launch_presets
 from ..i18n import tr
+from ..launch_presets import parse_presets, proton_kind
 from ..launcher_scan import ExternalLauncherGame
 from ..modes import STANDALONE, STEAM, feature_note
 from ..proton_policy import (
@@ -65,10 +65,12 @@ from ..steam_vdf import (
     get_compatdata_migration_state,
     get_shortcut_proton,
     list_microsd_compatdata_targets,
+    load_shortcuts,
     migrate_compatdata_to_microsd,
     remove_compat_tool,
     restore_compatdata_from_microsd,
     set_shortcut_proton,
+    update_shortcut_launch_options,
 )
 from ..ui_cards import (
     _BusyGuardedDialog,
@@ -347,8 +349,15 @@ def _edit_launch_hooks(win: MainWindow, parent: QDialog, game: StandaloneGame) -
     win.status_label.setText(tr("hooks.saved", name=game.name))
 
 
-def open_configure_game_dialog(win: MainWindow) -> None:
-    """Configure the selected game: three tabs by purpose (the game, running it, tools)."""
+def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> None:
+    """Show the game launch settings or its tools from the Library menu."""
+    from .launch_presets_dialog import (
+        LaunchOptions,
+        build_launch_options,
+        game_proton,
+        launch_options_of,
+        save_launch_options,
+    )
     sel = win._selected_library_item()
     if not sel:
         return
@@ -370,29 +379,37 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         exe_str = str(obj.exe_path)
         dir_str = str(obj.game_dir)
 
-    operation = {"migrating": False}
-    dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: operation["migrating"])
-    dlg.setWindowTitle(tr("configure.title", name=title_name))
+    operation = {"migrating": False, "saving": False}
+    dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: any(operation.values()))
+    dlg.setWindowTitle(tr("configure.tools_title", name=title_name) if tools_only
+                       else tr("configure.title", name=title_name))
     from ..ui_cards import clamp_dialog_size
 
-    clamp_dialog_size(dlg, 740, 560, dlg.parentWidget())
+    clamp_dialog_size(dlg, 620, 560 if tools_only else 280, dlg.parentWidget())
     dlg_alive = _dialog_guard(dlg)
     root_lay = QVBoxLayout(dlg)
 
-    tabs = QTabWidget(dlg)
-    root_lay.addWidget(tabs, 1)
+    scroll = QScrollArea(dlg)
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    body = QWidget(scroll)
+    body_layout = QVBoxLayout(body)
+    scroll.setWidget(body)
+    root_lay.addWidget(scroll, 1)
 
-    def _tab(title: str) -> QVBoxLayout:
-        """One tab: cards stacked in a scroll area (the Deck screen is short)."""
-        body = QWidget()
-        lay = QVBoxLayout(body)
-        lay.setSpacing(12)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setWidget(body)
-        tabs.addTab(scroll, title)
-        return lay
+    def _group() -> tuple[QWidget, QVBoxLayout]:
+        group = QWidget(body)
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(0, 0, 0, 0)
+        return group, layout
+
+    game_group, game_tab_lay = _group()
+    run_group, run_tab_lay = _group()
+    tools_group, prefix_lay = _group()
+    body_layout.addWidget(tools_group if tools_only else run_group)
+    body_layout.addStretch(1)
+    game_group.hide()
+    (run_group if tools_only else tools_group).hide()
 
     def _with_button(label: QLabel, button: QPushButton) -> QWidget:
         box = QWidget()
@@ -403,7 +420,6 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         return box
 
     # --- Tab 1: the game (its files, how it runs, its shortcuts) ---
-    game_tab_lay = _tab(tr("configure.tab_game"))
     files_card, files_lay, _top = section_card(tr("configure.card_files"))
     game_form = QFormLayout()
     files_lay.addLayout(game_form)
@@ -488,11 +504,8 @@ def open_configure_game_dialog(win: MainWindow) -> None:
         mode_form.addRow(tr("configure.lbl_launchers"), _launcher_checkboxes(win, dlg, sa_obj, steam_mode=is_steam))
     if mode_form.rowCount():
         game_tab_lay.addWidget(mode_card)
-    game_tab_lay.addStretch()
 
     # --- Tab 2: running it (Proton, launch options, commands, the log) ---
-    run_tab_lay = _tab(tr("configure.tab_run"))
-    runner_card, runner_lay, _top = section_card(tr("configure.tab_runner"))
     lbl_cur_proton: QLabel | None = None
     lbl_umu_badge: QLabel | None = None
     proton_combo: QComboBox | None = None
@@ -500,65 +513,24 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     active_proton_ref: list[str] = [""]
 
     if is_native:
-        runner_lay.addWidget(note_label(tr("configure.native_no_proton")))
+        run_tab_lay.addWidget(note_label(tr("configure.native_no_proton")))
     else:
-        runner_form = QFormLayout()
         if is_steam or is_standalone:
-            proton_combo = QComboBox()
+            proton_combo = QComboBox(run_group)
+            proton_combo.setObjectName("gameProton")
             proton_combo.addItem(tr("configure.loading"), "")
             proton_combo.setEnabled(False)
-            if sa_obj is not None:
+            if sa_obj is not None and tools_only:
                 btn_previous_proton = QPushButton(tr("configure.btn_previous_proton"))
                 btn_previous_proton.setEnabled(False)
-                proton_row = QWidget()
-                proton_row_lay = QHBoxLayout(proton_row)
-                proton_row_lay.setContentsMargins(0, 0, 0, 0)
-                proton_row_lay.addWidget(proton_combo, 1)
-                proton_row_lay.addWidget(btn_previous_proton)
-                runner_form.addRow(tr("configure.lbl_current_proton"), proton_row)
-            else:
-                runner_form.addRow(tr("configure.lbl_current_proton"), proton_combo)
+                prefix_lay.addWidget(btn_previous_proton)
         else:
-            lbl_cur_proton = QLabel(tr("configure.loading"))
-            runner_form.addRow(tr("configure.lbl_current_proton"), lbl_cur_proton)
-        if sa_obj is not None:
+            lbl_cur_proton = QLabel(tr("configure.loading"), run_group)
+        if sa_obj is not None and tools_only:
             lbl_umu_badge = QLabel(tr("configure.loading"))
             lbl_umu_badge.setWordWrap(True)
-            runner_form.addRow(tr("configure.lbl_umu_status"), lbl_umu_badge)
-        runner_lay.addLayout(runner_form)
-    run_tab_lay.addWidget(runner_card)
-
-    launch_card, launch_lay, _top = section_card(tr("configure.card_launch"), tr("configure.card_launch_hint"))
-    initial_opts_text = (
-        load_external_launch_presets(obj)
-        if isinstance(obj, ExternalLauncherGame)
-        else str(getattr(obj, "launch_options", "") or "")
-    )
-    opts_edit = QLineEdit(initial_opts_text)
-    opts_edit.setReadOnly(True)
-    opts_edit.setPlaceholderText(tr("configure.no_launch_opts"))
-    launch_lay.addWidget(opts_edit)
-
-    btn_edit_opts = QPushButton(tr("configure.btn_edit_launch_opts"))
-    btn_edit_opts.setEnabled(is_steam or is_standalone or is_external)
-
-    def _save_displayed_opts(new_opts: str) -> None:
-        nonlocal obj
-        if dlg_alive():
-            if isinstance(obj, ShortcutEntry):
-                obj = replace(obj, launch_options=new_opts)
-            opts_edit.setText(new_opts)
-
-    def _on_edit_opts() -> None:
-        if win._steam_busy:
-            return
-        # Pass this game and this dialog explicitly: the library selection may differ (or be empty),
-        # and without the parent the child can open behind this dialog under gamescope/Wayland.
-        win._edit_launch_options_presets((kind, obj), parent=dlg, on_saved=_save_displayed_opts)
-
-    btn_edit_opts.clicked.connect(_on_edit_opts)
+            prefix_lay.addWidget(lbl_umu_badge)
     launch_grid = action_grid()
-    action_row(launch_grid, 0, btn_edit_opts, tr("configure.edit_opts_hint"))
     if sa_obj is not None and not is_steam:
         btn_hooks = QPushButton(tr("hooks.btn"))
         btn_hooks.clicked.connect(lambda _=False: _edit_launch_hooks(win, dlg, sa_obj))
@@ -616,67 +588,118 @@ def open_configure_game_dialog(win: MainWindow) -> None:
     btn_view_log.clicked.connect(_on_view_log)
     action_row(launch_grid, 2, btn_view_log, tr("configure.view_log_hint"))
 
-    btn_rec = QPushButton(tr("rec.btn"))
-    btn_rec.setEnabled(is_steam or is_standalone or is_external)
+    prefix_lay.addLayout(launch_grid)
 
-    def _on_recommendations() -> None:
-        if win._steam_busy:
-            return
-        from ..proton_policy import newest_ge_proton
+    def _more(parent: QWidget, layout: QVBoxLayout, editor: LaunchOptions) -> None:
         from ..steam_paths import find_proton_binary, resolve_proton_dir
-        from ..steam_vdf import get_shortcut_proton
-        from ..ui_recommendations import Target, open_recommendations_dialog
-        from .launch_presets_dialog import game_proton, launch_options_of, save_launch_options
+        from ..ui_recommendations import Target, add_game_recommendations
 
-        steam_root = win.paths.steam_root if win.paths is not None else None
-        proton_dir: Path | None = None
-        if isinstance(obj, ShortcutEntry) and win.paths is not None:
-            try:
-                tool = get_shortcut_proton(win.paths.config_vdf, obj.appid_u32)
-            except Exception:
-                tool = ""
-            proton_bin = find_proton_binary(win.paths.steam_root)
-            proton_dir = resolve_proton_dir(tool, steam_root) if tool else (proton_bin.parent if proton_bin else None)
-        elif sa_obj is not None:
-            proton_dir = resolve_proton_dir(sa_obj.proton_name, steam_root) if sa_obj.proton_name else None
-            proton_dir = proton_dir or newest_ge_proton()
-        try:
-            prefix, _ = resolve_game_prefix(kind, obj, win.paths)
-            prefix_ready = prefix is not None and prefix.is_dir()
-        except Exception:
-            prefix_ready = False
-        opts_now, dll_now = launch_options_of(obj)
+        root = win.paths.steam_root if win.paths is not None else None
+        selected = str(proton_combo.currentData() or "") if proton_combo is not None else ""
+        default = selected in ("", DEFAULT_PROTON_ID, STEAM_DEFAULT_PROTON_ID)
+        proton_dir = None if default else resolve_proton_dir(selected, root)
+        if proton_dir is None:
+            if is_standalone:
+                proton_dir = newest_ge_proton()
+            elif root is not None:
+                binary = find_proton_binary(root)
+                proton_dir = binary.parent if binary else None
+        opts, dll = editor.values()
+        prefix = resolved_pfx_ref[0] or getattr(sa_obj or obj, "prefix_dir", None)
         target = Target(
             title=title_name,
             steam_appid=sa_obj.steam_appid if sa_obj is not None else None,
-            game_dir=sa_obj.game_dir if sa_obj is not None else Path(dir_str),
-            mode="steam" if is_steam else ("standalone" if is_standalone else "external"),
-            proton=game_proton(win, kind, obj),
+            game_dir=sa_obj.game_dir if sa_obj is not None else Path(dir_str.strip('"')),
+            mode=kind,
+            proton=proton_kind(selected) or ("valve" if is_steam else game_proton(win, kind, obj)),
             proton_dir=proton_dir,
-            opts=opts_now,
-            winedll=dll_now,
-            prefix_ready=prefix_ready,
+            opts=opts,
+            winedll=dll,
+            prefix_ready=prefix is not None and prefix.is_dir(),
             store=obj.store if isinstance(obj, ExternalLauncherGame) else "",
             codename=obj.game_id if isinstance(obj, ExternalLauncherGame) else "",
             dll_in_opts=not is_standalone,
-            exe=sa_obj.exe_path if sa_obj is not None else (Path(exe_str) if exe_str else None),
+            exe=sa_obj.exe_path if sa_obj is not None else Path(exe_str.strip('"')),
+        )
+        add_game_recommendations(
+            win, parent, layout, editor, target,
+            lambda verb: win._open_winetricks_dialog(kind, obj, preset_verbs=[verb]),
         )
 
-        def _apply(new_opts: str, new_dll: str, verbs: list[str]) -> None:
-            save_launch_options(win, (kind, obj), new_opts, new_dll, parent=dlg, on_saved=_save_displayed_opts)
-            if verbs and dlg_alive():
-                win._open_winetricks_dialog(kind, obj, preset_verbs=verbs)
+    def pending_steam_edit(op: str) -> QueuedVdfEdit | None:
+        if not isinstance(obj, ShortcutEntry) or win.paths is None:
+            return None
+        return next((
+            edit for edit in win._vdf_queue.list_pending()
+            if edit.op == op and edit.appid_u32 == obj.appid_u32
+            and edit.payload.get("user_id") == win.paths.user_id
+            and edit.payload.get("steam_root") == str(win.paths.steam_root)
+        ), None)
 
-        open_recommendations_dialog(win, target, _apply, parent=dlg)
+    editor: LaunchOptions | None = None
+    original_opts = launch_options_of(obj)
+    queued_opts = pending_steam_edit("set_launch_options")
+    if queued_opts is not None:
+        opts = str(queued_opts.payload.get("launch_options") or "")
+        original_opts = opts, str(parse_presets(opts).get("winedll") or "")
+    if not tools_only:
+        editor = build_launch_options(
+            win, dlg, kind, *original_opts, game_obj=obj, is_native_linux=is_native,
+            proton=game_proton(win, kind, obj), proton_control=proton_combo or lbl_cur_proton,
+            extra_options=game_group, more=None if is_native else _more,
+        )
+        run_tab_lay.addWidget(editor.widget)
+        editor.widget.setEnabled(not is_steam or win.paths is not None)
+        original_opts = editor.values()
 
-    btn_rec.clicked.connect(_on_recommendations)
-    action_row(launch_grid, 3, btn_rec, tr("rec.btn_hint"))
-    launch_lay.addLayout(launch_grid)
-    run_tab_lay.addWidget(launch_card)
-    run_tab_lay.addStretch()
+    def _proton_changed() -> bool:
+        return bool(proton_combo is not None and proton_combo.isEnabled()
+                    and proton_combo.currentData() != active_proton_ref[0])
 
-    # --- Tab 3: tools for the Wine prefix, and moving the game elsewhere ---
-    prefix_lay = _tab(tr("configure.tab_prefix"))
+    def _update_apply() -> None:
+        btn_apply.setEnabled(
+            not operation["saving"] and not win._steam_busy
+            and (bool(editor is not None and editor.values() != original_opts) or _proton_changed())
+        )
+
+    def _set_saving(saving: bool) -> None:
+        operation["saving"] = saving
+        run_group.setEnabled(not saving)
+        btn_close.setEnabled(not saving)
+        if not saving:
+            _update_apply()
+        else:
+            btn_apply.setEnabled(False)
+
+    def draft_options() -> tuple[str, str] | None:
+        if editor is None:
+            return None
+        values = editor.values()
+        return values if values != original_opts else None
+
+    def record_saved(values: tuple[str, str]) -> None:
+        nonlocal obj, original_opts
+        if isinstance(obj, ShortcutEntry):
+            obj = replace(obj, launch_options=values[0])
+        original_opts = values
+
+    def _save_options() -> None:
+        draft = draft_options()
+        if draft is None:
+            _set_saving(False)
+            return
+
+        def saved(_: str) -> None:
+            if dlg_alive():
+                record_saved(draft)
+                _show_saved(win.status_label.text())
+                _set_saving(False)
+
+        save_launch_options(
+            win, (kind, obj), *draft, parent=dlg, on_saved=saved,
+            on_failed=lambda: _set_saving(False) if dlg_alive() else None,
+        )
+
     pfx_label: QLabel | None = None
     win32_warn: QLabel | None = None
     btn_wt: QPushButton | None = None
@@ -767,6 +790,9 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                 try:
                     if isinstance(obj, ShortcutEntry) and is_steam and paths_snap:
                         raw_proton = get_shortcut_proton(paths_snap.config_vdf, obj.appid_u32)
+                        pending = pending_steam_edit("set_proton")
+                        if pending is not None:
+                            raw_proton = str(pending.payload.get("tool_name") or "")
                         proton_text = raw_proton or tr("proton.default_label")
                         tools.append((STEAM_DEFAULT_PROTON_ID, tr("proton.default_label")))
                         seen_ids.add(STEAM_DEFAULT_PROTON_ID)
@@ -798,7 +824,8 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                         if raw_proton and raw_proton not in seen_ids:
                             tools.insert(0, (raw_proton, raw_proton))
                     else:
-                        proton_text = str(getattr(obj, "runner", "") or tr("proton.default_label"))
+                        proton_text = (obj.runtime or obj.runner) if isinstance(obj, ExternalLauncherGame) else ""
+                        proton_text = proton_text or tr("proton.default_label")
 
                     try:
                         resolved_pfx, _ = resolve_game_prefix(kind, obj, paths_snap)
@@ -855,6 +882,8 @@ def open_configure_game_dialog(win: MainWindow) -> None:
             if not dlg_alive() or win._closing_pending:
                 return
             active_proton_ref[0] = raw_proton
+            if editor is not None:
+                editor.set_proton(proton_kind(raw_proton) or ("ge" if is_standalone else "valve" if is_steam else ""))
             if lbl_cur_proton is not None:
                 lbl_cur_proton.setText(proton_text)
             if proton_combo is not None:
@@ -874,6 +903,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                     and not win32_flag
                     and ((is_steam and bool(win.paths)) or is_standalone)
                 )
+            _update_apply()
             if btn_previous_proton is not None and sa_obj is not None:
                 previous = previous_proton_name(sa_obj)
                 btn_previous_proton.setEnabled(bool(previous) and not win32_flag)
@@ -935,13 +965,18 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                 if btn_previous_proton is not None:
                     btn_previous_proton.setEnabled(enabled)
 
-            def _on_proton_combo_activated(idx: int, use_previous: bool = False) -> None:
+            def _on_proton_combo_activated(
+                idx: int, use_previous: bool = False, after_saved: Callable[[], None] | None = None,
+            ) -> None:
                 tool_id = "" if use_previous else str(proton_combo.itemData(idx) or "")
                 if use_previous and sa_obj is not None:
                     tool_id = previous_proton_name(sa_obj)
                 if not tool_id or tool_id == active_proton_ref[0]:
+                    if after_saved is not None:
+                        after_saved()
                     return
                 auto_snap_enabled = win._is_auto_snapshot_enabled()
+                draft = draft_options() if after_saved is not None else None
 
                 if is_standalone and isinstance(obj, StandaloneGame):
                     sa = obj
@@ -958,7 +993,8 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                         return (
                             use_previous_proton(sa.game_dir)
                             if use_previous
-                            else set_game_proton(sa.game_dir, "" if tool_id == DEFAULT_PROTON_ID else tool_id)
+                            else set_game_proton(sa.game_dir, "" if tool_id == DEFAULT_PROTON_ID else tool_id,
+                                                 launch_settings=draft)
                         )
 
                     worker = SteamOpWorker(_do_sa, need_steam_closed=False)
@@ -969,6 +1005,8 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                         if isinstance(res, StandaloneGame):
                             sa.proton_name = res.proton_name
                             sa.meta = res.meta
+                            sa.launch_options = res.launch_options
+                            sa.winedlloverrides = res.winedlloverrides
                         active_proton_ref[0] = sa.proton_name or DEFAULT_PROTON_ID
                         win._refresh_shortcuts()
                         msg = tr(
@@ -980,12 +1018,17 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                         if dlg_alive():
                             _set_proton_controls_enabled(True)
                             _start_config_loader()
-                            QMessageBox.information(dlg, __app_name__, msg)
+                            _show_saved(msg)
+                            if draft is not None:
+                                record_saved(draft)
+                            if after_saved is not None:
+                                after_saved()
 
                     def _sa_err(err: str) -> None:
                         if dlg_alive():
                             _set_proton_controls_enabled(True)
                             _start_config_loader()
+                            _set_saving(False)
                             QMessageBox.critical(dlg, __app_name__, tr("proton.error", err=err))
 
                     worker.finished_ok.connect(_sa_ok)
@@ -1007,6 +1050,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
 
                         queued = win.should_queue_vdf_edits()  # Gaming Mode: save it for when Steam closes
                         queued_edit_id = f"set_proton:{entry.appid_u32}"
+                        combined = None if queued else draft
                         # Queue first: when the edit cannot be saved nothing else changes (the manifest
                         # keeps its Proton too); enqueue_vdf_edit already told the user why.
                         if queued and not win.enqueue_vdf_edit(
@@ -1017,6 +1061,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                             trigger_watch=False,
                         ):
                             _set_proton_controls_enabled(True)
+                            _set_saving(False)
                             return
                         win._begin_busy()
 
@@ -1029,23 +1074,40 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                                 enabled=auto_snap_enabled,
                             )
                             before = get_shortcut_proton(paths_local_p.config_vdf, entry.appid_u32)
+                            original_vdf_opts: str | None = None
+                            if combined is not None:
+                                shortcuts = load_shortcuts(paths_local_p.shortcuts_vdf, strict=True)
+                                current = next((item for item in shortcuts if item.appid_u32 == entry.appid_u32), None)
+                                if current is None:
+                                    raise RuntimeError(tr("add.steam_missing"))
+                                original_vdf_opts = current.launch_options
                             if not queued:
                                 if target_steam_tool:
                                     set_shortcut_proton(paths_local_p.config_vdf, entry.appid_u32, target_steam_tool)
                                 else:
                                     remove_compat_tool(paths_local_p.config_vdf, entry.appid_u32)
-                            if managed_game is None:
-                                return None
+                            options_written = False
                             try:
+                                if combined is not None:
+                                    if not update_shortcut_launch_options(paths_local_p, entry.appid_u32, combined[0]):
+                                        raise RuntimeError(tr("add.steam_missing"))
+                                    options_written = True
+                                if managed_game is None:
+                                    return None
                                 if use_previous:
                                     return use_previous_proton(managed_game.game_dir, previous_tool=before)
-                                return set_game_proton(managed_game.game_dir, target_steam_tool, previous_tool=before)
+                                return set_game_proton(
+                                    managed_game.game_dir, target_steam_tool, previous_tool=before,
+                                    launch_settings=combined,
+                                )
                             except Exception:
                                 if not queued:
                                     if before:
                                         set_shortcut_proton(paths_local_p.config_vdf, entry.appid_u32, before)
                                     else:
                                         remove_compat_tool(paths_local_p.config_vdf, entry.appid_u32)
+                                if options_written and original_vdf_opts is not None:
+                                    update_shortcut_launch_options(paths_local_p, entry.appid_u32, original_vdf_opts)
                                 raise
 
                         worker = SteamOpWorker(_do_steam, need_steam_closed=not queued)
@@ -1057,6 +1119,8 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                             if managed_game is not None and isinstance(res, StandaloneGame):
                                 managed_game.proton_name = res.proton_name
                                 managed_game.meta = res.meta
+                                managed_game.launch_options = res.launch_options
+                                managed_game.winedlloverrides = res.winedlloverrides
                             active_proton_ref[0] = tool_id
                             msg = tr("proton.updated", name=entry.app_name, tool=display_tool)
                             if queued:
@@ -1067,7 +1131,11 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                             if dlg_alive():
                                 _set_proton_controls_enabled(True)
                                 _start_config_loader()
-                                QMessageBox.information(dlg, __app_name__, msg)
+                                _show_saved(msg)
+                                if combined is not None:
+                                    record_saved(combined)
+                                if after_saved is not None:
+                                    after_saved()
 
                         def _st_err(err: str) -> None:
                             win._end_busy()
@@ -1080,6 +1148,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                             if dlg_alive():
                                 _set_proton_controls_enabled(True)
                                 _start_config_loader()
+                                _set_saving(False)
                             if not win._closing_pending:
                                 QMessageBox.critical(
                                     dlg if dlg_alive() else win, __app_name__, tr("proton.error", err=err),
@@ -1093,6 +1162,7 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                         if dlg_alive():
                             _set_proton_controls_enabled(True)
                             _start_config_loader()
+                            _set_saving(False)
 
                     win._confirm_close_steam_async(
                         _proceed_steam_proton,
@@ -1101,7 +1171,13 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                         alive_fn=dlg_alive,
                     )
 
-            proton_combo.activated.connect(_on_proton_combo_activated)
+            def _proton_draft_changed() -> None:
+                if editor is not None:
+                    editor.set_proton(proton_kind(str(proton_combo.currentData() or ""))
+                                      or ("ge" if is_standalone else "valve"))
+                _update_apply()
+
+            proton_combo.currentIndexChanged.connect(_proton_draft_changed)
             if btn_previous_proton is not None:
                 btn_previous_proton.clicked.connect(
                     lambda: _on_proton_combo_activated(proton_combo.currentIndex(), use_previous=True)
@@ -1214,7 +1290,32 @@ def open_configure_game_dialog(win: MainWindow) -> None:
 
     btn_close = QPushButton(tr("configure.btn_close"))
     btn_close.clicked.connect(dlg.accept)
-    root_lay.addLayout(dialog_footer(btn_close))
+    btn_apply = QPushButton(tr("rec.apply"))
+    btn_apply.setObjectName("primaryBtn")
+    btn_apply.setEnabled(False)
+    save_status = note_label(tr("add.steam_unavailable") if is_steam and win.paths is None else "")
+    save_status.setVisible(bool(save_status.text()))
+    root_lay.addWidget(save_status)
+
+    def _show_saved(message: str) -> None:
+        save_status.setText(message)
+        save_status.show()
+
+    def apply() -> None:
+        if win._steam_busy or operation["saving"]:
+            return
+        change_proton = _proton_changed()
+        _set_saving(True)
+        if change_proton and proton_combo is not None:
+            _on_proton_combo_activated(proton_combo.currentIndex(), after_saved=_save_options)
+        else:
+            _save_options()
+
+    btn_apply.clicked.connect(apply)
+    if editor is not None:
+        editor.raw.textChanged.connect(_update_apply)
+        editor.dll.textChanged.connect(_update_apply)
+    root_lay.addLayout(dialog_footer(btn_close) if tools_only else dialog_footer(btn_apply, btn_close))
 
     dlg.exec()
     dlg.deleteLater()

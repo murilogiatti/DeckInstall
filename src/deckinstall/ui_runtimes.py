@@ -87,7 +87,7 @@ def build_runtimes_page(win: MainWindow) -> QWidget:
     layout.addWidget(_component_card(
         tr("runtimes.proton_title"), tr("runtimes.proton_about"),
         [win.lbl_rt_steam_proton, win.lbl_maint_proton],
-        [win.btn_bulk_proton, win.btn_rt_ge_update, _remove({GE})], win.lbl_rt_proton_note,
+        [win.btn_rt_ge_update, _remove({GE})], win.lbl_rt_proton_note,
     ))
 
     # umu-run + Steam Runtime (Standalone mode only)
@@ -117,7 +117,7 @@ def build_runtimes_page(win: MainWindow) -> QWidget:
     layout.addWidget(_component_card(
         tr("runtimes.optiscaler_title"), tr("runtimes.optiscaler_about"),
         [win.lbl_rt_optiscaler],
-        [win.btn_bulk_optiscaler, win.btn_rt_optiscaler_update, _remove({OPTISCALER})], _note_label(),
+        [win.btn_rt_optiscaler_update, _remove({OPTISCALER})], _note_label(),
     ))
 
     # Tools found on the system (read only)

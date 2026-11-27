@@ -20,6 +20,7 @@ from .standalone import (
     StandaloneGame,
     _load_manifest,
     _resolve_proton_path,
+    _validate_launch_options,
     _write_manifest,
     list_standalone_games,
     refresh_integration_files,
@@ -81,9 +82,17 @@ def _apply(game: StandaloneGame, tool_name: str, *, before: str) -> StandaloneGa
     return game
 
 
-def set_game_proton(game_dir: Path, tool_name: str, *, previous_tool: str = "") -> StandaloneGame:
+def set_game_proton(
+    game_dir: Path, tool_name: str, *, previous_tool: str = "", launch_settings: tuple[str, str] | None = None,
+) -> StandaloneGame:
     """Pin a game to tool_name, or put it back on "Default (newest)" with an empty name."""
     game = _load(game_dir)
+    if launch_settings is not None:
+        opts, dll = launch_settings
+        _validate_launch_options(opts)
+        _validate_launch_options(dll)
+        game.launch_options = opts
+        game.winedlloverrides = dll
     cleaned = "" if tool_name.strip() == DEFAULT_PROTON_ID else tool_name.strip()
     return _apply(game, cleaned, before=previous_tool or effective_proton_name(game))
 

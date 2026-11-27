@@ -90,36 +90,6 @@ def test_install_form_has_one_presets_button_with_summary(tmp_path: Path) -> Non
         win.close()
 
 
-def test_edit_presets_uses_given_game_and_parent_and_warns_without_steam(tmp_path: Path) -> None:
-    from PySide6.QtWidgets import QApplication, QWidget
-
-    from deckinstall.steam_vdf import ShortcutEntry
-    from deckinstall.ui_dialogs import launch_presets_dialog as lpd
-
-    app = QApplication.instance() or QApplication([])
-    parent = QWidget()
-    try:
-        win = mock.Mock()
-        win.paths = None
-        win._selected_library_item.return_value = None
-        sc = ShortcutEntry("0", 2147483649, "Game", '"/g/Game.exe"', '"/g"', "", "")
-        with mock.patch.object(lpd.QMessageBox, "warning") as warn:
-            lpd.edit_launch_options_presets(win, sel=("steam", sc), parent=parent)
-        warn.assert_called_once()
-        assert warn.call_args.args[0] is parent
-        win._open_launch_presets_dialog.assert_not_called()
-
-        win.paths = mock.Mock()
-        win._open_launch_presets_dialog.return_value = None
-        lpd.edit_launch_options_presets(win, sel=("steam", sc), parent=parent)
-        assert win._open_launch_presets_dialog.call_args.kwargs["parent"] is parent
-        assert win._open_launch_presets_dialog.call_args.kwargs["game_obj"] is sc
-        win._selected_library_item.assert_not_called()
-    finally:
-        parent.deleteLater()
-        app.processEvents()
-
-
 def test_toggle_presets_round_trip_and_keep_custom_values() -> None:
     from deckinstall.launch_presets import TOGGLES, apply_presets, parse_presets
 
@@ -188,7 +158,7 @@ def test_recommended_for_this_pc() -> None:
 
 def test_presets_window_follows_the_gpu_the_game_runs_on() -> None:
     from PySide6.QtCore import QTimer
-    from PySide6.QtWidgets import QApplication, QCheckBox, QWidget
+    from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QToolButton, QWidget
 
     from deckinstall.hardware import Gpu, HardwareProfile
     from deckinstall.i18n import tr
@@ -206,11 +176,12 @@ def test_presets_window_follows_the_gpu_the_game_runs_on() -> None:
         if dlg is None:
             QTimer.singleShot(10, inspect)
             return
+        next(b for b in dlg.findChildren(QToolButton) if b.text() == tr("launch.more_options")).click()
         boxes = {c.text(): c for c in dlg.findChildren(QCheckBox)}
         fsr4, dlss = boxes[tr("launch.fsr4_upgrade")], boxes[tr("launch.dlss_upgrade")]
-        prime = boxes[tr("launch.prime_on_gpu", name="RTX 3050")]
+        gpu = dlg.findChild(QComboBox, "gameGpu")
         seen["on_vega"] = (not fsr4.isHidden(), fsr4.isEnabled(), not dlss.isHidden())
-        prime.setChecked(True)
+        gpu.setCurrentIndex(gpu.findData(True))
         seen["on_rtx"] = (not fsr4.isHidden(), not dlss.isHidden(), dlss.isEnabled())
         dlg.reject()
 

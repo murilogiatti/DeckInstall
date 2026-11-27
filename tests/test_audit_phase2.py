@@ -158,9 +158,9 @@ def test_configure_dialog_managed_steam_and_reset_default_proton(tmp_path: Path)
             if modal is None:
                 QTimer.singleShot(10, _inspect)
                 return
-            combos = modal.findChildren(QComboBox)
+            combos = [c.objectName() for c in modal.findChildren(QComboBox) if c.isVisibleTo(modal)]
             buttons = [b.text() for b in modal.findChildren(QPushButton)]
-            seen["combo_count"] = len(combos)
+            seen["combos"] = combos
             seen["buttons"] = buttons
             modal.accept()
 
@@ -177,7 +177,7 @@ def test_configure_dialog_managed_steam_and_reset_default_proton(tmp_path: Path)
             QTimer.singleShot(0, _inspect)
             configure_game_dialog.open_configure_game_dialog(win)
 
-        assert seen["combo_count"] == 2  # exe_combo + proton_combo both present
+        assert seen["combos"] == ["gameProton", "gameGpu", "gameFps"]
         btn_texts = seen["buttons"]
         assert isinstance(btn_texts, list)
         assert not any("microSD" in t or "Compatdata" in t for t in btn_texts)

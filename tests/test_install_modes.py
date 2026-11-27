@@ -104,11 +104,13 @@ def test_steam_mode_install_creates_no_app_launchers(tmp_path: Path) -> None:
         win.add_exe_combo.setEditText(str(exe))
         win.btn_shortcut_menu.setChecked(True)
         win.chk_keep_in_place.setChecked(True)
+        win._add_proton = STEAM, "proton_experimental"
         with mock.patch.object(ui, "StandaloneInstallWorker") as worker, mock.patch.object(win, "_track_worker"):
             win._install_selected()  # a Mock worker must not be tracked: closing would wait for it forever
         kwargs = worker.call_args.kwargs
         assert kwargs["create_menu_shortcut"] is False and kwargs["create_desktop_shortcut"] is False
         assert kwargs["prepare_standalone_runtime"] is False
+        assert kwargs["proton_name"] == "proton_experimental"
         win._end_busy()
     finally:
         win.paths = None

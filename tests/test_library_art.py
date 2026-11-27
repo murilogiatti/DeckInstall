@@ -118,11 +118,11 @@ def test_library_buttons_fetch_art_and_the_cover_grid_shows_it(monkeypatch: pyte
             cell.setData(Qt.ItemDataRole.UserRole + 1, "standalone:/g/Hades")
             table.setItem(0, 0, cell)
             table.setCurrentCell(0, 0)
-            assert win.btn_game_art.isEnabled()
+            assert win.act_game_art.isEnabled()
             # No key yet: the key dialog opens right here; cancelled, nothing is fetched.
             with mock.patch("deckinstall.ui_system.set_steamgriddb_key") as ask:
                 monkeypatch.setattr(ui_library_art, "api_key", lambda: "")
-                win.btn_game_art.click()
+                win.act_game_art.trigger()
                 ask.assert_called_once()
             assert calls == []
             monkeypatch.setattr(ui_library_art, "api_key", lambda: "k")
@@ -137,7 +137,7 @@ def test_library_buttons_fetch_art_and_the_cover_grid_shows_it(monkeypatch: pyte
             win.btn_all_art.click()  # nothing missing any more
             assert win.message_bar.text() == tr("art.nothing_missing")
             with mock.patch.object(ui_library_art.QMessageBox, "question", return_value=ui.QMessageBox.StandardButton.No) as q:
-                win.btn_game_art.click()  # it has art: asks before swapping
+                win.act_game_art.trigger()  # it has art: asks before swapping
                 q.assert_called_once()
         finally:
             assert ui._wait_for_workers(app, win, 10.0)  # type: ignore[arg-type]

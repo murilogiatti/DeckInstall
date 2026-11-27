@@ -13,7 +13,6 @@ from typing import Any, Protocol
 FAVORITES_KEY = "library/favorites"
 PLAYTIME_KEY = "library/playtime"
 MIN_SESSION_SECONDS = 10  # shorter runs are failed starts, not play
-PROTONDB_URL = "https://www.protondb.com/app/{appid}"
 
 
 class _Settings(Protocol):
@@ -78,7 +77,3 @@ def format_duration(seconds: float) -> str:
     minutes = int(seconds // 60)
     hours, minutes = divmod(minutes, 60)
     return f"{hours} h {minutes:02d} min" if hours else f"{minutes} min"
-
-
-def protondb_url(appid: int | None) -> str:
-    return PROTONDB_URL.format(appid=appid) if appid and appid > 0 else ""

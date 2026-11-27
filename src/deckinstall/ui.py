@@ -173,7 +173,6 @@ from .ui_cards import (
 )
 from .ui_dialogs import (
     bulk_proton_dialog,
-    edit_launch_options_presets,
     open_configure_game_dialog,
     open_launch_presets_dialog,
     open_optiscaler_dialog,
@@ -183,6 +182,7 @@ from .ui_dialogs import (
     run_exe_in_prefix_dialog,
 )
 from .ui_dialogs.adopt_wizard import open_adopt_wizard
+from .ui_dialogs.launch_presets_dialog import LaunchOptions
 from .ui_dialogs.relocate_dialog import move_game_to_disk
 from .ui_dialogs.save_sync_dialog import (
     AUTO_SNAPSHOT_KEY,
@@ -297,8 +297,11 @@ class MainWindow(QMainWindow):
     """Main DeckInstall application window."""
 
     # Built by ui_pages / ui_system (bound onto the window there).
-    btn_favorite: QPushButton
-    btn_protondb: QPushButton
+    act_favorite: QAction
+    btn_game_actions: QPushButton
+    btn_bulk_actions: QPushButton
+    act_tools: QAction
+    _add_proton: tuple[str, str]
     _install_mode_chosen: bool
     _standalone_launchers: tuple[bool, ...]
     _add_launch_options: str
@@ -314,25 +317,25 @@ class MainWindow(QMainWindow):
     add_name: QLineEdit
     btn_add_launch_adv: QPushButton
     btn_adopt_games: QPushButton
-    btn_bulk_optiscaler: QPushButton
-    btn_bulk_proton: QPushButton
+    act_bulk_optiscaler: QAction
+    act_bulk_proton: QAction
     btn_cancel_extract: QPushButton
     btn_configure_game: QPushButton
     btn_copy_diag: QPushButton
     btn_extract: QPushButton
     btn_install: QPushButton
     btn_lib_sub_add: QPushButton
-    btn_game_art: QPushButton
+    act_game_art: QAction
     lbl_sgdb_state: QLabel
     btn_all_art: QPushButton
     btn_mode_standalone: QPushButton
     btn_mode_steam: QPushButton
-    btn_move_game: QPushButton
+    act_move_game: QAction
     btn_play_game: QPushButton
     btn_redetect_steam: QPushButton
     btn_reload: QPushButton
     btn_remove_existing: QPushButton
-    btn_remove_game: QPushButton
+    act_remove_game: QAction
     btn_scan: QPushButton
     btn_scan_folders: QPushButton
     default_fps_combo: QComboBox
@@ -1807,6 +1810,7 @@ class MainWindow(QMainWindow):
         opts, winedll = self._load_last_launch_prefs()
         self._add_launch_options = opts
         self._add_winedlloverrides = winedll
+        self._add_proton = ("", "")
         self._update_add_presets_summary()
 
     def _update_add_presets_summary(self) -> None:
@@ -1838,6 +1842,8 @@ class MainWindow(QMainWindow):
             active.append(tr("presets.short_frame_rate", fps=frame))
         if self._add_winedlloverrides.strip():
             active.append(tr("presets.short_dll"))
+        if self._add_proton[1] and self._add_proton[0] == self._selected_install_mode():
+            active.insert(0, self._add_proton[1])
         self.lbl_add_presets.setText(", ".join(active) if active else tr("presets.none"))
 
     def _is_add_exe_native(self) -> bool:
@@ -1856,56 +1862,65 @@ class MainWindow(QMainWindow):
         winedll = "" if is_native else self._add_winedlloverrides.strip()
         return merged_opts, winedll
 
-    def _open_add_recommendations(self) -> None:
-        """Recommendations for the game being installed: they change its launch options here
-        (winetricks waits for the first Play, which creates the prefix)."""
-        from .proton_policy import newest_ge_proton
-        from .steam_paths import find_proton_binary
-        from .ui_recommendations import Target, open_recommendations_dialog
-
-        opts, winedll = self._resolve_add_launch_options()
-        exe = Path(self.add_exe_combo.currentText().strip())
-        standalone = self._selected_install_mode() == STANDALONE
-        proton_bin = find_proton_binary(self.paths.steam_root) if self.paths is not None else None
-        target = Target(
-            title=self.add_name.text().strip() or tr("add.page_title"),
-            steam_appid=self._resolve_selected_steam_appid(),
-            game_dir=exe.parent if exe.name else None,
-            mode="standalone" if standalone else "steam",
-            proton="ge" if standalone else "",
-            proton_dir=newest_ge_proton() if standalone else (proton_bin.parent if proton_bin else None),
-            opts=opts,
-            winedll=winedll,
-            prefix_ready=False,
-            exe=exe if exe.name else None,
-        )
-
-        def _apply(new_opts: str, new_dll: str, _verbs: list[str]) -> None:
-            self._add_launch_options = new_opts
-            self._add_winedlloverrides = new_dll
-            self._update_add_presets_summary()
-
-        open_recommendations_dialog(self, target, _apply)
-
     def _open_add_launch_advanced(self) -> None:
+        from .launch_presets import proton_kind
+        from .proton_policy import newest_ge_proton
+        from .runtime_manager import list_installed_compat_tools
+        from .steam_paths import find_proton_binary, list_installed_protons, resolve_proton_dir
+        from .ui_recommendations import Target, add_game_recommendations
+
         cur_opts, cur_winedll = self._resolve_add_launch_options()
         title = self.add_name.text().strip() or tr("add.page_title")
-        res = self._open_launch_presets_dialog(
-            title=title,
-            kind="standalone",
-            initial_opts=cur_opts,
-            initial_winedll=cur_winedll,
-            game_obj=None,
-            is_native_linux=self._is_add_exe_native(),
-            mode=self._selected_install_mode(),
-            proton="ge" if self._selected_install_mode() == STANDALONE else "",  # Steam: its own choice
+        mode = self._selected_install_mode()
+        root = self.paths.steam_root if mode == STEAM and self.paths is not None else None
+        tools = (
+            list_installed_protons(root) if root is not None
+            else [(tool.tool_id, tool.folder_name or tool.tool_id) for tool in list_installed_compat_tools()]
+            if mode == STANDALONE else []
         )
-        if res is None:
-            return
-        new_opts, new_winedll = res
-        self._add_launch_options = new_opts
-        self._add_winedlloverrides = new_winedll
-        self._update_add_presets_summary()
+        picker = QComboBox()
+        picker.addItem(tr("launch.steam_default") if mode == STEAM else tr("proton.default_label"), "")
+        for tool_id, label in dict(tools).items():
+            if tool_id:
+                picker.addItem(label, tool_id)
+        if self._add_proton[0] == mode:
+            picker.setCurrentIndex(max(0, picker.findData(self._add_proton[1])))
+        picker.setEnabled(picker.count() > 1)
+        default_proton = "ge" if mode == STANDALONE else "valve"
+
+        def more(parent: QWidget, layout: QVBoxLayout, editor: LaunchOptions) -> None:
+            exe_text = self.add_exe_combo.currentText().strip()
+            exe = Path(exe_text) if exe_text else None
+            tool = str(picker.currentData() or "")
+            if tool:
+                directory = resolve_proton_dir(tool, root)
+            elif mode == STANDALONE:
+                directory = newest_ge_proton()
+            else:
+                binary = find_proton_binary(root) if root is not None else None
+                directory = binary.parent if binary else None
+            opts, dll = editor.values()
+            target = Target(
+                title, self._resolve_selected_steam_appid(), exe.parent if exe else None,
+                mode, proton_kind(tool) or default_proton, directory, opts, dll, False, exe=exe,
+            )
+            if not self._is_add_exe_native():
+                add_game_recommendations(self, parent, layout, editor, target)
+
+        try:
+            res = self._open_launch_presets_dialog(
+                title=title, kind="standalone", initial_opts=cur_opts, initial_winedll=cur_winedll,
+                is_native_linux=self._is_add_exe_native(), mode=mode,
+                proton=proton_kind(str(picker.currentData() or "")) or default_proton,
+                proton_picker=picker, more=more,
+            )
+            if res is not None:
+                self._add_launch_options, self._add_winedlloverrides = res
+                self._add_proton = mode, str(picker.currentData() or "")
+                self._update_add_presets_summary()
+        finally:
+            if picker.parent() is None:
+                picker.deleteLater()
 
     def _auto_search_steam_art(self) -> None:
         """Auto-fetch Steam artwork in the background when the Add form is active."""
@@ -2159,6 +2174,7 @@ class MainWindow(QMainWindow):
         app_name, exe_path = validated
         steam_appid = self._resolve_selected_steam_appid()
         launch_opts, winedll = self._resolve_add_launch_options()
+        proton_name = self._add_proton[1] if self._add_proton[0] == mode else ""
         self._save_last_launch_prefs(launch_opts, winedll)
 
         keep_in_place = self.chk_keep_in_place.isChecked()
@@ -2231,6 +2247,7 @@ class MainWindow(QMainWindow):
                 single_exe_only=final_single_exe_only,
                 library=target_library,
                 prepare_standalone_runtime=not steam_only,
+                proton_name=proton_name,
             )
             self._track_worker(worker)
             worker.status.connect(self.status_label.setText)
@@ -2770,12 +2787,13 @@ class MainWindow(QMainWindow):
         self.btn_configure_game.setEnabled(idle and sel is not None)
         self._update_play_button(sel)
         row_key = self._selected_row_key()
-        self.btn_favorite.setEnabled(bool(row_key))
-        self.btn_game_art.setEnabled(bool(row_key) and not self._steam_busy)
-        self.btn_favorite.setChecked(bool(row_key) and row_key in library_extras.favorites(self.settings))
-        self.btn_protondb.setEnabled(bool(library_extras.protondb_url(self._selected_store_appid())))
+        self.act_favorite.setEnabled(bool(row_key))
+        self.act_game_art.setEnabled(bool(row_key) and not self._steam_busy)
+        self.act_favorite.setChecked(bool(row_key) and row_key in library_extras.favorites(self.settings))
+        self.btn_game_actions.setEnabled(idle and sel is not None)
+        self.act_tools.setEnabled(idle and sel is not None)
         managed = self._managed_library_game(sel[1]) if sel is not None else None
-        self.btn_move_game.setEnabled(managed is not None and not self._steam_busy)
+        self.act_move_game.setEnabled(managed is not None and not self._steam_busy)
 
         # Hide mutually exclusive per-game actions instead of merely disabling them
         self.act_ext_to_steam.setVisible(is_external)
@@ -2789,8 +2807,8 @@ class MainWindow(QMainWindow):
 
         self.act_ext_to_steam.setEnabled(is_external and can_write_vdf)
         self.act_ext_import_saves.setEnabled(idle and has_ext_prefix)
-        self.btn_remove_game.setEnabled((is_steam and can_write_vdf) or (idle and is_standalone))
-        self.btn_remove_game.setVisible(not is_external)
+        self.act_remove_game.setEnabled((is_steam and can_write_vdf) or (idle and is_standalone))
+        self.act_remove_game.setVisible(not is_external)
 
     def should_queue_vdf_edits(self) -> bool:
         """Gaming Mode cannot close Steam: Steam edits wait in the saved queue instead of applying now."""
@@ -3388,9 +3406,9 @@ class MainWindow(QMainWindow):
     ) -> None:
         run_exe_in_prefix_dialog(self, kind=kind, obj=obj)
 
-    def _open_configure_game_dialog(self) -> None:
+    def _open_configure_game_dialog(self, *, tools_only: bool = False) -> None:
         if not self._steam_busy:
-            open_configure_game_dialog(self)
+            open_configure_game_dialog(self, tools_only=tools_only)
 
     @staticmethod
     def _play_key(kind: str, obj: object) -> str:
@@ -3431,15 +3449,6 @@ class MainWindow(QMainWindow):
         key = item.data(Qt.ItemDataRole.UserRole + 1) if item is not None else None
         return str(key) if key else ""
 
-    def _selected_store_appid(self) -> int | None:
-        """The Steam store AppID of the selected game, when one is known (for ProtonDB)."""
-        sel = self._selected_library_item()
-        if sel is None:
-            return None
-        managed = self._managed_library_game(sel[1])
-        appid = getattr(managed or sel[1], "steam_appid", None)
-        return appid if isinstance(appid, int) and appid > 0 else None
-
     def _toggle_favorite(self) -> None:
         key = self._selected_row_key()
         if not key:
@@ -3450,13 +3459,8 @@ class MainWindow(QMainWindow):
         if item is not None:
             text = item.text().removeprefix("★ ")
             item.setText(("★ " + text) if now else text)
-        self.btn_favorite.setChecked(now)
+        self.act_favorite.setChecked(now)
         self._filter_library_list()
-
-    def _open_protondb(self) -> None:
-        url = library_extras.protondb_url(self._selected_store_appid())
-        if url:
-            QDesktopServices.openUrl(QUrl(url))
 
     def _focus_library_search(self) -> None:
         """Ctrl+F: go to the Library and put the cursor in its search box."""
@@ -3698,8 +3702,9 @@ class MainWindow(QMainWindow):
             self.shortcuts_list,
             self.btn_play_game,
             self.btn_configure_game,
-            self.btn_move_game,
-            self.btn_remove_game,
+            self.btn_game_actions,
+            self.act_move_game,
+            self.act_remove_game,
             self.act_ext_import_saves,
             self.btn_save_backup,
             self.btn_save_restore,
@@ -3708,8 +3713,9 @@ class MainWindow(QMainWindow):
             self.btn_save_refresh,
             self.btn_adopt_games,
             self.btn_all_art,
-            self.btn_bulk_optiscaler,
-            self.btn_bulk_proton,
+            self.btn_bulk_actions,
+            self.act_bulk_optiscaler,
+            self.act_bulk_proton,
             self.btn_maint_scan,
             self.btn_maint_clean_safe,
             self.btn_maint_delete_selected,
@@ -3811,6 +3817,9 @@ class MainWindow(QMainWindow):
         parent: QWidget | None = None,
         mode: str | None = None,
         proton: str = "",
+        *,
+        proton_picker: QComboBox | None = None,
+        more: Callable[[QWidget, QVBoxLayout, LaunchOptions], None] | None = None,
     ) -> tuple[str, str] | None:
         return open_launch_presets_dialog(
             self,
@@ -3823,15 +3832,9 @@ class MainWindow(QMainWindow):
             parent=parent,
             mode=mode,
             proton=proton,
+            proton_picker=proton_picker,
+            more=more,
         )
-
-    def _edit_launch_options_presets(
-        self,
-        sel: tuple[str, object] | None = None,
-        parent: QWidget | None = None,
-        on_saved: Callable[[str], None] | None = None,
-    ) -> None:
-        edit_launch_options_presets(self, sel=sel, parent=parent, on_saved=on_saved)
 
     def _open_winetricks_dialog(
         self, kind: str | None = None, obj: object | None = None, preset_verbs: list[str] | None = None

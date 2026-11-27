@@ -465,6 +465,7 @@ class StandaloneInstallWorker(QThread):
         single_exe_only: bool = False,
         library: Library | None = None,
         prepare_standalone_runtime: bool = True,
+        proton_name: str = "",
     ) -> None:
         super().__init__()
         self.library = library
@@ -480,6 +481,7 @@ class StandaloneInstallWorker(QThread):
         self.game_dir = game_dir
         self.single_exe_only = single_exe_only
         self.prepare_standalone_runtime = prepare_standalone_runtime
+        self.proton_name = proton_name
 
     def run(self) -> None:
         try:
@@ -491,7 +493,6 @@ class StandaloneInstallWorker(QThread):
                 # Best effort: GAMEID/STORE lookups (protonfixes) need the umu-database.
                 _rm.ensure_umu_database(timeout=15)
                 ensure_ge_proton11(progress_cb=lambda msg, _pct: self.status.emit(msg))
-            proton_name = ""
 
             if self.game_dir is not None:
                 game_dir = self.game_dir
@@ -509,7 +510,7 @@ class StandaloneInstallWorker(QThread):
                 game_name=self.app_name,
                 exe_path=self.exe_path,
                 game_dir=game_dir,
-                proton_name=proton_name,
+                proton_name=self.proton_name,
                 steam_appid=self.steam_appid,
                 winedlloverrides=self.winedlloverrides,
                 launch_options=self.launch_options,

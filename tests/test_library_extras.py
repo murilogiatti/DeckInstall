@@ -1,4 +1,4 @@
-"""Favorites, play time and the ProtonDB link of the Library."""
+"""Favorites, play time of the Library."""
 
 from __future__ import annotations
 
@@ -39,8 +39,3 @@ def test_playtime_adds_sessions_and_skips_failed_starts() -> None:
     assert le.format_duration(59) == "0 min"
     s.data[le.PLAYTIME_KEY] = "not json"
     assert le.playtime(s, "k") == (0.0, 0.0)
-
-
-def test_protondb_url() -> None:
-    assert le.protondb_url(1091500) == "https://www.protondb.com/app/1091500"
-    assert le.protondb_url(None) == "" and le.protondb_url(0) == ""

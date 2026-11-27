@@ -13,13 +13,14 @@ SRC = Path(__file__).resolve().parent.parent / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from PySide6.QtGui import QAction  # noqa: E402
 from PySide6.QtWidgets import QApplication, QPushButton  # noqa: E402
 
 from deckinstall import ui  # noqa: E402
 from deckinstall.i18n import tr  # noqa: E402
 
 
-def test_bulk_buttons_live_with_their_component() -> None:
+def test_batch_actions_are_grouped_in_the_library() -> None:
     app = QApplication.instance() or QApplication([])
     with (
         mock.patch.object(ui.MainWindow, "_refresh_games"),
@@ -28,10 +29,13 @@ def test_bulk_buttons_live_with_their_component() -> None:
         win = ui.MainWindow(app)
     try:
         pages = {idx: win.stack.widget(idx) for idx in (ui.PAGE_LIBRARY, ui.PAGE_MAINT, ui.PAGE_RUNTIMES)}
-        labels = {idx: [b.text() for b in page.findChildren(QPushButton)] for idx, page in pages.items()}
+        labels = {
+            idx: [b.text() for b in page.findChildren(QPushButton)] + [a.text() for a in page.findChildren(QAction)]
+            for idx, page in pages.items()
+        }
         expected = {
-            "library.btn_bulk_optiscaler": ui.PAGE_RUNTIMES,
-            "library.btn_bulk_proton": ui.PAGE_RUNTIMES,
+            "library.btn_bulk_optiscaler": ui.PAGE_LIBRARY,
+            "library.btn_bulk_proton": ui.PAGE_LIBRARY,
             "maint.btn_migrate_legacy": ui.PAGE_LIBRARY,
         }
         for key, home in expected.items():
