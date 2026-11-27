@@ -668,15 +668,21 @@ def _write_launch_script(
         if pre:
             lines.append(f'bash -c {shlex.quote(pre)} || echo "== DeckInstall: the command before the game failed"')
         lines.extend(run_lines)
-        lines.append('echo "== DeckInstall: exit code $rc at $(date -Is)"')
         if post:
             lines.append(f'bash -c {shlex.quote(post)} || echo "== DeckInstall: the command after the game failed"')
-        lines.append('exit "$rc"')
+        lines.extend([
+            # close the capped log pipe, let it finish, then always record how the game ended
+            'if [ -n "${_di_log_pid:-}" ]; then exec >/dev/null 2>&1; wait "$_di_log_pid" 2>/dev/null || true; fi',
+            'echo "== DeckInstall: exit code $rc at $(date -Is)" >>"$LOG_DIR/run.log" 2>/dev/null || true',
+            'exit "$rc"',
+        ])
 
     atomic_write_text(script_path, "\n".join(lines) + "\n", mode=0o755)
 
 
 LOG_KEEP = 5
+# A run log stops growing here (a chatty game cannot fill the disk or the microSD card).
+LOG_MAX_BYTES = 10 * 1024 * 1024
 # launch.sh lets umu-run update the Steam Runtime at most once a week (fast, offline starts otherwise).
 RUNTIME_CHECK_MINUTES = 7 * 24 * 60
 
@@ -818,7 +824,12 @@ def _log_lines(log_dir: Path, title: str) -> list[str]:
         '    if [ -f "$LOG_DIR/run.$i.log" ]; then mv -f "$LOG_DIR/run.$i.log" "$LOG_DIR/run.$((i + 1)).log"; fi',
         "  done",
         '  if [ -f "$LOG_DIR/run.log" ]; then mv -f "$LOG_DIR/run.log" "$LOG_DIR/run.1.log"; fi',
-        '  exec >"$LOG_DIR/run.log" 2>&1',
+        '  : >"$LOG_DIR/run.log"',
+        # Past LOG_MAX_BYTES the rest is read and dropped (never blocking the game), with a note.
+        f'  exec > >({{ head -c {LOG_MAX_BYTES}; if IFS= read -r -n 1 _; then'
+        f' printf \'\\n== DeckInstall: log truncated at {LOG_MAX_BYTES // (1024 * 1024)} MiB\\n\';'
+        ' cat >/dev/null; fi; } >>"$LOG_DIR/run.log") 2>&1',
+        "  _di_log_pid=$!",
         f'  echo "== DeckInstall: starting {safe_title} at $(date -Is)"',
         "fi",
     ]

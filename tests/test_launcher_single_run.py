@@ -149,3 +149,23 @@ def test_sleep_inhibit_problem_reports_the_reason(tmp_path: Path, monkeypatch: p
         assert (problem == "") if not expected else (expected in problem)
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     assert "not installed" in fsutil.sleep_inhibit_problem()
+
+
+def test_run_log_is_capped_without_blocking_the_game(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(standalone, "LOG_MAX_BYTES", 64 * 1024)
+    src = tmp_path / "Games" / "Chatty"
+    src.mkdir(parents=True)
+    exe = src / "start.sh"
+    exe.write_text(
+        '#!/bin/sh\necho run >> "$COUNTER"\nhead -c 3000000 /dev/zero | tr "\\\\0" x\necho done-writing >&2\nexit 5\n',
+        encoding="utf-8",
+    )
+    exe.chmod(0o755)
+    with mock.patch.object(standalone, "resolve_game_icon", return_value=None):
+        game = standalone.install_standalone_game("Chatty", exe, src, native_linux=True)
+    rc, runs, log = _run(game, tmp_path, "works")
+    assert (rc, runs) == (5, 1)  # the game was never blocked or killed by a full pipe
+    size = standalone.game_run_logs(game)[0].stat().st_size
+    assert size < 64 * 1024 + 4096
+    assert "log truncated" in log
+    assert log.rstrip().splitlines()[-1].startswith("== DeckInstall: exit code 5")
