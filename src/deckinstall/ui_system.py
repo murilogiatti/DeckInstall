@@ -25,7 +25,7 @@ if TYPE_CHECKING:
 
 def copy_diagnostics(win: MainWindow) -> None:
     """Run the --doctor checks in the background and put the text report on the clipboard."""
-    from .doctor import collect_report, format_text
+    from .doctor import collect_report, shareable_text
 
     win.btn_copy_diag.setEnabled(False)
 
@@ -41,7 +41,7 @@ def copy_diagnostics(win: MainWindow) -> None:
         if not win._closing_pending:
             QMessageBox.warning(_dialog_parent(win), __app_name__, err)
 
-    win._run_pkexec(lambda: (True, format_text(collect_report())), on_result=_done, on_error=_err)
+    win._run_pkexec(lambda: (True, shareable_text(collect_report())), on_result=_done, on_error=_err)
 
 
 def offer_steam_sandbox_access(win: MainWindow, steam_root: Path, folders: list[Path]) -> None:

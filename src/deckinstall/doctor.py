@@ -282,10 +282,63 @@ def format_text(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _private_words() -> list[tuple[str, str]]:
+    """(text, replacement) pairs that identify this person: home, user name, Steam accounts."""
+    import getpass
+    import os
+    import socket
+    from pathlib import Path
+
+    pairs: list[tuple[str, str]] = []
+    home = str(Path.home())
+    if home not in ("", "/"):
+        pairs.append((home, "~"))
+    try:
+        from .steam_paths import find_steam_roots, list_steam_accounts
+
+        n = 0
+        for root in find_steam_roots():
+            for acc in list_steam_accounts(root):
+                n += 1
+                for value in {acc.persona_name, acc.account_name, getattr(acc, "user_id", ""), acc.display_label}:
+                    if value and len(str(value)) >= 3:
+                        pairs.append((str(value), f"<steam account {n}>"))
+    except Exception:  # a broken Steam probe must not leak by aborting the masking
+        pass
+    for value, label in ((getpass.getuser(), "<user>"), (socket.gethostname(), "<host>"),
+                         (os.environ.get("USER", ""), "<user>")):
+        if value and len(value) >= 3:
+            pairs.append((value, label))
+    return sorted(set(pairs), key=lambda kv: -len(kv[0]))  # longest first: the home before the user name
+
+
+def mask_text(text: str, words: list[tuple[str, str]] | None = None) -> str:
+    """The report with home paths, user/host names and Steam accounts replaced by placeholders."""
+    import re
+
+    for value, label in (words if words is not None else _private_words()):
+        if re.fullmatch(r"[\w.-]+", value):  # a bare name or number: only as a whole word
+            text = re.sub(rf"(?<![\w.-]){re.escape(value)}(?![\w-])", label, text)
+        else:
+            text = text.replace(value, label)
+    return re.sub(r"\b7656119\d{10}\b", "<steamid>", text)  # 64-bit Steam IDs
+
+
+def shareable_text(report: dict[str, Any]) -> str:
+    """What "Copy diagnostics" puts on the clipboard: masked, with a note saying so."""
+    return "(personal paths, user and Steam account names are masked)\n" + mask_text(format_text(report))
+
+
 def main(args: list[str]) -> int:
-    """Print the report. Exit code: 0 all fine, 1 warnings, 2 failures."""
+    """Print the report. Exit code: 0 all fine, 1 warnings, 2 failures.
+
+    --share masks personal data (home folder, user and host names, Steam accounts).
+    """
     report = collect_report()
-    if "--json" in args:
+    if "--share" in args:
+        print(mask_text(json.dumps(report, indent=2, ensure_ascii=False)) if "--json" in args
+              else shareable_text(report))
+    elif "--json" in args:
         print(json.dumps(report, indent=2, ensure_ascii=False))
     else:
         print(format_text(report))

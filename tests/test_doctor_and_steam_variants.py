@@ -158,3 +158,24 @@ def test_debug_log_preset_round_trip() -> None:
     assert opts == "UMU_LOG=1 PROTON_LOG=1 %command% -x"
     assert launch_presets.active_flags(opts) == ["debug_log"]
     assert launch_presets.apply_presets(opts, {"debug_log": False}) == "%command% -x"
+
+
+def test_shareable_report_masks_personal_data() -> None:
+    words = [("/home/alice", "~"), ("alice", "<user>"), ("Alice Gamer", "<steam account 1>"),
+             ("123456", "<steam account 1>"), ("alice-laptop", "<host>")]
+    words.sort(key=lambda kv: -len(kv[0]))
+    text = (
+        "native: /home/alice/.local/share/Steam (2 user(s)) — Alice Gamer (123456), bob (9)\n"
+        "host alice-laptop, user alice, size 1234567 bytes, id 76561198000000000, malice=1"
+    )
+    out = doctor.mask_text(text, words)
+    assert "alice" not in out.replace("malice", "") and "Alice" not in out and "123456 " not in out
+    assert "~/.local/share/Steam" in out and "<steam account 1>" in out and "<host>" in out
+    assert "1234567 bytes" in out  # numbers that only contain an id are kept
+    assert "<steamid>" in out and "malice=1" in out
+
+
+def test_shareable_text_uses_the_live_values(monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
+    report = {"app": [{"name": "home", "status": doctor.INFO, "detail": f"config at {home}/.config"}]}
+    out = doctor.shareable_text(report)
+    assert str(home) not in out and "~/.config" in out and "masked" in out
