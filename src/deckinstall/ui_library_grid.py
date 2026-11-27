@@ -224,6 +224,9 @@ class LibraryGridModel(QAbstractListModel):
                 if pix is not None:
                     _cache.move_to_end(cache_key)
                     return QIcon(pix)
+                # The cover was loaded once but the cache dropped it (LRU): load it again.
+                # (None means "this game has no cover", which is never retried.)
+                del self._resolved_cache_key[entry.key]
             if entry.key not in self._resolved_cache_key and entry.key not in self._pending:
                 self._schedule_load(entry)
             return QIcon(_initials_tile(entry.name))
