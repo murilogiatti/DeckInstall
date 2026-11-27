@@ -28,7 +28,7 @@ from . import standalone as _sa
 from .adopt import SnapshotFn, _move_back, _move_tree
 from .fsutil import atomic_write_text, is_within, symlink_points_to, unique_dir
 from .library import Library, find_library_root
-from .manifest import decode_path, encode_path, find_manifest
+from .manifest import decode_path, encode_path, find_manifest, read_manifest_fields
 from .standalone import StandaloneGame
 from .steam_paths import dir_size_bytes
 
@@ -275,6 +275,84 @@ def _run_undo(steps: list[tuple[str, Callable[[], None]]]) -> list[str]:
     return problems
 
 
+# --- journal: what a move was doing, on disk, so an interrupted one is found next time --------
+
+def _journal_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME", "").strip()
+    return (Path(base) if base else Path.home() / ".local" / "state") / "DeckInstall" / "relocations"
+
+
+def _journal_path(game: StandaloneGame) -> Path:
+    key = game.uid or "".join(c if c.isalnum() else "-" for c in game.name)[:60] or "game"
+    return _journal_dir() / f"{key}.json"
+
+
+def _write_journal(path: Path, data: dict[str, Any]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        import json
+
+        atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False))
+    except OSError as exc:  # the move itself does not depend on it
+        logging.warning("Could not write the move journal %s: %s", path, exc)
+
+
+@dataclass(frozen=True)
+class InterruptedMove:
+    name: str
+    step: str
+    old_dir: Path
+    new_dir: Path
+    old_prefix: Path | None
+    new_prefix: Path | None
+    journal: Path
+
+
+def _p(raw: object) -> Path | None:
+    return Path(raw) if isinstance(raw, str) and raw else None
+
+
+def interrupted_moves() -> list[InterruptedMove]:
+    """Moves that did not finish (the app was closed or the PC lost power), after reconciling.
+
+    A move whose files are all in one place (nothing was moved yet, or everything arrived and
+    the old copy is gone) is settled and its journal removed. The others are returned: files
+    may be in both places and nothing is deleted automatically.
+    """
+    import json
+
+    out: list[InterruptedMove] = []
+    try:
+        journals = sorted(_journal_dir().glob("*.json"))
+    except OSError:
+        return out
+    for path in journals:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        old_dir, new_dir = _p(raw.get("old_dir")), _p(raw.get("new_dir"))
+        if old_dir is None or new_dir is None:
+            continue
+        old_pfx, new_pfx = _p(raw.get("old_prefix")), _p(raw.get("new_prefix"))
+        nothing_moved = old_dir.is_dir() and not new_dir.exists() and (
+            new_pfx is None or old_pfx is None or (old_pfx.exists() and not new_pfx.exists())
+        )
+        manifest = find_manifest(new_dir) if new_dir.is_dir() else None
+        fields = read_manifest_fields(manifest) if manifest is not None else None
+        all_moved = (
+            fields is not None and fields.get("game_dir") == new_dir and not old_dir.exists()
+            and (new_pfx is None or old_pfx is None or (new_pfx.exists() and not old_pfx.exists()))
+        )
+        if nothing_moved or all_moved:
+            path.unlink(missing_ok=True)
+            continue
+        out.append(InterruptedMove(
+            str(raw.get("name") or ""), str(raw.get("step") or "?"), old_dir, new_dir, old_pfx, new_pfx, path,
+        ))
+    return out
+
+
 def relocate_game(
     plan: RelocatePlan,
     progress: ProgressFn | None = None,
@@ -308,6 +386,19 @@ def relocate_game(
             raise RelocateError(f"Save snapshot failed, nothing was changed: {exc}") from exc
     undo: list[tuple[str, Callable[[], None]]] = []
     src_root = find_library_root(old_dir)
+    journal = _journal_path(game)
+    record: dict[str, Any] = {
+        "name": game.name, "uid": game.uid, "step": "started",
+        "old_dir": str(old_dir), "new_dir": str(new_dir),
+        "old_prefix": str(game.prefix_dir) if plan.new_prefix_dir is not None else "",
+        "new_prefix": str(plan.new_prefix_dir) if plan.new_prefix_dir is not None else "",
+    }
+    _write_journal(journal, record)
+
+    def step(name: str) -> None:
+        say(name)
+        record["step"] = name
+        _write_journal(journal, record)
 
     try:
         # Files rewritten below keep their old content so a failure restores them.
@@ -320,7 +411,7 @@ def relocate_game(
         }
         undo.append(("restore files", _restore_files(saved)))
 
-        say("game")
+        step("game")
         target.games_dir.mkdir(parents=True, exist_ok=True)
         _move_tree(old_dir, new_dir)
         undo.append((f"move {new_dir} back", _move_back(old_dir, new_dir)))
@@ -331,14 +422,14 @@ def relocate_game(
 
         new_prefix = game.prefix_dir
         if plan.new_prefix_dir is not None:
-            say("prefix")
+            step("prefix")
             plan.new_prefix_dir.parent.mkdir(parents=True, exist_ok=True)
             _move_tree(game.prefix_dir, plan.new_prefix_dir)
             undo.append((f"move {plan.new_prefix_dir} back", _move_back(game.prefix_dir, plan.new_prefix_dir)))
             new_prefix = plan.new_prefix_dir
         new_cache = game.cache_dir
         if plan.new_cache_dir is not None and game.cache_dir is not None:
-            say("cache")
+            step("cache")
             plan.new_cache_dir.parent.mkdir(parents=True, exist_ok=True)
             _move_tree(game.cache_dir, plan.new_cache_dir)
             undo.append((f"move {plan.new_cache_dir} back", _move_back(game.cache_dir, plan.new_cache_dir)))
@@ -388,7 +479,7 @@ def relocate_game(
             meta=meta,
         )
 
-        say("integration")
+        step("integration")
         # Steam's compatdata link follows the prefix (the shortcut itself is only warned about).
         link_raw = str((game.meta.get("steam") or {}).get("compatdata_link") or "")
         if plan.new_prefix_dir is not None and link_raw:
@@ -405,8 +496,16 @@ def relocate_game(
         if src_root is not None:
             _lib.forget_game(src_root, game.uid)
             undo.append(("record in source", lambda: _lib.record_game(src_root, game.uid, game.name, old_dir)))
+        journal.unlink(missing_ok=True)
         return moved
     except Exception as exc:
         logging.exception("Relocating %s failed; undoing it", game.name)
-        raise RelocateError(str(exc), _run_undo(undo)) from exc
+        problems = _run_undo(undo)
+        if problems:
+            record["step"] = f"rollback incomplete after {record['step']}"
+            record["problems"] = problems
+            _write_journal(journal, record)
+        else:
+            journal.unlink(missing_ok=True)
+        raise RelocateError(str(exc), problems) from exc
 

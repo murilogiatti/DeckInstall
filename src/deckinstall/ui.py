@@ -2323,6 +2323,8 @@ class MainWindow(QMainWindow):
         runner_labels: dict[tuple[str, str], str] | None = None,
         matched: tuple[Any, Any, Any] | None = None,
     ) -> None:
+        if not self._library_loaded:
+            QTimer.singleShot(0, self, self._report_interrupted_moves)
         self._library_loaded = True
         if self._library_size_worker is not None:
             self._library_size_worker.requestInterruption()
@@ -2823,6 +2825,24 @@ class MainWindow(QMainWindow):
         if trigger_watch:
             self._vdf_watch_tick()
         return True
+
+    def _report_interrupted_moves(self) -> None:
+        """A game move that did not finish (app closed, power lost): say where its files are."""
+        from .relocate import interrupted_moves
+
+        try:
+            moves = interrupted_moves()
+        except Exception as exc:  # only a hint
+            logging.warning("Could not check interrupted moves: %s", exc)
+            return
+        for move in moves:
+            msg = tr(
+                "relocate.interrupted", name=move.name or "?", step=move.step,
+                old=str(move.old_dir), new=str(move.new_dir), journal=str(move.journal),
+            )
+            logging.warning("%s", msg)
+            if not self._closing_pending:
+                self.notify(msg, "warning")
 
     def _report_vdf_queue_load_problem(self) -> None:
         """Tell the user once when the saved Steam edit queue could not be read as it was."""
