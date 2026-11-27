@@ -467,5 +467,5 @@ def test_large_entries_are_written_with_zip64(tmp_path: Path, monkeypatch: pytes
 
     monkeypatch.setattr(fsutil, "ZIP64_ENTRY_BYTES", 1 << 40)  # as before: no ZIP64 decided up front
     _save(prefix, payload + b"x")
-    with pytest.raises(Exception, match="force_zip64"):
+    with pytest.raises(Exception, match="force_zip64|ZIP64 limit"):  # wording differs by Python version
         save_sync.auto_snapshot(prefix, GAME, "manual", dest_root=tmp_path / "snaps3")
