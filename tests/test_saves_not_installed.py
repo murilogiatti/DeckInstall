@@ -333,3 +333,26 @@ def test_offer_existing_saves_restores_the_newest_when_accepted(tmp_path: Path) 
             ssd.offer_existing_saves(win, game)
             run.call_args.args[2]()  # the job given to the worker
             assert job.call_args.args[1] is new
+
+
+def test_restore_offer_shows_origin_size_file_and_defaults_to_no(tmp_path: Path) -> None:
+    from deckinstall.i18n import tr
+
+    game = mock.Mock(native_linux=False, prefix_dir=tmp_path / "pfx", game_dir=tmp_path / "g", steam_appid=1245620)
+    game.name = "Elden Ring"
+    win = mock.Mock(_steam_busy=False, _closing_pending=False)
+    snap = tmp_path / "elden-ring" / "20261126-221500-remove-game.zip"
+    entry = save_sync.SaveArchiveEntry(snap, "save_snapshot", "", "elden-ring", 9.0, 3 * 1024 * 1024)
+    with (
+        mock.patch.object(ssd, "list_save_archives", return_value=[entry]),
+        mock.patch.object(ssd, "game_log_dir", return_value=tmp_path / "logs"),
+        mock.patch.object(ssd, "_dialog_parent", return_value=None),
+        mock.patch.object(ssd.QMessageBox, "question", return_value=ssd.QMessageBox.StandardButton.No) as ask,
+        mock.patch.object(ssd, "_run"),
+    ):
+        ssd.offer_existing_saves(win, game)
+    text = ask.call_args.args[2]
+    assert tr("saves.origin.remove-game") in text and snap.name in text and "1245620" in text
+    assert ask.call_args.args[4] == ssd.QMessageBox.StandardButton.No  # a stray press restores nothing
+    assert ssd.snapshot_origin_label("20260101-120000-after-play-2.zip") == tr("saves.origin.after-play")
+    assert ssd.snapshot_origin_label("20260101-120000-something-new.zip") == "something-new"

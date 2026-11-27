@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 import zipfile
 from collections.abc import Callable
@@ -60,6 +61,7 @@ from ..save_sync import (
     snapshot_dir_for,
     snapshot_display_name,
     snapshot_home_files,
+    snapshot_steamcloud_appid,
 )
 from ..standalone import StandaloneGame, game_log_dir
 from ..steam_paths import SteamPaths, invalidate_process_cache, is_steam_running
@@ -972,6 +974,33 @@ def _import_ludusavi_checked(target: SaveTarget, folder: Path) -> lds.ImportResu
     )
 
 
+_SNAPSHOT_NAME_RE = re.compile(r"^\d{8}-\d{6}-(?P<reason>[a-z0-9-]+?)(?:-\d+)?\.zip$")
+
+
+def snapshot_origin_label(file_name: str) -> str:
+    """Why a snapshot was made, from its file name (20260101-120000-after-play.zip)."""
+    m = _SNAPSHOT_NAME_RE.match(file_name)
+    reason = m.group("reason") if m else ""
+    labels = {
+        "after-play": tr("saves.origin.after-play"),
+        "remove-game": tr("saves.origin.remove-game"),
+        "remove": tr("saves.origin.remove"),
+        "uninstall": tr("saves.origin.uninstall"),
+        "relocate": tr("saves.origin.relocate"),
+        "proton-change": tr("saves.origin.proton-change"),
+        "proton-bulk-migrate": tr("saves.origin.proton-bulk-migrate"),
+        "winetricks": tr("saves.origin.winetricks"),
+        "pre-restore": tr("saves.origin.pre-restore"),
+        "pre-import": tr("saves.origin.pre-import"),
+        "pre-sync-pull": tr("saves.origin.pre-sync-pull"),
+        "manual": tr("saves.origin.manual"),
+        "migration": tr("saves.origin.migration"),
+        "ludusavi-import": tr("saves.origin.ludusavi-import"),
+        "adopt": tr("saves.origin.adopt"),
+    }
+    return labels.get(reason) or reason or "?"
+
+
 def offer_existing_saves(win: MainWindow, game: StandaloneGame) -> None:
     """Right after an install: offer the saves DeckInstall already has (snapshot or Ludusavi backup)."""
     if game.native_linux or win._steam_busy or win._closing_pending:
@@ -982,8 +1011,16 @@ def offer_existing_saves(win: MainWindow, game: StandaloneGame) -> None:
     if snaps:
         newest = snaps[0]
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(newest.mtime))
+        appid = snapshot_steamcloud_appid(newest.path) or (str(game.steam_appid) if game.steam_appid else "")
+        text = tr(
+            "saves.offer_restore", name=game.name, count=len(snaps), date=when,
+            origin=snapshot_origin_label(newest.path.name), size=format_size_bytes(newest.size_bytes),
+            file=newest.path.name, appid=tr("saves.offer_appid", appid=appid) if appid else "",
+        )
         if QMessageBox.question(
-            parent, __app_name__, tr("saves.offer_restore", name=game.name, count=len(snaps), date=when)
+            parent, __app_name__, text,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,  # never restore on a stray press
         ) != QMessageBox.StandardButton.Yes:
             return
 
