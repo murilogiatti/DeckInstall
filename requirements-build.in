@@ -1,0 +1,2 @@
+# Build-only pins on top of pyproject.toml (see requirements-build.txt)
+nuitka==4.3.5
