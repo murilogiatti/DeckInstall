@@ -20,7 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
-from .fsutil import FileIdentity, atomic_write_bytes, file_identity, file_lock, file_sha256, is_within, open_regular_fd
+from . import save_sync_repo as repo
+from .fsutil import FileIdentity, atomic_write_bytes, file_identity, file_lock, is_within, open_regular_fd
 from .steam_vdf import (
     _RESTORE_MAX_ENTRIES,
     _RESTORE_MAX_FILE_BYTES,
@@ -81,12 +82,14 @@ class SyncPlanItem:
     game_name: str
     slug: str
     prefix_dir: Path
-    action: str  # "PUSH", "PULL", "IN_SYNC", "CONFLICT", "NO_SAVES"
+    action: str  # "PUSH", "PULL", "IN_SYNC", "CONFLICT", "NO_SAVES", "UNAVAILABLE"
     reason: str
     game_dir: Path | None = None
     steam_appid: int | None = None
     extra_dirs: ExtraDirs = ()
     source: str = "deckinstall"
+    heads: tuple[repo.Revision, ...] = ()  # the shared versions (several when they conflict)
+    waiting: int = 0  # revision files still arriving or damaged (never used)
 
 
 @dataclass(frozen=True)
@@ -1963,12 +1966,27 @@ def _read_sync_base_pair(prefix_dir: Path, sync_root: Path, slug: str) -> tuple[
     return "", ""
 
 
+def _read_sync_base_rev(prefix_dir: Path, sync_root: Path, slug: str) -> str:
+    """The shared revision this device last pushed or restored ("" when none)."""
+    state_path = prefix_dir / _SYNC_BASE_FILE
+    try:
+        if state_path.is_symlink() or not state_path.is_file() or state_path.stat().st_size > 1_048_576:
+            return ""
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    value = data.get(_sync_base_key(sync_root, slug)) if isinstance(data, dict) else None
+    rev = value.get("rev") if isinstance(value, dict) else None
+    return rev if isinstance(rev, str) else ""
+
+
 def _record_sync_base(
     prefix_dir: Path,
     sync_root: Path,
     slug: str,
     digest: str,
     local_digest: str | None = None,
+    rev_id: str = "",
 ) -> None:
     """Remember the digest both sides agreed on; stored locally in the prefix (never synced)."""
     state_path = prefix_dir / _SYNC_BASE_FILE
@@ -1984,10 +2002,7 @@ def _record_sync_base(
             except ValueError:
                 data = {}
         key = _sync_base_key(sync_root, slug)
-        if local_digest is None or local_digest == digest:
-            data[key] = digest
-        else:
-            data[key] = {"remote": digest, "local": local_digest}
+        data[key] = {"remote": digest, "local": local_digest or digest, "rev": rev_id}
         atomic_write_bytes(state_path, json.dumps(data, indent=2).encode("utf-8"))
     except OSError:
         logging.warning("Could not record sync base for %s in %s", slug, prefix_dir, exc_info=True)
@@ -2000,8 +2015,15 @@ def push_game_saves(
     game_dir: Path | None = None,
     steam_appid: int | None = None,
     extra_dirs: ExtraDirs | None = None,
+    *,
+    resolve_heads: bool = False,
 ) -> Path | None:
-    """Package prefix saves into <sync_root>/<slug>/latest.zip with atomic meta.json."""
+    """Publish the prefix saves as a new immutable revision in <sync_root>/<slug>/revs/.
+
+    Nothing in the shared folder is ever replaced. With resolve_heads the new revision replaces
+    every current version (the user resolved a conflict); otherwise the push refuses, with
+    SyncRemoteChanged, when another device published something this device has not seen.
+    """
     if not prefix_dir.is_dir() and not extra_dirs:
         return None
     entries = _collect_prefix_save_entries(
@@ -2015,108 +2037,118 @@ def push_game_saves(
     if not entries and not reg_bytes:
         return None
 
+    repo.open_sync_root(sync_root)  # never creates a missing (unmounted) folder
     slug, game_sync_dir = _resolve_game_slug_dir(sync_root, game_name, meta_file="meta.json", name_key="game_name")
-    latest_zip = game_sync_dir / "latest.zip"
-    game_sync_dir.mkdir(parents=True, exist_ok=True)
-    with file_lock(game_sync_dir / ".sync.lock"):
-        fd, tmp_name = tempfile.mkstemp(
-            prefix=f".{latest_zip.stem}-", suffix=".zip.tmp", dir=str(game_sync_dir)
-        )
-        os.close(fd)
-        tmp_zip = Path(tmp_name)
-
-        h = hashlib.sha256()
-        file_count = 0
-        total_uncompressed = 0
+    game_sync_dir.mkdir(exist_ok=True)
+    with repo.game_lock(game_sync_dir), file_lock(game_sync_dir / ".sync.lock"):
+        tmp_zip = repo.staging_file(game_sync_dir)
         try:
             with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for section, src_file, rel_path in entries:
-                    try:
-                        sfd = open_regular_fd(src_file)
-                    except OSError:
-                        continue
-                    try:
-                        st = os.fstat(sfd)
-                        before_id = file_identity(st)
-                    except OSError:
-                        os.close(sfd)
-                        continue
-                    fsize = st.st_size
-                    if file_count + 1 > _RESTORE_MAX_ENTRIES:
-                        os.close(sfd)
-                        raise RuntimeError(
-                            f"Backup exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})"
-                        )
-                    if (
-                        fsize > _RESTORE_MAX_FILE_BYTES
-                        or total_uncompressed + fsize > _RESTORE_MAX_TOTAL_BYTES
-                    ):
-                        os.close(sfd)
-                        raise RuntimeError(f"Backup size limit exceeded on {src_file.name}")
-                    arcname = f"save/{section}/{rel_path.as_posix()}"
-                    h.update(f"{section}/{rel_path.as_posix()}\0{fsize}\0".encode())
-                    file_bytes = 0
-                    with os.fdopen(sfd, "rb") as fh, zf.open(arcname, "w") as zout:
-                        while chunk := fh.read(65536):
-                            file_bytes += len(chunk)
-                            if (
-                                file_bytes > _RESTORE_MAX_FILE_BYTES
-                                or total_uncompressed + file_bytes > _RESTORE_MAX_TOTAL_BYTES
-                            ):
-                                raise RuntimeError(f"Backup size limit exceeded on {src_file.name}")
-                            h.update(chunk)
-                            zout.write(chunk)
-                        after_id = file_identity(os.fstat(fh.fileno()))
-                        if after_id != before_id or file_bytes != fsize:
-                            raise RuntimeError(
-                                f"Save file changed while syncing (is the game running?): {src_file.name}"
-                            )
-                    total_uncompressed += file_bytes
-                    file_count += 1
-
-                if reg_bytes:
-                    if file_count + 1 > _RESTORE_MAX_ENTRIES:
-                        raise RuntimeError(
-                            f"Backup exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})"
-                        )
-                    if (
-                        len(reg_bytes) > _RESTORE_MAX_FILE_BYTES
-                        or total_uncompressed + len(reg_bytes) > _RESTORE_MAX_TOTAL_BYTES
-                    ):
-                        raise RuntimeError("Backup size limit exceeded on registry.json")
-                    h.update(f"registry/registry.json\0{len(reg_bytes)}\0".encode())
-                    h.update(reg_bytes)
-                    zf.writestr("save/registry/registry.json", reg_bytes)
-                    total_uncompressed += len(reg_bytes)
-                    file_count += 1
-
-            if file_count == 0:
-                try:
-                    tmp_zip.unlink()
-                except OSError:
-                    pass
-                return None
-            os.replace(tmp_zip, latest_zip)
-        except Exception:
-            try:
-                tmp_zip.unlink()
-            except OSError:
-                pass
+                file_count, total_uncompressed = _write_save_entries(zf, entries, reg_bytes)
+                if file_count == 0:
+                    zf.close()
+                    tmp_zip.unlink(missing_ok=True)
+                    return None
+                digest, fp_count, _ = repo.save_entries_digest(zf)
+                # Decide the parents only now, right before publishing (the folder may have changed).
+                state = repo.scan_game_folder(game_sync_dir)
+                parents, same = _push_parents(state, prefix_dir, sync_root, slug, digest, resolve_heads)
+                if same is not None:  # the shared version already has exactly these saves
+                    zf.close()
+                    tmp_zip.unlink(missing_ok=True)
+                    if prefix_dir.is_dir():
+                        _record_sync_base(prefix_dir, sync_root, slug, digest, rev_id=same.rev_id)
+                    return same.path
+                rev_id = repo.new_rev_id()
+                save_id = next((state.revisions[p].save_id for p in parents
+                                if p in state.revisions and state.revisions[p].save_id), "") or repo.new_rev_id()
+                zf.writestr(repo.REV_MANIFEST, repo.revision_manifest(
+                    rev_id, parents, save_id, digest, fp_count, total_uncompressed, game_name,
+                ))
+            final = repo.publish_revision(game_sync_dir, tmp_zip, rev_id)
+        except BaseException:
+            tmp_zip.unlink(missing_ok=True)
             raise
-
-        meta = {
-            "game_name": game_name,
-            "slug": slug,
-            "updated_at": time.time(),
-            "sha256": file_sha256(latest_zip),
-            "file_count": file_count,
-            "fingerprint_digest": h.hexdigest(),
-        }
-        meta_bytes = json.dumps(meta, indent=2, ensure_ascii=False).encode("utf-8")
-        atomic_write_bytes(game_sync_dir / "meta.json", meta_bytes)
         if prefix_dir.is_dir():
-            _record_sync_base(prefix_dir, sync_root, slug, str(meta["fingerprint_digest"]))
-        return latest_zip
+            _record_sync_base(prefix_dir, sync_root, slug, digest, rev_id=rev_id)
+        return final
+
+
+def _push_parents(
+    state: repo.RepoState, prefix_dir: Path, sync_root: Path, slug: str, digest: str, resolve_heads: bool,
+) -> tuple[list[str], repo.Revision | None]:
+    """Parents of a new revision, or the existing head that already holds these saves.
+
+    Raises SyncRemoteChanged when another device published something the plan did not see:
+    pushing would hide it, so the user plans again (a conflict resolution passes resolve_heads).
+    """
+    heads = state.heads()
+    if not heads:
+        return [], None
+    distinct = state.distinct_heads()
+    if len(distinct) == 1 and distinct[0].content_digest == digest:
+        return [h.rev_id for h in heads] if len(heads) > 1 else [], distinct[0] if len(heads) == 1 else None
+    if resolve_heads:
+        return [h.rev_id for h in heads], None
+    base_rev = _read_sync_base_rev(prefix_dir, sync_root, slug) if prefix_dir.is_dir() else ""
+    base_remote, _ = _read_sync_base_pair(prefix_dir, sync_root, slug) if prefix_dir.is_dir() else ("", "")
+    head_ids = {h.rev_id for h in heads}
+    if len(distinct) == 1 and (base_rev in head_ids or (not base_rev and base_remote == distinct[0].content_digest)):
+        return sorted(head_ids), None
+    raise repo.SyncRemoteChanged(
+        "The shared saves changed since the last sync on this device; check again before sending"
+    )
+
+
+def _write_save_entries(
+    zf: zipfile.ZipFile, entries: list[tuple[str, Path, Path]], reg_bytes: bytes | None,
+) -> tuple[int, int]:
+    """Write save/<section>/<path> entries (bounded, checked against changes while reading)."""
+    file_count = 0
+    total_uncompressed = 0
+    for section, src_file, rel_path in entries:
+        try:
+            sfd = open_regular_fd(src_file)
+        except OSError:
+            continue
+        try:
+            st = os.fstat(sfd)
+            before_id = file_identity(st)
+        except OSError:
+            os.close(sfd)
+            continue
+        fsize = st.st_size
+        if file_count + 1 > _RESTORE_MAX_ENTRIES:
+            os.close(sfd)
+            raise RuntimeError(f"Backup exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})")
+        if fsize > _RESTORE_MAX_FILE_BYTES or total_uncompressed + fsize > _RESTORE_MAX_TOTAL_BYTES:
+            os.close(sfd)
+            raise RuntimeError(f"Backup size limit exceeded on {src_file.name}")
+        arcname = f"save/{section}/{rel_path.as_posix()}"
+        file_bytes = 0
+        with os.fdopen(sfd, "rb") as fh, zf.open(arcname, "w") as zout:
+            while chunk := fh.read(65536):
+                file_bytes += len(chunk)
+                if (
+                    file_bytes > _RESTORE_MAX_FILE_BYTES
+                    or total_uncompressed + file_bytes > _RESTORE_MAX_TOTAL_BYTES
+                ):
+                    raise RuntimeError(f"Backup size limit exceeded on {src_file.name}")
+                zout.write(chunk)
+            after_id = file_identity(os.fstat(fh.fileno()))
+            if after_id != before_id or file_bytes != fsize:
+                raise RuntimeError(f"Save file changed while syncing (is the game running?): {src_file.name}")
+        total_uncompressed += file_bytes
+        file_count += 1
+    if reg_bytes:
+        if file_count + 1 > _RESTORE_MAX_ENTRIES:
+            raise RuntimeError(f"Backup exceeds maximum entry count ({_RESTORE_MAX_ENTRIES})")
+        if len(reg_bytes) > _RESTORE_MAX_FILE_BYTES or total_uncompressed + len(reg_bytes) > _RESTORE_MAX_TOTAL_BYTES:
+            raise RuntimeError("Backup size limit exceeded on registry.json")
+        zf.writestr("save/registry/registry.json", reg_bytes)
+        total_uncompressed += len(reg_bytes)
+        file_count += 1
+    return file_count, total_uncompressed
 
 
 def _resolve_drive_c_target(prefix_dir: Path) -> Path:
@@ -2173,72 +2205,102 @@ def pull_game_saves(
     max_keep: int = SNAPSHOT_KEEP_DEFAULT,
     allow_home: bool = False,
     extra_dirs: ExtraDirs | None = None,
+    rev_id: str = "",
 ) -> tuple[int, Path | None]:
-    """Snapshot local saves, then safely extract synced saves into prefix drive_c."""
+    """Verify a private copy of the shared version, snapshot local saves, then restore that copy.
+
+    rev_id picks one version when several conflict; without it there must be exactly one.
+    """
+    repo.open_sync_root(sync_root)
     slug, game_sync_dir = _resolve_game_slug_dir(sync_root, game_name, meta_file="meta.json", name_key="game_name")
-    latest_zip = game_sync_dir / "latest.zip"
-    if latest_zip.is_symlink() or not latest_zip.is_file():
+    if not game_sync_dir.is_dir() or game_sync_dir.is_symlink():
         return 0, None
-
-    meta = _read_sync_meta(game_sync_dir / "meta.json")
-    expected_sha = meta.get("sha256") if meta is not None else None
-    if isinstance(expected_sha, str) and expected_sha.strip():
-        actual_sha = file_sha256(latest_zip)
-        if actual_sha.lower() != expected_sha.strip().lower():
-            raise RuntimeError(
-                f"Sync archive checksum mismatch for {game_name}: "
-                f"expected {expected_sha}, got {actual_sha}"
+    with repo.game_lock(game_sync_dir):
+        state = repo.scan_game_folder(game_sync_dir)
+        distinct = state.distinct_heads()
+        if not distinct:
+            legacy = game_sync_dir / repo.LEGACY_ZIP
+            if state.waiting and not state.legacy_unverified:
+                raise RuntimeError(
+                    f"Sync archive checksum mismatch for {game_name}: the shared version is incomplete "
+                    "or damaged (still being copied?); nothing was restored"
+                )
+            if state.legacy_unverified and not allow_unverified:
+                raise RuntimeError(f"Missing sync metadata or checksum for {game_name}")
+            if not (state.legacy_unverified and legacy.is_file() and not legacy.is_symlink()):
+                return 0, None
+            source = repo.Revision(
+                rev_id="", path=legacy, parents=(), save_id="", content_digest="", file_count=0,
+                uncompressed_bytes=0, created_at=0.0, legacy=True,
             )
-    elif not allow_unverified:
-        raise RuntimeError(f"Missing sync metadata or checksum for {game_name}")
+            copy = repo.local_staging_dir() / f"unverified-{os.getpid()}.zip"
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            shutil_copy(legacy, copy)
+        else:
+            if rev_id:
+                source_opt = state.revisions.get(rev_id)
+                if source_opt is None or source_opt.rev_id not in {h.rev_id for h in state.heads()}:
+                    raise repo.SyncRemoteChanged("The chosen shared version is no longer current; check again")
+                source = source_opt
+            elif len(distinct) == 1:
+                source = distinct[0]
+            else:
+                raise repo.SyncRemoteChanged("There are several shared versions of these saves; choose one")
+            try:
+                copy = repo.verified_local_copy(source, repo.local_staging_dir())
+            except repo.RevisionInvalid as exc:
+                raise RuntimeError(
+                    f"Sync archive checksum mismatch for {game_name}: the shared version is incomplete "
+                    f"or damaged ({exc}); it was not restored"
+                ) from exc
+        try:
+            snap_path = snapshot_prefix_saves(
+                prefix_dir,
+                game_name,
+                "pre-sync-pull",
+                dest_root=snapshots_root,
+                max_keep=max_keep,
+                game_dir=game_dir,
+                steam_appid=steam_appid,
+                extra_dirs=extra_dirs,
+            )
+            try:
+                restored_files = _restore_saves_archive(
+                    copy,
+                    prefix_dir,
+                    game_dir,
+                    source.created_at or None,
+                    extra_dirs=extra_dirs,
+                    allow_home=allow_home,
+                )
+            except Exception as exc:
+                raise _wrap_restore_error(exc, snap_path) from exc
+        finally:
+            copy.unlink(missing_ok=True)
 
-    raw_ts = meta.get("updated_at") if meta is not None else None
-    remote_updated_at = (
-        float(raw_ts)
-        if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool) and float(raw_ts) > 0
-        else None
-    )
-
-    snap_path = snapshot_prefix_saves(
-        prefix_dir,
-        game_name,
-        "pre-sync-pull",
-        dest_root=snapshots_root,
-        max_keep=max_keep,
-        game_dir=game_dir,
-        steam_appid=steam_appid,
-        extra_dirs=extra_dirs,
-    )
-
-    try:
-        restored_files = _restore_saves_archive(
-            latest_zip,
-            prefix_dir,
-            game_dir,
-            remote_updated_at,
-            extra_dirs=extra_dirs,
-            allow_home=allow_home,
-        )
-    except Exception as exc:
-        raise _wrap_restore_error(exc, snap_path) from exc
-
-    remote_digest = meta.get("fingerprint_digest") if meta is not None else None
-    if isinstance(remote_digest, str) and remote_digest and prefix_dir.is_dir():
-        post_fp = compute_prefix_saves_fingerprint(
-            prefix_dir,
-            game_name=game_name,
-            game_dir=game_dir,
-            steam_appid=steam_appid,
-            extra_dirs=extra_dirs,
-        )
-        _record_sync_base(
-            prefix_dir,
-            sync_root,
-            slug,
-            remote_digest,
-            local_digest=post_fp.digest or remote_digest,
-        )
+        if source.content_digest and prefix_dir.is_dir():
+            post_fp = compute_prefix_saves_fingerprint(
+                prefix_dir,
+                game_name=game_name,
+                game_dir=game_dir,
+                steam_appid=steam_appid,
+                extra_dirs=extra_dirs,
+            )
+            _record_sync_base(
+                prefix_dir,
+                sync_root,
+                slug,
+                source.content_digest,
+                local_digest=post_fp.digest or source.content_digest,
+                rev_id=source.rev_id,
+            )
     return restored_files, snap_path
+
+
+def shutil_copy(src: Path, dst: Path) -> None:
+    import shutil
+
+    shutil.copyfile(src, dst)
 
 
 def _resolve_existing_rel_parts(
@@ -2595,6 +2657,17 @@ def _save_file_nonempty(path: Path) -> bool:
         return False
 
 
+def _sync_root_problem(sync_root: Path) -> str:
+    """Why the sync folder cannot be used now ("" when it can; a new folder is set up on push)."""
+    try:
+        repo.open_sync_root(sync_root, initialize=False)
+    except repo.SyncFolderUnavailable as exc:
+        if repo.is_new_sync_root(sync_root):
+            return ""  # set up by the first push
+        return str(exc)
+    return ""
+
+
 def plan_sync_all(
     games: Sequence[tuple[str, Path] | SyncGameTarget],
     sync_root: Path,
@@ -2602,8 +2675,9 @@ def plan_sync_all(
     steam_appid: int | None = None,
     extra_dirs: ExtraDirs | None = None,
 ) -> list[SyncPlanItem]:
-    """Compare local prefix save fingerprints against sync_root metadata."""
+    """Compare this device's saves with the shared versions (read only: nothing is written)."""
     plan: list[SyncPlanItem] = []
+    unavailable = _sync_root_problem(sync_root)
     for item in games:
         if isinstance(item, SyncGameTarget):
             game_name = item.game_name
@@ -2620,8 +2694,23 @@ def plan_sync_all(
             item_source = "deckinstall"
 
         slug, game_sync_dir = _resolve_game_slug_dir(sync_root, game_name, meta_file="meta.json", name_key="game_name")
-        latest_zip = game_sync_dir / "latest.zip"
-        has_remote = not latest_zip.is_symlink() and latest_zip.is_file()
+        common = {
+            "game_name": game_name,
+            "slug": slug,
+            "prefix_dir": prefix_dir,
+            "game_dir": item_game_dir,
+            "steam_appid": item_appid,
+            "extra_dirs": tuple(item_extra or ()),
+            "source": item_source,
+        }
+        if unavailable:
+            plan.append(SyncPlanItem(action="UNAVAILABLE", reason=unavailable, **common))  # type: ignore[arg-type]
+            continue
+        state = repo.scan_game_folder(game_sync_dir) if game_sync_dir.is_dir() else repo.RepoState()
+        distinct = state.distinct_heads()
+        common["heads"] = tuple(distinct)
+        common["waiting"] = len(state.waiting)
+        has_remote = bool(distinct)
         local_fp = None
         if has_remote:
             local_fp = compute_prefix_saves_fingerprint(
@@ -2636,70 +2725,61 @@ def plan_sync_all(
             has_local = any(_save_file_nonempty(path) for _, path, _ in entries) or bool(
                 _extract_manifest_reg_bytes(prefix_dir, game_name, item_appid)
             )
-
-        common = {
-            "game_name": game_name,
-            "slug": slug,
-            "prefix_dir": prefix_dir,
-            "game_dir": item_game_dir,
-            "steam_appid": item_appid,
-            "extra_dirs": tuple(item_extra or ()),
-            "source": item_source,
-        }
-
-        if not has_local and not has_remote:
-            plan.append(SyncPlanItem(action="NO_SAVES", reason="No local or remote saves found", **common))  # type: ignore[arg-type]
-            continue
-        if has_local and not has_remote:
-            plan.append(SyncPlanItem(action="PUSH", reason="Local saves present; no remote sync archive yet", **common))  # type: ignore[arg-type]
-            continue
-        if not has_local and has_remote:
-            plan.append(SyncPlanItem(action="PULL", reason="Remote sync archive available; no local saves", **common))  # type: ignore[arg-type]
-            continue
-
-        meta = _read_sync_meta(game_sync_dir / "meta.json")
-        if meta is None:
-            plan.append(SyncPlanItem(action="CONFLICT", reason="Remote metadata missing or unreadable", **common))  # type: ignore[arg-type]
-            continue
-
-        remote_digest = str(meta.get("fingerprint_digest") or "")
-        raw_updated = meta.get("updated_at")
-        if isinstance(raw_updated, (int, float, str)) and not isinstance(raw_updated, bool):
-            try:
-                remote_updated_at = float(raw_updated)
-            except (TypeError, ValueError):
-                remote_updated_at = 0.0
-        else:
-            remote_updated_at = 0.0
-
-        assert local_fp is not None
-        # Three-way decision against the last digests this machine synced (the "base").
-        # Timestamps alone cannot tell "only one side changed" from "both sides changed".
-        base_remote, base_local = _read_sync_base_pair(prefix_dir, sync_root, slug)
-        if remote_digest and (
-            local_fp.digest == remote_digest
-            or (base_remote and remote_digest == base_remote and local_fp.digest == base_local)
-        ):
-            action = "IN_SYNC"
-            reason = "Local and remote save digests match"
-        elif not remote_digest or remote_updated_at <= 0.0:
-            action = "CONFLICT"
-            reason = "Incomplete remote metadata; manual resolution required"
-        elif not base_remote and not base_local:
-            action = "CONFLICT"
-            reason = "No previous sync recorded on this device; choose which saves to keep"
-        elif base_remote and remote_digest == base_remote:
-            action = "PUSH"
-            reason = "Only local saves changed since last sync"
-        elif base_local and local_fp.digest == base_local:
-            action = "PULL"
-            reason = "Only remote saves changed since last sync"
-        else:
-            action = "CONFLICT"
-            reason = "Both local and remote saves changed since last sync"
-
+        action, reason = _plan_action(state, distinct, has_local, local_fp, prefix_dir, sync_root, slug)
+        if state.waiting and action in ("IN_SYNC", "PUSH", "NO_SAVES"):
+            reason += f" ({len(state.waiting)} shared file(s) still arriving or damaged; not used)"
         plan.append(SyncPlanItem(action=action, reason=reason, **common))  # type: ignore[arg-type]
     return plan
+
+
+def _plan_action(
+    state: repo.RepoState,
+    distinct: list[repo.Revision],
+    has_local: bool,
+    local_fp: SaveFingerprint | None,
+    prefix_dir: Path,
+    sync_root: Path,
+    slug: str,
+) -> tuple[str, str]:
+    """Three-way decision between this device's saves, the shared versions and the last sync."""
+    if not distinct:
+        if state.legacy_unverified:
+            return "CONFLICT", "Remote metadata missing or unreadable (the old archive could not be verified)"
+        if has_local:
+            return "PUSH", "Local saves present; no remote sync archive yet"
+        return "NO_SAVES", "No local or remote saves found"
+    if len(distinct) > 1:
+        if any(par not in state.revisions for h in distinct for par in h.parents):
+            return "CONFLICT", "Older shared versions are still arriving; wait for the transfer to finish (or choose)"
+        return "CONFLICT", f"{len(distinct)} different shared versions (made offline on different devices)"
+    head = distinct[0]
+    if not has_local:
+        return "PULL", "Remote sync archive available; no local saves"
+    assert local_fp is not None
+    if local_fp.digest == head.content_digest:
+        return "IN_SYNC", "Local and remote save digests match"
+    base_rev = _read_sync_base_rev(prefix_dir, sync_root, slug)
+    base_remote, base_local = _read_sync_base_pair(prefix_dir, sync_root, slug)
+    head_ids = {h.rev_id for h in state.heads()}
+    local_unchanged = bool(base_local) and local_fp.digest == base_local
+    if base_rev in head_ids or (not base_rev and base_remote and base_remote == head.content_digest):
+        if local_unchanged:
+            return "IN_SYNC", "Local and remote save digests match"
+        return "PUSH", "Only local saves changed since last sync"
+    ancestors = state.ancestors(head.rev_id)
+    known_ancestor = (base_rev and base_rev in ancestors) or (
+        not base_rev and base_remote
+        and any(state.revisions[a].content_digest == base_remote for a in ancestors if a in state.revisions)
+    )
+    if known_ancestor:
+        if local_unchanged:
+            return "PULL", "Only remote saves changed since last sync"
+        return "CONFLICT", "Both local and remote saves changed since last sync"
+    if not base_rev and not base_remote:
+        return "CONFLICT", "No previous sync recorded on this device; choose which saves to keep"
+    if any(a not in state.revisions for a in ancestors):
+        return "CONFLICT", "Older shared versions are still arriving; wait for the transfer to finish (or choose)"
+    return "CONFLICT", "The shared saves do not continue the version this device synced last"
 
 
 def preview_sync_operation(
@@ -2771,7 +2851,9 @@ def preview_sync_operation(
             )
             total_bytes += len(reg_bytes)
     elif effective_action == "PULL":
-        latest_zip = sync_root / slug / "latest.zip"
+        _, preview_dir = _resolve_game_slug_dir(sync_root, game_name, meta_file="meta.json", name_key="game_name")
+        preview_heads = repo.scan_game_folder(preview_dir).distinct_heads() if preview_dir.is_dir() else []
+        latest_zip = preview_heads[-1].path if preview_heads else preview_dir / "latest.zip"
         if latest_zip.is_file() and not latest_zip.is_symlink():
             with zipfile.ZipFile(latest_zip, "r") as zf:
                 infos = zf.infolist()

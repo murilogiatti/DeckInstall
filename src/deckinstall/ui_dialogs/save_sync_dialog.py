@@ -7,7 +7,7 @@ import time
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from PySide6.QtCore import QSettings, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QCloseEvent, QDesktopServices
@@ -100,6 +100,23 @@ class SaveTarget(NamedTuple):
     source: str = "deckinstall"  # deckinstall, shortcut, steam, heroic, lutris, bottles, hydra, umu, nexus
     extra_dirs: ExtraDirs = ()  # e.g. Steam's local cloud folder
 
+
+
+def _format_version_date(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts > 0 else "?"
+
+
+def describe_shared_versions(heads: tuple[Any, ...]) -> str:
+    """One line per shared version: device, date, size and number of files."""
+    lines = []
+    for head in heads:
+        size_kib = max(1, (head.uncompressed_bytes or head.stored_bytes) // 1024)
+        lines.append(tr(
+            "save_sync.version_line", device=head.device_label or "?", date=_format_version_date(head.created_at),
+            size=f"{size_kib:,} KiB".replace(",", "."), files=head.file_count,
+            version=head.app_version or "?",
+        ))
+    return "\n".join(lines)
 
 def source_label(source: str) -> str:
     """Name shown in the "Origin" column."""
@@ -1371,7 +1388,8 @@ def open_save_sync_dialog(win: MainWindow) -> None:
                         tr("save_sync.syncing_game", name=item.game_name, action=action)
                     )
                     try:
-                        if action == "PUSH":
+                        pull_rev = action.split(":", 1)[1] if action.startswith("PULL:") else ""
+                        if action in ("PUSH", "PUSH_RESOLVE"):
                             if (
                                 push_game_saves(
                                     item.game_name,
@@ -1380,11 +1398,12 @@ def open_save_sync_dialog(win: MainWindow) -> None:
                                     game_dir=item.game_dir,
                                     steam_appid=item.steam_appid,
                                     extra_dirs=item.extra_dirs,
+                                    resolve_heads=action == "PUSH_RESOLVE",
                                 )
                                 is not None
                             ):
                                 pushed += 1
-                        elif action == "PULL":
+                        elif action == "PULL" or pull_rev:
                             if item.source == "nexus" and is_nexus_running():
                                 raise RuntimeError(tr("saves.nexus_running"))
                             if any(name == "steamcloud" for name, _ in item.extra_dirs):
@@ -1401,9 +1420,17 @@ def open_save_sync_dialog(win: MainWindow) -> None:
                                 steam_appid=item.steam_appid,
                                 max_keep=self._max_keep,
                                 extra_dirs=item.extra_dirs,
+                                rev_id=pull_rev,
                             )
                             if restored > 0:
                                 pulled += 1
+                            if pull_rev and len(item.heads) > 1:
+                                # the chosen version replaces every other one in the shared folder
+                                push_game_saves(
+                                    item.game_name, item.prefix_dir, self._sync_root,
+                                    game_dir=item.game_dir, steam_appid=item.steam_appid,
+                                    extra_dirs=item.extra_dirs, resolve_heads=True,
+                                )
                     except Exception as exc:
                         errors.append(f"{item.game_name}: {_format_worker_error(exc)}")
                 self.finished_ok.emit(pushed, pulled, errors)
@@ -1426,12 +1453,20 @@ def open_save_sync_dialog(win: MainWindow) -> None:
                 box.setIcon(QMessageBox.Icon.Question)
                 box.setWindowTitle(__app_name__)
                 box.setText(tr("save_sync.conflict_prompt", name=item.game_name, reason=item.reason))
+                if item.heads:
+                    box.setInformativeText(describe_shared_versions(item.heads))
                 btn_push = box.addButton(
                     tr("save_sync.conflict_keep_local"), QMessageBox.ButtonRole.AcceptRole
                 )
-                btn_pull = box.addButton(
-                    tr("save_sync.conflict_use_remote"), QMessageBox.ButtonRole.AcceptRole
-                )
+                pull_buttons = []
+                heads: list[Any] = list(item.heads)[-3:] or [None]
+                for head in heads:
+                    label = (
+                        tr("save_sync.conflict_use_version", device=head.device_label or "?",
+                           date=_format_version_date(head.created_at))
+                        if head is not None and len(heads) > 1 else tr("save_sync.conflict_use_remote")
+                    )
+                    pull_buttons.append((box.addButton(label, QMessageBox.ButtonRole.AcceptRole), head))
                 btn_skip = box.addButton(
                     tr("save_sync.conflict_skip"), QMessageBox.ButtonRole.RejectRole
                 )
@@ -1440,9 +1475,10 @@ def open_save_sync_dialog(win: MainWindow) -> None:
                 clicked = box.clickedButton()
                 box.deleteLater()
                 if clicked == btn_push:
-                    ops.append((item, "PUSH"))
-                elif clicked == btn_pull:
-                    ops.append((item, "PULL"))
+                    ops.append((item, "PUSH_RESOLVE"))
+                for btn, head in pull_buttons:
+                    if clicked == btn:
+                        ops.append((item, f"PULL:{head.rev_id}" if head is not None else "PULL"))
 
         if not dlg_alive["open"] or win._closing_pending:
             return

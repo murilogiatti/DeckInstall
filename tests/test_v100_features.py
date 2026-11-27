@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import types
 import unittest
 import zipfile
@@ -91,20 +92,23 @@ class SaveSyncTests(unittest.TestCase):
             self.assertIsNotNone(pushed_zip)
             assert pushed_zip is not None
             self.assertTrue(pushed_zip.is_file())
-            self.assertTrue((pushed_zip.parent / "meta.json").is_file())
+            self.assertEqual(pushed_zip.parent.name, "revs")  # one immutable revision per push
 
-            # Inject malicious path-traversal and symlink entries into the sync archive,
-            # and update meta.json sha256 so pull reaches archive extraction traversal checks.
+            # A revision changed after it was published (traversal and symlink entries added)
+            # no longer matches its manifest: it is refused before anything is extracted.
             with zipfile.ZipFile(pushed_zip, "a") as zf:
                 zf.writestr("save/users/../../escaped.txt", b"pwned")
                 zf.writestr("save/other_section/bad.txt", b"ignored")
 
-            import hashlib
-            meta_file = pushed_zip.parent / "meta.json"
-            meta_data = json.loads(meta_file.read_text(encoding="utf-8"))
-            meta_data["sha256"] = hashlib.sha256(pushed_zip.read_bytes()).hexdigest()
-            meta_file.write_text(json.dumps(meta_data), encoding="utf-8")
+            with self.assertRaises(RuntimeError):
+                pull_game_saves("Cool Game", dst_prefix, sync_root, snapshots_root=snaps_root)
+            self.assertEqual(local_save.read_bytes(), b"local-old-payload")
+            self.assertFalse((root / "escaped.txt").exists())
+            self.assertFalse((dst_prefix / "drive_c" / "escaped.txt").exists())
 
+            # An intact revision restores, with a snapshot of the local saves taken first.
+            pushed_zip.unlink()
+            push_game_saves("Cool Game", src_prefix, sync_root)
             restored, snap_path = pull_game_saves(
                 "Cool Game",
                 dst_prefix,
@@ -116,8 +120,6 @@ class SaveSyncTests(unittest.TestCase):
             assert snap_path is not None
             self.assertTrue(snap_path.is_file())
             self.assertEqual(local_save.read_bytes(), b"remote-save-payload")
-            self.assertFalse((root / "escaped.txt").exists())
-            self.assertFalse((dst_prefix / "drive_c" / "escaped.txt").exists())
 
     def test_plan_sync_all_states(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -140,11 +142,25 @@ class SaveSyncTests(unittest.TestCase):
             _make_prefix_with_save(p_sync, content=b"synced-data")
             push_game_saves("Sync Game", p_sync, sync_root)
 
-            # 4) CONFLICT: different digest and missing/unreadable meta.json
+            # 4) CONFLICT: two devices published different saves from the same start (offline)
             p_conflict = root / "pfx_conflict"
             _make_prefix_with_save(p_conflict, content=b"local-conflict")
-            push_game_saves("Conflict Game", p_conflict, sync_root)
-            (sync_root / "conflict-game" / "meta.json").unlink()
+            first = push_game_saves("Conflict Game", p_conflict, sync_root)
+            assert first is not None
+            other = root / "pfx_conflict_other"
+            _make_prefix_with_save(other, content=b"other-device")
+            push_game_saves("Conflict Game", other, sync_root, resolve_heads=True)  # replaces `first`
+            # ...but the other device made its revision before seeing `first`: drop that link
+            import zipfile as _zf
+
+            newest = max((p for p in first.parent.glob("*.zip") if p != first), key=lambda p: p.stat().st_mtime)
+            with _zf.ZipFile(newest) as zin:
+                items = [(i, zin.read(i)) for i in zin.infolist()]
+            manifest = json.loads(dict((i.filename, d) for i, d in items)["deckinstall-revision.json"])
+            manifest["parents"] = []
+            with _zf.ZipFile(newest, "w") as zout:
+                for i, d in items:
+                    zout.writestr(i, json.dumps(manifest) if i.filename == "deckinstall-revision.json" else d)
 
             plan = plan_sync_all(
                 [
@@ -167,15 +183,14 @@ class SaveSyncTests(unittest.TestCase):
             push_game_saves("TS Game", dev_a, sync_root)
             dev_b = root / "dev_b"
             dev_b.mkdir()
-            meta_path = sync_root / "ts-game" / "meta.json"
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            updated_at = time.time()
             self.assertEqual(plan_sync_all([("TS Game", dev_b)], sync_root)[0].action, "PULL")
             pull_game_saves("TS Game", dev_b, sync_root, snapshots_root=root / "snaps_b")
             self.assertEqual(plan_sync_all([("TS Game", dev_b)], sync_root)[0].action, "IN_SYNC")
 
             # Only local changed (even with an older mtime) -> PUSH.
             a_file.write_bytes(b"v2-local")
-            os.utime(a_file, (meta["updated_at"] - 1000, meta["updated_at"] - 1000))
+            os.utime(a_file, (updated_at - 1000, updated_at - 1000))
             self.assertEqual(plan_sync_all([("TS Game", dev_a)], sync_root)[0].action, "PUSH")
             push_game_saves("TS Game", dev_a, sync_root)
 

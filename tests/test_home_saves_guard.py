@@ -18,8 +18,8 @@ if str(SRC) not in sys.path:
 
 import pytest  # noqa: E402
 
+from deckinstall import fsutil, save_sync  # noqa: E402
 from deckinstall import ludusavi as lds  # noqa: E402
-from deckinstall import save_sync  # noqa: E402
 from deckinstall.i18n import tr  # noqa: E402
 from deckinstall.ui_dialogs import save_sync_dialog as ssd  # noqa: E402
 
@@ -125,7 +125,7 @@ def test_sync_zip_refuses_blocked_home_files(tmp_path: Path, home: Path) -> None
         {f"home/{rel}": b"x" for rel in (ALLOWED, *BLOCKED, ".config/Game/run")},
         executable=("home/.config/Game/run",),
     )
-    (sync_root / "game" / "meta.json").write_text(json.dumps({"sha256": save_sync.file_sha256(latest)}))
+    (sync_root / "game" / "meta.json").write_text(json.dumps({"sha256": fsutil.file_sha256(latest)}))
     count_default, _ = save_sync.pull_game_saves("Game", tmp_path / "pfx", sync_root, snapshots_root=tmp_path / "snaps")
     assert count_default == 0
     assert sorted(p.relative_to(home).as_posix() for p in home.rglob("*") if p.is_file()) == []

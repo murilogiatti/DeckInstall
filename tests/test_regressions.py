@@ -306,10 +306,16 @@ class Fase4RegressionTests(unittest.TestCase):
             self.assertIsNotNone(pushed_zip)
             assert pushed_zip is not None
 
-            meta_file = pushed_zip.parent / "meta.json"
-            meta = json.loads(meta_file.read_text(encoding="utf-8"))
-            meta["sha256"] = "0" * 64
-            meta_file.write_text(json.dumps(meta), encoding="utf-8")
+            # a damaged (or half-transferred) revision: one byte of the stored save changed
+            import struct
+            import zipfile
+
+            with zipfile.ZipFile(pushed_zip) as zf:
+                info = next(i for i in zf.infolist() if i.filename.endswith("save.dat"))
+            data = bytearray(pushed_zip.read_bytes())
+            name_len, extra_len = struct.unpack("<HH", data[info.header_offset + 26:info.header_offset + 30])
+            data[info.header_offset + 30 + name_len + extra_len] ^= 0xFF  # first byte of the stored data
+            pushed_zip.write_bytes(bytes(data))
 
             with self.assertRaises(RuntimeError) as ctx:
                 pull_game_saves("TamperGame", dst_pfx, sync_root, snapshots_root=snaps_root)

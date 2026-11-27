@@ -404,6 +404,8 @@
   "save_sync.no_games": "No Wine/Proton game prefixes found.",
   "save_sync.pick_folder": "Select Save Sync Folder",
   "save_sync.syncing_game": "Syncing '{name}' ({action})...",
+  "save_sync.conflict_use_version": "Use the one from {device} ({date})",
+  "save_sync.version_line": "• {device}, {date}: {size}, {files} file(s), DeckInstall {version}",
   "save_sync.conflict_prompt": "Save conflict for '{name}':\n{reason}\n\nHow do you want to resolve this conflict?",
   "save_sync.conflict_keep_local": "Keep Local (Push)",
   "save_sync.conflict_use_remote": "Use Remote (Pull)",

@@ -404,6 +404,8 @@
   "save_sync.no_games": "Nenhum jogo com prefixo Wine/Proton encontrado.",
   "save_sync.pick_folder": "Escolher a pasta de sincronização",
   "save_sync.syncing_game": "Sincronizando '{name}' ({action})...",
+  "save_sync.conflict_use_version": "Usar a de {device} ({date})",
+  "save_sync.version_line": "• {device}, {date}: {size}, {files} arquivo(s), DeckInstall {version}",
   "save_sync.conflict_prompt": "Os saves de '{name}' estão diferentes nos dois lados:\n{reason}\n\nQual versão manter?",
   "save_sync.conflict_keep_local": "Manter a daqui (enviar)",
   "save_sync.conflict_use_remote": "Usar a da pasta (baixar)",
