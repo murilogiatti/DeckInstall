@@ -65,7 +65,7 @@ def _run(game: standalone.StandaloneGame, tmp_path: Path, case: str, **env: str)
     if not tools.exists():
         tools.mkdir()
         for name in ("bash", "sh", "mktemp", "rm", "tr", "date", "mkdir", "touch", "find", "cat", "mv",
-                     "ls", "printf", "kill", "dirname", "basename", "env", "tee", "head", "sed", "stat", "sleep"):
+                     "ls", "printf", "kill", "dirname", "basename", "env", "tee", "head", "sed", "stat", "sleep", "tail"):
             for base in ("/usr/bin", "/bin"):
                 if (Path(base) / name).exists():
                     (tools / name).symlink_to(Path(base) / name)
@@ -169,6 +169,7 @@ def test_run_log_is_capped_without_blocking_the_game(tmp_path: Path, monkeypatch
     assert size < 64 * 1024 + 4096
     assert "log truncated" in log
     assert log.rstrip().splitlines()[-1].startswith("== DeckInstall: exit code 5")
+    assert "x== DeckInstall" not in log  # the game's last line had no newline
 
 
 def test_uninstall_also_removes_the_kept_previous_launcher(tmp_path: Path) -> None:

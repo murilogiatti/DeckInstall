@@ -677,6 +677,9 @@ def _write_launch_script(
             'if [ -n "${_di_log_pid:-}" ]; then exec >/dev/null 2>&1;'
             ' for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20;'
             ' do kill -0 "$_di_log_pid" 2>/dev/null || break; sleep 0.1 2>/dev/null || break; done; fi',
+            # on its own line even when the game's last output had no newline
+            'if [ -s "$LOG_DIR/run.log" ] && [ -n "$(tail -c 1 "$LOG_DIR/run.log" 2>/dev/null)" ];'
+            ' then echo >>"$LOG_DIR/run.log" 2>/dev/null || true; fi',
             'echo "== DeckInstall: exit code $rc at $(date -Is)" >>"$LOG_DIR/run.log" 2>/dev/null || true',
             'exit "$rc"',
         ])
