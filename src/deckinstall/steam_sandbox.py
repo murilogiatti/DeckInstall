@@ -142,4 +142,3 @@ def revoke_flatpak_access(folders: Iterable[Path]) -> tuple[bool, str]:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
     return proc.returncode == 0, (proc.stdout + proc.stderr).strip()
-
