@@ -195,3 +195,8 @@ def test_account_names_are_masked_only_in_the_steam_section(monkeypatch: pytest.
     assert masked["steam"][0]["detail"] == "native: ~/S — <steam account 1> (1), <steam account 2> (2)"
     assert masked["runtimes"][0]["detail"] == "GE-Proton11-14 in ~/.steam"  # "Proton" kept outside Steam
     assert "Bob" not in json.dumps(masked)  # masked before JSON escaping
+
+
+def test_user_name_inside_a_hyphenated_path_is_masked() -> None:
+    out = doctor.mask_text("appimage: /tmp/app-1000/-home-alice-Projects/x.AppImage", [("alice", "<user>")])
+    assert "alice" not in out and "-home-<user>-Projects" in out

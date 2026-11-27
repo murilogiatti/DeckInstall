@@ -321,7 +321,7 @@ def mask_text(text: str, words: list[tuple[str, str]] | None = None) -> str:
 
     for value, label in (words if words is not None else _private_words()):
         if re.fullmatch(r"[\w.-]+", value):  # a bare name or number: only as a whole word
-            text = re.sub(rf"(?<![\w.-]){re.escape(value)}(?![\w-])", label, text)
+            text = re.sub(rf"(?<!\w){re.escape(value)}(?!\w)", label, text)
         else:
             text = text.replace(value, label)
     return re.sub(r"\b7656119\d{10}\b", "<steamid>", text)  # 64-bit Steam IDs
