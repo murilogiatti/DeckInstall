@@ -33,9 +33,9 @@ from .runtime_manager import (
     _load_versions,
     check_runtime_updates,
     check_ubuntu_bwrap_userns,
-    ensure_ge_proton11,
     ensure_mangohud,
     ensure_optiscaler,
+    ensure_umu_proton,
     ensure_umu_run,
     mangohud_versions,
     run_exe_in_prefix,
@@ -286,7 +286,7 @@ class ScanWorker(QThread):
 
 
 
-RUNTIME_COMPONENTS = ("umu", "ge_proton", "mangohud", "optiscaler")
+RUNTIME_COMPONENTS = ("umu", "umu_proton", "mangohud", "optiscaler")
 
 
 class RuntimeUpdateWorker(QThread):
@@ -306,11 +306,11 @@ class RuntimeUpdateWorker(QThread):
         self.updated_proton = ""
         self.updated_optiscaler = ""
 
-    def _after_ge_update(self, previous: str) -> str:
+    def _after_proton_update(self, previous: str) -> str:
         """Update launchers on the Default policy and leave older versions for review."""
-        from .proton_policy import newest_ge_proton, retarget_default_games
+        from .proton_policy import newest_default_proton, retarget_default_games
 
-        newest = newest_ge_proton()
+        newest = newest_default_proton()
         if newest is None or newest.name == previous:
             return ""
         self.updated_proton = newest.name
@@ -348,22 +348,22 @@ class RuntimeUpdateWorker(QThread):
             logging.warning("umu-database.csv could not be downloaded")
         return ("+" if changed else "") + f"umu-run ({umu_path.name})"
 
-    def _update_ge(self, info: dict[str, Any]) -> str:
-        """Newest GE-Proton, then move "Default" games to it."""
-        from .proton_policy import newest_ge_proton
+    def _update_proton(self, info: dict[str, Any]) -> str:
+        """Newest UMU-Proton, then move "Default" games to it."""
+        from .proton_policy import newest_default_proton
 
-        before = newest_ge_proton()
-        ge_info = info.get("ge_proton", {})
-        changed = bool(ge_info.get("update_available")) or not ge_info.get("installed")
-        if changed or not ge_info.get("installed_path"):
-            ge_path = ensure_ge_proton11(
-                force_update=bool(ge_info.get("update_available")),
+        before = newest_default_proton()
+        proton_info = info.get("umu_proton", {})
+        changed = bool(proton_info.get("update_available")) or not proton_info.get("installed")
+        if changed or not proton_info.get("installed_path"):
+            proton_path = ensure_umu_proton(
+                force_update=bool(proton_info.get("update_available")),
                 progress_cb=lambda msg, _pct: self.status.emit(msg),
             )
         else:
-            ge_path = Path(str(ge_info["installed_path"]))
-        text = ("+" if changed else "") + ge_path.name
-        policy_msg = self._after_ge_update(before.name if before is not None else "")
+            proton_path = Path(str(proton_info["installed_path"]))
+        text = ("+" if changed else "") + proton_path.name
+        policy_msg = self._after_proton_update(before.name if before is not None else "")
         return f"{text} | {policy_msg}" if policy_msg else text
 
     def _update_optiscaler(self) -> str:
@@ -381,12 +381,12 @@ class RuntimeUpdateWorker(QThread):
         try:
             self.status.emit(tr("runtime.checking"))
             comps = self.components
-            info = check_runtime_updates(force=True) if ("umu" in comps or "ge_proton" in comps) else {}
+            info = check_runtime_updates(force=True) if ("umu" in comps or "umu_proton" in comps) else {}
             parts: list[str] = []
             if "umu" in comps:
                 parts.append(self._update_umu(info))
-            if "ge_proton" in comps:
-                parts.append(self._update_ge(info))
+            if "umu_proton" in comps:
+                parts.append(self._update_proton(info))
             if "optiscaler" in comps:
                 parts.append(self._update_optiscaler())
             if "mangohud" in comps:
@@ -492,7 +492,7 @@ class StandaloneInstallWorker(QThread):
                 ensure_umu_run(progress_cb=lambda msg, _pct: self.status.emit(msg))
                 # Best effort: GAMEID/STORE lookups (protonfixes) need the umu-database.
                 _rm.ensure_umu_database(timeout=15)
-                ensure_ge_proton11(progress_cb=lambda msg, _pct: self.status.emit(msg))
+                ensure_umu_proton(progress_cb=lambda msg, _pct: self.status.emit(msg))
 
             if self.game_dir is not None:
                 game_dir = self.game_dir

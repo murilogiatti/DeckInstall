@@ -101,15 +101,15 @@ def test_runtime_update_moves_default_games_and_prunes(tmp_path: Path) -> None:
     for name in ("GE-Proton10-4", "GE-Proton10-25"):
         _proton(name)
     game = _install(tmp_path, "Alpha")
-    _proton("GE-Proton11-2")  # what ensure_ge_proton11 just installed
+    _proton("GE-Proton11-2")  # what ensure_umu_proton just installed
     worker = ui_workers.RuntimeUpdateWorker(paths=None)
-    msg = worker._after_ge_update("GE-Proton10-25")
+    msg = worker._after_proton_update("GE-Proton10-25")
     assert "GE-Proton11-2" in msg
     assert _protonpath(standalone.list_standalone_games()[0]).endswith("GE-Proton11-2")
     # Without Steam paths the Steam mappings are unknown, so nothing is deleted.
     assert (runtime_manager.get_compat_tools_dir() / "GE-Proton10-4").is_dir()
     assert game.name == "Alpha"
-    assert worker._after_ge_update("GE-Proton11-2") == ""
+    assert worker._after_proton_update("GE-Proton11-2") == ""
 
 
 def test_runtime_update_retains_old_tools_for_review(tmp_path: Path) -> None:
@@ -122,7 +122,72 @@ def test_runtime_update_retains_old_tools_for_review(tmp_path: Path) -> None:
     _install(tmp_path, "Alpha")
     usage = [SimpleNamespace(tool_name="GE-Proton9-27")]
     with mock.patch.object(steam_vdf, "list_compat_tool_usage", return_value=usage):
-        msg = ui_workers.RuntimeUpdateWorker(paths=mock.Mock())._after_ge_update("GE-Proton10-25")
+        msg = ui_workers.RuntimeUpdateWorker(paths=mock.Mock())._after_proton_update("GE-Proton10-25")
     assert "GE-Proton11-2" in msg
     left = sorted(p.name for p in runtime_manager.get_compat_tools_dir().iterdir())
     assert left == ["GE-Proton10-25", "GE-Proton10-4", "GE-Proton11-2", "GE-Proton9-27"]
+
+
+def test_umu_proton_is_the_default_and_ge_games_move_to_it(tmp_path: Path) -> None:
+    """UMU-Proton wins over a GE-Proton already on disk; "Default" games baked with GE move to it at
+    the next library load, GE kept as their previous version (one click back). Pinned games stay."""
+    ge = _proton("GE-Proton11-14")
+    game = _install(tmp_path, "Alpha")
+    pinned = _install(tmp_path, "Beta", proton="GE-Proton11-14")
+    assert _protonpath(game) == str(ge)  # no UMU-Proton yet: the GE one already installed keeps games running
+
+    umu = _proton("UMU-Proton-11.0-2e-x86_64")
+    older = _proton("UMU-Proton-10.0-4")
+    assert runtime_manager.list_umu_proton_dirs() == [umu, older]
+    assert proton_policy.newest_default_proton() == umu
+    assert proton_policy.retarget_stale_default_games() == 1
+
+    by_name = {g.name: g for g in standalone.list_standalone_games()}
+    assert _protonpath(by_name["Alpha"]) == str(umu)
+    assert proton_policy.previous_proton_name(by_name["Alpha"]) == ge.name
+    assert _protonpath(by_name["Beta"]) == str(ge) and pinned.proton_name == ge.name
+    assert proton_policy.retarget_stale_default_games() == 0  # once only
+    # Every GE-Proton DeckInstall installed is superseded now (Cleanup keeps the ones a game uses).
+    assert ge in runtime_manager.superseded_managed_compat_tools()
+    assert older in runtime_manager.superseded_managed_compat_tools()
+    assert umu not in runtime_manager.superseded_managed_compat_tools()
+
+
+def test_umu_proton_download_checks_sha512_and_keeps_umu_runs_folder_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import hashlib
+    import io
+    import tarfile
+
+    tag = "UMU-Proton-11.0-3"
+    stem = f"{tag}-x86_64"
+    payload = io.BytesIO()
+    with tarfile.open(fileobj=payload, mode="w:gz") as tar:
+        for rel, data in (("proton", b"#!/bin/sh\n"), ("compatibilitytool.vdf", b"x"), ("toolmanifest.vdf", b"x"),
+                          ("files/bin/wine", b"\x7fELF")):
+            info = tarfile.TarInfo(f"{stem}/{rel}")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    blob = payload.getvalue()
+    sums = {"good": f"{hashlib.sha512(blob).hexdigest()}  {stem}.tar.gz\n", "bad": "0" * 128 + f"  {stem}.tar.gz\n"}
+    monkeypatch.setattr(runtime_manager, "_get_arch", lambda: "x86_64")
+    monkeypatch.setattr(runtime_manager, "_fetch_latest_umu_proton_release", lambda: {
+        "tag_name": tag,
+        "assets": [{"name": f"{stem}{ext}", "browser_download_url": f"https://github.com/x/{ext}"}
+                   for ext in (".tar.gz", ".sha512sum")],
+    })
+    which = {"sum": "bad"}
+
+    def download(url: str, dest: Path, _name: str, **_kw: object) -> None:
+        dest.write_bytes(blob if url.endswith(".tar.gz") else sums[which["sum"]].encode())
+
+    monkeypatch.setattr(runtime_manager, "_download_file", download)
+    with pytest.raises(RuntimeError, match="SHA-512"):
+        runtime_manager.ensure_umu_proton()
+    assert runtime_manager.list_umu_proton_dirs() == []
+    which["sum"] = "good"
+    installed = runtime_manager.ensure_umu_proton()
+    assert installed.name == stem  # the folder umu-run uses, so it never downloads the same release again
+    assert runtime_manager.is_managed_compat_tool(installed)
+    assert runtime_manager.ensure_umu_proton() == installed  # already there: nothing downloaded

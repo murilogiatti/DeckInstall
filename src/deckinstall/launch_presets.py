@@ -1,7 +1,7 @@
 """Launch presets (MangoHud, gamemode, frame cap, upscaler upgrades, PRIME, Wayland, wined3d, ...).
 
-Checked against what Valve's Proton 11 and GE-Proton 11 really read (their `proton` scripts and
-the DXVK/VKD3D-Proton DLLs), not against older guides.
+Checked against what UMU-Proton 11 (the default Proton) and Valve's Proton 11 really read (their
+`proton` scripts and the DXVK/VKD3D-Proton DLLs), not against older guides.
 
 One place to read the presets out of a launch-options string, re-apply them after a change
 and describe them; the single presets dialog and every caller go through here.
@@ -60,11 +60,15 @@ TOGGLES: tuple[Toggle, ...] = (
     Toggle("hdr", ("PROTON_ENABLE_HDR=1",), "gpu"),
 )
 TOGGLE_TOKENS = frozenset(tok for toggle in TOGGLES for tok in toggle.tokens)
-# Old presets: shown only while on, never offered or recommended. NVAPI is on by default in both
-# Protons; esync is gone from Valve's and unused with NTSYNC in GE; RDNA3 FSR 4 and HDR flags are gone.
-LEGACY = frozenset({"nvapi", "no_esync", "fsr4_rdna3", "hdr"})
+# Old presets: shown only while on (so they can be turned off), never offered or recommended. NVAPI is
+# on by default; esync is gone; RDNA3 FSR 4 and HDR flags are gone; the upscaler upgrades, Wayland,
+# SDL and NTSYNC variables were GE-Proton's, which DeckInstall no longer uses (UMU-Proton ignores them).
+LEGACY = frozenset({
+    "nvapi", "no_esync", "fsr4_rdna3", "hdr",
+    "dlss_upgrade", "fsr3_upgrade", "fsr4_upgrade", "xess_upgrade", "wayland", "prefer_sdl", "no_ntsync",
+})
 # Frame cap (works in Steam mode too): DXVK reads it from DXVK_CONFIG (DXVK_FRAME_RATE is gone,
-# checked in Proton 11 and GE-Proton 11), VKD3D-Proton from VKD3D_FRAME_RATE.
+# checked in Proton 11 and UMU-Proton 11), VKD3D-Proton from VKD3D_FRAME_RATE.
 FRAME_RATES = (30, 40, 45, 60, 90, 120, 144)
 _DXVK_FRAME_KEYS = ("dxgi.maxFrameRate", "d3d9.maxFrameRate")
 _DXVK_MANAGED = frozenset((*_DXVK_FRAME_KEYS, *(t.dxvk.split("=", 1)[0] for t in TOGGLES if t.dxvk)))
@@ -93,24 +97,16 @@ class Need:
     generations: tuple[str, ...] = ()
     proprietary_nvidia: bool = False
     min_nvidia: int = 0
-    ge_proton: bool = False  # GE-Proton / Proton-CachyOS variables; Valve's Proton ignores them
     hybrid: bool = False
     wayland: bool = False  # a Wayland or gamescope session
     legacy: bool = False  # no Proton reads it any more: hidden unless already on
 
 
 NEEDS: dict[str, Need] = {
-    "dlss_upgrade": Need(vendor="nvidia", generations=("rtx",), proprietary_nvidia=True, ge_proton=True),
     "descriptor_heap": Need(vendor="nvidia", proprietary_nvidia=True, min_nvidia=595),
     "disable_nvapi": Need(vendor="nvidia"),
-    "fsr3_upgrade": Need(ge_proton=True),
-    "fsr4_upgrade": Need(vendor="amd", generations=("rdna4",), ge_proton=True),
-    "xess_upgrade": Need(ge_proton=True),
     "vendor_amd": Need(vendor="intel"),
     "prime": Need(hybrid=True),
-    "wayland": Need(wayland=True, ge_proton=True),
-    "prefer_sdl": Need(ge_proton=True),
-    "no_ntsync": Need(ge_proton=True),
     **{key: Need(legacy=True) for key in LEGACY},
 }
 
@@ -118,8 +114,10 @@ OK, HIDE, OFF = "ok", "hide", "off"
 
 
 def proton_kind(name: str) -> str:
-    """"ge", "cachyos", "valve" or "" (unknown) from a compatibility tool name or id."""
+    """"umu", "ge", "cachyos", "valve" or "" (unknown) from a compatibility tool name or id."""
     low = name.lower()
+    if "umu-proton" in low:
+        return "umu"
     if "cachyos" in low:
         return "cachyos"
     if "ge-proton" in low or low.startswith("ge_") or "proton-ge" in low:
@@ -133,7 +131,7 @@ def availability(key: str, gpu: Any, profile: Any, proton: str = "") -> tuple[st
     """(OK, "") or (HIDE | OFF, reason) for a preset on the game's GPU (a hardware.Gpu) and Proton.
 
     Reasons: "need_nvidia_driver", "need_rtx", "need_rdna4", "need_nvidia_595",
-    "need_ge", "need_wayland". Unknown hardware or Proton never blocks.
+    "need_wayland". Unknown hardware or Proton never blocks.
     """
     need = NEEDS.get(key)
     if need is None:
@@ -151,8 +149,6 @@ def availability(key: str, gpu: Any, profile: Any, proton: str = "") -> tuple[st
             return OFF, f"need_{need.generations[0]}"
         if need.min_nvidia and profile is not None and 0 < profile.nvidia_major < need.min_nvidia:
             return OFF, "need_nvidia_595"
-    if need.ge_proton and proton == "valve":
-        return OFF, "need_ge"
     if need.wayland and profile is not None and profile.session == "x11":
         return OFF, "need_wayland"
     return OK, ""
@@ -161,27 +157,13 @@ def availability(key: str, gpu: Any, profile: Any, proton: str = "") -> tuple[st
 def recommend(profile: Any, proton: str = "", frame_rate: int = 0) -> dict[str, Any]:
     """The presets this computer benefits from, as changes to apply (never turns anything off).
 
-    Hybrid laptop: the game goes to the dedicated GPU. RTX: DLSS upgrade; AMD RDNA4: FSR 4;
-    Intel: newest XeSS. Each one only when `availability` allows it on the GPU the game will run
-    on. The frame cap is the user's choice (it depends on the screen and the battery), never here.
+    Hybrid laptop: the game goes to the dedicated GPU. Upscalers are OptiScaler's (per game), not a
+    preset. The frame cap is the user's choice (it depends on the screen and the battery), never here.
     """
     changes: dict[str, Any] = {}
     dedicated = profile.dedicated if profile is not None else None
     if dedicated is not None and not dedicated.integrated:
         changes["prime"] = True
-    gpu = profile.game_gpu(bool(changes.get("prime"))) if profile is not None else None
-
-    def want(key: str) -> None:
-        if availability(key, gpu, profile, proton)[0] == OK:
-            changes[key] = True
-
-    if gpu is not None:
-        if gpu.vendor == "nvidia" and gpu.generation == "rtx":
-            want("dlss_upgrade")
-        elif gpu.vendor == "amd" and gpu.generation == "rdna4":
-            want("fsr4_upgrade")
-        elif gpu.vendor == "intel":
-            want("xess_upgrade")
     return changes
 
 

@@ -19,8 +19,7 @@ from .runtime_manager import (
     get_steamrt4_dir,
     get_umu_run_path,
     is_steamrt4_valid,
-    list_ge_proton10_dirs,
-    list_ge_proton11_dirs,
+    list_default_proton_dirs,
 )
 from .steam_paths import SteamPaths, dir_size_bytes_many, find_proton_binary, find_steam_root
 from .steam_vdf import (
@@ -73,7 +72,7 @@ class MaintHealthWorker(QThread):
             else tr("maint.status_missing")
         )
 
-        from .runtime_manager import find_system_umu_run, list_cachyos_proton_dirs
+        from .runtime_manager import find_system_umu_run
 
         umu_path = find_system_umu_run() or get_umu_run_path()
         umu_status = (
@@ -82,9 +81,9 @@ class MaintHealthWorker(QThread):
             else missing_status
         )
 
-        ge_dirs = list_ge_proton11_dirs() or list_cachyos_proton_dirs() or list_ge_proton10_dirs()
+        proton_dirs = list_default_proton_dirs()
         proton_status = (
-            f"{len(ge_dirs)} ({ge_dirs[0].name})" if ge_dirs else missing_status
+            f"{len(proton_dirs)} ({proton_dirs[0].name})" if proton_dirs else missing_status
         )
 
         steamrt4_dir = get_steamrt4_dir()
@@ -181,7 +180,7 @@ class MaintHealthWorker(QThread):
             optiscaler_status = tr("runtimes.status_not_downloaded")
         steam_protons = [
             label for tool_id, label in (list_installed_protons(steam_root) if steam_root is not None else [])
-            if not tool_id.lower().startswith("ge-proton")
+            if not tool_id.lower().startswith(("ge-proton", "umu-proton"))
         ]
         tools = {
             name: shutil.which(name) is not None

@@ -1,9 +1,9 @@
 """Per-game Proton policy: "Default (newest)" or pinned, previous version, update and pruning.
 
 A game in "default" mode has an empty ``proton_name``: its launcher is written with the newest
-installed GE-Proton, and updating GE-Proton rewrites those launchers.  The version a game ran
+installed UMU-Proton, and updating UMU-Proton rewrites those launchers.  The version a game ran
 before a change is kept in ``meta["proton_previous"]`` so "Use previous version" is one click.
-Only the current and the previous GE-Proton are kept, unless a game is pinned to another one.
+Only the current and the previous UMU-Proton are kept, unless a game is pinned to another one.
 """
 
 from __future__ import annotations
@@ -32,13 +32,9 @@ PINNED = "pinned"
 DEFAULT_PROTON_ID = "__default__"
 
 
-def newest_ge_proton() -> Path | None:
-    """Return the newest installed GE-Proton (11+), CachyOS Proton, or GE-Proton10, or None."""
-    found = (
-        _rm.list_ge_proton11_dirs()
-        or _rm.list_cachyos_proton_dirs()
-        or _rm.list_ge_proton10_dirs()
-    )
+def newest_default_proton() -> Path | None:
+    """The Proton "Default" games use: the newest UMU-Proton (else a legacy GE/CachyOS on disk), or None."""
+    found = _rm.list_default_proton_dirs()
     return found[0] if found else None
 
 
@@ -52,7 +48,7 @@ def effective_proton_name(game: StandaloneGame) -> str:
         return ""
     if game.proton_name.strip():
         return game.proton_name.strip()
-    newest = newest_ge_proton()
+    newest = newest_default_proton()
     return newest.name if newest is not None else ""
 
 
@@ -122,8 +118,8 @@ def set_games_proton(game_dirs: Iterable[Path], tool_name: str) -> tuple[int, li
 
 
 def retarget_default_games(previous_name: str, games: Iterable[StandaloneGame] | None = None) -> int:
-    """After a GE-Proton change, rewrite the launchers of every "Default" game to match."""
-    newest = newest_ge_proton()
+    """After the default Proton changes, rewrite the launchers of every "Default" game to match."""
+    newest = newest_default_proton()
     moved = 0
     for game in games if games is not None else list_standalone_games():
         if not is_default(game):
@@ -146,10 +142,13 @@ def retarget_default_games(previous_name: str, games: Iterable[StandaloneGame] |
 
 
 def retarget_stale_default_games(games: Iterable[StandaloneGame] | None = None) -> int:
-    """Rewrite "Default" launchers whose baked PROTONPATH no longer exists (e.g. a system package upgrade)."""
-    newest = newest_ge_proton()
+    """Rewrite "Default" launchers whose baked PROTONPATH no longer exists (e.g. a system package upgrade),
+    or that still bake a legacy GE-Proton/CachyOS once a UMU-Proton is installed (it is the default now).
+    The legacy one is kept as the game's previous version, so going back is one click."""
+    newest = newest_default_proton()
     if newest is None:
         return 0
+    umu_default = _rm._parse_umu_proton_version(newest.name) is not None
     moved = 0
     for game in games if games is not None else list_standalone_games():
         if not is_default(game):
@@ -165,9 +164,14 @@ def retarget_stale_default_games(games: Iterable[StandaloneGame] | None = None) 
             baked = shlex.split(match.group(1))[0]
         except (ValueError, IndexError):
             continue
-        if baked == str(newest) or Path(baked).is_dir():
+        legacy = umu_default and _rm._parse_umu_proton_version(Path(baked).name) is None
+        if baked == str(newest) or (Path(baked).is_dir() and not legacy):
             continue
         try:
+            if legacy and Path(baked).is_dir():
+                game.meta["proton_previous"] = Path(baked).name
+                game.meta["proton_mode"] = DEFAULT
+                _write_manifest(game)
             refresh_integration_files(game)
             moved += 1
         except OSError as exc:

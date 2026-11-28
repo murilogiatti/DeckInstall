@@ -114,27 +114,23 @@ def test_presets_are_judged_for_the_game_gpu_and_its_proton() -> None:
     vega = Gpu("amd", "amdgpu", "0000:06:00.0", "Vega", True, True, "gcn", 512)
     rtx = Gpu("nvidia", "nvidia", "0000:01:00.0", "RTX 3050", False, False, "rtx")
     laptop = HardwareProfile("amd", "Ryzen 5 5600H with Radeon Graphics", "", (rtx, vega), "wayland", "595.99")
-    assert availability("fsr4_upgrade", vega, laptop, "ge") == (OFF, "need_rdna4")  # Vega is not RDNA 4
-    assert availability("dlss_upgrade", vega, laptop, "ge")[0] == HIDE  # an NVIDIA option on the AMD GPU
-    assert availability("dlss_upgrade", rtx, laptop, "ge") == (OK, "")
-    assert availability("dlss_upgrade", rtx, laptop, "valve") == (OFF, "need_ge")
     assert availability("descriptor_heap", rtx, laptop, "") == (OK, "")
+    assert availability("disable_nvapi", vega, laptop, "")[0] == HIDE  # an NVIDIA option on the AMD GPU
     assert availability("prime", vega, laptop, "") == (OK, "")
     old_driver = HardwareProfile("amd", "", "", (rtx, vega), "x11", "580.1")
     assert availability("descriptor_heap", rtx, old_driver, "") == (OFF, "need_nvidia_595")
-    assert availability("wayland", rtx, old_driver, "ge") == (OFF, "need_wayland")
-    assert availability("wayland", rtx, laptop, "valve") == (OFF, "need_ge")  # Valve's Proton has no switch
-    nouveau = Gpu("nvidia", "nouveau", "0000:01:00.0", "GTX 1060", False, True, "gtx")
-    assert availability("dlss_upgrade", nouveau, None, "ge") == (OFF, "need_nvidia_driver")
-    for gone in ("nvapi", "no_esync", "hdr", "fsr4_rdna3"):  # no Proton reads them any more
-        assert availability(gone, rtx, laptop, "ge")[0] == HIDE
+    # GE-Proton's variables (upscaler upgrades, Wayland, SDL, NTSYNC) and the old ones are legacy now:
+    # hidden unless a game still has one on.
+    for gone in ("nvapi", "no_esync", "hdr", "fsr4_rdna3", "dlss_upgrade", "fsr3_upgrade", "fsr4_upgrade",
+                 "xess_upgrade", "wayland", "prefer_sdl", "no_ntsync"):
+        assert availability(gone, rtx, laptop, "umu")[0] == HIDE
+    assert OFF == "off"
     deck = HardwareProfile("amd", "AMD Custom APU 0932", "Steam Deck", (vega,), "gamescope")
     assert availability("prime", vega, deck, "")[0] == HIDE  # one GPU: nothing to send elsewhere
     assert availability("vendor_amd", vega, deck, "")[0] == HIDE
-    assert availability("xess_upgrade", None, None, "") == (OK, "")  # unknown hardware never blocks
-    assert [proton_kind(n) for n in ("GE-Proton11-14", "proton-cachyos-11", "proton_experimental", "")] == [
-        "ge", "cachyos", "valve", ""
-    ]
+    assert availability("descriptor_heap", None, None, "") == (OK, "")  # unknown hardware never blocks
+    names = ("UMU-Proton-11.0-2e-x86_64", "GE-Proton11-14", "proton-cachyos-11", "proton_experimental", "")
+    assert [proton_kind(n) for n in names] == ["umu", "ge", "cachyos", "valve", ""]
 
 
 def test_recommended_for_this_pc() -> None:
@@ -144,15 +140,11 @@ def test_recommended_for_this_pc() -> None:
     vega = Gpu("amd", "amdgpu", "a", "Vega", True, True, "gcn", 512)
     rtx = Gpu("nvidia", "nvidia", "b", "RTX 3050", False, False, "rtx")
     laptop = HardwareProfile("amd", "", "", (rtx, vega), "wayland", "595.99")
-    assert recommend(laptop, "ge") == {"prime": True, "dlss_upgrade": True}  # NVAPI is on by default
-    assert recommend(laptop, "valve") == {"prime": True}  # DLSS upgrade needs GE-Proton
+    assert recommend(laptop, "umu") == {"prime": True}  # the dedicated GPU; upscalers are OptiScaler's
     deck_gpu = Gpu("amd", "amdgpu", "c", "Custom GPU 0405", True, True, "rdna2", 1024)
     deck = HardwareProfile("amd", "AMD Custom APU 0932", "Steam Deck", (deck_gpu,), "gamescope")
-    assert recommend(deck, "ge") == {}  # the frame cap is the user's choice, never recommended
-    rdna4 = HardwareProfile("amd", "", "", (Gpu("amd", "amdgpu", "d", "RX 9070", False, True, "rdna4", 16384),), "x11")
-    assert recommend(rdna4, "ge") == {"fsr4_upgrade": True}
+    assert recommend(deck, "umu") == {}  # the frame cap is the user's choice, never recommended
     arc = Gpu("intel", "xe", "0000:03:00.0", "Arc B580", False, True, "arc")
-    assert recommend(HardwareProfile("intel", "", "", (arc,), "wayland"), "cachyos") == {"xess_upgrade": True}
     assert [recommended_upscaler(g) for g in (rtx, arc, deck_gpu, None)] == ["dlss", "xess", "fsr3", "auto"]
 
 
@@ -178,22 +170,22 @@ def test_presets_window_follows_the_gpu_the_game_runs_on() -> None:
             return
         next(b for b in dlg.findChildren(QToolButton) if b.text() == tr("launch.more_options")).click()
         boxes = {c.text(): c for c in dlg.findChildren(QCheckBox)}
-        fsr4, dlss = boxes[tr("launch.fsr4_upgrade")], boxes[tr("launch.dlss_upgrade")]
+        nvapi_off, dlss = boxes[tr("launch.disable_nvapi")], boxes[tr("launch.dlss_upgrade")]
         gpu = dlg.findChild(QComboBox, "gameGpu")
-        seen["on_vega"] = (not fsr4.isHidden(), fsr4.isEnabled(), not dlss.isHidden())
+        seen["on_vega"] = (not nvapi_off.isHidden(), not dlss.isHidden())
         gpu.setCurrentIndex(gpu.findData(True))
-        seen["on_rtx"] = (not fsr4.isHidden(), not dlss.isHidden(), dlss.isEnabled())
+        seen["on_rtx"] = (not nvapi_off.isHidden(), nvapi_off.isEnabled(), not dlss.isHidden())
         dlg.reject()
 
     try:
         with mock.patch.object(lpd, "hardware", return_value=laptop):
             QTimer.singleShot(0, inspect)
             res = lpd.open_launch_presets_dialog(
-                mock.Mock(), "Game", "standalone", "", "", parent=parent, proton="ge"
+                mock.Mock(), "Game", "standalone", "", "", parent=parent, proton="umu"
             )
         assert res is None
-        assert seen["on_vega"] == (True, False, False)  # FSR 4: greyed with the reason; DLSS: not for AMD
-        assert seen["on_rtx"] == (False, True, True)  # sent to the RTX: DLSS appears, AMD options go
+        assert seen["on_vega"] == (False, False)  # an NVIDIA option on the AMD GPU; GE's DLSS upgrade: gone
+        assert seen["on_rtx"] == (True, True, False)  # sent to the RTX: the NVIDIA option appears
     finally:
         parent.deleteLater()
         app.processEvents()

@@ -2,7 +2,7 @@
 
 Steam mode: Steam runs the game (its own Proton, Steam Linux Runtime and performance overlay).
 DeckInstall installs/configures the game and adds the shortcut; it downloads no runtime for it.
-Standalone mode: DeckInstall runs the game itself with umu-run + GE-Proton (+ MangoHud), from its
+Standalone mode: DeckInstall runs the game itself with umu-run + UMU-Proton (+ MangoHud), from its
 Library, the app menu or a desktop shortcut. Steam is not needed.
 
 SteamOS always runs games through Steam, so it only offers Steam mode. Without Steam only
@@ -83,11 +83,11 @@ class ModeEnv:
     def component_note(self, component: str) -> str:
         """Why a runtime component is not needed on this system ("" when it is useful).
 
-        component: "ge_proton", "umu" or "mangohud" (what Standalone mode downloads).
+        component: "umu_proton", "umu" or "mangohud" (what Standalone mode downloads).
         """
         if not self.steamos:
             return ""
-        if component == "ge_proton":
+        if component == "umu_proton":
             return tr("runtimes.note_proton_steamos")
         if component == "umu":
             return tr("runtimes.note_umu_steamos")

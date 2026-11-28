@@ -228,11 +228,12 @@ def test_upscaler_upgrades_only_for_upscalers_the_game_ships(tmp_path: Path, mon
     def run(gpu: Gpu, upscalers: list[str]) -> rec.Found:
         ships[:] = upscalers
         monkeypatch.setattr(rec, "hardware", lambda: HardwareProfile("amd", "", "", (gpu,), "wayland"))
-        return rec.gather(rec.Target("Game", 1, tmp_path, "standalone", "ge", None, "", "", True, exe=exe))
+        return rec.gather(rec.Target("Game", 1, tmp_path, "standalone", "umu", None, "", "", True, exe=exe))
 
-    assert run(rtx, []).presets == {}  # no DLSS in the game: nothing to upgrade
-    assert run(rtx, ["DLSS"]).presets == {"dlss_upgrade": True}
-    assert run(deck, ["FSR"]).presets == {"fsr3_upgrade": True}  # FSR 3.1 runs on the Deck's GPU
+    # UMU-Proton has no upscaler upgrades: never a preset, whatever the game ships (OptiScaler instead).
+    assert run(rtx, []).presets == {}
+    assert run(rtx, ["DLSS"]).presets == {}
+    assert run(deck, ["FSR"]).presets == {}
     only_dlss = run(deck, ["DLSS"])
     assert only_dlss.presets == {} and only_dlss.suggest_optiscaler  # OptiScaler can give it FSR/XeSS
     assert not run(rtx, ["DLSS"]).suggest_optiscaler

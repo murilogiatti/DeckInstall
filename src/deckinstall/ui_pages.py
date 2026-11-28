@@ -51,6 +51,7 @@ from .ui_cards import (
     note_label,
     page_layout,
     section_card,
+    section_page,
     shortcut_check,
     shortcut_target_button,
 )
@@ -696,7 +697,7 @@ def build_settings_page(win: MainWindow) -> QWidget:
     from .ui import DEFAULT_FPS_KEY  # ui imports this module
     from .ui_scale import SCALE_KEY
 
-    page, layout = page_layout(tr("settings.section_general"), tr("settings.page_subtitle"))
+    page, layout = section_page()
 
     win.theme_combo = QComboBox()
     win.theme_combo.addItem(tr("header.theme.auto"), "auto")

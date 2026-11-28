@@ -88,15 +88,15 @@ def test_update_all_skips_what_steamos_does_not_use(monkeypatch: pytest.MonkeyPa
     from deckinstall.modes import ModeEnv
 
     monkeypatch.setattr(ui, "get_umu_run_path", lambda: Path("/nonexistent/umu-run"))
-    monkeypatch.setattr(ui, "list_ge_proton11_dirs", lambda: [Path("/x/GE-Proton11-1")])
+    monkeypatch.setattr(ui, "list_default_proton_dirs", lambda: [Path("/x/UMU-Proton-11.0-1")])
     monkeypatch.setattr(ui, "official_mangohud_installed", lambda: True)
     monkeypatch.setattr(ui, "optiscaler_downloaded", lambda: True)
     win = Mock(mode_env=ModeEnv(steamos=True, steam=True))
     assert ui.MainWindow._runtime_components_for_update_all(win) == ("optiscaler",)
     win = Mock(mode_env=ModeEnv(steamos=False, steam=True))
-    assert ui.MainWindow._runtime_components_for_update_all(win) == ("ge_proton", "mangohud", "optiscaler")
+    assert ui.MainWindow._runtime_components_for_update_all(win) == ("umu_proton", "mangohud", "optiscaler")
     win = Mock(mode_env=ModeEnv(steamos=False, steam=False))
-    assert ui.MainWindow._runtime_components_for_update_all(win)[:2] == ("umu", "ge_proton")
+    assert ui.MainWindow._runtime_components_for_update_all(win)[:2] == ("umu", "umu_proton")
 
 
 def test_managed_windows_shortcut_pointing_to_launch_script_is_listed(
@@ -116,7 +116,7 @@ def test_managed_windows_shortcut_pointing_to_launch_script_is_listed(
     monkeypatch.setattr(proton_bulk_dialog, "load_shortcuts", lambda _: [shortcut, other])
     monkeypatch.setattr(proton_bulk_dialog, "get_compat_tool_map", lambda _: {appid: "GE-Proton11"})
     monkeypatch.setattr(proton_bulk_dialog, "orphan_shortcut_mappings", lambda _: [])
-    monkeypatch.setattr(proton_bulk_dialog, "newest_ge_proton", lambda: None)
+    monkeypatch.setattr(proton_bulk_dialog, "newest_default_proton", lambda: None)
 
     rows, _, _ = proton_bulk_dialog.collect_rows(paths)
 

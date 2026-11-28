@@ -29,7 +29,7 @@ def _app_info(**kw: object) -> SimpleNamespace:
 def _runtime_data() -> dict:
     return {
         "umu": {"installed": "1.4.3", "latest": "1.4.4", "update_available": True},
-        "ge_proton": {"installed": "GE-Proton11-14", "latest": "GE-Proton11-14", "update_available": False},
+        "umu_proton": {"installed": "GE-Proton11-14", "latest": "GE-Proton11-14", "update_available": False},
     }
 
 
@@ -38,10 +38,10 @@ def test_check_all_merges_every_component_in_display_order(monkeypatch: pytest.M
     monkeypatch.setattr(rm, "check_runtime_updates", lambda force=False: _runtime_data())
     monkeypatch.setattr(rm, "optiscaler_versions", lambda force=False: ("v0.9.4", "v0.9.5"))
     monkeypatch.setattr(rm, "mangohud_versions", lambda force=False: ("v0.8.4", "v0.8.4"))
-    res = updates.check_all(("mangohud", "umu", "ge_proton", "optiscaler"))
-    assert list(res) == ["app", "ge_proton", "umu", "optiscaler", "mangohud"]
+    res = updates.check_all(("mangohud", "umu", "umu_proton", "optiscaler"))
+    assert list(res) == ["app", "umu_proton", "umu", "optiscaler", "mangohud"]
     assert updates.pending(res) == ["app", "umu", "optiscaler"]
-    assert res["ge_proton"]["update"] is False and res["mangohud"]["update"] is False
+    assert res["umu_proton"]["update"] is False and res["mangohud"]["update"] is False
     assert res["app"]["info"].latest_version == "0.28.0"
 
 
@@ -67,7 +67,7 @@ def test_app_update_that_cannot_apply_here_is_shown_with_its_reason(monkeypatch:
 
 
 def test_missing_runtime_needed_by_standalone_mode_counts_as_install(monkeypatch: pytest.MonkeyPatch) -> None:
-    data = {"umu": {"installed": None, "latest": "1.4.4", "update_available": False}, "ge_proton": {}}
+    data = {"umu": {"installed": None, "latest": "1.4.4", "update_available": False}, "umu_proton": {}}
     monkeypatch.setattr(updates, "check_app_update", lambda **_k: _app_info(has_update=False))
     monkeypatch.setattr(rm, "check_runtime_updates", lambda force=False: data)
     res = updates.check_all(("umu",))
@@ -194,10 +194,10 @@ def test_card_rows_badge_and_banner_follow_the_check(monkeypatch: pytest.MonkeyP
     app = QApplication.instance() or QApplication([])
     results = {
         "app": {**updates._entry("0.27.1", "0.28.0", True), "info": _app_info()},
-        "ge_proton": updates._entry("GE-Proton11-14", "GE-Proton11-14", False),
+        "umu_proton": updates._entry("GE-Proton11-14", "GE-Proton11-14", False),
         "umu": updates._entry("1.4.3", "1.4.4", True),
     }
-    monkeypatch.setattr(ui_updates, "_runtimes_in_use", lambda win: ("umu", "ge_proton"))
+    monkeypatch.setattr(ui_updates, "_runtimes_in_use", lambda win: ("umu", "umu_proton"))
     monkeypatch.setattr(ui_updates, "UpdatesCheckWorker", lambda runtimes: _FakeWorker(results))
     with tempfile.TemporaryDirectory() as tmp:
         win = _window(app, tmp)
@@ -208,7 +208,7 @@ def test_card_rows_badge_and_banner_follow_the_check(monkeypatch: pytest.MonkeyP
             assert win._section_buttons[ui.PAGE_RUNTIMES].text().endswith("(2)")
             assert win.btn_update_runtimes.isEnabled() and win.btn_update_runtimes.text().endswith("(2)")
             boxes = {c: w for c, w in win._update_checks.items() if isinstance(w, QCheckBox)}
-            assert boxes["app"].isChecked() and not boxes["ge_proton"].isEnabled()
+            assert boxes["app"].isChecked() and not boxes["umu_proton"].isEnabled()
             assert not win.message_bar.isHidden() and "DeckInstall" in win.message_bar.text()
             assert not win.btn_updates_check.isEnabled()  # a minute before asking GitHub again
             boxes["app"].setChecked(False)

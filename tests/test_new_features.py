@@ -16,7 +16,7 @@ from deckinstall.cleanup import delete_cleanup_candidates_checked, find_cleanup_
 from deckinstall.runtime_manager import (
     get_umu_protonfix_status,
     lookup_umu_database,
-    validate_ge_proton_integrity,
+    validate_proton_integrity,
 )
 from deckinstall.save_sync import (
     _extract_registry_saves,
@@ -112,8 +112,8 @@ class TestNewFeatures(unittest.TestCase):
             self.assertFalse(missing_status["found"])
             self.assertFalse(missing_status["has_protonfix"])
 
-    # 2. validate_ge_proton_integrity
-    def test_validate_ge_proton_integrity(self) -> None:
+    # 2. validate_proton_integrity
+    def test_validate_proton_integrity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             valid_dir = tmp_path / "GE-Proton9-10"
@@ -121,7 +121,7 @@ class TestNewFeatures(unittest.TestCase):
             for rel in ("proton", "compatibilitytool.vdf", "toolmanifest.vdf", "files/bin/wine"):
                 (valid_dir / rel).write_bytes(b"ok")
 
-            ok_report = validate_ge_proton_integrity(valid_dir)
+            ok_report = validate_proton_integrity(valid_dir)
             self.assertTrue(ok_report.valid)
             self.assertEqual(ok_report.missing_files, ())
             self.assertEqual(ok_report.broken_symlinks, ())
@@ -135,7 +135,7 @@ class TestNewFeatures(unittest.TestCase):
             (broken_dir / "files" / "bin" / "wine").write_bytes(b"ok")
             (broken_dir / "files" / "bin" / "broken_tool").symlink_to(tmp_path / "does_not_exist")
 
-            bad_report = validate_ge_proton_integrity(broken_dir)
+            bad_report = validate_proton_integrity(broken_dir)
             self.assertFalse(bad_report.valid)
             self.assertIn("proton", bad_report.missing_files)
             self.assertIn("toolmanifest.vdf", bad_report.missing_files)
@@ -143,7 +143,7 @@ class TestNewFeatures(unittest.TestCase):
             self.assertIsNotNone(bad_report.error)
 
             # Missing directory
-            missing_report = validate_ge_proton_integrity(tmp_path / "nonexistent")
+            missing_report = validate_proton_integrity(tmp_path / "nonexistent")
             self.assertFalse(missing_report.valid)
             self.assertEqual(missing_report.error, "Proton directory does not exist.")
 

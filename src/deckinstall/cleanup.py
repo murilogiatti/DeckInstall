@@ -803,7 +803,7 @@ def _find_orphan_desktop_files(ctx: _ScanContext) -> Iterator[_Found]:
 def _find_old_compat_tools(ctx: _ScanContext) -> Iterator[_Found]:
     """Find superseded compatibility tools that have no current or rollback reference."""
     from .library import list_unavailable_games
-    from .proton_policy import newest_ge_proton
+    from .proton_policy import newest_default_proton
     from .runtime_manager import superseded_managed_compat_tools
     from .steam_paths import find_steam_root
 
@@ -818,7 +818,7 @@ def _find_old_compat_tools(ctx: _ScanContext) -> Iterator[_Found]:
     # Retain mappings for disconnected Steam libraries as well as the games
     # currently visible. AppID 0 describes Steam's default compatibility tool.
     protected = ctx.active_tools | set(mappings.values())
-    current = newest_ge_proton()
+    current = newest_default_proton()
     for child in superseded_managed_compat_tools():
         if current is not None and child.name == current.name:
             continue

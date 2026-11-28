@@ -1,8 +1,8 @@
-"""Uninstall the runtimes DeckInstall downloaded: umu-run, Steam Runtime 4, GE-Proton, MangoHud, OptiScaler.
+"""Uninstall the runtimes DeckInstall downloaded: umu-run, Steam Runtime 4, Proton, MangoHud, OptiScaler.
 
 Each item can be removed on its own or all together. Nothing here is needed to keep games and
 saves: "Update runtimes" (or the next launch) downloads what is missing again. Removing the
-GE-Proton that "Default" games use moves them to the newest one left.
+Proton that "Default" games use moves them to the newest one left.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from .steam_paths import SteamPaths, dir_size_bytes
 if TYPE_CHECKING:
     from .standalone import StandaloneGame
 
-UMU, STEAMRT4, MANGOHUD, OPTISCALER, GE = "umu", "steamrt4", "mangohud", "optiscaler", "ge"
+UMU, STEAMRT4, MANGOHUD, OPTISCALER, PROTON = "umu", "steamrt4", "mangohud", "optiscaler", "proton"
 
 
 @dataclass(frozen=True)
@@ -118,8 +118,8 @@ def list_runtimes(paths: SteamPaths | None = None) -> list[RuntimeItem]:
                     managed_tools.append(entry)
         except OSError:
             managed_tools = []
-    ge_order = {p: idx for idx, p in enumerate(rm.list_ge_proton_dirs(min_major=1))}
-    managed_tools.sort(key=lambda p: (0 if p in ge_order else 1, ge_order.get(p, 0), p.name.lower()))
+    order = {p: idx for idx, p in enumerate([*rm.list_umu_proton_dirs(), *rm.list_ge_proton_dirs(min_major=1)])}
+    managed_tools.sort(key=lambda p: (0 if p in order else 1, order.get(p, 0), p.name.lower()))
     for path in managed_tools:
         tool_users = list(users.get(path.name, ()))
         vdf_file = path / "compatibilitytool.vdf"
@@ -134,18 +134,18 @@ def list_runtimes(paths: SteamPaths | None = None) -> list[RuntimeItem]:
                             tool_users.append(u_name)
             except OSError:
                 pass
-        items.append(RuntimeItem(GE, path.name, path, dir_size_bytes(path), tuple(tool_users)))
+        items.append(RuntimeItem(PROTON, path.name, path, dir_size_bytes(path), tuple(tool_users)))
     return items
 
 
 def uninstall(items: list[RuntimeItem]) -> tuple[list[str], list[str]]:
     """Remove the items. Returns (removed names, errors)."""
-    from .proton_policy import is_default, newest_ge_proton, retarget_default_games
+    from .proton_policy import is_default, newest_default_proton, retarget_default_games
     from .standalone import list_standalone_games
 
     removed: list[str] = []
     errors: list[str] = []
-    newest_before = newest_ge_proton()
+    newest_before = newest_default_proton()
     for item in items:
         try:
             if item.kind == UMU:
@@ -156,7 +156,7 @@ def uninstall(items: list[RuntimeItem]) -> tuple[list[str], list[str]]:
                 changed = rm.uninstall_mangohud()
             elif item.kind == OPTISCALER:
                 changed = rm.uninstall_optiscaler_package()
-            elif item.kind == GE and rm.is_managed_compat_tool(item.path):
+            elif item.kind == PROTON and rm.is_managed_compat_tool(item.path):
                 from .i18n import tr
                 from .steam_paths import _read_compat_tool_id
 
@@ -174,7 +174,7 @@ def uninstall(items: list[RuntimeItem]) -> tuple[list[str], list[str]]:
                 removed.append(item.name)
         except (OSError, ValueError) as exc:
             errors.append(f"{item.name}: {exc}")
-    newest_after = newest_ge_proton()
+    newest_after = newest_default_proton()
     if newest_before is not None and (newest_after is None or newest_after.name != newest_before.name):
         # "Default" games pointed at the removed newest version: rewrite them to match what remains.
         retarget_default_games("")

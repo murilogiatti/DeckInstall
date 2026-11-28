@@ -204,6 +204,7 @@ def _runtimes() -> list[dict[str, str]]:
         find_system_umu_run,
         get_umu_run_path,
         list_ge_proton_dirs,
+        list_umu_proton_dirs,
         official_mangohud_installed,
         optiscaler_downloaded,
         system_mangohud_installed,
@@ -211,11 +212,13 @@ def _runtimes() -> list[dict[str, str]]:
 
     umu = get_umu_run_path()
     umu_detail = str(umu) if umu.is_file() else (str(find_system_umu_run() or "") or "not installed")
-    ge = [p.name for p in list_ge_proton_dirs(min_major=1)]
+    umu_proton = [p.name for p in list_umu_proton_dirs()]
+    legacy = [p.name for p in list_ge_proton_dirs(min_major=1)]
     mango = "official" if official_mangohud_installed() else ("system" if system_mangohud_installed() else "none")
     return [
         _check("umu-run", INFO, umu_detail),
-        _check("ge-proton", INFO, ", ".join(ge) or "none"),
+        _check("umu-proton", INFO, ", ".join(umu_proton) or "none"),
+        *([_check("ge-proton (legacy)", INFO, ", ".join(legacy))] if legacy else []),
         _check("mangohud", INFO, mango),
         _check("optiscaler", INFO, "downloaded" if optiscaler_downloaded() else "not downloaded"),
     ]

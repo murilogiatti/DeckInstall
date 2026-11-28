@@ -183,7 +183,7 @@ def test_bulk_proton_steamos_defaults_no_download_confirm_and_single_row_update(
 
     with (
         mock.patch.object(pbd, "_dialog_parent", return_value=None),
-        mock.patch.object(pbd, "ensure_newest_ge_proton") as m_dl,
+        mock.patch.object(pbd, "ensure_newest_default_proton") as m_dl,
         mock.patch.object(steam_vdf, "is_steam_running", return_value=False),
         mock.patch("deckinstall.ui_workers.is_steam_running", return_value=False),
         mock.patch.object(QMessageBox, "information"),
@@ -196,7 +196,7 @@ def test_bulk_proton_steamos_defaults_no_download_confirm_and_single_row_update(
             assert dlg.tbl.item(1, 0).checkState() == Qt.CheckState.Unchecked  # type: ignore[attr-defined]
 
             # Switching to Download GE on SteamOS asks confirmation with default No -> No skips download.
-            dl_idx = dlg.cmb_target.findData(pbd.DOWNLOAD_NEWEST_GE_ID)  # type: ignore[attr-defined]
+            dl_idx = dlg.cmb_target.findData(pbd.DOWNLOAD_NEWEST_PROTON_ID)  # type: ignore[attr-defined]
             assert dl_idx >= 0
             dlg.cmb_target.setCurrentIndex(dl_idx)  # type: ignore[attr-defined]
             app.processEvents()
@@ -238,13 +238,13 @@ def test_bulk_proton_steamos_defaults_no_download_confirm_and_single_row_update(
     reloaded = {g.name: g for g in standalone.list_standalone_games()}
     assert reloaded[game_b.name].proton_name == ""
 
-    # ensure_newest_ge_proton(retarget_defaults=False) does not invoke global retargeting.
+    # ensure_newest_default_proton(retarget_defaults=False) does not invoke global retargeting.
     _make_tool("GE-Proton11-1")
     with (
-        mock.patch.object(pbd, "check_runtime_updates", return_value={"ge_proton": {"update_available": False, "installed": True}}),
+        mock.patch.object(pbd, "check_runtime_updates", return_value={"umu_proton": {"update_available": False, "installed": True}}),
         mock.patch.object(pbd, "retarget_default_games") as m_retarget,
     ):
-        assert pbd.ensure_newest_ge_proton(retarget_defaults=False) == "GE-Proton11-1"
+        assert pbd.ensure_newest_default_proton(retarget_defaults=False) == "GE-Proton11-1"
         m_retarget.assert_not_called()
 
 
@@ -270,7 +270,7 @@ def test_standalone_install_worker_steam_only_skips_downloads_and_keeps_default_
     worker.finished_ok.connect(lambda g, _b: done_games.append(g))
     with (
         mock.patch.object(ui_workers, "ensure_umu_run") as m_umu,
-        mock.patch.object(ui_workers, "ensure_ge_proton11") as m_ge,
+        mock.patch.object(ui_workers, "ensure_umu_proton") as m_ge,
         mock.patch.object(standalone, "resolve_game_icon", return_value=None),
     ):
         worker.run()
@@ -392,7 +392,7 @@ def test_retarget_without_ge_and_repair_backup(
     for n in ("GE-Proton11-2", "GE-Proton11-3"):
         _make_tool(n, managed=True)
 
-    # Retarget with newest_ge_proton() == None still clears dead PROTONPATH from launch.sh.
+    # Retarget with newest_default_proton() == None still clears dead PROTONPATH from launch.sh.
     game = _install_game(tmp_path, "LaunchRefresh", proton_name="")
     game.launch_script.write_text("export PROTONPATH='/gone/GE-Proton11-3'\n", encoding="utf-8")
     for d in list(rm.get_compat_tools_dir().iterdir()):
@@ -400,20 +400,20 @@ def test_retarget_without_ge_and_repair_backup(
             import shutil
 
             shutil.rmtree(d)
-    assert proton_policy.newest_ge_proton() is None
+    assert proton_policy.newest_default_proton() is None
     assert proton_policy.retarget_default_games("") == 1
     assert "/gone/GE-Proton11-3" not in game.launch_script.read_text(encoding="utf-8")
 
-    # repair_ge_proton preserves existing folder if replacement fails.
+    # repair_managed_proton preserves existing folder if replacement fails.
     broken = _make_tool("GE-Proton11-9", managed=True)
     marker = broken / "keep-on-fail.txt"
     marker.write_text("precious", encoding="utf-8")
     with (
         mock.patch.object(rm, "fetch_available_proton_releases", side_effect=RuntimeError("offline")),
-        mock.patch.object(rm, "ensure_ge_proton11", side_effect=RuntimeError("offline")),
+        mock.patch.object(rm, "ensure_umu_proton", side_effect=RuntimeError("offline")),
         pytest.raises(RuntimeError, match="offline"),
     ):
-        rm.repair_ge_proton(broken)
+        rm.repair_managed_proton(broken)
     assert marker.is_file()
 
 
@@ -447,7 +447,7 @@ def test_runtime_update_isolates_optiscaler_and_maint_health_counts_external_lib
             "check_runtime_updates",
             return_value={
                 "umu": {"installed": "0.1", "latest": "0.1", "update_available": False, "installed_path": str(umu_dir / "umu-run")},
-                "ge_proton": {"installed": "GE-Proton11-2", "latest": "GE-Proton11-2", "update_available": False, "installed_path": str(ge)},
+                "umu_proton": {"installed": "GE-Proton11-2", "latest": "GE-Proton11-2", "update_available": False, "installed_path": str(ge)},
             },
         ),
         mock.patch.object(ui_workers, "ensure_optiscaler", side_effect=RuntimeError("opti github 503")),

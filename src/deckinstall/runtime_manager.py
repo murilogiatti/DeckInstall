@@ -1,4 +1,4 @@
-"""Portable umu-launcher and GE-Proton11+ runtime manager."""
+"""Portable umu-launcher and UMU-Proton runtime manager."""
 
 from __future__ import annotations
 
@@ -50,11 +50,12 @@ if TYPE_CHECKING:
 UMU_RELEASES_LATEST_URL = (
     "https://api.github.com/repos/Open-Wine-Components/umu-launcher/releases/latest"
 )
-GE_PROTON_RELEASES_LATEST_URL = (
-    "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest"
+# UMU-Proton (Open Wine Components): Valve's Proton with umu's protonfixes, the default Proton.
+UMU_PROTON_RELEASES_LATEST_URL = (
+    "https://api.github.com/repos/Open-Wine-Components/umu-proton/releases/latest"
 )
-GE_PROTON_RELEASES_URL = (
-    "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases"
+UMU_PROTON_RELEASES_URL = (
+    "https://api.github.com/repos/Open-Wine-Components/umu-proton/releases"
 )
 OPTISCALER_RELEASES_API = (
     "https://api.github.com/repos/optiscaler/OptiScaler/releases/latest"
@@ -65,7 +66,10 @@ MANGOHUD_RELEASES_API = (
 
 UPDATE_CACHE_TTL_SECONDS = 24 * 60 * 60
 USER_AGENT = f"DeckInstall/{__version__}"
+# GE-Proton is no longer downloaded; copies already installed are still found so games keep running.
 _GE_PROTON_TAG_RE = re.compile(r"^GE-Proton(\d+)([A-Za-z0-9._-]*)$")
+# Release tags ("UMU-Proton-11.0-2e") and folders (umu-run adds the arch: "UMU-Proton-11.0-2e-x86_64").
+_UMU_PROTON_TAG_RE = re.compile(r"^UMU-Proton-(\d+)\.(\d+)-(\d+)([A-Za-z]*)(?:-(?:x86_64|aarch64))?$")
 _WINETRICKS_VERB_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _ALLOWED_URL_HOSTS = frozenset(
     {
@@ -163,7 +167,7 @@ class InstalledCompatTool:
 
 @dataclass(frozen=True)
 class ProtonIntegrityReport:
-    """Integrity verification result for an installed GE-Proton directory."""
+    """Integrity verification result for an installed Proton directory."""
 
     proton_dir: Path
     valid: bool
@@ -185,10 +189,10 @@ class UmuDbLookupResult:
 
 
 PROTON_FAMILIES: dict[str, ProtonFamily] = {
-    "ge-proton": ProtonFamily(
-        id="ge-proton",
-        label="GE-Proton (GloriousEggroll)",
-        repo="GloriousEggroll/proton-ge-custom",
+    "umu-proton": ProtonFamily(
+        id="umu-proton",
+        label="UMU-Proton (Open Wine Components)",
+        repo="Open-Wine-Components/umu-proton",
     ),
     "cachyos-proton": ProtonFamily(
         id="cachyos-proton",
@@ -317,7 +321,7 @@ def get_user_vulkan_layer_dir() -> Path:
 
 
 _MANGOHUD_LAYERS = (("MangoHud.x86_64.json", "lib64"), ("MangoHud.x86.json", "lib32"))
-_GE_MANAGED_MARKER = ".deckinstall-managed"
+_MANAGED_MARKER = ".deckinstall-managed"
 
 
 def official_mangohud_installed() -> bool:
@@ -618,7 +622,7 @@ def _is_writable_dir_candidate(path: Path) -> bool:
 
 
 def get_compat_tools_dir() -> Path:
-    """Return the Steam compatibilitytools.d directory for GE-Proton."""
+    """Return the Steam compatibilitytools.d directory DeckInstall installs Proton into."""
     for extra_dir in _iter_extra_compat_tool_dirs():
         if _is_writable_dir_candidate(extra_dir):
             return extra_dir
@@ -744,7 +748,7 @@ def _get_arch() -> str:
 def _parse_ge_proton_version(
     name: str, min_major: int = 11, max_major: int | None = None
 ) -> tuple[int, ...] | None:
-    """Parse GE-Proton folder/tag names within [min_major, max_major]."""
+    """Parse legacy GE-Proton folder names within [min_major, max_major]."""
     match = _GE_PROTON_TAG_RE.match(name)
     if not match:
         return None
@@ -760,7 +764,7 @@ def _parse_ge_proton_version(
 def list_ge_proton_dirs(
     min_major: int = 11, max_major: int | None = None
 ) -> list[Path]:
-    """List installed GE-Proton directories within [min_major, max_major] sorted newest first."""
+    """List GE-Proton directories already installed (legacy) within [min_major, max_major], newest first."""
     candidate_dirs = _all_compat_tool_dirs()
 
     seen_dirs: set[Path] = set()
@@ -804,7 +808,7 @@ def list_ge_proton_dirs(
 
 def is_managed_compat_tool(path: Path) -> bool:
     """True for any compatibility tool directory recorded as installed by this app."""
-    marker = path / _GE_MANAGED_MARKER
+    marker = path / _MANAGED_MARKER
     try:
         return (
             path.is_dir()
@@ -824,11 +828,15 @@ def is_managed_ge_proton(path: Path) -> bool:
 
 def superseded_managed_compat_tools() -> list[Path]:
     """Return older owned releases, preserving the newest installed build of each variant."""
+    umu = list_umu_proton_dirs()
     ge = list_ge_proton_dirs(min_major=1)
-    superseded = [path for path in ge[1:] if is_managed_ge_proton(path)]
+    # GE-Proton is legacy once a UMU-Proton is there: every copy DeckInstall installed can go
+    # (Cleanup still keeps the ones a game uses).
+    superseded = [path for path in (ge if umu else ge[1:]) if is_managed_ge_proton(path)]
+    superseded += [path for path in umu[1:] if is_managed_compat_tool(path)]
     other_families = {
         name.lower(): family.id
-        for family in PROTON_FAMILIES.values() if family.id != "ge-proton"
+        for family in PROTON_FAMILIES.values() if family.id != "umu-proton"
         for name in (family.id, family.repo.rsplit("/", 1)[-1])
     }
     root = get_compat_tools_dir()
@@ -901,6 +909,56 @@ def list_cachyos_proton_dirs() -> list[Path]:
 def list_ge_proton10_dirs() -> list[Path]:
     """List installed GE-Proton10 directories sorted newest first."""
     return list_ge_proton_dirs(min_major=10, max_major=10)
+
+
+def _parse_umu_proton_version(name: str) -> tuple[int, int, int, str] | None:
+    """(major, minor, build, suffix) of a UMU-Proton tag or folder name, else None."""
+    match = _UMU_PROTON_TAG_RE.match(name)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3)), match.group(4).lower()
+
+
+def umu_proton_release_name(name: str) -> str:
+    """The release tag of a UMU-Proton folder ("UMU-Proton-11.0-2e-x86_64" -> "UMU-Proton-11.0-2e")."""
+    return re.sub(r"-(?:x86_64|aarch64)$", "", name)
+
+
+def list_umu_proton_dirs() -> list[Path]:
+    """Installed UMU-Proton directories (DeckInstall's or umu-run's), newest first."""
+    seen: set[Path] = set()
+    found: list[tuple[tuple[int, int, int, str], Path]] = []
+    for compat_dir in _all_compat_tool_dirs():
+        try:
+            entries = list(compat_dir.iterdir()) if compat_dir.is_dir() else []
+        except OSError:
+            continue
+        for entry in entries:
+            version = _parse_umu_proton_version(entry.name)
+            if version is None:
+                continue
+            try:
+                if not entry.is_dir() or not (entry / "proton").is_file():
+                    continue
+                resolved = entry.resolve()
+            except OSError:
+                continue
+            if resolved not in seen:
+                seen.add(resolved)
+                found.append((version, entry))
+    found.sort(key=lambda item: item[0], reverse=True)
+    return [entry for _, entry in found]
+
+
+def list_default_proton_dirs() -> list[Path]:
+    """The Proton a "Default" game runs on, newest first: UMU-Proton; while none is installed, a
+    GE-Proton 11 or CachyOS Proton already on disk (then GE-Proton 10), so older games keep running."""
+    return (
+        list_umu_proton_dirs()
+        or list_ge_proton11_dirs()
+        or list_cachyos_proton_dirs()
+        or list_ge_proton10_dirs()
+    )
 
 
 @contextlib.contextmanager
@@ -1232,23 +1290,23 @@ def _safe_extract_tar(tar_path: Path, dest_dir: Path) -> None:
                     tf.extract(member, dest_dir)
 
 
-def _fetch_latest_ge_proton11_release() -> dict[str, Any]:
-    latest = _fetch_json(GE_PROTON_RELEASES_LATEST_URL)
-    if isinstance(latest, dict):
+def _fetch_latest_umu_proton_release() -> dict[str, Any]:
+    latest = _fetch_json(UMU_PROTON_RELEASES_LATEST_URL)
+    if isinstance(latest, dict) and not latest.get("prerelease"):
         tag = str(latest.get("tag_name", ""))
-        if _parse_ge_proton_version(tag) is not None:
+        if _parse_umu_proton_version(tag) is not None:
             return latest
 
-    releases = _fetch_json(GE_PROTON_RELEASES_URL)
+    releases = _fetch_json(UMU_PROTON_RELEASES_URL)
     if not isinstance(releases, list):
-        raise RuntimeError("Unexpected GitHub releases response for GE-Proton.")
+        raise RuntimeError("Unexpected GitHub releases response for UMU-Proton.")
     for rel in releases:
-        if not isinstance(rel, dict) or rel.get("draft"):
+        if not isinstance(rel, dict) or rel.get("draft") or rel.get("prerelease"):
             continue
         tag = str(rel.get("tag_name", ""))
-        if _parse_ge_proton_version(tag) is not None:
+        if _parse_umu_proton_version(tag) is not None:
             return rel
-    raise RuntimeError("No GE-Proton11+ release found on GitHub.")
+    raise RuntimeError("No UMU-Proton release found on GitHub.")
 
 
 def _find_release_asset(release: dict[str, Any], name: str) -> dict[str, Any] | None:
@@ -1708,8 +1766,8 @@ def _is_nonempty_file(path: Path) -> bool:
         return False
 
 
-def validate_ge_proton_integrity(proton_dir: Path) -> ProtonIntegrityReport:
-    """Validate an installed GE-Proton directory for required files and broken symlinks."""
+def validate_proton_integrity(proton_dir: Path) -> ProtonIntegrityReport:
+    """Validate an installed Proton directory for required files and broken symlinks."""
     if proton_dir.is_symlink():
         return ProtonIntegrityReport(
             proton_dir=proton_dir,
@@ -1769,101 +1827,87 @@ def validate_ge_proton_integrity(proton_dir: Path) -> ProtonIntegrityReport:
 
 
 @_serialize_runtime("compat-tools")
-def repair_ge_proton(
+def repair_managed_proton(
     proton_dir: Path,
     progress_cb: ProgressCallback | None = None,
 ) -> Path:
-    """Replace a managed GE-Proton after its replacement has been downloaded and validated."""
+    """Replace a broken Proton DeckInstall installed, after the new copy is downloaded and checked."""
     if not is_managed_compat_tool(proton_dir):
         raise ValueError(f"Refusing to repair a compatibility tool installed outside DeckInstall: {proton_dir}")
-    _emit_progress(progress_cb, f"Replacing broken GE-Proton directory {proton_dir.name}...", 0)
-    tag = proton_dir.name
-    if _parse_ge_proton_version(tag, min_major=1) is not None:
+    _emit_progress(progress_cb, f"Replacing broken Proton directory {proton_dir.name}...", 0)
+    tag = umu_proton_release_name(proton_dir.name)
+    if _parse_umu_proton_version(tag) is not None:
         try:
-            releases = fetch_available_proton_releases("ge-proton", limit=50)
-            for rel in releases:
+            for rel in fetch_available_proton_releases("umu-proton", limit=50):
                 if rel.tag_name == tag:
                     return install_compat_tool(rel, progress_cb=progress_cb)
         except Exception:
-            logging.warning("Could not reinstall %s; trying the latest GE-Proton", tag, exc_info=True)
-    return ensure_ge_proton11(force_update=True, progress_cb=progress_cb)
+            logging.warning("Could not reinstall %s; trying the latest UMU-Proton", tag, exc_info=True)
+    return ensure_umu_proton(force_update=True, progress_cb=progress_cb)
 
 
 @_serialize_runtime("compat-tools")
-def ensure_ge_proton11(
+def ensure_umu_proton(
     force_update: bool = False,
     progress_cb: ProgressCallback | None = None,
     verify_integrity: bool = True,
 ) -> Path:
-    """Ensure a GE-Proton11+ directory is installed in Steam compatibilitytools.d."""
-    existing = list_ge_proton11_dirs()
+    """Ensure a UMU-Proton is installed in Steam's compatibilitytools.d (downloaded with its SHA-512)."""
+    existing = list_umu_proton_dirs()
     if existing and not force_update:
         if not verify_integrity:
             return existing[0]
         first_report: ProtonIntegrityReport | None = None
         for candidate in existing:
-            report = validate_ge_proton_integrity(candidate)
+            report = validate_proton_integrity(candidate)
             if first_report is None:
                 first_report = report
             if report.valid:
                 return candidate
         managed = next((candidate for candidate in existing if is_managed_compat_tool(candidate)), None)
         if managed is not None:
-            logging.warning("Repairing broken DeckInstall GE-Proton: %s (%s)", managed, first_report)
-            return repair_ge_proton(managed, progress_cb=progress_cb)
-        logging.warning("GE-Proton integrity check failed; preserving manually installed copies.")
+            logging.warning("Repairing broken DeckInstall UMU-Proton: %s (%s)", managed, first_report)
+            return repair_managed_proton(managed, progress_cb=progress_cb)
+        logging.warning("UMU-Proton integrity check failed; preserving manually installed copies.")
 
-    if not force_update:
-        cachy_dirs = list_cachyos_proton_dirs()
-        if cachy_dirs:
-            return cachy_dirs[0]
-
-    _emit_progress(progress_cb, "Checking latest GE-Proton11+ release...", 0)
-    release = _fetch_latest_ge_proton11_release()
+    _emit_progress(progress_cb, "Checking the latest UMU-Proton release...", 0)
+    release = _fetch_latest_umu_proton_release()
     tag = str(release.get("tag_name", "")).strip()
-    if not tag:
-        raise RuntimeError("GE-Proton release is missing tag_name.")
-    if _parse_ge_proton_version(tag) is None or ".." in tag:
-        raise RuntimeError(f"Unsafe GE-Proton tag name: {tag!r}")
+    if _parse_umu_proton_version(tag) is None or ".." in tag or "/" in tag:
+        raise RuntimeError(f"Unsafe UMU-Proton tag name: {tag!r}")
 
     arch = _get_arch()
-    tar_name = _sanitize_asset_name(f"{tag}-{arch}.tar.gz")
+    # Newer releases name the arch ("UMU-Proton-11.0-2e-x86_64.tar.gz"); older ones are x86_64 only.
+    names = [f"{tag}-{arch}"] + ([tag] if arch == "x86_64" else [])
+    stem = next((n for n in names if _find_release_asset(release, f"{n}.tar.gz") is not None), None)
+    if stem is None:
+        raise RuntimeError(f"UMU-Proton release {tag} has no package for {arch}.")
+    tar_name = _sanitize_asset_name(f"{stem}.tar.gz")
     tar_asset = _find_release_asset(release, tar_name)
-    if tar_asset is None:
-        if arch != "x86_64":
-            raise RuntimeError(
-                f"Upstream GE-Proton release {tag} did not publish an asset for {arch} "
-                f"(expected {tar_name})."
-            )
-        raise RuntimeError(f"GE-Proton asset {tar_name} not found in release {tag}.")
-
-    sha_asset = (
-        _find_release_asset(release, f"{tag}-{arch}.sha512sum")
-        or _find_release_asset(release, f"{tar_name}.sha512sum")
+    sha_asset = _find_release_asset(release, f"{stem}.sha512sum") or _find_release_asset(
+        release, f"{tar_name}.sha512sum"
     )
-    if sha_asset is None:
-        raise RuntimeError(f"GE-Proton checksum asset for {tar_name} not found in release {tag}.")
-
+    if tar_asset is None or sha_asset is None:
+        raise RuntimeError(f"UMU-Proton checksum for {tar_name} not found in release {tag}.")
     tar_url = str(tar_asset.get("browser_download_url", ""))
     sha_url = str(sha_asset.get("browser_download_url", ""))
     if not tar_url or not sha_url:
-        raise RuntimeError("GE-Proton release asset is missing download URL.")
+        raise RuntimeError("UMU-Proton release asset is missing download URL.")
 
     compat_dir = get_compat_tools_dir()
     compat_dir.mkdir(parents=True, exist_ok=True)
-    target_dir = compat_dir / tag
+    target_dir = compat_dir / stem  # the folder name umu-run uses too, so it never downloads it again
     if target_dir.resolve().parent != compat_dir.resolve():
-        raise RuntimeError(f"Unsafe GE-Proton target directory: {target_dir}")
+        raise RuntimeError(f"Unsafe UMU-Proton target directory: {target_dir}")
     if (target_dir.exists() or target_dir.is_symlink()) and not is_managed_compat_tool(target_dir):
-        if not target_dir.is_symlink() and validate_ge_proton_integrity(target_dir).valid:
-            return target_dir
-        raise ValueError(f"Manually installed GE-Proton occupies {target_dir}; it was preserved.")
+        if not target_dir.is_symlink() and validate_proton_integrity(target_dir).valid:
+            return target_dir  # umu-run (or the user) installed this release already
+        raise ValueError(f"Another UMU-Proton occupies {target_dir}; it was preserved.")
 
-    with tempfile.TemporaryDirectory(prefix=_runtime_temp_prefix("ge"), dir=str(compat_dir)) as tmp_dir:
+    with tempfile.TemporaryDirectory(prefix=_runtime_temp_prefix("proton"), dir=str(compat_dir)) as tmp_dir:
         tmp_path = Path(tmp_dir)
         tar_path = tmp_path / tar_name
-        sha_name = _sanitize_asset_name(str(sha_asset.get("name", f"{tag}-{arch}.sha512sum")))
-        sha_path = tmp_path / sha_name
+        sha_path = tmp_path / _sanitize_asset_name(str(sha_asset.get("name", f"{stem}.sha512sum")))
 
         _download_file(sha_url, sha_path, sha_path.name)
         _download_file(tar_url, tar_path, tar_name, progress_cb=progress_cb, timeout=120)
@@ -1876,29 +1920,26 @@ def ensure_ge_proton11(
         extract_dir.mkdir(parents=True, exist_ok=True)
         _safe_extract_tar(tar_path, extract_dir)
 
-        extracted_root = extract_dir / tag
-        if not extracted_root.is_dir():
+        extracted_root = next((extract_dir / n for n in (stem, tag) if (extract_dir / n).is_dir()), None)
+        if extracted_root is None:
             subdirs = [p for p in extract_dir.iterdir() if p.is_dir()]
             extracted_root = subdirs[0] if len(subdirs) == 1 else extract_dir
 
-        report = validate_ge_proton_integrity(extracted_root)
+        report = validate_proton_integrity(extracted_root)
         if not report.valid:
-            raise RuntimeError(f"Invalid GE-Proton package {tag}: {report.error}")
-        atomic_write_text(extracted_root / _GE_MANAGED_MARKER, f"{tag}\n")
+            raise RuntimeError(f"Invalid UMU-Proton package {tag}: {report.error}")
+        atomic_write_text(extracted_root / _MANAGED_MARKER, f"{tag}\n")
         if (target_dir.exists() or target_dir.is_symlink()) and not is_managed_compat_tool(target_dir):
             raise ValueError(f"Refusing to overwrite a compatibility tool installed outside DeckInstall: {target_dir}")
         with _publish_runtime_directory(extracted_root, target_dir):
             pass
 
+    def _set_latest(versions: dict[str, Any]) -> None:
+        versions["umu_proton_latest_version"] = tag
 
-    def _set_ge(versions: dict[str, Any]) -> None:
-        versions["ge_proton_latest_version"] = tag
-
-    _update_versions(_set_ge)
+    _update_versions(_set_latest)
     _emit_progress(progress_cb, f"{tag} ready.", 100)
     return target_dir
-
-
 
 
 def _strip_tar_suffix(name: str) -> str:
@@ -2015,7 +2056,7 @@ def fetch_available_proton_releases(
                 prerelease=bool(rel.get("prerelease", False)),
             )
         )
-    # GitHub lists by publish date, which puts GE-Proton11-9 above GE-Proton11-12: order by version.
+    # GitHub lists by publish date, which can put 11.0-9 above 11.0-12: order by version.
     results.sort(
         key=lambda r: (tuple(int(n) for n in re.findall(r"\d+", r.tag_name)), r.published_at),
         reverse=True,
@@ -2158,11 +2199,11 @@ def install_compat_tool(
             raise RuntimeError(f"Unsafe compatibility tool target directory: {target_dir}")
         if not all((extracted_root / name).is_file() for name in ("proton", "compatibilitytool.vdf")):
             raise RuntimeError(f"Compatibility tool package is incomplete: {folder_name}")
-        if release.family_id == "ge-proton":
-            report = validate_ge_proton_integrity(extracted_root)
+        if release.family_id == "umu-proton":
+            report = validate_proton_integrity(extracted_root)
             if not report.valid:
-                raise RuntimeError(f"Invalid GE-Proton package {folder_name}: {report.error}")
-        atomic_write_text(extracted_root / _GE_MANAGED_MARKER, f"{folder_name}\n")
+                raise RuntimeError(f"Invalid UMU-Proton package {folder_name}: {report.error}")
+        atomic_write_text(extracted_root / _MANAGED_MARKER, f"{folder_name}\n")
         if (target_dir.exists() or target_dir.is_symlink()) and not is_managed_compat_tool(target_dir):
             raise ValueError(f"Refusing to overwrite a compatibility tool installed outside DeckInstall: {target_dir}")
         with _publish_runtime_directory(extracted_root, target_dir):
@@ -2212,7 +2253,7 @@ def remove_compat_tool(tool_path: Path, *, managed_only: bool = False) -> None:
 
 
 def check_runtime_updates(force: bool = False) -> dict[str, Any]:
-    """Check GitHub for newer umu-launcher and GE-Proton11+ releases (24h cache)."""
+    """Check GitHub for newer umu-launcher and UMU-Proton releases (24h cache)."""
     versions = _load_versions()
     now = time.time()
     last_check = float(versions.get("last_check", 0) or 0)
@@ -2225,13 +2266,23 @@ def check_runtime_updates(force: bool = False) -> dict[str, Any]:
         if use_managed_umu
         else (f"system ({sys_umu.name})" if sys_umu is not None else None)
     )
-    ge_dirs = list_ge_proton11_dirs()
-    cachy_dirs = [] if ge_dirs else list_cachyos_proton_dirs()
-    installed_ge = ge_dirs[0].name if ge_dirs else (cachy_dirs[0].name if cachy_dirs else None)
+    proton_dirs = list_umu_proton_dirs()
+    installed_proton = umu_proton_release_name(proton_dirs[0].name) if proton_dirs else None
+
+    def _proton_entry(latest: str | None) -> dict[str, Any]:
+        newest = _parse_umu_proton_version(latest) if latest else None
+        current = _parse_umu_proton_version(installed_proton) if installed_proton else None
+        newer = bool(newest and current and newest > current)
+        return {
+            "installed": installed_proton,
+            "latest": latest,
+            "update_available": newer,
+            "installed_path": str(proton_dirs[0]) if proton_dirs else None,
+        }
 
     if not force and last_check > 0 and (now - last_check) < UPDATE_CACHE_TTL_SECONDS:
         latest_umu = versions.get("umu_latest_version")
-        latest_ge = versions.get("ge_proton_latest_version")
+        latest_proton = versions.get("umu_proton_latest_version")
         return {
             "checked_at": last_check,
             "from_cache": True,
@@ -2241,25 +2292,20 @@ def check_runtime_updates(force: bool = False) -> dict[str, Any]:
                 "update_available": bool(use_managed_umu and latest_umu and installed_umu != latest_umu),
                 "installed_path": str(sys_umu) if sys_umu else (str(umu_path) if umu_path.is_file() else None),
             },
-            "ge_proton": {
-                "installed": installed_ge,
-                "latest": latest_ge,
-                "update_available": bool(ge_dirs and latest_ge and installed_ge != latest_ge),
-                "installed_path": str(ge_dirs[0]) if ge_dirs else (str(cachy_dirs[0]) if cachy_dirs else None),
-            },
+            "umu_proton": _proton_entry(latest_proton),
         }
 
     umu_release = _fetch_json(UMU_RELEASES_LATEST_URL)
     latest_umu = str(umu_release.get("tag_name", "")).strip() or None
-    ge_release = _fetch_latest_ge_proton11_release()
-    latest_ge = str(ge_release.get("tag_name", "")).strip() or None
+    proton_release = _fetch_latest_umu_proton_release()
+    latest_proton = str(proton_release.get("tag_name", "")).strip() or None
 
     def _set_checked(v: dict[str, Any]) -> None:
         v["last_check"] = now
         if latest_umu:
             v["umu_latest_version"] = latest_umu
-        if latest_ge:
-            v["ge_proton_latest_version"] = latest_ge
+        if latest_proton:
+            v["umu_proton_latest_version"] = latest_proton
 
     _update_versions(_set_checked)
 
@@ -2272,12 +2318,7 @@ def check_runtime_updates(force: bool = False) -> dict[str, Any]:
             "update_available": bool(use_managed_umu and latest_umu and installed_umu != latest_umu),
             "installed_path": str(sys_umu) if sys_umu else (str(umu_path) if umu_path.is_file() else None),
         },
-        "ge_proton": {
-            "installed": installed_ge,
-            "latest": latest_ge,
-            "update_available": bool(ge_dirs and latest_ge and installed_ge != latest_ge),
-            "installed_path": str(ge_dirs[0]) if ge_dirs else (str(cachy_dirs[0]) if cachy_dirs else None),
-        },
+        "umu_proton": _proton_entry(latest_proton),
     }
 
 
@@ -2695,9 +2736,9 @@ def resolve_game_prefix(
         if proton_name:
             proton_dir = _resolve_proton_name_in_compat_dirs(proton_name)
         if proton_dir is None:
-            ge_dirs = list_ge_proton11_dirs() or list_cachyos_proton_dirs() or list_ge_proton10_dirs()
-            if ge_dirs:
-                proton_dir = ge_dirs[0]
+            defaults = list_default_proton_dirs()
+            if defaults:
+                proton_dir = defaults[0]
         return (prefix_dir, proton_dir)
 
     if kind_norm == "external":
@@ -2870,7 +2911,7 @@ def run_exe_in_prefix(
     """Run an arbitrary Windows executable inside an existing Wine prefix via umu-run."""
     resolved_proton = proton_path
     if resolved_proton is None:
-        candidates = list_ge_proton11_dirs() or list_cachyos_proton_dirs() or list_ge_proton10_dirs()
+        candidates = list_default_proton_dirs()
         if candidates:
             resolved_proton = candidates[0]
         else:
@@ -2882,7 +2923,7 @@ def run_exe_in_prefix(
                 resolved_proton = steam_proton.parent
             else:
                 raise RuntimeError(
-                    "No GE-Proton11+/10 or official Steam Proton installation found. Install Proton first."
+                    "No UMU-Proton or official Steam Proton installation found. Install Proton first."
                 )
 
     if allow_download:

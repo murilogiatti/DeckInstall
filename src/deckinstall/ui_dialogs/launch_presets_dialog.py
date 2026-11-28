@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import shutil
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import shiboken6
@@ -36,6 +36,7 @@ from ..i18n import tr
 from ..launch_presets import (
     FRAME_RATES,
     HIDE,
+    LEGACY,
     OFF,
     OK,
     TOGGLES,
@@ -96,9 +97,9 @@ def half_rate(hz: int) -> int:
 
 
 def game_proton(win: MainWindow, kind: str, obj: object | None) -> str:
-    """The Proton kind a game runs on ("ge", "cachyos", "valve" or "" when unknown)."""
+    """The Proton kind a game runs on ("umu", "ge", "cachyos", "valve" or "" when unknown)."""
     if isinstance(obj, StandaloneGame):
-        return proton_kind(obj.proton_name or "GE-Proton")  # default: newest GE (or the system CachyOS)
+        return proton_kind(obj.proton_name or "UMU-Proton")  # default: the newest UMU-Proton
     if isinstance(obj, ExternalLauncherGame):
         return proton_kind(obj.runtime)
     if isinstance(obj, ShortcutEntry) and win.paths is not None:
@@ -110,7 +111,7 @@ def game_proton(win: MainWindow, kind: str, obj: object | None) -> str:
             return proton_kind(tool)
         managed = win._managed_library_game(obj)
         return proton_kind(managed.proton_name) if isinstance(managed, StandaloneGame) else ""
-    return "ge" if kind == "standalone" else ""
+    return "umu" if kind == "standalone" else ""
 
 
 def _gpu_label(gpu: Gpu) -> str:
@@ -192,11 +193,14 @@ def build_launch_options(
     layout.addWidget(details)
     current: dict[str, QVBoxLayout] = {}
 
+    section_cards: list[tuple[QWidget, QVBoxLayout]] = []
+
     def _section(text: str) -> None:
         card, card_lay, _top = section_card(text)
         card_lay.setSpacing(4)
         details_layout.addWidget(card)
         current["lay"] = card_lay
+        section_cards.append((card, card_lay))
 
     def _add(widget: QWidget) -> None:
         current["lay"].addWidget(widget)
@@ -569,24 +573,19 @@ def build_launch_options(
         _update_optiscaler_dxgi_guard()
 
     def _add_optiscaler_card() -> None:
-        card, card_lay, top = section_card(tr("launch.optiscaler_title"), tr("configure.optiscaler_hint"))
-        details_layout.addWidget(card)
-        btn_opti = QPushButton(tr("library.btn_optiscaler"))
-        top.addWidget(btn_opti)
-        target = game_obj
-        if isinstance(target, ShortcutEntry):
-            managed = win._managed_library_game(target)
-            if managed is not None:
-                target = replace(target, exe=str(managed.exe_path))
-        usable = target is not None and kind in ("steam", "standalone", "external") and (
-            kind != "steam" or win.paths is not None
-        )
-        btn_opti.setEnabled(usable)
-        if not usable:
-            card_lay.addWidget(note_label(tr("launch.optiscaler_after_install")))
+        """OptiScaler's own options, right in the list (an installed game only)."""
+        from .prefix_tools_dialogs import build_optiscaler_panel
+
+        _section(tr("launch.optiscaler_title"))
+        _add(_muted_hint(tr("configure.optiscaler_hint")))
+        usable = game_obj is not None and kind in ("steam", "standalone", "external")
+        if usable:
+            assert game_obj is not None
+            _add(build_optiscaler_panel(win, dlg, kind, game_obj, on_saved=_on_opti_saved))
+        else:
+            _add(note_label(tr("launch.optiscaler_after_install")))
         if proton == "cachyos":
-            card_lay.addWidget(note_label(tr("launch.optiscaler_cachyos")))
-        btn_opti.clicked.connect(lambda: win._open_optiscaler_dialog(kind, target, on_saved=_on_opti_saved))
+            _add(note_label(tr("launch.optiscaler_cachyos")))
 
     gpu_choice = QComboBox()
     gpu_choice.setObjectName("gameGpu")
@@ -628,7 +627,6 @@ def build_launch_options(
         "need_rtx": tr("launch.need_rtx"),
         "need_rdna4": tr("launch.need_rdna4"),
         "need_nvidia_595": tr("launch.need_nvidia_595"),
-        "need_ge": tr("launch.need_ge"),
         "need_wayland": tr("launch.need_wayland"),
     }
 
@@ -652,7 +650,17 @@ def build_launch_options(
             chk.setVisible(state != HIDE or on)
             hint.setVisible(state != HIDE or on)
             chk.setEnabled(state == OK or on)
-            hint.setText(reasons.get(reason, normal) if state == OFF else normal)
+            if key in LEGACY:
+                hint.setText(tr("launch.legacy_hint"))  # only shown while on: say why to turn it off
+            else:
+                hint.setText(reasons.get(reason, normal) if state == OFF else normal)
+        # A card whose every option is hidden on this GPU goes too (no empty "GPU" card).
+        for card, card_lay in section_cards:
+            items = (card_lay.itemAt(i) for i in range(card_lay.count()))
+            boxes = [item.widget() for item in items if item is not None]
+            checks_in = [w for w in boxes if isinstance(w, QCheckBox)]
+            others = [w for w in boxes if w is not None and not isinstance(w, (QCheckBox, QLabel))]
+            card.setVisible(bool(others) or not checks_in or any(not c.isHidden() for c in checks_in))
 
     def _gpu_changed() -> None:
         _sync_preview()
@@ -664,11 +672,10 @@ def build_launch_options(
         _ruled("nvapi", chk_nvapi, tr("launch.nvidia_nvapi_hint"))
         _add_toggles("gpu")
 
-        _section(tr("launch.section_upscaler"))
+        _add_optiscaler_card()
+        # Upscaler upgrades of the old GE-Proton: shown only on a game that still has one on (to turn it off).
         _ruled("dlss_upgrade", chk_dlss, tr("launch.dlss_hint"))
         _add_toggles("upscaler")
-        _add(note_label(tr("launch.upscaler_needs_ge")))
-        _add_optiscaler_card()
 
         _section(tr("launch.section_compat"))
         _ruled("wayland", chk_wayland, tr("launch.proton_wayland_hint"))

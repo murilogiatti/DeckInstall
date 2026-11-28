@@ -2,8 +2,8 @@
 
 - Valve: Proton's own list (`default_compat_config` in its `proton` script) is chosen by the
   game's Steam AppID, so a non-Steam shortcut never gets it. Its options can be given back with
-  STEAM_COMPAT_CONFIG, which Valve's Proton and GE-Proton both read.
-- umu/protonfixes: one small Python file per game, which umu and GE-Proton run by themselves.
+  STEAM_COMPAT_CONFIG, which Valve's Proton and UMU-Proton both read.
+- umu/protonfixes: one small Python file per game, which umu and UMU-Proton run by themselves.
   With Valve's Proton they do not run; most of them only set variables, arguments, DLLs or
   install winetricks packages, which DeckInstall can do with any Proton.
 
@@ -46,7 +46,7 @@ class Fix:
 
     kind: "env" (KEY=VALUE), "arg" (game argument), "dll" (name=order), "winetricks" (a verb),
     "compat" (a Proton compat option, given through STEAM_COMPAT_CONFIG) or "advanced" (a step only
-    umu/GE-Proton can do: shown, never applied). source: "valve" or "umu".
+    umu/UMU-Proton can do: shown, never applied). source: "valve" or "umu".
     """
 
     kind: str
@@ -115,7 +115,7 @@ def protonfixes_cache_dir() -> Path:
 
 
 def local_protonfixes(candidates: Iterable[Path]) -> Path | None:
-    """A protonfixes folder that is already on disk (inside an installed GE-Proton), newest first."""
+    """A protonfixes folder that is already on disk (inside an installed UMU-Proton), newest first."""
     for proton_dir in candidates:
         folder = proton_dir / "protonfixes"
         if (folder / "gamefixes-steam").is_dir():
@@ -288,7 +288,7 @@ def umu_fixes(path: Path | None, game_dir: Path | None = None) -> list[Fix]:
     mains = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("main", "main_with_id")]
     for node in mains:
         _translate(node.body, game_dir, out)
-    if not mains:  # the fix lives in shared code (another module): only umu/GE-Proton can run it
+    if not mains:  # the fix lives in shared code (another module): only umu/UMU-Proton can run it
         out.append(Fix("advanced", "shared", "umu"))
     return list(dict.fromkeys(out))
 

@@ -320,23 +320,19 @@ def _is_protected_dir(path: Path) -> bool:
 
 
 def _resolve_proton_path(proton_name: str) -> str:
-    """Resolve a Proton/GE-Proton tool name to a filesystem path for PROTONPATH when possible."""
+    """Resolve a Proton tool name to a filesystem path for PROTONPATH when possible."""
     name = proton_name.strip()
     if not name:
-        # "Default (newest)": bake the newest installed GE-Proton into the launcher; updating
-        # GE-Proton rewrites these launchers (proton_policy.retarget_default_games).
-        from .runtime_manager import (
-            list_cachyos_proton_dirs,
-            list_ge_proton10_dirs,
-            list_ge_proton11_dirs,
-        )
+        # "Default (newest)": bake the newest installed UMU-Proton into the launcher; updating
+        # UMU-Proton rewrites these launchers (proton_policy.retarget_default_games).
+        from .runtime_manager import list_default_proton_dirs
 
-        newest = list_ge_proton11_dirs() or list_cachyos_proton_dirs() or list_ge_proton10_dirs()
+        newest = list_default_proton_dirs()
         if newest:
             return str(newest[0])
         steam_root = find_steam_root()
         proton = find_proton_binary(steam_root) if steam_root is not None else None
-        return str(proton.parent) if proton is not None else "GE-Proton"
+        return str(proton.parent) if proton is not None else "UMU-Proton"
     from .runtime_manager import get_compat_tools_dir
 
     steam_root = find_steam_root() or (Path.home() / ".local" / "share" / "Steam")
@@ -345,12 +341,8 @@ def _resolve_proton_path(proton_name: str) -> str:
 
 
 def resolve_standalone_proton_fallback(game: StandaloneGame) -> tuple[Path | None, str | None]:
-    """Resolve game.proton_name or fall back to the newest installed GE-Proton11+/10 or CachyOS Proton."""
-    from .runtime_manager import (
-        list_cachyos_proton_dirs,
-        list_ge_proton10_dirs,
-        list_ge_proton11_dirs,
-    )
+    """Resolve game.proton_name or fall back to the default Proton (the newest UMU-Proton)."""
+    from .runtime_manager import list_default_proton_dirs
 
     pinned_name = game.proton_name.strip()
     if pinned_name:
@@ -359,7 +351,7 @@ def resolve_standalone_proton_fallback(game: StandaloneGame) -> tuple[Path | Non
         if resolved_path.is_dir() and (resolved_path / "proton").is_file():
             return (resolved_path, None)
 
-    candidates = list_ge_proton11_dirs() or list_cachyos_proton_dirs() or list_ge_proton10_dirs()
+    candidates = list_default_proton_dirs()
     if candidates:
         fallback_dir = candidates[0]
         return (fallback_dir, fallback_dir.name if pinned_name else None)

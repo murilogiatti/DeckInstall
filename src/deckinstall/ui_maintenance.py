@@ -36,8 +36,8 @@ from .ui_cards import (
     _SortableTableItem,
     dialog_footer,
     format_size_bytes,
-    page_layout,
     section_card,
+    section_page,
 )
 from .ui_runtimes import show_runtime_health
 from .ui_workers_maint import (
@@ -57,7 +57,7 @@ _GROUP_RANK = {group: idx for idx, group in enumerate(GROUP_ORDER)}
 
 def build_maintenance_page(win: MainWindow) -> QWidget:
     """Build the Maintenance & Cleanup page widget and bind controls onto ``win``."""
-    page, layout = page_layout(tr("nav.maintenance"), tr("maint.page_subtitle"))
+    page, layout = section_page()
 
     win._maint_candidates = []
     win._maint_checked = {}
@@ -619,7 +619,7 @@ def open_uninstall_runtimes_dialog(win: MainWindow, kinds: set[str] | None = Non
 
     kinds: only list these runtime kinds (a Runtimes card's "Remove"); None lists everything.
     """
-    from .runtime_uninstall import GE, OPTISCALER, RuntimeItem, affected_steam_appids, list_runtimes, uninstall
+    from .runtime_uninstall import OPTISCALER, PROTON, RuntimeItem, affected_steam_appids, list_runtimes, uninstall
     from .steam_paths import _read_compat_tool_id
     from .steam_vdf import bulk_migrate_compat_tool
     from .ui_workers import SteamOpWorker
@@ -669,7 +669,7 @@ def open_uninstall_runtimes_dialog(win: MainWindow, kinds: set[str] | None = Non
             it.setToolTip(str(item.path))
             tbl.setItem(row, 0, it)
             tbl.setItem(row, 1, _SortableTableItem(format_size_bytes(item.size_bytes), item.size_bytes))
-            users = ", ".join(item.users) if item.users else ("-" if item.kind == GE else "")
+            users = ", ".join(item.users) if item.users else ("-" if item.kind == PROTON else "")
             tbl.setItem(row, 2, QTableWidgetItem(users))
         tbl.horizontalHeader().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
         tbl.setSortingEnabled(True)
@@ -722,7 +722,7 @@ def open_uninstall_runtimes_dialog(win: MainWindow, kinds: set[str] | None = Non
                 blocked = []
                 affected_by_name: dict[str, list[int]] = {}
                 for item in chosen:
-                    if item.kind == GE:
+                    if item.kind == PROTON:
                         tool_id = _read_compat_tool_id(item.path / "compatibilitytool.vdf", item.name)
                         ids = affected_steam_appids(paths_at_start, {item.name, tool_id})
                         if 0 in ids or (queued_now and ids):

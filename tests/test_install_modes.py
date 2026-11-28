@@ -129,7 +129,7 @@ def test_runtimes_tab_greys_out_what_steamos_does_not_use(tmp_path: Path) -> Non
         win._steamos = True
         win._update_steam_mode_ui()
         for btn, note, key in (
-            (win.btn_rt_ge_update, win.lbl_rt_proton_note, "runtimes.note_proton_steamos"),
+            (win.btn_rt_proton_update, win.lbl_rt_proton_note, "runtimes.note_proton_steamos"),
             (win.btn_rt_umu_update, win.lbl_rt_umu_note, "runtimes.note_umu_steamos"),
             (win.btn_rt_mangohud_update, win.lbl_rt_mangohud_note, "runtimes.note_mangohud_steamos"),
         ):

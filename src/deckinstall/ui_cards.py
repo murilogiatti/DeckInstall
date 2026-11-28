@@ -607,6 +607,15 @@ def page_layout(title_text: str, subtitle_text: str) -> tuple[QWidget, QVBoxLayo
     return page, layout
 
 
+def section_page() -> tuple[QWidget, QVBoxLayout]:
+    """A Settings section: no title of its own (the section button above already names it)."""
+    page = QWidget()
+    layout = QVBoxLayout(page)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(14)
+    return page, layout
+
+
 def note_label(text: str = "", kind: str = "MutedText") -> QLabel:
     """A wrapped hint or notice. kind: MutedText (hint), WarningText or ErrorText (theme colors,
     readable in light and dark), or UnavailableBanner (a boxed warning)."""

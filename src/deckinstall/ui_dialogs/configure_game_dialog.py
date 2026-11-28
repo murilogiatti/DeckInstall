@@ -39,7 +39,7 @@ from ..launcher_scan import ExternalLauncherGame
 from ..modes import STANDALONE, STEAM, feature_note
 from ..proton_policy import (
     DEFAULT_PROTON_ID,
-    newest_ge_proton,
+    newest_default_proton,
     previous_proton_name,
     set_game_proton,
     use_previous_proton,
@@ -600,7 +600,7 @@ def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> 
         proton_dir = None if default else resolve_proton_dir(selected, root)
         if proton_dir is None:
             if is_standalone:
-                proton_dir = newest_ge_proton()
+                proton_dir = newest_default_proton()
             elif root is not None:
                 binary = find_proton_binary(root)
                 proton_dir = binary.parent if binary else None
@@ -807,12 +807,12 @@ def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> 
                             tools.insert(1, (raw_proton, raw_proton))
                         raw_proton = raw_proton or STEAM_DEFAULT_PROTON_ID
                     elif isinstance(obj, StandaloneGame) and is_standalone:
-                        newest = newest_ge_proton()
+                        newest = newest_default_proton()
                         raw_proton = obj.proton_name or DEFAULT_PROTON_ID
                         proton_text = obj.proton_name or tr("proton.default_label")
                         tools.append((
                             DEFAULT_PROTON_ID,
-                            tr("proton.default_newest", name=newest.name if newest else "GE-Proton"),
+                            tr("proton.default_newest", name=newest.name if newest else "UMU-Proton"),
                         ))
                         seen_ids.add(DEFAULT_PROTON_ID)
                         for ct in list_installed_compat_tools():
@@ -886,7 +886,7 @@ def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> 
                 return
             active_proton_ref[0] = raw_proton
             if editor is not None:
-                editor.set_proton(proton_kind(raw_proton) or ("ge" if is_standalone else "valve" if is_steam else ""))
+                editor.set_proton(proton_kind(raw_proton) or ("umu" if is_standalone else "valve" if is_steam else ""))
             if lbl_cur_proton is not None:
                 lbl_cur_proton.setText(proton_text)
             if proton_combo is not None:
@@ -1180,7 +1180,7 @@ def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> 
             def _proton_draft_changed() -> None:
                 if editor is not None:
                     editor.set_proton(proton_kind(str(proton_combo.currentData() or ""))
-                                      or ("ge" if is_standalone else "valve"))
+                                      or ("umu" if is_standalone else "valve"))
                 _update_apply()
 
             proton_combo.currentIndexChanged.connect(_proton_draft_changed)

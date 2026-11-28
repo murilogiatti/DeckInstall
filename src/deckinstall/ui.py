@@ -104,7 +104,8 @@ from .runtime_manager import (
     fix_bwrap_userns,
     get_umu_run_path,
     is_win32_prefix,
-    list_ge_proton11_dirs,
+    list_default_proton_dirs,
+    list_umu_proton_dirs,
     official_mangohud_installed,
     optiscaler_downloaded,
 )
@@ -415,7 +416,7 @@ class MainWindow(QMainWindow):
     _updates_checking: bool
     _updates_cooldown: QTimer
     # Runtimes tab (ui_runtimes.py)
-    btn_rt_ge_update: QPushButton
+    btn_rt_proton_update: QPushButton
     btn_rt_umu_update: QPushButton
     btn_rt_mangohud_update: QPushButton
     btn_rt_optiscaler_update: QPushButton
@@ -1285,14 +1286,15 @@ class MainWindow(QMainWindow):
             )
 
     def _runtime_components_for_update_all(self) -> tuple[str, ...]:
-        """What "Update all" touches: what is already installed, plus umu-run and GE-Proton when only
-        Standalone mode exists. Never what the system does not use (SteamOS)."""
+        """What "Update all" touches: what is already installed, plus umu-run and UMU-Proton when only
+        Standalone mode exists (a legacy GE-Proton counts as installed: updating brings UMU-Proton).
+        Never what the system does not use (SteamOS)."""
         env = self.mode_env
         wanted: list[str] = []
         if get_umu_run_path().is_file() or not env.steam:
             wanted.append("umu")
-        if list_ge_proton11_dirs() or not env.steam:
-            wanted.append("ge_proton")
+        if list_default_proton_dirs() or not env.steam:
+            wanted.append("umu_proton")
         if official_mangohud_installed():
             wanted.append("mangohud")
         if optiscaler_downloaded():
@@ -1863,7 +1865,7 @@ class MainWindow(QMainWindow):
 
     def _open_add_launch_advanced(self) -> None:
         from .launch_presets import proton_kind
-        from .proton_policy import newest_ge_proton
+        from .proton_policy import newest_default_proton
         from .runtime_manager import get_compat_tools_dir, list_installed_compat_tools
         from .steam_paths import find_proton_binary, list_installed_protons, resolve_proton_dir
         from .ui_recommendations import Target, add_game_recommendations
@@ -1887,7 +1889,7 @@ class MainWindow(QMainWindow):
         if self._add_proton[0] == mode:
             picker.setCurrentIndex(max(0, picker.findData(self._add_proton[1])))
         picker.setEnabled(picker.count() > 1)
-        default_proton = "ge" if mode == STANDALONE else "valve"
+        default_proton = "umu" if mode == STANDALONE else "valve"
 
         def more(parent: QWidget, layout: QVBoxLayout, editor: LaunchOptions) -> None:
             exe_text = self.add_exe_combo.currentText().strip()
@@ -1898,7 +1900,7 @@ class MainWindow(QMainWindow):
                     tool, root, extra_compat_dirs=[get_compat_tools_dir()] if mode == STANDALONE else (),
                 )
             elif mode == STANDALONE:
-                directory = newest_ge_proton()
+                directory = newest_default_proton()
             else:
                 binary = find_proton_binary(root) if root is not None else None
                 directory = binary.parent if binary else None
@@ -2150,7 +2152,7 @@ class MainWindow(QMainWindow):
     def _install_selected(self) -> None:
         """Install the selected game into the library in the chosen mode.
 
-        Steam mode: the game gets a Steam shortcut (Steam's Proton, no umu/GE-Proton download, no menu or
+        Steam mode: the game gets a Steam shortcut (Steam's Proton, no umu/UMU-Proton download, no menu or
         desktop launcher). Standalone mode: launch.sh + umu-run, plus the menu/desktop launchers picked.
         """
         if self._steam_busy:
@@ -2215,11 +2217,11 @@ class MainWindow(QMainWindow):
             inside_games_dir = False
 
         def _start_install(final_keep_in_place: bool, final_single_exe_only: bool) -> None:
-            from .runtime_manager import find_system_umu_run, list_cachyos_proton_dirs
+            from .runtime_manager import find_system_umu_run
 
-            steam_only = mode == STEAM  # Steam runs it: no umu-run / GE-Proton download
+            steam_only = mode == STEAM  # Steam runs it: no umu-run / UMU-Proton download
             has_umu = find_system_umu_run() is not None or get_umu_run_path().is_file()
-            has_proton = bool(list_ge_proton11_dirs() or list_cachyos_proton_dirs())
+            has_proton = bool(list_umu_proton_dirs())
             if (
                 not steam_only
                 and not is_native_linux_exe(exe_path)
@@ -4206,11 +4208,11 @@ class MainWindow(QMainWindow):
                 assert paths is not None
                 worker = SteamOpWorker(lambda: switch_to_steam(paths, game), need_steam_closed=True)
             else:
-                from .runtime_manager import find_system_umu_run, list_cachyos_proton_dirs
+                from .runtime_manager import find_system_umu_run
 
                 needs_runtime = not game.native_linux and (
                     (find_system_umu_run() is None and not get_umu_run_path().is_file())
-                    or not (list_ge_proton11_dirs() or list_cachyos_proton_dirs())
+                    or not list_umu_proton_dirs()
                 )
 
                 def _to_standalone() -> object:
@@ -4221,7 +4223,7 @@ class MainWindow(QMainWindow):
                         say(tr("add.preparing_runtime"))
                         rm.ensure_umu_run(progress_cb=lambda msg, _pct: say(msg))
                         rm.ensure_umu_database(timeout=15)
-                        rm.ensure_ge_proton11(progress_cb=lambda msg, _pct: say(msg))
+                        rm.ensure_umu_proton(progress_cb=lambda msg, _pct: say(msg))
                     return switch_to_standalone(paths, game)
 
                 worker = SteamOpWorker(_to_standalone, need_steam_closed=paths is not None)

@@ -570,3 +570,34 @@ def test_launch_editor_enforces_optiscaler_dxgi_without_more_options(
     result = _modal(lambda: launch_presets_dialog.open_launch_presets_dialog(
         window, "Game", "standalone", "%command%", "", game_obj=game), [edit])
     assert isinstance(result, tuple) and "dxgi=n,b" in result[1]
+
+
+def test_configure_shows_optiscaler_options_in_the_list(
+    window: ui.MainWindow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OptiScaler's options sit in Configure's own list (More options), not behind a button."""
+    from deckinstall import standalone
+    from deckinstall.ui_dialogs import prefix_tools_dialogs
+    from tests.conftest import pe_exe_bytes
+
+    source = tmp_path / "Game"
+    source.mkdir()
+    exe = source / "game.exe"
+    exe.write_bytes(pe_exe_bytes())
+    monkeypatch.setattr(standalone, "resolve_game_icon", lambda *a, **kw: None)
+    game = standalone.install_standalone_game("Game", exe, source, create_menu_shortcut=False)
+    window._selected_library_item = lambda: ("standalone", game)
+    monkeypatch.setattr(prefix_tools_dialogs, "inspect_optiscaler_state", lambda _exe: None)
+    monkeypatch.setattr(prefix_tools_dialogs, "recommend_proxy", lambda *_a: ("dxgi", []))
+
+    def check(dialog: QDialog) -> bool:
+        more = next(b for b in dialog.findChildren(QToolButton) if b.text() == tr("launch.more_options"))
+        more.click()
+        install = _button(dialog, "optiscaler.btn_install")
+        assert install.isVisibleTo(dialog)
+        proxy = next(c for c in dialog.findChildren(QComboBox) if c.findData("dxgi") >= 0 and c.count() > 1)
+        assert proxy.isVisibleTo(dialog)  # the options themselves, not a button to another window
+        assert not any(b.text() == "OptiScaler" for b in dialog.findChildren(QPushButton))
+        return _escape(dialog)
+
+    _modal(lambda: configure_game_dialog.open_configure_game_dialog(window), [check])

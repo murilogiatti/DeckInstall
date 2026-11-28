@@ -1,6 +1,6 @@
 """Proton in batch: unified list (DeckInstall games + Steam shortcuts) with target Proton selector.
 
-Never downloads GE-Proton implicitly: Steam users default to Steam's official Proton (or pick an
+Never downloads UMU-Proton implicitly: Steam users default to Steam's official Proton (or pick an
 already-installed Proton / explicit GitHub download with confirmation). Only checked rows are modified.
 """
 
@@ -31,14 +31,14 @@ from ..proton_policy import (
     DEFAULT_PROTON_ID,
     effective_proton_name,
     is_default,
-    newest_ge_proton,
+    newest_default_proton,
     retarget_default_games,
     set_games_proton,
     use_previous_proton,
 )
 from ..runtime_manager import (
     check_runtime_updates,
-    ensure_ge_proton11,
+    ensure_umu_proton,
     list_installed_compat_tools,
 )
 from ..standalone import list_standalone_games, match_owned_shortcuts, primary_owned_shortcuts
@@ -59,7 +59,7 @@ if TYPE_CHECKING:
     from ..ui import MainWindow
 
 STEAM_DEFAULT_PROTON_ID = "__steam_default__"
-DOWNLOAD_NEWEST_GE_ID = "__download_ge__"
+DOWNLOAD_NEWEST_PROTON_ID = "__download_umu__"
 
 
 @dataclass(frozen=True)
@@ -67,15 +67,15 @@ class ProtonRow:
     name: str
     source: str  # "deckinstall" | "shortcut"
     current: str  # Proton in use now ("" = Steam's default tool)
-    newest: bool  # already on the newest local GE-Proton
+    newest: bool  # already on the newest local UMU-Proton
     game_dir: Path | None = None  # DeckInstall game (set even on Steam shortcuts owned by a game)
     steam_tools: tuple[tuple[int, str], ...] = ()
     has_previous: bool = False
 
 
 def collect_rows(paths: SteamPaths | None) -> tuple[list[ProtonRow], list[int], str]:
-    """(rows, orphan Steam mappings, newest local GE-Proton name) for the dialog."""
-    newest = newest_ge_proton()
+    """(rows, orphan Steam mappings, newest local default Proton name) for the dialog."""
+    newest = newest_default_proton()
     newest_name = newest.name if newest is not None else ""
     games = list_standalone_games()
     orphans: list[int] = []
@@ -161,24 +161,24 @@ def collect_target_options(
             options.append((tool.tool_id, tool.folder_name))
             seen_ids.add(tool.tool_id)
 
-    options.append((DOWNLOAD_NEWEST_GE_ID, tr("proton_bulk.target_download_ge")))
+    options.append((DOWNLOAD_NEWEST_PROTON_ID, tr("proton_bulk.target_download_umu")))
     return options, custom_map, has_official
 
 
-def ensure_newest_ge_proton(
+def ensure_newest_default_proton(
     progress: Callable[[str], None] | None = None,
     *,
     retarget_defaults: bool = True,
 ) -> str:
-    """Download a newer GE-Proton when GitHub has one; optionally retarget all Default games."""
-    before = newest_ge_proton()
-    info = check_runtime_updates(force=True).get("ge_proton", {})
+    """Download a newer UMU-Proton when GitHub has one; optionally retarget all Default games."""
+    before = newest_default_proton()
+    info = check_runtime_updates(force=True).get("umu_proton", {})
     if info.get("update_available") or not info.get("installed"):
-        ensure_ge_proton11(
+        ensure_umu_proton(
             force_update=bool(info.get("update_available")),
             progress_cb=(lambda msg, _pct: progress(msg)) if progress is not None else None,
         )
-    after = newest_ge_proton()
+    after = newest_default_proton()
     if after is None:
         raise RuntimeError(tr("proton.none_found"))
     if retarget_defaults and before is not None and before.name != after.name:
@@ -215,18 +215,18 @@ class _ApplyWorker(QThread):
         game_dirs: list[Path],
         target_id: str,
         standalone_tool: str,
-        download_ge: bool,
+        download_proton: bool,
     ) -> None:
         super().__init__()
         self._dirs = game_dirs
         self._target_id = target_id
         self._standalone_tool = standalone_tool
-        self._download_ge = download_ge
+        self._download_proton = download_proton
 
     def run(self) -> None:
         try:
-            if self._download_ge:
-                resolved = ensure_newest_ge_proton(self.status.emit, retarget_defaults=False)
+            if self._download_proton:
+                resolved = ensure_newest_default_proton(self.status.emit, retarget_defaults=False)
                 standalone_arg = ""
             else:
                 resolved = self._target_id
@@ -280,7 +280,7 @@ def _row_matches_target(
         if not row.steam_tools:
             return True
         return row.current == ""
-    if target_id == DOWNLOAD_NEWEST_GE_ID:
+    if target_id == DOWNLOAD_NEWEST_PROTON_ID:
         return row.newest
     if target_id == DEFAULT_PROTON_ID:
         return row.newest or (row.game_dir is not None and not row.steam_tools and row.current == newest)
@@ -603,11 +603,11 @@ def _show(
         if not dirs and not appids:
             QMessageBox.information(dlg, __app_name__, tr("proton_bulk.none_selected"))
             return
-        download_ge = target_id == DOWNLOAD_NEWEST_GE_ID
+        download_proton = target_id == DOWNLOAD_NEWEST_PROTON_ID
         has_official = bool(
             state_ctx["has_official_steam"] or win.paths is not None or win._steam_root_found
         )
-        if download_ge and has_official:
+        if download_proton and has_official:
             ans = QMessageBox.question(
                 dlg,
                 __app_name__,
@@ -620,7 +620,7 @@ def _show(
 
         standalone_tool = (
             ""
-            if target_id in (STEAM_DEFAULT_PROTON_ID, DEFAULT_PROTON_ID, DOWNLOAD_NEWEST_GE_ID)
+            if target_id in (STEAM_DEFAULT_PROTON_ID, DEFAULT_PROTON_ID, DOWNLOAD_NEWEST_PROTON_ID)
             else custom_map.get(target_id, target_id)
         )
 
@@ -628,7 +628,7 @@ def _show(
             if not dlg_alive() or win._closing_pending:
                 return
             _busy(True)
-            worker = _ApplyWorker(dirs, target_id, standalone_tool, download_ge)
+            worker = _ApplyWorker(dirs, target_id, standalone_tool, download_proton)
             win._track_worker(worker)
             worker.status.connect(_set_status)
 

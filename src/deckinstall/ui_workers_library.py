@@ -23,8 +23,7 @@ from .runtime_manager import (
     ensure_mangohud,
     get_umu_run_path,
     is_win32_prefix,
-    list_ge_proton10_dirs,
-    list_ge_proton11_dirs,
+    list_default_proton_dirs,
     list_installed_compat_tools,
     official_mangohud_installed,
     system_mangohud_installed,
@@ -110,10 +109,10 @@ def compute_library_runner_labels(
             pass
         return ""
 
-    from .proton_policy import newest_ge_proton
+    from .proton_policy import newest_default_proton
 
-    newest = newest_ge_proton()
-    # "Default" means two things: Steam's own default tool, or DeckInstall's newest GE-Proton.
+    newest = newest_default_proton()
+    # "Default" means two things: Steam's own default tool, or DeckInstall's newest UMU-Proton.
     steam_default_lbl = tr("proton.steam_default_label")
     default_lbl = tr("proton.default_is", name=newest.name) if newest is not None else tr("proton.default_label")
     native_lbl = tr("library.tag_native_linux")
@@ -424,16 +423,16 @@ class LaunchPrepWorker(QThread):
                 if obj.launch_cmd:
                     self.ready.emit("ok", "", list(obj.launch_cmd), None, clean_child_env())
                     return
-                from .runtime_manager import find_system_umu_run, list_cachyos_proton_dirs
+                from .runtime_manager import find_system_umu_run
 
                 umu_run = find_system_umu_run() or get_umu_run_path()
                 if not umu_run.is_file():
                     self.ready.emit("warn", tr("play.umu_missing"), [], None, None)
                     return
                 proton_dir: Path | None = None
-                ge_dirs = list_ge_proton11_dirs() or list_cachyos_proton_dirs() or list_ge_proton10_dirs()
-                if ge_dirs:
-                    proton_dir = ge_dirs[0]
+                defaults = list_default_proton_dirs()
+                if defaults:
+                    proton_dir = defaults[0]
                 else:
                     installed_tools = list_installed_compat_tools()
                     if installed_tools:

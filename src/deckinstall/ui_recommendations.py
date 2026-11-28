@@ -29,7 +29,7 @@ class Target:
     steam_appid: int | None
     game_dir: Path | None
     mode: str  # "steam", "standalone" or "external"
-    proton: str  # "ge", "cachyos", "valve" or ""
+    proton: str  # "umu", "ge", "cachyos", "valve" or ""
     proton_dir: Path | None
     opts: str
     winedll: str
@@ -52,32 +52,21 @@ class Found:
 def gather(target: Target) -> Found:
     """Everything to recommend that the game does not have yet (runs in a worker: reads files,
     may download protonfixes)."""
-    from .runtime_manager import list_cachyos_proton_dirs, list_ge_proton11_dirs
+    from .runtime_manager import list_default_proton_dirs
 
     profile = hardware()
     current = parse_presets(target.opts)
     presets = recommend(profile, target.proton)
-    upscalers = _game_upscalers(target)
-    if upscalers is not None:  # an upgrade only for an upscaler the game ships
-        for key, name in _UPSCALER_OF.items():
-            if name not in upscalers:
-                presets.pop(key, None)
-        gpu = profile.game_gpu(bool(presets.get("prime") or current.get("prime")))
-        if "FSR" in upscalers and "fsr4_upgrade" not in presets and availability("fsr3_upgrade", gpu, profile,
-                                                                                  target.proton)[0] == OK:
-            presets["fsr3_upgrade"] = True
+    upscalers = _game_upscalers(target)  # upscalers are OptiScaler's: suggested below, never a preset
     found = Found(presets={k: v for k, v in presets.items() if not current.get(k)})
     found.suggest_optiscaler = _optiscaler_helps(target, upscalers, profile.game_gpu(bool(current.get("prime"))))
     found.valve = valve_fixes(target.proton_dir, target.steam_appid)
     if target.steam_appid or (target.store and target.codename):
-        root = local_protonfixes([*list_ge_proton11_dirs(), *list_cachyos_proton_dirs()]) or refresh_protonfixes()
+        root = local_protonfixes(list_default_proton_dirs()) or refresh_protonfixes()
         path = fix_file(root, target.steam_appid, target.store, target.codename) if root is not None else None
         found.umu_file = path is not None
         found.umu = umu_fixes(path, target.game_dir)
     return found
-
-
-_UPSCALER_OF = {"dlss_upgrade": "DLSS", "fsr4_upgrade": "FSR", "xess_upgrade": "XeSS"}
 
 
 def _game_upscalers(target: Target) -> tuple[str, ...] | None:
@@ -179,7 +168,7 @@ def add_game_recommendations(
             add_fix(fix)
         if target.mode == "standalone" and found.umu_file:
             actions.addWidget(note_label(tr("rec.umu_automatic")))
-        elif found.umu_file and target.proton in ("ge", "cachyos") and target.steam_appid:
+        elif found.umu_file and target.proton in ("umu", "ge", "cachyos") and target.steam_appid:
             add_fix(Fix("env", f"UMU_ID=umu-{target.steam_appid}", "umu"))
         else:
             for fix in found.umu:

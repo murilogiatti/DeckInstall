@@ -19,10 +19,10 @@ from .app_updater import check_app_update
 
 APP = "app"
 # Display order; "app" is always checked, the runtimes only when in use (the caller says which).
-ORDER = (APP, "ge_proton", "umu", "optiscaler", "mangohud")
+ORDER = (APP, "umu_proton", "umu", "optiscaler", "mangohud")
 LABELS = {
     APP: "DeckInstall",
-    "ge_proton": "GE-Proton",
+    "umu_proton": "UMU-Proton",
     "umu": "umu-run",
     "optiscaler": "OptiScaler",
     "mangohud": "MangoHud",
@@ -56,7 +56,7 @@ def _check_app() -> dict[str, dict[str, Any]]:
 def _check_umu_ge(wanted: set[str]) -> dict[str, dict[str, Any]]:
     data = _rm.check_runtime_updates(force=True)
     out: dict[str, dict[str, Any]] = {}
-    for comp in ("umu", "ge_proton"):
+    for comp in ("umu", "umu_proton"):
         if comp not in wanted:
             continue
         d = data.get(comp) or {}
@@ -72,11 +72,11 @@ def _check_pair(comp: str, fn: Callable[..., tuple[str, str]]) -> dict[str, dict
 
 
 def check_all(runtimes: Iterable[str]) -> dict[str, dict[str, Any]]:
-    """Check DeckInstall plus the given runtime components ("umu", "ge_proton", "mangohud",
+    """Check DeckInstall plus the given runtime components ("umu", "umu_proton", "mangohud",
     "optiscaler"); returns {component: entry} in ORDER."""
     wanted = set(runtimes)
     jobs: list[tuple[tuple[str, ...], Callable[[], dict[str, dict[str, Any]]]]] = [((APP,), _check_app)]
-    umu_ge = tuple(c for c in ("umu", "ge_proton") if c in wanted)
+    umu_ge = tuple(c for c in ("umu", "umu_proton") if c in wanted)
     if umu_ge:
         jobs.append((umu_ge, lambda: _check_umu_ge(wanted)))
     if "mangohud" in wanted:

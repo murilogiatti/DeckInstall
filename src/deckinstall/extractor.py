@@ -967,7 +967,7 @@ def _installer_command(
     on_log: Callable[[str], None] | None,
     cancel_flag: Callable[[], bool] | None,
 ) -> tuple[list[str], dict[str, str], Path]:
-    """Return (command, env, wine prefix): Steam Proton, else umu-run + GE-Proton, else system wine."""
+    """Return (command, env, wine prefix): Steam Proton, else umu-run + UMU-Proton, else system wine."""
     is_msi = installer_exe.suffix.lower() == ".msi"
     run_target = (
         ["msiexec", "/i", f"{INSTALLER_SOURCE_DRIVE.rstrip(':').upper()}:\\{installer_exe.name}"]
@@ -987,7 +987,7 @@ def _installer_command(
         raise RuntimeError("Installer cancelled by user.")
     try:
         umu_run = runtime_manager.ensure_umu_run()
-        resolved_proton = runtime_manager.ensure_ge_proton11()
+        resolved_proton = runtime_manager.ensure_umu_proton()
         runtime_manager.validate_steamrt4_integrity()
         env = runtime_manager.build_umu_env(tmp_pfx, resolved_proton)
         if on_log:
@@ -997,7 +997,7 @@ def _installer_command(
         wine = shutil.which("wine")
         if wine is None:
             raise
-        logging.warning("umu-run/GE-Proton unavailable (%s); using system wine", exc)
+        logging.warning("umu-run/UMU-Proton unavailable (%s); using system wine", exc)
         env = clean_child_env()
         env["WINEPREFIX"] = str(tmp_pfx)
         if on_log:

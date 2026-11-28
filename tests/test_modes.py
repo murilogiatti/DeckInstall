@@ -52,7 +52,7 @@ def test_features_belong_to_one_mode() -> None:
 
 def test_steamos_needs_no_standalone_runtime() -> None:
     steamos = ModeEnv(steamos=True, steam=True)
-    for component in ("ge_proton", "umu", "mangohud"):
+    for component in ("umu_proton", "umu", "mangohud"):
         assert steamos.component_note(component)
     assert ModeEnv(steamos=False, steam=True).component_note("mangohud") == ""
 
@@ -96,8 +96,7 @@ def test_cachyos_proton_and_system_runtime_handling(tmp_path: Path, monkeypatch:
     monkeypatch.setattr(runtime_manager, "list_ge_proton10_dirs", lambda: [])
 
     assert runtime_manager.list_cachyos_proton_dirs() == [cachy_dir]
-    assert proton_policy.newest_ge_proton() == cachy_dir
-    assert runtime_manager.ensure_ge_proton11() == cachy_dir
+    assert proton_policy.newest_default_proton() == cachy_dir
     assert runtime_manager.is_managed_compat_tool(cachy_dir) is False
 
     monkeypatch.setattr(runtime_manager, "_SYSTEM_COMPAT_TOOL_DIRS", (sys_compat,))
@@ -165,7 +164,7 @@ def test_stale_default_launcher_is_retargeted(tmp_path: Path, monkeypatch) -> No
     script = tmp_path / "launch.sh"
     script.write_text(f"export PROTONPATH={tmp_path / 'proton-cachyos-old'}\n", encoding="utf-8")
     game = SimpleNamespace(native_linux=False, proton_name="", launch_script=script, name="G")
-    monkeypatch.setattr(proton_policy, "newest_ge_proton", lambda: newest)
+    monkeypatch.setattr(proton_policy, "newest_default_proton", lambda: newest)
     calls: list[object] = []
     monkeypatch.setattr(proton_policy, "refresh_integration_files", calls.append)
     assert proton_policy.retarget_stale_default_games([game]) == 1  # type: ignore[list-item]

@@ -591,7 +591,7 @@ def resolve_proton_dir(
 
 
 def list_installed_protons(steam_root: Path) -> list[tuple[str, str]]:
-    """Return list of (internal_tool_name, display_label) for installed Proton/GE-Proton versions."""
+    """Return list of (internal_tool_name, display_label) for installed Proton versions (Valve and custom)."""
     found: list[tuple[str, str]] = []
     seen: set[str] = set()
 
@@ -603,7 +603,7 @@ def list_installed_protons(steam_root: Path) -> list[tuple[str, str]]:
                 if tool_id not in seen:
                     seen.add(tool_id)
                     label = (
-                        f"{entry.name} (Custom / GE-Proton)"
+                        f"{entry.name} (Custom)"
                         if tool_id == entry.name
                         else f"{entry.name} ({tool_id})"
                     )

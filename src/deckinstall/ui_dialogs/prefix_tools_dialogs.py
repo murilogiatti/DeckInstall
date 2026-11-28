@@ -10,6 +10,7 @@ from PySide6.QtCore import QThread, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QFormLayout,
     QGridLayout,
     QHBoxLayout,
@@ -414,6 +415,17 @@ def open_winetricks_dialog(
     dlg.deleteLater()
 
 
+def optiscaler_exe(win: MainWindow, kind: str, obj: object) -> Path | None:
+    """The game executable OptiScaler goes next to, or None when the game has no usable folder."""
+    if _is_native_linux_game(kind, obj) or (kind == "steam" and not win.paths):
+        return None
+    managed = win._managed_library_game(obj) if isinstance(obj, ShortcutEntry) else None
+    exe_path = managed.exe_path if managed is not None else _resolve_game_exe_path(kind, obj)
+    if exe_path is None or not str(exe_path).strip() or not exe_path.parent.is_dir():
+        return None
+    return exe_path
+
+
 def open_optiscaler_dialog(
     win: MainWindow, kind: str | None = None, obj: object | None = None, *,
     on_saved: Callable[[str], None] | None = None,
@@ -424,48 +436,67 @@ def open_optiscaler_dialog(
         if not sel:
             return
         kind, obj = sel
-    if _is_native_linux_game(kind, obj):
+    if _is_native_linux_game(kind, obj) or (kind == "steam" and not win.paths):
         return
-    if kind == "steam" and not win.paths:
-        return
-
-    managed = win._managed_library_game(obj) if isinstance(obj, ShortcutEntry) else None
-    exe_path = managed.exe_path if managed is not None else _resolve_game_exe_path(kind, obj)
-    current_steam_opts = obj.launch_options if isinstance(obj, ShortcutEntry) else ""
-    if exe_path is None or not str(exe_path).strip() or not exe_path.parent.is_dir():
+    if optiscaler_exe(win, kind, obj) is None:
+        exe_path = _resolve_game_exe_path(kind, obj)
         QMessageBox.warning(
             win,
             __app_name__,
             tr("optiscaler.invalid_exe_dir", path=str(exe_path.parent) if exe_path else ""),
         )
         return
-
-    title_name = (
-        obj.app_name
-        if isinstance(obj, ShortcutEntry)
-        else str(getattr(obj, "name", "") or "")
-    )
+    title_name = obj.app_name if isinstance(obj, ShortcutEntry) else str(getattr(obj, "name", "") or "")
     operation = {"busy": False, "refresh_id": 0}
     dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: bool(operation["busy"]))
     dlg.setWindowTitle(tr("optiscaler.title", name=title_name))
     dlg.resize(560, 460)
     lay = QVBoxLayout(dlg)
     lay.setSpacing(12)
+    btn_close = QPushButton(tr("optiscaler.btn_close"))
+    btn_close.clicked.connect(dlg.accept)
+    card, card_lay, _top = section_card(tr("launch.optiscaler_title"), tr("optiscaler.options_hint"))
+    card_lay.addWidget(build_optiscaler_panel(
+        win, dlg, kind, obj, on_saved=on_saved, operation=operation,
+        on_busy=lambda busy: btn_close.setEnabled(not busy),
+    ))
+    lay.addWidget(card)
+    lay.addStretch(1)
+    lay.addLayout(dialog_footer(btn_close))
+    dlg.exec()
+    dlg.deleteLater()
+
+
+def build_optiscaler_panel(
+    win: MainWindow, dlg: QDialog, kind: str, obj: object, *,
+    on_saved: Callable[[str], None] | None = None,
+    operation: dict[str, Any] | None = None,
+    on_busy: Callable[[bool], None] | None = None,
+) -> QWidget:
+    """OptiScaler for one game, inside `dlg` (its own dialog, or Configure game's list): the state,
+    the options and Install / Remove. A game without a usable folder gets a line saying so."""
+    exe_path = optiscaler_exe(win, kind, obj)
+    if exe_path is None:
+        return note_label(tr("launch.optiscaler_after_install"))
+    managed = win._managed_library_game(obj) if isinstance(obj, ShortcutEntry) else None
+    current_steam_opts = obj.launch_options if isinstance(obj, ShortcutEntry) else ""
+    title_name = obj.app_name if isinstance(obj, ShortcutEntry) else str(getattr(obj, "name", "") or "")
+    if operation is None:
+        operation = {"busy": False, "refresh_id": 0}
+    panel = QWidget()
+    lay = QVBoxLayout(panel)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(6)
 
     dlg_alive = _dialog_guard(dlg)
 
-    # 1. Where it goes and whether it is there.
-    state_card, state_lay, _top = section_card(tr("optiscaler.state_title"))
+    # Whether it is there, and where it goes.
     lbl_state = QLabel()
     lbl_state.setWordWrap(True)
-    state_lay.addWidget(lbl_state)
-    state_lay.addWidget(
-        note_label(tr("optiscaler.exe_dir_label", path=str(optiscaler_executable(exe_path).parent)))
-    )
-    lay.addWidget(state_card)
+    lay.addWidget(lbl_state)
+    lay.addWidget(note_label(tr("optiscaler.exe_dir_label", path=str(optiscaler_executable(exe_path).parent))))
 
-    # 2. How it runs (Automatic picks what fits this game and GPU).
-    opts_card, opts_lay, _top = section_card(tr("optiscaler.options_title"), tr("optiscaler.options_hint"))
+    # How it runs (Automatic picks what fits this game and GPU).
     form = QFormLayout()
     combo_backend = QComboBox()
     backend_labels = {
@@ -510,21 +541,20 @@ def open_optiscaler_dialog(
     chk_overlay_menu = QCheckBox(tr("optiscaler.overlay_menu_label"))
     chk_overlay_menu.setChecked(True)
     form.addRow("", chk_overlay_menu)
-    opts_lay.addLayout(form)
-    lay.addWidget(opts_card)
+    lay.addLayout(form)
 
     lbl_progress = note_label()
     lbl_progress.setVisible(False)
     lay.addWidget(lbl_progress)
-    lay.addStretch(1)
 
     btn_install = QPushButton(tr("optiscaler.btn_install"))
-    btn_install.setObjectName("primaryBtn")
     btn_remove = QPushButton(tr("optiscaler.btn_remove"))
     btn_remove.setObjectName("dangerBtn")
-    btn_close = QPushButton(tr("optiscaler.btn_close"))
-    btn_close.clicked.connect(dlg.accept)
-    lay.addLayout(dialog_footer(btn_install, btn_close, left=(btn_remove,)))
+    buttons = QHBoxLayout()
+    buttons.addWidget(btn_install)
+    buttons.addWidget(btn_remove)
+    buttons.addStretch()
+    lay.addLayout(buttons)
 
 
     def _on_state_refreshed(req_id: int, st_now: object, recommended: str = "") -> None:
@@ -608,7 +638,8 @@ def open_optiscaler_dialog(
         spoof_combo.setEnabled(not busy)
         chk_overlay_menu.setEnabled(not busy)
         btn_install.setEnabled(not busy)
-        btn_close.setEnabled(not busy)
+        if on_busy is not None:
+            on_busy(busy)
         if busy:
             btn_remove.setEnabled(False)
             lbl_progress.setText(status_text)
@@ -975,5 +1006,4 @@ def open_optiscaler_dialog(
     btn_install.clicked.connect(lambda: _start_install(False))
     btn_remove.clicked.connect(_on_remove)
     _refresh_state_ui()
-    dlg.exec()
-    dlg.deleteLater()
+    return panel

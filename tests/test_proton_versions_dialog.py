@@ -85,23 +85,23 @@ def test_update_downloads_a_newer_ge_proton_and_moves_default_games(tmp_path: Pa
         _tool("GE-Proton11-2")
         return runtime_manager.get_compat_tools_dir() / "GE-Proton11-2"
 
-    info = {"ge_proton": {"installed": "GE-Proton11-1", "latest": "GE-Proton11-2", "update_available": True}}
+    info = {"umu_proton": {"installed": "GE-Proton11-1", "latest": "GE-Proton11-2", "update_available": True}}
     with (
         mock.patch.object(pbd, "check_runtime_updates", return_value=info),
-        mock.patch.object(pbd, "ensure_ge_proton11", side_effect=_download) as dl,
+        mock.patch.object(pbd, "ensure_umu_proton", side_effect=_download) as dl,
         mock.patch.object(pbd, "retarget_default_games", return_value=1) as retarget,
     ):
-        assert pbd.ensure_newest_ge_proton() == "GE-Proton11-2"
+        assert pbd.ensure_newest_default_proton() == "GE-Proton11-2"
     assert dl.call_args.kwargs["force_update"] is True
     retarget.assert_called_once_with("GE-Proton11-1")
 
 
 def test_up_to_date_ge_proton_is_not_downloaded(tmp_path: Path) -> None:
     _tool("GE-Proton11-2")
-    info = {"ge_proton": {"installed": "GE-Proton11-2", "latest": "GE-Proton11-2", "update_available": False}}
+    info = {"umu_proton": {"installed": "GE-Proton11-2", "latest": "GE-Proton11-2", "update_available": False}}
     with (
         mock.patch.object(pbd, "check_runtime_updates", return_value=info),
-        mock.patch.object(pbd, "ensure_ge_proton11") as dl,
+        mock.patch.object(pbd, "ensure_umu_proton") as dl,
     ):
-        assert pbd.ensure_newest_ge_proton() == "GE-Proton11-2"
+        assert pbd.ensure_newest_default_proton() == "GE-Proton11-2"
     dl.assert_not_called()

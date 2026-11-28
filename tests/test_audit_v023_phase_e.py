@@ -90,27 +90,27 @@ def test_legacy_import_reuses_original_appid(tmp_path: Path) -> None:
     assert (paths.compatdata_dir / str(appid) / "pfx" / "drive_c" / "save").read_bytes() == b"standalone"
 
 
-def test_manually_installed_ge_proton_is_preserved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_manually_installed_umu_proton_is_preserved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runtime_manager, "get_compat_tools_dir", lambda: tmp_path)
-    tool = tmp_path / "GE-Proton11-42"
+    tool = tmp_path / "UMU-Proton-11.0-42-x86_64"
     tool.mkdir()
     user_file = tool / "my-settings"
     user_file.write_bytes(b"keep")
-    monkeypatch.setattr(runtime_manager, "list_ge_proton11_dirs", lambda: [tool])
+    monkeypatch.setattr(runtime_manager, "list_umu_proton_dirs", lambda: [])
     monkeypatch.setattr(runtime_manager, "_get_arch", lambda: "x86_64")
-    monkeypatch.setattr(runtime_manager, "_fetch_latest_ge_proton11_release", lambda: {
-        "tag_name": tool.name,
+    monkeypatch.setattr(runtime_manager, "_fetch_latest_umu_proton_release", lambda: {
+        "tag_name": "UMU-Proton-11.0-42",
         "assets": [
-            {"name": f"{tool.name}-x86_64{suffix}", "browser_download_url": "https://github.com/test/test"}
+            {"name": f"{tool.name}{suffix}", "browser_download_url": "https://github.com/test/test"}
             for suffix in (".tar.gz", ".sha512sum")
         ],
     })
     download = Mock()
     monkeypatch.setattr(runtime_manager, "_download_file", download)
     with pytest.raises(ValueError, match="outside DeckInstall"):
-        runtime_manager.repair_ge_proton(tool)
+        runtime_manager.repair_managed_proton(tool)
     with pytest.raises(ValueError, match="was preserved"):
-        runtime_manager.ensure_ge_proton11()
+        runtime_manager.ensure_umu_proton()  # a broken copy someone else put there is never replaced
     assert user_file.read_bytes() == b"keep"
     download.assert_not_called()
 
