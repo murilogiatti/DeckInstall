@@ -785,7 +785,7 @@
   "maint.mangohud_system": "System MangoHud",
   "runtime.uninstall_none": "No runtime downloaded by DeckInstall was found.",
   "runtime.uninstall_title": "Uninstall runtimes",
-  "runtime.uninstall_hint": "Select the DeckInstall runtimes to remove. Games in Default mode use the newest Proton left. If you remove a version used by a Steam shortcut or a pinned game, reinstall it or select another version before playing.",
+  "runtime.uninstall_hint": "Select what to remove. Every Proton in your user folder is listed, whoever installed it (the system's are not); the games using each one are shown. Games in Default mode use the newest Proton left. If you remove a version used by a Steam shortcut or a pinned game, select another version before playing.",
   "runtime.uninstall_col_users": "Used by",
   "runtime.uninstall_btn_selected": "Uninstall checked",
   "runtime.uninstall_game_running": "Close running games before removing runtimes.",
@@ -1120,5 +1120,7 @@
   "winetricks.needs_umu_proton": "Winetricks comes with the default Proton and runs inside the game's own container: choose Default in Configure > Proton to use it.",
   "runtimes.tool_7z": "OptiScaler",
   "runtimes.tool_innoextract": "GOG installers",
-  "runtimes.tool_gamemode": "system performance mode"
+  "runtimes.tool_gamemode": "system performance mode",
+  "runtime.previous_of": "previous version of {count} game(s)",
+  "runtime.previous_lost": "{count} game(s) lose \"Use previous version\""
 }

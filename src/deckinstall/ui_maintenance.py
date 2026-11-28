@@ -626,6 +626,8 @@ def open_uninstall_runtimes_dialog(win: MainWindow, kinds: set[str] | None = Non
             tbl.setItem(row, 0, it)
             tbl.setItem(row, 1, _SortableTableItem(format_size_bytes(item.size_bytes), item.size_bytes))
             users = ", ".join(item.users) if item.users else ("-" if item.kind == PROTON else "")
+            if item.previous_of:  # nobody runs on it, but it is their one-click way back
+                users = tr("runtime.previous_of", count=len(item.previous_of)) if not item.users else users
             tbl.setItem(row, 2, QTableWidgetItem(users))
         tbl.horizontalHeader().setSortIndicator(0, Qt.SortOrder.AscendingOrder)
         tbl.setSortingEnabled(True)
@@ -657,6 +659,7 @@ def open_uninstall_runtimes_dialog(win: MainWindow, kinds: set[str] | None = Non
             listing = "\n".join(
                 f"• {i.name} ({format_size_bytes(i.size_bytes)})"
                 + (f" - {tr('runtime.uninstall_used_by', games=', '.join(i.users))}" if i.users else "")
+                + (f" - {tr('runtime.previous_lost', count=len(i.previous_of))}" if i.previous_of else "")
                 for i in chosen
             )
             if QMessageBox.question(

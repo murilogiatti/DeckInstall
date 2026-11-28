@@ -785,7 +785,7 @@
   "maint.mangohud_system": "MangoHud do sistema",
   "runtime.uninstall_none": "Nenhum runtime baixado pelo DeckInstall foi encontrado.",
   "runtime.uninstall_title": "Desinstalar runtimes",
-  "runtime.uninstall_hint": "Selecione os runtimes do DeckInstall que quer remover. Jogos no modo Padrão usam o Proton mais novo que sobrar. Se remover a versão de um atalho da Steam ou de um jogo com Proton fixado, reinstale a versão ou selecione outra antes de jogar.",
+  "runtime.uninstall_hint": "Selecione o que quer remover. Todo Proton da sua pasta de usuário aparece, seja quem for que instalou (os do sistema não); os jogos que usam cada um aparecem ao lado. Jogos no modo Padrão usam o Proton mais novo que sobrar. Se remover a versão de um atalho da Steam ou de um jogo com Proton fixado, selecione outra antes de jogar.",
   "runtime.uninstall_col_users": "Usado por",
   "runtime.uninstall_btn_selected": "Desinstalar marcados",
   "runtime.uninstall_game_running": "Feche os jogos abertos antes de remover runtimes.",
@@ -1120,5 +1120,7 @@
   "winetricks.needs_umu_proton": "O winetricks vem com o Proton padrão e roda no próprio contêiner do jogo: escolha Padrão em Configurar > Proton para usá-lo.",
   "runtimes.tool_7z": "OptiScaler",
   "runtimes.tool_innoextract": "instaladores da GOG",
-  "runtimes.tool_gamemode": "modo de desempenho do sistema"
+  "runtimes.tool_gamemode": "modo de desempenho do sistema",
+  "runtime.previous_of": "versão anterior de {count} jogo(s)",
+  "runtime.previous_lost": "{count} jogo(s) perdem o \"Usar versão anterior\""
 }

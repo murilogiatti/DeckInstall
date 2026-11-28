@@ -30,6 +30,7 @@ class RuntimeItem:
     path: Path
     size_bytes: int
     users: tuple[str, ...] = ()  # games that use it (custom Proton tools)
+    previous_of: tuple[str, ...] = ()  # games that keep it as "Use previous version" (Protons)
 
 
 def _managed_mangohud_layers() -> list[tuple[Path, int]]:
@@ -110,11 +111,14 @@ def list_runtimes(paths: SteamPaths | None = None) -> list[RuntimeItem]:
 
     users = _proton_users(paths, games)
     compat_dir = rm.get_compat_tools_dir()
+    # Every Proton in the user's compatibilitytools.d, whoever installed it (DeckInstall, umu-run,
+    # ProtonUp...); the system's (/usr/share) are never listed.
     managed_tools: list[Path] = []
     if compat_dir.is_dir():
         try:
             for entry in compat_dir.iterdir():
-                if rm.is_managed_compat_tool(entry):
+                if (entry.is_dir() and not entry.is_symlink() and (entry / "proton").is_file()
+                        and not rm.is_system_compat_tool(entry)):
                     managed_tools.append(entry)
         except OSError:
             managed_tools = []
@@ -134,7 +138,11 @@ def list_runtimes(paths: SteamPaths | None = None) -> list[RuntimeItem]:
                             tool_users.append(u_name)
             except OSError:
                 pass
-        items.append(RuntimeItem(PROTON, path.name, path, dir_size_bytes(path), tuple(tool_users)))
+        previous_of = tuple(
+            game.name for game in games
+            if not game.native_linux and str(game.meta.get("proton_previous") or "") == path.name
+        )
+        items.append(RuntimeItem(PROTON, path.name, path, dir_size_bytes(path), tuple(tool_users), previous_of))
     return items
 
 
@@ -156,7 +164,7 @@ def uninstall(items: list[RuntimeItem]) -> tuple[list[str], list[str]]:
                 changed = rm.uninstall_mangohud()
             elif item.kind == OPTISCALER:
                 changed = rm.uninstall_optiscaler_package()
-            elif item.kind == PROTON and rm.is_managed_compat_tool(item.path):
+            elif item.kind == PROTON and item.path.parent == rm.get_compat_tools_dir():
                 from .i18n import tr
                 from .steam_paths import _read_compat_tool_id
 
@@ -166,10 +174,10 @@ def uninstall(items: list[RuntimeItem]) -> tuple[list[str], list[str]]:
                     for game in list_standalone_games()
                 ):
                     raise ValueError(tr("runtime.uninstall_pinned"))
-                rm.remove_compat_tool(item.path, managed_only=True)
+                rm.remove_compat_tool(item.path)
                 changed = True
             else:
-                raise ValueError(f"Runtime is not managed by DeckInstall: {item.path}")
+                raise ValueError(f"Runtime is not in DeckInstall's reach: {item.path}")
             if changed:
                 removed.append(item.name)
         except (OSError, ValueError) as exc:

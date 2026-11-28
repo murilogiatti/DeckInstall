@@ -191,3 +191,24 @@ def test_umu_proton_download_checks_sha512_and_keeps_umu_runs_folder_name(
     assert installed.name == stem  # the folder umu-run uses, so it never downloads the same release again
     assert runtime_manager.is_managed_compat_tool(installed)
     assert runtime_manager.ensure_umu_proton() == installed  # already there: nothing downloaded
+
+
+def test_remove_lists_every_user_proton_with_its_users_and_rollbacks(tmp_path: Path) -> None:
+    """A Proton installed by another program (no DeckInstall mark) is listed and can be removed;
+    one kept as the "previous version" says which games lose it."""
+    from deckinstall import runtime_uninstall as ru
+
+    ge = _proton("GE-Proton11-14")
+    game = _install(tmp_path, "Alpha")  # Default: on the GE one
+    umu = _proton("UMU-Proton-11.0-2e-x86_64")
+    assert proton_policy.retarget_stale_default_games() == 1  # now on UMU, GE kept as previous
+    other = runtime_manager.get_compat_tools_dir() / "GE-Proton11-12"  # e.g. from ProtonUp
+    other.mkdir()
+    (other / "proton").write_text("#!/bin/sh\n", encoding="utf-8")
+    items = {i.name: i for i in ru.list_runtimes(None) if i.kind == ru.PROTON}
+    assert set(items) == {ge.name, umu.name, other.name}
+    assert items[umu.name].users == (game.name,)
+    assert items[ge.name].previous_of == (game.name,) and items[ge.name].users == ()
+    assert items[other.name].users == () and items[other.name].previous_of == ()
+    removed, errors = ru.uninstall([items[other.name]])
+    assert removed == [other.name] and errors == [] and not other.exists()
