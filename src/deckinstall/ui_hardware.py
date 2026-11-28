@@ -1,14 +1,14 @@
-"""Settings > General > "This computer": what DeckInstall detected and what it means for games."""
+"""Settings > General > System: what DeckInstall detected on this computer and what it means for games."""
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from PySide6.QtWidgets import QLabel, QWidget
+from PySide6.QtWidgets import QFormLayout, QLabel
 
 from .hardware import Gpu, HardwareProfile, hardware, mesa_version
 from .i18n import tr
-from .ui_cards import note_label, section_card
+from .ui_cards import note_label
 
 if TYPE_CHECKING:
     from .ui import MainWindow
@@ -59,15 +59,24 @@ def describe(profile: HardwareProfile, mesa: tuple[int, int] | None) -> tuple[li
     return facts, notes
 
 
-def build_hardware_card(win: MainWindow) -> QWidget:
-    card, layout, _top = section_card(tr("hw.title"), tr("hw.hint"))
+def summary(profile: HardwareProfile) -> str:
+    """One short line: CPU, GPUs (the one games run on first) and the session."""
+    cpu = (profile.cpu_model or profile.cpu_vendor.upper()).replace(" with Radeon Graphics", "")
+    gpus = sorted(profile.gpus, key=lambda gpu: gpu is not profile.primary)
+    names = " + ".join(gpu.name or gpu.vendor.upper() for gpu in gpus) or tr("hw.no_gpu")
+    session = {"gamescope": tr("hw.session_gamescope"), "wayland": "Wayland", "x11": "X11"}[profile.session]
+    return " · ".join(part for part in (profile.device, cpu, names, session) if part)
+
+
+def build_hardware_rows(win: MainWindow, form: QFormLayout) -> None:
+    """"This computer" in the System form: a short line (details in its tooltip) and any warning."""
     win.lbl_hardware = QLabel(tr("runtimes.loading"))
     win.lbl_hardware.setWordWrap(True)
-    layout.addWidget(win.lbl_hardware)
+    form.addRow(tr("hw.title"), win.lbl_hardware)
     win.lbl_hardware_notes = note_label(kind="WarningText")
-    win.lbl_hardware_notes.setVisible(False)
-    layout.addWidget(win.lbl_hardware_notes)
-    return card
+    form.addRow(win.lbl_hardware_notes)
+    form.setRowVisible(win.lbl_hardware_notes, False)
+    win._hardware_form = form
 
 
 def refresh_hardware_card(win: MainWindow) -> None:
@@ -82,9 +91,10 @@ def refresh_hardware_card(win: MainWindow) -> None:
         if win._closing_pending or not isinstance(result, tuple):
             return
         facts, notes = describe(*result)
-        win.lbl_hardware.setText("\n".join(facts))
+        win.lbl_hardware.setText(summary(result[0]))
+        win.lbl_hardware.setToolTip("\n".join(facts))
         win.lbl_hardware_notes.setText("\n".join(notes))
-        win.lbl_hardware_notes.setVisible(bool(notes))
+        win._hardware_form.setRowVisible(win.lbl_hardware_notes, bool(notes))
 
     worker.finished_ok.connect(_done)
     worker.start()

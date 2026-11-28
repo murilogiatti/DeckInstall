@@ -54,7 +54,7 @@ from ..runtime_manager import (
     official_mangohud_installed,
     system_mangohud_installed,
 )
-from ..standalone import StandaloneGame, update_standalone_launch_options
+from ..standalone import StandaloneGame, merge_dll_overrides, update_standalone_launch_options
 from ..steam_vdf import (
     ShortcutEntry,
     get_shortcut_proton,
@@ -153,11 +153,24 @@ def build_launch_options(
     )
     opts_now = initial_opts or ""
     winedll_now = initial_winedll or ""
+    # Steam and external games keep WINEDLLOVERRIDES in the launch line; Standalone in its own field,
+    # so a token found in a Standalone line moves to the field (the launcher would merge it anyway).
+    dll_in_line = kind in ("steam", "external") and not is_native_linux
+    dll_arg = None if dll_in_line else ""
     st = _parse_launch_preset_state(opts_now)
-    if kind == "standalone" and not winedll_now.strip():
-        extracted_dll = str(st.get("winedll") or "").strip()
-        if extracted_dll:
-            winedll_now = extracted_dll
+    extracted_dll = str(st.get("winedll") or "").strip()
+    if not dll_in_line and extracted_dll:
+        winedll_now = merge_dll_overrides(winedll_now, extracted_dll) if winedll_now.strip() else extracted_dll
+    if not dll_in_line:
+        try:
+            opts_now = apply_presets(opts_now, winedlloverrides="", native_linux=is_native_linux)
+        except ValueError:
+            pass
+    if mangohud_note and st["mangohud"]:  # a Steam-mode game keeps MangoHud from an older version
+        try:
+            opts_now = apply_presets(opts_now, mangohud=False, winedlloverrides=dll_arg, native_linux=is_native_linux)
+        except ValueError:
+            pass
 
     pane = QWidget(dlg)
     layout = QVBoxLayout(pane)
@@ -399,7 +412,11 @@ def build_launch_options(
             return
         try:
             opts = raw_edit.text()
-            raw_edit.setText(apply_presets(opts, {**parse_presets(opts), **changes}, native_linux=is_native_linux))
+            if mangohud_note:
+                changes["mangohud"] = False
+            raw_edit.setText(apply_presets(
+                opts, {**parse_presets(opts), **changes}, winedlloverrides=dll_arg, native_linux=is_native_linux,
+            ))
         except ValueError:
             return
         previous.update(state)
@@ -423,7 +440,7 @@ def build_launch_options(
         try:
             has_dxgi = remove_winedlloverride(text, "dxgi") != text
             chk_dxgi.setChecked(has_dxgi)
-            if kind in ("steam", "external") and not is_native_linux:
+            if dll_in_line:
                 raw_edit.setText(apply_presets(raw_edit.text(), winedlloverrides=text.strip()))
         except ValueError:
             pass
@@ -698,6 +715,7 @@ def build_launch_options(
         winedll_edit.setEnabled(False)
     winedll_edit.textChanged.connect(_on_winedll_text_changed)
     raw_edit.textChanged.connect(_on_raw_text_changed)
+    _update_optiscaler_dxgi_guard()
     _update_wined3d_warning()
     _refresh_rules()
 
@@ -718,7 +736,12 @@ def build_launch_options(
         try:
             for key, chk in checks.items():
                 chk.setChecked(bool(state.get(key)))
-            gpu_choice.setCurrentIndex(gpu_choice.findData(chk_prime.isChecked()))
+            gpu_idx = gpu_choice.findData(chk_prime.isChecked())
+            if gpu_idx < 0:  # PRIME in the line on a PC without a known dedicated GPU
+                gpu_choice.addItem(tr("launch.prime_offload"), True)
+                gpu_choice.setEnabled(True)
+                gpu_idx = gpu_choice.findData(True)
+            gpu_choice.setCurrentIndex(gpu_idx)
             rate = int(state.get("frame_rate") or 0)
             idx = frame_combo.findData(rate)
             if idx < 0:
@@ -753,8 +776,17 @@ def build_launch_options(
 
     def read_raw_edit() -> None:
         opts = raw_edit.text()
-        dll = (str(parse_presets(opts).get("winedll") or "")
-               if kind in ("steam", "external") else winedll_edit.text())
+        typed_dll = str(parse_presets(opts).get("winedll") or "")
+        if dll_in_line:
+            dll = typed_dll
+        else:
+            dll = winedll_edit.text().strip()
+            if typed_dll:
+                dll = merge_dll_overrides(dll, typed_dll) if dll else typed_dll
+                try:
+                    opts = apply_presets(opts, winedlloverrides="", native_linux=is_native_linux)
+                except ValueError:
+                    pass
         set_options(opts, dll)
 
     raw_edit.editingFinished.connect(read_raw_edit)
@@ -774,22 +806,17 @@ def build_launch_options(
         details_layout.insertWidget(0, suggestions)
         more(suggestions, suggestions_layout, editor)
 
-    loaded = False
     compact_height = dlg.height()
 
     def _toggle_more(opened: bool) -> None:
-        nonlocal loaded, compact_height
+        nonlocal compact_height
         if opened:
             compact_height = dlg.height()
         details.setVisible(opened)
         dlg.resize(dlg.width(), max(compact_height, 560) if opened else compact_height)
         more_button.setArrowType(Qt.ArrowType.DownArrow if opened else Qt.ArrowType.RightArrow)
-        if opened:
-            if not loaded:
-                loaded = True
-                _update_optiscaler_dxgi_guard()
-            if suggestions is None:
-                _load_recommendations()
+        if opened and suggestions is None:
+            _load_recommendations()
 
     more_button.toggled.connect(_toggle_more)
     return editor

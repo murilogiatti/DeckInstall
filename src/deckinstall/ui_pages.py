@@ -151,17 +151,11 @@ def build_add_page(win: MainWindow) -> QWidget:
     lbl_det.setObjectName("SectionTitle")
     win.btn_scan = QPushButton(tr("install.btn_rescan"))
     win.btn_scan.clicked.connect(win._refresh_games)
-    win.btn_scan_folders = QPushButton(tr("scan_folders.btn"))
-    win.btn_scan_folders.clicked.connect(win._open_scan_folders_dialog)
-    win.lbl_scan_folders_count = QLabel()
-    win.lbl_scan_folders_count.setObjectName("MutedText")
-    win._update_scan_folders_label()
-    btn_browse_exe = QPushButton(tr("install.browse"))
+    win.btn_scan.setToolTip(tr("install.rescan_tip"))  # the folders searched are in Settings
+    btn_browse_exe = QPushButton(tr("install.pick_exe"))
     btn_browse_exe.clicked.connect(win._pick_manual_exe)
     scan_row.addWidget(lbl_det)
     scan_row.addStretch()
-    scan_row.addWidget(win.lbl_scan_folders_count)
-    scan_row.addWidget(win.btn_scan_folders)
     scan_row.addWidget(win.btn_scan)
     scan_row.addWidget(btn_browse_exe)
     list_layout.addLayout(scan_row)
@@ -223,17 +217,17 @@ def build_add_page(win: MainWindow) -> QWidget:
     )
     win.steam_match_combo.setMinimumContentsLength(24)
     win.steam_match_combo.currentIndexChanged.connect(win._on_steam_match_changed)
-    form.addRow(tr("add.match_label"), win.steam_match_combo)
-
+    # One line for the Steam match: the result picked, and the search that fills it.
     art_row = QHBoxLayout()
     win.steam_search_input = QLineEdit()
     win.steam_search_input.setPlaceholderText(tr("install.game_name_placeholder"))
     win.steam_search_input.returnPressed.connect(win._search_steam_art)
     btn_search = QPushButton(tr("install.search_steam"))
     btn_search.clicked.connect(win._search_steam_art)
-    art_row.addWidget(win.steam_search_input, 1)
+    art_row.addWidget(win.steam_match_combo, 3)
+    art_row.addWidget(win.steam_search_input, 2)
     art_row.addWidget(btn_search)
-    form.addRow(tr("add.steam_store_label"), art_row)
+    form.addRow(tr("add.match_label"), art_row)
 
     # Step 3 (where and how it runs) has its own card: library, mode, presets, shortcuts.
     run_form = QFormLayout()
@@ -284,7 +278,7 @@ def build_add_page(win: MainWindow) -> QWidget:
 
     win._add_launch_options = ""
     win._add_winedlloverrides = ""
-    win._add_proton = ("", "")
+    win._add_proton = ("", "", "")
     # The installer uses the same launch controls as the Library.
     launch_row = QHBoxLayout()
     launch_row.setSpacing(10)
@@ -602,23 +596,17 @@ def build_library_page(win: MainWindow) -> QWidget:
     find_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
     find_shortcut.activated.connect(win._focus_library_search)
 
-    win.btn_game_actions = QPushButton("⋯")
-    win.btn_game_actions.setAccessibleName(tr("library.game_actions"))
-    win.btn_game_actions.setToolTip(tr("library.game_actions"))
-    game_actions = QMenu(win.btn_game_actions)
-    win.btn_game_actions.setMenu(game_actions)
-    win.act_favorite = game_actions.addAction(tr("library.btn_favorite"))
+    # The selected game's actions, all in the row under the list (one button per action; the
+    # QActions keep the enabled/visible state and the Configure dialog reuses two of them).
+    win.act_favorite = QAction(tr("library.btn_favorite"), win)
     win.act_favorite.setCheckable(True)
     win.act_favorite.triggered.connect(win._toggle_favorite)
-    win.act_move_game = game_actions.addAction(tr("library.btn_move_disk"))
+    win.act_move_game = QAction(tr("library.btn_move_disk"), win)
     win.act_move_game.triggered.connect(win._move_selected_game)
-    win.act_game_art = game_actions.addAction(tr("art.btn_selected"))
-    win.act_tools = game_actions.addAction(tr("configure.tab_prefix"))
+    win.act_game_art = QAction(tr("art.btn_selected"), win)
+    win.act_tools = QAction(tr("configure.tab_prefix"), win)
     win.act_tools.triggered.connect(lambda: win._open_configure_game_dialog(tools_only=True))
-    game_actions.addAction(win.act_ext_to_steam)
-    game_actions.addAction(win.act_ext_import_saves)
-    game_actions.addSeparator()
-    win.act_remove_game = game_actions.addAction(tr("library.btn_uninstall"))
+    win.act_remove_game = QAction(tr("library.btn_uninstall"), win)
     win.act_remove_game.triggered.connect(win._remove_selected_shortcut)
 
     win.btn_bulk_actions = QPushButton(tr("library.bulk_actions"))
@@ -635,9 +623,17 @@ def build_library_page(win: MainWindow) -> QWidget:
 
     win.act_game_art.triggered.connect(lambda: fetch_selected_art(win))
     footer = FlowLayout(spacing=8)
-    for btn in (win.btn_play_game, win.btn_configure_game, win.btn_game_actions):
-        footer.addWidget(btn)
     lib_layout.addLayout(footer)
+    footer.addWidget(win.btn_play_game)
+    footer.addWidget(win.btn_configure_game)
+    win.game_action_buttons = {}
+    for action in (
+        win.act_favorite, win.act_tools, win.act_game_art, win.act_move_game,
+        win.act_ext_to_steam, win.act_ext_import_saves, win.act_remove_game,
+    ):
+        btn = action_button(action, "dangerBtn" if action is win.act_remove_game else "")
+        footer.addWidget(btn)
+        win.game_action_buttons[action] = btn
     win.shortcuts_list.setMinimumHeight(420)
     win.library_grid.setMinimumHeight(420)
 
@@ -664,6 +660,30 @@ def build_library_page(win: MainWindow) -> QWidget:
     return page
 
 
+def action_button(action: QAction, object_name: str = "") -> QPushButton:
+    """A push button that shows and triggers `action` (text, enabled, visible and checked follow it)."""
+    btn = QPushButton(action.text())
+    if object_name:
+        btn.setObjectName(object_name)
+
+    def sync() -> None:
+        btn.setText(action.text())
+        btn.setToolTip(action.toolTip() if action.toolTip() != action.text().replace("&", "") else "")
+        btn.setEnabled(action.isEnabled())
+        btn.setCheckable(action.isCheckable())
+        btn.setChecked(action.isChecked())
+        if not action.isVisible():
+            btn.hide()
+        elif btn.parentWidget() is not None:  # never show a parentless button as a window
+            btn.show()
+
+    action.changed.connect(sync)
+    action.toggled.connect(lambda _on: sync())
+    btn.clicked.connect(lambda _checked=False: action.trigger())
+    sync()
+    return btn
+
+
 def update_sgdb_state(win: MainWindow) -> None:
     """Say whether a SteamGridDB key is saved (the key itself is never shown)."""
     from .steamgriddb import api_key
@@ -672,14 +692,12 @@ def update_sgdb_state(win: MainWindow) -> None:
 
 
 def build_settings_page(win: MainWindow) -> QWidget:
-    """Settings > General: appearance, new games, this computer, Steam, artwork and the app itself."""
+    """Settings > General: preferences (look, new games, artwork) and the system (Steam, this PC, the app)."""
     from .ui import DEFAULT_FPS_KEY  # ui imports this module
     from .ui_scale import SCALE_KEY
 
     page, layout = page_layout(tr("settings.section_general"), tr("settings.page_subtitle"))
 
-    # Appearance: a form, one setting per line.
-    look, look_layout, _top = section_card(tr("settings.look_title"))
     win.theme_combo = QComboBox()
     win.theme_combo.addItem(tr("header.theme.auto"), "auto")
     win.theme_combo.addItem(tr("header.theme.dark"), "dark")
@@ -705,17 +723,8 @@ def build_settings_page(win: MainWindow) -> QWidget:
         win.message_bar.show_message(tr("settings.scale_restart"), "info", key="scale")
 
     win.scale_combo.currentIndexChanged.connect(_on_scale_changed)
-    look_form = QFormLayout()
-    look_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
-    look_form.addRow(tr("header.theme"), win.theme_combo)
-    look_form.addRow(tr("header.language"), win.lang_combo)
-    look_form.addRow(tr("settings.scale"), win.scale_combo)
-    look_form.addRow(note_label(tr("settings.scale_tip")))  # the whole width: it is a sentence
-    look_layout.addLayout(look_form)
-    layout.addWidget(look)
 
-    # New games: the frame cap they start with (the presets of each game can change it later).
-    games_card, games_layout, _top = section_card(tr("settings.games_title"))
+    # New games: the frame cap they start with (Configure can change it per game later).
     win.default_fps_combo = QComboBox()
     for label, data in (
         (tr("settings.fps_last"), "last"),
@@ -727,66 +736,80 @@ def build_settings_page(win: MainWindow) -> QWidget:
         win.default_fps_combo.addItem(label, data)
     fidx = win.default_fps_combo.findData(str(win.settings.value(DEFAULT_FPS_KEY, "last") or "last"))
     win.default_fps_combo.setCurrentIndex(max(0, fidx))
+    win.default_fps_combo.setToolTip(tr("settings.fps_hint"))
 
     def _on_default_fps(_idx: int) -> None:
         win.settings.setValue(DEFAULT_FPS_KEY, win.default_fps_combo.currentData())
         win._reset_add_launch_options()
 
     win.default_fps_combo.currentIndexChanged.connect(_on_default_fps)
-    games_form = QFormLayout()
-    games_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
-    games_form.addRow(tr("launch.frame_rate_label"), win.default_fps_combo)
-    games_form.addRow(note_label(tr("settings.fps_hint")))
-    games_layout.addLayout(games_form)
-    layout.addWidget(games_card)
 
-    # This computer: what was detected and what it means for games.
-    from .ui_hardware import build_hardware_card, refresh_hardware_card
+    # Artwork: the SteamGridDB key (never shown, only whether one is saved).
+    win.lbl_sgdb_state = note_label()
+    btn_sgdb = QPushButton(tr("sgdb.btn"))
+    btn_sgdb.setToolTip(tr("sgdb.tip"))
+    btn_sgdb.clicked.connect(win._set_steamgriddb_key)
+    sgdb_row = QHBoxLayout()
+    sgdb_row.addWidget(btn_sgdb)
+    sgdb_row.addWidget(win.lbl_sgdb_state)
+    sgdb_row.addStretch()
+    update_sgdb_state(win)
 
-    layout.addWidget(build_hardware_card(win))
-    refresh_hardware_card(win)
+    # Preferences: one setting per line.
+    prefs, prefs_layout, _top = section_card(tr("settings.prefs_title"))
+    form = QFormLayout()
+    form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+    form.addRow(tr("header.theme"), win.theme_combo)
+    form.addRow(tr("header.language"), win.lang_combo)
+    form.addRow(tr("settings.scale"), win.scale_combo)
+    form.addRow(tr("settings.new_games_fps"), win.default_fps_combo)
+    form.addRow(tr("settings.art_label"), sgdb_row)
+    win.btn_scan_folders = QPushButton(tr("scan_folders.btn"))
+    win.btn_scan_folders.clicked.connect(win._open_scan_folders_dialog)
+    win.lbl_scan_folders_count = note_label()
+    win._update_scan_folders_label()
+    folders_row = QHBoxLayout()
+    folders_row.addWidget(win.btn_scan_folders)
+    folders_row.addWidget(win.lbl_scan_folders_count)
+    folders_row.addStretch()
+    form.addRow(tr("settings.scan_folders_label"), folders_row)
+    prefs_layout.addLayout(form)
+    prefs_layout.addWidget(note_label(tr("settings.prefs_hint")))
+    layout.addWidget(prefs)
 
-    # Steam: which one is in use, and the button to look again (top right, like every status card).
-    steam, steam_layout, steam_top = section_card(tr("settings.steam_title"))
+    # System: the Steam in use, this computer, and the app itself.
+    system, system_layout, system_top = section_card(tr("settings.system_title"))
     win.btn_redetect_steam = QPushButton(tr("sidebar.redetect_steam"))
+    win.btn_redetect_steam.setToolTip(tr("settings.redetect_hint"))
     win.btn_redetect_steam.clicked.connect(win._redetect_steam)
-    steam_top.addWidget(win.btn_redetect_steam)
+    system_top.addWidget(win.btn_redetect_steam)
+    sys_form = QFormLayout()
     win.steam_status_lbl = QLabel(win._format_steam_status_text())
     win.steam_status_lbl.setWordWrap(True)
-    steam_layout.addWidget(win.steam_status_lbl)
-    win.steam_account_row = QWidget()
-    acct_lay = QFormLayout(win.steam_account_row)
-    acct_lay.setContentsMargins(0, 4, 0, 0)
+    sys_form.addRow(tr("settings.steam_title"), win.steam_status_lbl)
     win.steam_account_combo = QComboBox()
     win.steam_account_combo.setToolTip(tr("settings.steam_account_hint"))
     win.steam_account_combo.currentIndexChanged.connect(win._on_steam_account_changed)
-    acct_lay.addRow(tr("settings.steam_account_label"), win.steam_account_combo)
-    win.steam_account_row.setVisible(False)
-    steam_layout.addWidget(win.steam_account_row)
-    steam_layout.addWidget(note_label(tr("settings.redetect_hint")))
-    layout.addWidget(steam)
+    sys_form.addRow(tr("settings.steam_account_label"), win.steam_account_combo)
+    sys_form.setRowVisible(win.steam_account_combo, False)  # shown with more than one account
+    win._settings_system_form = sys_form
+    from .ui_hardware import build_hardware_rows, refresh_hardware_card
 
-    # Artwork: the SteamGridDB key (never shown, only whether one is saved).
-    art, art_layout, art_top = section_card(tr("settings.art_title"), tr("sgdb.tip"))
-    win.lbl_sgdb_state = note_label()
-    art_top.addWidget(win.lbl_sgdb_state)
-    btn_sgdb = QPushButton(tr("sgdb.btn"))
-    btn_sgdb.clicked.connect(win._set_steamgriddb_key)
-    art_top.addWidget(btn_sgdb)
-    update_sgdb_state(win)
-    layout.addWidget(art)
-
-    # The app: about and support (removing it all lives in Cleanup).
-    app_card, app_layout, _top = section_card(tr("settings.app_title"))
+    build_hardware_rows(win, sys_form)
+    refresh_hardware_card(win)
+    system_layout.addLayout(sys_form)
     btn_about = QPushButton(tr("header.about"))
+    btn_about.setToolTip(tr("settings.about_hint"))
     btn_about.clicked.connect(win._show_about_dialog)
     win.btn_copy_diag = QPushButton(tr("maint.copy_diagnostics"))
+    win.btn_copy_diag.setToolTip(tr("maint.copy_diagnostics_tip"))
     win.btn_copy_diag.clicked.connect(win._copy_diagnostics)
-    app_grid = action_grid()
-    action_row(app_grid, 0, btn_about, tr("settings.about_hint"))
-    action_row(app_grid, 1, win.btn_copy_diag, tr("maint.copy_diagnostics_tip"))
-    app_layout.addLayout(app_grid)
-    layout.addWidget(app_card)
+    app_row = QHBoxLayout()
+    app_row.addWidget(btn_about)
+    app_row.addWidget(win.btn_copy_diag)
+    app_row.addStretch()
+    system_layout.addLayout(app_row)
+    layout.addWidget(system)
     layout.addStretch(1)
     win._update_steam_status_style()
     return page

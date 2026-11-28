@@ -161,27 +161,18 @@ def add_game_recommendations(
         if not isValid(parent) or not isinstance(found, Found):
             return
         status.hide()
+        preset_buttons: dict[str, QPushButton] = {}
         for key, value in found.presets.items():
             if key == "prime":  # the shortcut for this suggestion is beside the GPU picker
                 continue
             btn = QPushButton(_preset_text(key))
-
-            def refresh(_text: str = "", name: str = key, button: QPushButton = btn) -> None:
-                if not isValid(button):
-                    return
-                current = parse_presets(editor.raw.text())
-                profile = hardware()
-                gpu = profile.game_gpu(bool(current.get("prime")))
-                button.setVisible(availability(name, gpu, profile, target.proton)[0] == OK and not current.get(name))
-
-            editor.raw.textChanged.connect(refresh)
-            refresh()
             btn.clicked.connect(
                 lambda _checked=False, k=key, v=value: editor.set_options(
                     apply_presets(editor.raw.text(), **{k: v}), editor.dll.text(),
                 )
             )
             actions.addWidget(btn)
+            preset_buttons[key] = btn
         if found.suggest_optiscaler:
             actions.addWidget(note_label(tr("rec.optiscaler")))
         for fix in found.valve:
@@ -196,8 +187,31 @@ def add_game_recommendations(
                     add_fix(fix)
             if any(f.kind == "advanced" for f in found.umu):
                 actions.addWidget(note_label(tr("rec.umu_advanced")))
-        if actions.count() == empty_count:
-            card.hide()
+        others = actions.count() - empty_count - len(preset_buttons)
+
+        def refresh(_text: str = "") -> None:
+            """Hide the suggestions the launch line already has; hide the card when none is left."""
+            if not isValid(card):
+                return
+            current = parse_presets(editor.raw.text())
+            profile = hardware()
+            gpu = profile.game_gpu(bool(current.get("prime")))
+            for name, button in preset_buttons.items():
+                button.setVisible(
+                    availability(name, gpu, profile, target.proton)[0] == OK and not current.get(name)
+                )
+            card.setVisible(others > 0 or any(not b.isHidden() for b in preset_buttons.values()))
+
+        if preset_buttons:
+            # One connection per load, dropped with these suggestions (they reload on each Proton change).
+            connection = editor.raw.textChanged.connect(refresh)
+
+            def drop(_obj: object = None) -> None:
+                if isValid(editor.raw):
+                    editor.raw.textChanged.disconnect(connection)
+
+            parent.destroyed.connect(drop)
+        refresh()
 
     def failed(err: str) -> None:
         if isValid(parent):

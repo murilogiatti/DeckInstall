@@ -776,6 +776,10 @@ def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> 
         class _ConfigureLoadWorker(QThread):
             ready = Signal(str, object, bool, bool, str, str, object, list, str)
 
+            def __init__(self, pending_proton: str | None) -> None:
+                super().__init__()
+                self.pending_proton = pending_proton  # read on the GUI thread, which owns the queue
+
             def run(self) -> None:
                 raw_proton = ""
                 tools: list[tuple[str, str]] = []
@@ -790,9 +794,8 @@ def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> 
                 try:
                     if isinstance(obj, ShortcutEntry) and is_steam and paths_snap:
                         raw_proton = get_shortcut_proton(paths_snap.config_vdf, obj.appid_u32)
-                        pending = pending_steam_edit("set_proton")
-                        if pending is not None:
-                            raw_proton = str(pending.payload.get("tool_name") or "")
+                        if self.pending_proton is not None:
+                            raw_proton = self.pending_proton
                         proton_text = raw_proton or tr("proton.default_label")
                         tools.append((STEAM_DEFAULT_PROTON_ID, tr("proton.default_label")))
                         seen_ids.add(STEAM_DEFAULT_PROTON_ID)
@@ -951,7 +954,10 @@ def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> 
                     btn_compat_migrate.setEnabled(False)
 
         def _start_config_loader() -> None:
-            loader = _ConfigureLoadWorker()
+            pending = pending_steam_edit("set_proton")
+            loader = _ConfigureLoadWorker(
+                str(pending.payload.get("tool_name") or "") if pending is not None else None
+            )
             win._track_worker(loader)
             loader.ready.connect(_apply_loaded)
             loader.start()

@@ -9,11 +9,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from PySide6.QtWidgets import QLabel, QPushButton, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
 
 from .i18n import tr
 from .runtime_uninstall import GE, MANGOHUD, OPTISCALER, STEAMRT4, UMU
-from .ui_cards import FlowLayout, _make_card, action_grid, action_row, page_layout, section_card
+from .ui_cards import FlowLayout, _make_card, page_layout
 
 if TYPE_CHECKING:
     from .ui import MainWindow
@@ -44,8 +44,16 @@ def _component_card(
     desc.setObjectName("MutedText")
     desc.setWordWrap(True)
     layout.addWidget(desc)
-    for lbl in labels:
-        layout.addWidget(lbl)
+    status = QHBoxLayout()  # one status line, its parts side by side
+    status.setSpacing(6)
+    for i, lbl in enumerate(labels):
+        if i:
+            dot = QLabel("·")
+            dot.setObjectName("MutedText")
+            status.addWidget(dot)
+        status.addWidget(lbl)
+    status.addStretch()
+    layout.addLayout(status)
     layout.addWidget(note)
     row = FlowLayout(spacing=8)
     for btn in buttons:
@@ -63,11 +71,6 @@ def build_runtimes_page(win: MainWindow) -> QWidget:
     from .ui_updates import build_updates_card
 
     layout.addWidget(build_updates_card(win))
-
-    win.btn_uninstall_runtimes = QPushButton(tr("runtime.btn_uninstall"))
-    win.btn_uninstall_runtimes.clicked.connect(lambda: open_uninstall_runtimes_dialog(win))
-    win.btn_rt_refresh = QPushButton(tr("maint.btn_refresh_health"))
-    win.btn_rt_refresh.clicked.connect(win._refresh_maintenance_health)
 
     def _remove(kinds: set[str]) -> QPushButton:
         btn = QPushButton(tr("runtimes.btn_remove"))
@@ -125,13 +128,6 @@ def build_runtimes_page(win: MainWindow) -> QWidget:
     layout.addWidget(_component_card(
         tr("runtimes.tools_title"), tr("runtimes.tools_about"), [win.lbl_rt_tools], [], _note_label(),
     ))
-    # Every runtime at once, after the cards of each one.
-    all_card, all_layout, _top = section_card(tr("runtimes.section_all"))
-    all_grid = action_grid()
-    action_row(all_grid, 0, win.btn_rt_refresh, tr("runtimes.refresh_hint"))
-    action_row(all_grid, 1, win.btn_uninstall_runtimes, tr("runtime.uninstall_tip"))
-    all_layout.addLayout(all_grid)
-    layout.addWidget(all_card)
     layout.addStretch(1)
     apply_runtimes_mode(win)
     return page

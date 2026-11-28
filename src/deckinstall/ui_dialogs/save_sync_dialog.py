@@ -325,7 +325,17 @@ def build_saves_page(win: MainWindow) -> QWidget:
     win.btn_save_restore_selected.clicked.connect(lambda: _restore_selected(win))
     win.btn_save_open_folder = QPushButton(tr("saves.btn_open_folder"))
     win.btn_save_open_folder.clicked.connect(lambda: _open_folder(win))
-    for b in (win.btn_save_snapshot_now, win.btn_save_restore_selected, win.btn_save_open_folder):
+    # Ludusavi, for this game only (the whole backup is imported in "Every game at once").
+    win.btn_save_import_one = QPushButton(tr("saves.btn_import_one"))
+    win.btn_save_import_one.setToolTip(tr("saves.import_one_hint"))
+    win.btn_save_import_one.clicked.connect(lambda: _ludusavi_pick(win, export=False, one=True))
+    win.btn_save_export = QPushButton(tr("saves.btn_export"))
+    win.btn_save_export.setToolTip(tr("saves.export_hint"))
+    win.btn_save_export.clicked.connect(lambda: _ludusavi_pick(win, export=True))
+    for b in (
+        win.btn_save_snapshot_now, win.btn_save_restore_selected, win.btn_save_open_folder,
+        win.btn_save_import_one, win.btn_save_export,
+    ):
         row_actions.addWidget(b)
     row_actions.addStretch()
     card_layout.addLayout(row_actions)
@@ -345,30 +355,13 @@ def build_saves_page(win: MainWindow) -> QWidget:
     action_row(grid, 0, win.btn_save_backup, tr("saves.backup_hint"))
     action_row(grid, 1, win.btn_save_restore, tr("saves.restore_hint"))
     action_row(grid, 2, win.btn_save_sync, tr("saves.sync_hint"))
+    win.btn_save_import = QPushButton(tr("saves.btn_import"))
+    win.btn_save_import.clicked.connect(lambda: _ludusavi_pick(win, export=False))
+    action_row(grid, 3, win.btn_save_import, tr("saves.import_hint"))
     all_layout.addLayout(grid)
     layout.addWidget(all_card)
 
-    # 3. Ludusavi: only for people who already use it.
-    lds_card, lds_layout, _top = section_card(tr("saves.section_ludusavi"), tr("saves.section_ludusavi_hint"))
-    lds_grid = QGridLayout()
-    lds_grid.setHorizontalSpacing(12)
-    lds_grid.setColumnStretch(1, 1)
-    win.btn_save_import = QPushButton(tr("saves.btn_import"))
-    win.btn_save_import.clicked.connect(lambda: _ludusavi_pick(win, export=False))
-    win.btn_save_import_one = QPushButton(tr("saves.btn_import_one"))
-    win.btn_save_import_one.clicked.connect(lambda: _ludusavi_pick(win, export=False, one=True))
-    win.btn_save_export = QPushButton(tr("saves.btn_export"))
-    win.btn_save_export.clicked.connect(lambda: _ludusavi_pick(win, export=True))
-    win.btn_save_dedup = QPushButton(tr("saves.btn_dedup"))
-    win.btn_save_dedup.clicked.connect(lambda: _remove_import_duplicates(win))
-    action_row(lds_grid, 0, win.btn_save_import, tr("saves.import_hint"))
-    action_row(lds_grid, 1, win.btn_save_import_one, tr("saves.import_one_hint"))
-    action_row(lds_grid, 2, win.btn_save_export, tr("saves.export_hint"))
-    action_row(lds_grid, 3, win.btn_save_dedup, tr("saves.btn_dedup_tip"))
-    lds_layout.addLayout(lds_grid)
-    layout.addWidget(lds_card)
-
-    # 4. What happens on its own.
+    # 3. What happens on its own.
     auto_card, auto_layout, _top = section_card(tr("saves.section_auto"))
     chk_auto = QCheckBox(tr("save_sync.auto_snapshot"))
     chk_auto.setChecked(_setting_bool(win.settings, AUTO_SNAPSHOT_KEY, True))
@@ -814,16 +807,26 @@ def _import_to_snapshots(win: MainWindow, root: Path, row: SaveRow | None) -> No
             if picked != labels[0]:
                 games = [games[labels.index(picked) - 1]]
 
+        removed = [0]
+
         def _job() -> object:
             done: list[tuple[str, int, int, bool]] = []
             for name, folder in games:
                 _snap, stored, skipped, already = lds.import_ludusavi_to_snapshot(folder, name)
                 done.append((name, stored, skipped, already))
+            # Older imports with exactly the same content as a newer one are dropped (the newest stays).
+            for dupe in lds.find_import_duplicates():
+                try:
+                    removed[0] += lds.remove_import_duplicate(dupe)
+                except OSError as exc:
+                    logging.getLogger(__name__).warning("Could not remove %s: %s", dupe, exc)
             return done
 
         def _ok(import_res: object) -> None:
             win.chk_saves_orphans.setChecked(True)  # show what was just imported, installed or not
             show_import_result(win, import_res if isinstance(import_res, list) else [])
+            if removed[0]:
+                win.status_label.setText(tr("saves.dedup_done", count=removed[0]))
 
         _run(win, tr("saves.import_running", name=root.name), _job, _ok)
 
@@ -864,67 +867,6 @@ def show_import_result(win: MainWindow, results: list[tuple[str, int, int, bool]
         QMessageBox.information(_dialog_parent(win), __app_name__, summary)
         return
     show_text_dialog(win, tr("saves.import_result_title"), summary, tr("saves.import_snapshot_done") + "\n\n" + details)
-
-
-def _remove_import_duplicates(win: MainWindow) -> None:
-    """Delete Ludusavi imports identical to a newer one of the same game, after a confirmation listing them."""
-    if win._steam_busy or win._closing_pending:
-        return
-    win._begin_busy()
-    win.status_label.setText(tr("saves.dedup_scanning"))
-    scan_worker = SteamOpWorker(lds.find_import_duplicates)
-    win._track_worker(scan_worker)
-
-    def _on_scanned(res: object) -> None:
-        win._end_busy()
-        win.status_label.setText(tr("status.ready"))
-        if win._closing_pending or win._steam_busy:
-            return
-        dupes: list[Path] = res if isinstance(res, list) else []
-        parent = _dialog_parent(win)
-        if not dupes:
-            QMessageBox.information(parent, __app_name__, tr("saves.dedup_none"))
-            return
-        listing = "\n".join(f"• {snapshot_display_name(p.parent.name)}: {p.name}" for p in dupes)
-        box = QMessageBox(
-            QMessageBox.Icon.Question,
-            __app_name__,
-            tr("saves.dedup_confirm", count=len(dupes)),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            parent,
-        )
-        box.setDefaultButton(QMessageBox.StandardButton.No)
-        box.setDetailedText(listing)
-        box.setInformativeText(listing if len(dupes) <= 8 else tr("saves.dedup_see_details"))
-        answer = box.exec()
-        box.deleteLater()
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-
-        def _delete_job() -> object:
-            removed = 0
-            for p in dupes:
-                try:
-                    if lds.remove_import_duplicate(p):
-                        removed += 1
-                except OSError as exc:
-                    logging.getLogger(__name__).warning("Could not remove %s: %s", p, exc)
-            return removed
-
-        def _on_deleted(removed: object) -> None:
-            _info(win, tr("saves.dedup_done", count=int(removed) if isinstance(removed, int) else 0))
-
-        _run(win, tr("saves.dedup_scanning"), _delete_job, _on_deleted)
-
-    def _on_scan_err(err: str) -> None:
-        win._end_busy()
-        win.status_label.setText(tr("status.ready"))
-        if not win._closing_pending:
-            QMessageBox.critical(_dialog_parent(win), __app_name__, tr("saves.error", err=err))
-
-    scan_worker.finished_ok.connect(_on_scanned)
-    scan_worker.failed.connect(_on_scan_err)
-    scan_worker.start()
 
 
 def existing_snapshots_for(name: str, archives: list[SaveArchiveEntry]) -> list[SaveArchiveEntry]:

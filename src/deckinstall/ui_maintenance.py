@@ -72,6 +72,7 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     win.btn_maint_scan.clicked.connect(lambda: scan_maintenance_cleanup(win))
     win.btn_maint_revalidate = QPushButton(tr("cleanup.btn_revalidate"))
     win.btn_maint_revalidate.setEnabled(win.paths is not None)
+    win.btn_maint_revalidate.setToolTip(tr("maint.revalidate_tip"))
     win.btn_maint_revalidate.clicked.connect(lambda: revalidate_maintenance_cleanup(win))
     clean_top.addWidget(clean_lbl)
     clean_top.addStretch()

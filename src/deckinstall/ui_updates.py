@@ -39,7 +39,9 @@ def build_updates_card(win: MainWindow) -> QWidget:
     win.lbl_updates_status = QLabel(tr("updates.never"))
     win.lbl_updates_status.setObjectName("MutedText")
     win.btn_updates_check = QPushButton(tr("updates.btn_check"))
+    # Checks online for updates and, at once, what is installed here (the cards below).
     win.btn_updates_check.clicked.connect(lambda: check_updates(win))
+    win.btn_updates_check.clicked.connect(win._refresh_maintenance_health)
     head.addWidget(title)
     head.addStretch(1)
     head.addWidget(win.lbl_updates_status)

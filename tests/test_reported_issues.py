@@ -198,7 +198,9 @@ class UniqueLibraryActionTests(unittest.TestCase):
             win = ui.MainWindow(app)
             try:
                 self.assertFalse(hasattr(win, "_tools_menu"))
-                self.assertIn(win.act_remove_game, win.btn_game_actions.menu().actions())
+                remove = win.game_action_buttons[win.act_remove_game]  # a button in the row, not a menu
+                self.assertIsNone(remove.menu())
+                self.assertEqual(remove.text(), tr("library.btn_uninstall"))
                 self.assertEqual(win.act_remove_game.text(), tr("library.btn_uninstall"))
                 self.assertIsNone(win.btn_save_sync.menu())
                 self.assertEqual(win.stack.count(), 6)
@@ -233,7 +235,8 @@ class UniqueLibraryActionTests(unittest.TestCase):
                 win._show_page(ui.PAGE_LIBRARY)
                 self.assertEqual(win.nav_tabs.currentIndex(), 0)
                 self.assertFalse(hasattr(win, "_hub_buttons"))
-                self.assertEqual(win.btn_game_actions.text(), "⋯")
+                self.assertFalse(hasattr(win, "btn_game_actions"))
+                self.assertNotIn("⋯", [b.text() for b in win.stack.widget(ui.PAGE_LIBRARY).findChildren(QPushButton)])
                 self.assertFalse(hasattr(win, "btn_tools_menu"))
                 self.assertNotEqual(win.shortcuts_list.contextMenuPolicy(), Qt.ContextMenuPolicy.CustomContextMenu)
                 labels = [button.text() for button in win.stack.widget(ui.PAGE_LIBRARY).findChildren(QPushButton)]

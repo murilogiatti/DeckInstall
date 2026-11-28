@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QFormLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -298,10 +299,10 @@ class MainWindow(QMainWindow):
 
     # Built by ui_pages / ui_system (bound onto the window there).
     act_favorite: QAction
-    btn_game_actions: QPushButton
+    game_action_buttons: dict[QAction, QPushButton]
     btn_bulk_actions: QPushButton
     act_tools: QAction
-    _add_proton: tuple[str, str]
+    _add_proton: tuple[str, str, str]  # mode, compat tool id, its label
     _install_mode_chosen: bool
     _standalone_launchers: tuple[bool, ...]
     _add_launch_options: str
@@ -341,6 +342,7 @@ class MainWindow(QMainWindow):
     default_fps_combo: QComboBox
     lbl_hardware: QLabel
     lbl_hardware_notes: QLabel
+    _hardware_form: QFormLayout
     btn_shortcut_desktop: QCheckBox
     btn_shortcut_menu: QCheckBox
     btn_shortcut_steam: QCheckBox
@@ -368,7 +370,7 @@ class MainWindow(QMainWindow):
     steam_match_combo: QComboBox
     steam_search_input: QLineEdit
     steam_status_lbl: QLabel
-    steam_account_row: QWidget
+    _settings_system_form: QFormLayout
     steam_account_combo: QComboBox
     theme_combo: QComboBox
     unavailable_banner: QLabel
@@ -393,7 +395,6 @@ class MainWindow(QMainWindow):
     lbl_maint_disk: QLabel
     lbl_maint_summary: QLabel
     btn_update_runtimes: QPushButton
-    btn_uninstall_runtimes: QPushButton
     library_empty_state: QWidget
     library_no_results_state: QWidget
     message_bar: MessageBar
@@ -414,7 +415,6 @@ class MainWindow(QMainWindow):
     _updates_checking: bool
     _updates_cooldown: QTimer
     # Runtimes tab (ui_runtimes.py)
-    btn_rt_refresh: QPushButton
     btn_rt_ge_update: QPushButton
     btn_rt_umu_update: QPushButton
     btn_rt_mangohud_update: QPushButton
@@ -433,7 +433,6 @@ class MainWindow(QMainWindow):
     btn_save_backup: QPushButton
     btn_save_restore: QPushButton
     btn_save_sync: QPushButton
-    btn_save_dedup: QPushButton
     btn_save_refresh: QPushButton
     btn_save_snapshot_now: QPushButton
     btn_save_restore_selected: QPushButton
@@ -954,7 +953,7 @@ class MainWindow(QMainWindow):
         root = self.paths.steam_root if self.paths is not None else find_steam_root()
         accounts = list_steam_accounts(root) if root is not None else []
         show = len(accounts) > 1
-        self.steam_account_row.setVisible(show)
+        self._settings_system_form.setRowVisible(self.steam_account_combo, show)
         if not show:
             return
         saved_uid = str(self.settings.value("steam/user_id", "") or "").strip()
@@ -1810,7 +1809,7 @@ class MainWindow(QMainWindow):
         opts, winedll = self._load_last_launch_prefs()
         self._add_launch_options = opts
         self._add_winedlloverrides = winedll
-        self._add_proton = ("", "")
+        self._add_proton = ("", "", "")
         self._update_add_presets_summary()
 
     def _update_add_presets_summary(self) -> None:
@@ -1843,7 +1842,7 @@ class MainWindow(QMainWindow):
         if self._add_winedlloverrides.strip():
             active.append(tr("presets.short_dll"))
         if self._add_proton[1] and self._add_proton[0] == self._selected_install_mode():
-            active.insert(0, self._add_proton[1])
+            active.insert(0, self._add_proton[2] or self._add_proton[1])
         self.lbl_add_presets.setText(", ".join(active) if active else tr("presets.none"))
 
     def _is_add_exe_native(self) -> bool:
@@ -1865,23 +1864,25 @@ class MainWindow(QMainWindow):
     def _open_add_launch_advanced(self) -> None:
         from .launch_presets import proton_kind
         from .proton_policy import newest_ge_proton
-        from .runtime_manager import list_installed_compat_tools
+        from .runtime_manager import get_compat_tools_dir, list_installed_compat_tools
         from .steam_paths import find_proton_binary, list_installed_protons, resolve_proton_dir
         from .ui_recommendations import Target, add_game_recommendations
 
         cur_opts, cur_winedll = self._resolve_add_launch_options()
         title = self.add_name.text().strip() or tr("add.page_title")
         mode = self._selected_install_mode()
-        root = self.paths.steam_root if mode == STEAM and self.paths is not None else None
-        tools = (
-            list_installed_protons(root) if root is not None
-            else [(tool.tool_id, tool.folder_name or tool.tool_id) for tool in list_installed_compat_tools()]
-            if mode == STANDALONE else []
-        )
+        root = self.paths.steam_root if self.paths is not None else None
+        # Same choices as Configure: Steam's Protons in Steam mode; DeckInstall's tools, then
+        # Steam's (when Steam is there), in Standalone.
+        tools: list[tuple[str, str]] = []
+        if mode == STANDALONE:
+            tools = [(tool.tool_id, tool.folder_name or tool.tool_id) for tool in list_installed_compat_tools()]
+        if root is not None and mode in (STEAM, STANDALONE):
+            tools += list_installed_protons(root)
         picker = QComboBox()
         picker.addItem(tr("launch.steam_default") if mode == STEAM else tr("proton.default_label"), "")
-        for tool_id, label in dict(tools).items():
-            if tool_id:
+        for tool_id, label in tools:
+            if tool_id and picker.findData(tool_id) < 0:
                 picker.addItem(label, tool_id)
         if self._add_proton[0] == mode:
             picker.setCurrentIndex(max(0, picker.findData(self._add_proton[1])))
@@ -1893,7 +1894,9 @@ class MainWindow(QMainWindow):
             exe = Path(exe_text) if exe_text else None
             tool = str(picker.currentData() or "")
             if tool:
-                directory = resolve_proton_dir(tool, root)
+                directory = resolve_proton_dir(
+                    tool, root, extra_compat_dirs=[get_compat_tools_dir()] if mode == STANDALONE else (),
+                )
             elif mode == STANDALONE:
                 directory = newest_ge_proton()
             else:
@@ -1916,7 +1919,7 @@ class MainWindow(QMainWindow):
             )
             if res is not None:
                 self._add_launch_options, self._add_winedlloverrides = res
-                self._add_proton = mode, str(picker.currentData() or "")
+                self._add_proton = mode, str(picker.currentData() or ""), picker.currentText()
                 self._update_add_presets_summary()
         finally:
             if picker.parent() is None:
@@ -2790,7 +2793,6 @@ class MainWindow(QMainWindow):
         self.act_favorite.setEnabled(bool(row_key))
         self.act_game_art.setEnabled(bool(row_key) and not self._steam_busy)
         self.act_favorite.setChecked(bool(row_key) and row_key in library_extras.favorites(self.settings))
-        self.btn_game_actions.setEnabled(idle and sel is not None)
         self.act_tools.setEnabled(idle and sel is not None)
         managed = self._managed_library_game(sel[1]) if sel is not None else None
         self.act_move_game.setEnabled(managed is not None and not self._steam_busy)
@@ -3702,14 +3704,14 @@ class MainWindow(QMainWindow):
             self.shortcuts_list,
             self.btn_play_game,
             self.btn_configure_game,
-            self.btn_game_actions,
+            self.act_favorite,
+            self.act_tools,
             self.act_move_game,
             self.act_remove_game,
             self.act_ext_import_saves,
             self.btn_save_backup,
             self.btn_save_restore,
             self.btn_save_sync,
-            self.btn_save_dedup,
             self.btn_save_refresh,
             self.btn_adopt_games,
             self.btn_all_art,
@@ -3725,7 +3727,6 @@ class MainWindow(QMainWindow):
         for name in (
             "btn_extract",
             "btn_migrate_legacy",
-            "btn_uninstall_runtimes",
         ):
             widget = getattr(self, name, None)
             if widget is not None:

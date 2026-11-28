@@ -511,3 +511,62 @@ def test_relocation_runs_after_real_target_and_confirmation_dialogs(
     _modal(outer.exec, [pick, confirm, finish, done])
     move.assert_called_once()
     assert move.call_args.args == (plan,)
+
+
+def _open_more(dialog: QDialog) -> None:
+    next(b for b in dialog.findChildren(QToolButton) if b.text() == tr("launch.more_options")).click()
+
+
+def test_launch_editor_drops_old_mangohud_in_steam_mode(window: ui.MainWindow) -> None:
+    """Steam has its own overlay: MANGOHUD=1 kept from an older version leaves the line."""
+    def edit(dialog: QDialog) -> bool:
+        fps = dialog.findChild(QComboBox, "gameFps")
+        fps.setCurrentIndex(fps.findData(45))
+        dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Apply).click()
+        return True
+
+    result = _modal(lambda: launch_presets_dialog.open_launch_presets_dialog(
+        window, "Game", "steam", "MANGOHUD=1 %command%", "", mode="steam"), [edit])
+    assert isinstance(result, tuple)
+    assert "MANGOHUD" not in result[0] and "45" in result[0]
+
+
+def test_launch_editor_moves_standalone_dll_token_to_its_field(window: ui.MainWindow) -> None:
+    """Standalone keeps WINEDLLOVERRIDES in its own field, so unticking DXGI really turns it off."""
+    def edit(dialog: QDialog) -> bool:
+        raw = dialog.findChild(QLineEdit, "gameLaunchOptions")
+        assert "WINEDLLOVERRIDES" not in raw.text()
+        _open_more(dialog)
+        dxgi = next(c for c in dialog.findChildren(QCheckBox) if c.text() == tr("launch.dxgi_preset"))
+        assert dxgi.isChecked()
+        dxgi.click()
+        dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Apply).click()
+        return True
+
+    result = _modal(lambda: launch_presets_dialog.open_launch_presets_dialog(
+        window, "Game", "standalone", "WINEDLLOVERRIDES=dxgi=n,b %command%", ""), [edit])
+    assert result == ("", "")  # nothing left but %command%: the line is empty
+
+
+def test_launch_editor_enforces_optiscaler_dxgi_without_more_options(
+    window: ui.MainWindow, game: StandaloneGame, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OptiScaler as dxgi.dll needs the override even when only the FPS is changed."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(launch_presets_dialog, "inspect_optiscaler_state",
+                        lambda _exe: SimpleNamespace(proxy_dll="dxgi"))
+
+    def edit(dialog: QDialog) -> bool:
+        dxgi = next(c for c in dialog.findChildren(QCheckBox) if c.text() == tr("launch.dxgi_preset"))
+        if dxgi.isEnabled():
+            return False  # the OptiScaler check runs in the background
+        assert dxgi.isChecked()
+        fps = dialog.findChild(QComboBox, "gameFps")
+        fps.setCurrentIndex(fps.findData(45))
+        dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Apply).click()
+        return True
+
+    result = _modal(lambda: launch_presets_dialog.open_launch_presets_dialog(
+        window, "Game", "standalone", "%command%", "", game_obj=game), [edit])
+    assert isinstance(result, tuple) and "dxgi=n,b" in result[1]
