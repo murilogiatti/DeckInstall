@@ -144,7 +144,7 @@ def test_prime_preset_follows_the_gpus(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(runtime_manager, "detect_gpu_profile", lambda: profile(False))
     opts = launch_presets.apply_presets("", {"prime": True})
-    assert opts == "DRI_PRIME=1 %command%"
+    assert opts == "DRI_PRIME=1 PROTON_LOCAL_SHADER_CACHE=1 %command%"
     assert launch_presets.parse_presets(opts)["prime"]
     monkeypatch.setattr(runtime_manager, "detect_gpu_profile", lambda: profile(True))
     opts = launch_presets.apply_presets(opts, {"prime": True})
@@ -155,9 +155,9 @@ def test_debug_log_preset_round_trip() -> None:
     from deckinstall import launch_presets
 
     opts = launch_presets.apply_presets("%command% -x", {"debug_log": True})
-    assert opts == "UMU_LOG=1 PROTON_LOG=1 %command% -x"
+    assert opts == "UMU_LOG=1 PROTON_LOG=1 PROTON_LOCAL_SHADER_CACHE=1 %command% -x"
     assert launch_presets.active_flags(opts) == ["debug_log"]
-    assert launch_presets.apply_presets(opts, {"debug_log": False}) == "%command% -x"
+    assert launch_presets.apply_presets(opts, {"debug_log": False}) == "PROTON_LOCAL_SHADER_CACHE=1 %command% -x"
 
 
 def test_shareable_report_masks_personal_data() -> None:

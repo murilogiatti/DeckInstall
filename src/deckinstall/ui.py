@@ -79,7 +79,7 @@ from .external_actions import (
     load_external_launch_presets,
 )
 from .i18n import LOCALES_DIR, set_language, tr
-from .launch_presets import active_flags, apply_presets, parse_presets
+from .launch_presets import active_flags, apply_presets, parse_presets, turned_off_defaults
 from .launcher_scan import ExternalLauncherGame, scan_external_launcher_games
 from .library import (
     Library,
@@ -1759,6 +1759,7 @@ class MainWindow(QMainWindow):
             "no_xalia": tr("opt.no_xalia"),
         }
         active = list(dict.fromkeys(names[k] for k in active_flags(self._add_launch_options) if k in names))
+        active += [tr(f"presets.short_{key}_off") for key in turned_off_defaults(self._add_launch_options)]
         frame = int(parse_presets(self._add_launch_options).get("frame_rate") or 0)
         if frame:
             active.append(tr("presets.short_frame_rate", fps=frame))

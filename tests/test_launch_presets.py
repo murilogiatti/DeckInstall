@@ -29,7 +29,18 @@ def test_reapply_keeps_presets_and_custom_args() -> None:
     assert st["gamemode"] and st["mangohud"] and st["no_fsync"] and st["local_shader_cache"] and st["no_ntsync"]
     assert (st["mh_level"], st["mh_position"], st["mh_fps_limit"]) == (3, "top-left", 60)
     assert once.endswith("%command% -dx11")
-    assert lp.active_flags(once) == ["gamemode", "mangohud", "no_fsync", "local_shader_cache", "no_ntsync"]
+    assert lp.active_flags(once) == ["gamemode", "mangohud", "no_fsync", "no_ntsync"]  # cache: on in every game
+
+
+def test_shader_cache_is_on_by_default() -> None:
+    """Every game has the shader cache: on unless =0, and every rewrite writes it out (Steam's Proton too)."""
+    assert lp.parse_presets("%command%")["local_shader_cache"]
+    off = lp.apply_presets("%command%", local_shader_cache=False)
+    assert off == "PROTON_LOCAL_SHADER_CACHE=0 %command%"
+    assert not lp.parse_presets(off)["local_shader_cache"]
+    assert lp.apply_presets(off, local_shader_cache=True) == "PROTON_LOCAL_SHADER_CACHE=1 %command%"
+    assert lp.active_flags("%command%") == [] and lp.active_flags(off) == []
+    assert lp.turned_off_defaults("%command%") == [] and lp.turned_off_defaults(off) == ["local_shader_cache"]
 
 
 def test_variables_umu_proton_does_not_read_are_dropped() -> None:
@@ -38,8 +49,8 @@ def test_variables_umu_proton_does_not_read_are_dropped() -> None:
     old = ("PROTON_DLSS_UPGRADE=1 PROTON_FSR4_UPGRADE=4.0.1 PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1 "
            "PROTON_PREFER_SDL=1 PROTON_ENABLE_NVAPI=1 DXVK_ENABLE_NVAPI=1 PROTON_NO_ESYNC=1 "
            "PROTON_FORCE_LARGE_ADDRESS_AWARE=1 CUSTOM=1 %command%")
-    assert lp.migrate_launch_options(old) == "CUSTOM=1 %command%"
-    assert lp.apply_presets(old, gamemode=True) == "CUSTOM=1 gamemoderun %command%"
+    assert lp.migrate_launch_options(old) == "CUSTOM=1 PROTON_LOCAL_SHADER_CACHE=1 %command%"
+    assert lp.apply_presets(old, gamemode=True) == "CUSTOM=1 PROTON_LOCAL_SHADER_CACHE=1 gamemoderun %command%"
     keep = "PROTON_FORCE_LARGE_ADDRESS_AWARE=0 %command%"
     assert lp.migrate_launch_options(keep) == keep
 
@@ -94,6 +105,9 @@ def test_install_form_has_one_presets_button_with_summary(tmp_path: Path) -> Non
         assert win.lbl_add_presets.text() == tr("add.presets_after", opts=f"{tr('opt.gamemode')}, {tr('opt.mangohud')}")
         opts, dll = win._resolve_add_launch_options()
         assert "gamemoderun" in opts and "MANGOHUD=1" in opts and dll == ""
+        win._add_launch_options = "PROTON_LOCAL_SHADER_CACHE=0 %command%"  # the default turned off shows
+        win._update_add_presets_summary()
+        assert win.lbl_add_presets.text() == tr("add.presets_after", opts=tr("presets.short_local_shader_cache_off"))
     finally:
         # Let the window's background workers finish: a QThread alive at interpreter exit segfaults.
         for w in list(win._active_workers):
@@ -113,9 +127,10 @@ def test_toggle_presets_round_trip_and_keep_custom_values() -> None:
     assert state["frame_rate"] == 60 and "VKD3D_FRAME_RATE=60" in opts
     assert opts.startswith("CUSTOM=1 ") and opts.endswith("%command% -dx11")
     off = apply_presets(opts, {key: False for key in every}, winedlloverrides="", frame_rate=0)
-    assert off == "CUSTOM=1 %command% -dx11"  # turning them off leaves nothing behind
+    # turning them off leaves nothing behind but the default-on shader cache's =0
+    assert off == "CUSTOM=1 PROTON_LOCAL_SHADER_CACHE=0 %command% -dx11"
     hand = "VKD3D_CONFIG=dxr %command%"  # a value typed by hand is not ours to drop
-    assert apply_presets(hand) == hand and not parse_presets(hand)["descriptor_heap"]
+    assert apply_presets(hand) == "VKD3D_CONFIG=dxr PROTON_LOCAL_SHADER_CACHE=1 %command%" and not parse_presets(hand)["descriptor_heap"]
     native = apply_presets("", every, winedlloverrides="", native_linux=True, frame_rate=60)
     assert native == ""  # Proton-only presets never reach a native Linux game
 
@@ -210,16 +225,19 @@ def test_frame_cap_uses_what_proton_reads_and_one_dxvk_config() -> None:
     mine = "DXVK_CONFIG='dxgi.syncInterval=0' %command% -dx11"
     opts = apply_presets(mine, {}, winedlloverrides="", frame_rate=45, vendor_amd=True)
     assert opts == (
-        "DXVK_CONFIG='dxgi.syncInterval=0;dxgi.maxFrameRate=45;d3d9.maxFrameRate=45;dxgi.customVendorId=1002' "
+        "PROTON_LOCAL_SHADER_CACHE=1 DXVK_CONFIG='dxgi.syncInterval=0;dxgi.maxFrameRate=45;d3d9.maxFrameRate=45;dxgi.customVendorId=1002' "
         "VKD3D_FRAME_RATE=45 %command% -dx11"
     )  # DXVK_FRAME_RATE is gone from DXVK: Proton 11 and GE-Proton 11 read only DXVK_CONFIG
     state = parse_presets(opts)
     assert state["frame_rate"] == 45 and state["vendor_amd"] and state["dxvk_custom"] == ["dxgi.syncInterval=0"]
-    assert apply_presets(opts, frame_rate=0, vendor_amd=False) == "DXVK_CONFIG=dxgi.syncInterval=0 %command% -dx11"
+    assert apply_presets(opts, frame_rate=0, vendor_amd=False) == (
+        "PROTON_LOCAL_SHADER_CACHE=1 DXVK_CONFIG=dxgi.syncInterval=0 %command% -dx11"
+    )
     assert "fps_limit=60" in apply_presets("MANGOHUD=1 %command%", frame_rate=60)  # one cap, MangoHud too
     old = "PROTON_ENABLE_NVAPI=1 DXVK_ENABLE_NVAPI=1 DXVK_FRAME_RATE=40 gamemoderun %command% -x"
     assert migrate_launch_options(old) == (
-        "DXVK_CONFIG='dxgi.maxFrameRate=40;d3d9.maxFrameRate=40' VKD3D_FRAME_RATE=40 gamemoderun %command% -x"
+        "PROTON_LOCAL_SHADER_CACHE=1 DXVK_CONFIG='dxgi.maxFrameRate=40;d3d9.maxFrameRate=40' VKD3D_FRAME_RATE=40 "
+        "gamemoderun %command% -x"
     )
     assert migrate_launch_options("gamemoderun %command%") == "gamemoderun %command%"
 

@@ -490,7 +490,7 @@ def test_launch_editor_moves_standalone_dll_token_to_its_field(window: ui.MainWi
 
     result = _modal(lambda: launch_presets_dialog.open_launch_presets_dialog(
         window, "Game", "standalone", "WINEDLLOVERRIDES=dxgi=n,b %command%", ""), [edit])
-    assert result == ("", "")  # nothing left but %command%: the line is empty
+    assert result == ("PROTON_LOCAL_SHADER_CACHE=1 %command%", "")  # only the default-on shader cache left
 
 
 def test_launch_editor_enforces_optiscaler_dxgi_without_more_options(

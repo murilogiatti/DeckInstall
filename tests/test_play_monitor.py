@@ -6,6 +6,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -18,6 +19,16 @@ from PySide6.QtCore import QObject  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from deckinstall import play_monitor as pm  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _no_real_scopes(request):
+    """Launch tests run the command as is: the host's systemd is not part of what they check."""
+    if request.node.name == "test_game_gets_its_own_systemd_scope":
+        yield
+        return
+    with mock.patch.object(pm, "_in_own_scope", lambda cmd, env: cmd):
+        yield
 
 
 @pytest.fixture()
@@ -303,3 +314,17 @@ def test_session_length_reported_when_a_running_game_ends(mon: pm.PlayMonitor) -
     mon.stop("g")
     _wait(mon, lambda: mon.state("g") == pm.IDLE)
     assert len(sessions) == 1 and sessions[0][0] == "g" and sessions[0][1] > 0
+
+
+def test_game_gets_its_own_systemd_scope() -> None:
+    """A game killed for lack of memory must not take DeckInstall's scope (and the app) with it."""
+    which = lambda name, path=None: None if name == "/missing.exe" else f"/usr/bin/{name}"  # noqa: E731
+    with mock.patch.object(pm.shutil, "which", side_effect=which), \
+            mock.patch.object(pm, "_scope_works", return_value=True):
+        wrapped = pm._in_own_scope(["/g/launch.sh", "-x"], {})
+        assert wrapped[0] == "/usr/bin/systemd-run" and wrapped[-3:] == ["--", "/g/launch.sh", "-x"]
+        assert "--scope" in wrapped and "--user" in wrapped
+        assert pm._in_own_scope(["/missing.exe"], {}) == ["/missing.exe"]  # still FailedToStart
+    with mock.patch.object(pm.shutil, "which", side_effect=which), \
+            mock.patch.object(pm, "_scope_works", return_value=False):
+        assert pm._in_own_scope(["/g/launch.sh"], {}) == ["/g/launch.sh"]  # systemd does not answer

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import signal
 import time
 from collections.abc import Callable
@@ -83,6 +84,40 @@ _READ_MAX = 256 * 1024
 _LOG_TAIL_LINES = 20
 # Released on close: kept referenced so nothing deletes (and so kills) them before os._exit.
 _RELEASED: list[QProcess] = []
+
+
+@lru_cache(maxsize=1)
+def _scope_works(systemd_run: str) -> bool:
+    """True once a test scope really started (the socket alone does not prove the user manager answers)."""
+    import subprocess
+
+    try:
+        done = subprocess.run(
+            [systemd_run, "--user", "--scope", "--collect", "--quiet", "--", "true"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if done.returncode != 0:
+        logging.warning("systemd-run --scope does not work here: games share DeckInstall's scope")
+    return done.returncode == 0
+
+
+def _in_own_scope(cmd: list[str], env: dict[str, str] | None) -> list[str]:
+    """cmd in a systemd scope of its own, when the user's systemd answers.
+
+    Otherwise the game shares DeckInstall's scope: when the kernel kills the game for lack of
+    memory, systemd stops the whole scope (OOMPolicy=stop) and DeckInstall closes with it.
+    systemd-run --scope execs the command in place: same PID, session and exit code.
+    A command that cannot start is left alone, so it still fails as FailedToStart.
+    """
+    systemd_run = shutil.which("systemd-run")
+    game_path = (env or os.environ).get("PATH")
+    if not cmd or systemd_run is None or shutil.which(cmd[0], path=game_path) is None:
+        return cmd
+    if not _scope_works(systemd_run):
+        return cmd
+    return [systemd_run, "--user", "--scope", "--collect", "--quiet", "--", *cmd]
 
 
 def watch_paths(*candidates: object) -> tuple[str, ...]:
@@ -450,6 +485,7 @@ class PlayMonitor(QObject):
         exe_name: the game's .exe file name, to notice a game that died while Proton stays hung.
         """
         proc = QProcess(self)
+        cmd = _in_own_scope(cmd, env)
         proc.setProgram(cmd[0])
         proc.setArguments(cmd[1:])
         if cwd is not None:

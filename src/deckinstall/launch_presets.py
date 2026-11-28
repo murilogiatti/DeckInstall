@@ -39,12 +39,16 @@ class Toggle:
     tokens: tuple[str, ...]
     section: str  # "gpu", "upscaler" or "compat"
     dxvk: str = ""
+    # On by default: on unless one of these is in the options (turning it off writes them).
+    off_tokens: tuple[str, ...] = ()
 
 
 # Data, not code: one line per preset.
 TOGGLES: tuple[Toggle, ...] = (
-    # Performance: a shader cache per game (umu gives each game its own folder).
-    Toggle("local_shader_cache", ("PROTON_LOCAL_SHADER_CACHE=1",), "performance"),
+    # Performance: a shader cache per game (umu gives each game its own folder). On by default:
+    # every rewrite writes =1, and the Standalone launcher and the Steam import add it unless =0.
+    Toggle("local_shader_cache", ("PROTON_LOCAL_SHADER_CACHE=1",), "performance",
+           off_tokens=("PROTON_LOCAL_SHADER_CACHE=0",)),
     # GPU
     Toggle("disable_nvapi", ("PROTON_DISABLE_NVAPI=1",), "gpu"),
     Toggle("hide_nvidia_gpu", ("PROTON_HIDE_NVIDIA_GPU=1",), "gpu"),
@@ -59,7 +63,7 @@ TOGGLES: tuple[Toggle, ...] = (
     Toggle("integer_scaling", ("WINE_FULLSCREEN_INTEGER_SCALING=1",), "compat"),
     Toggle("no_xalia", ("PROTON_USE_XALIA=0",), "compat"),
 )
-TOGGLE_TOKENS = frozenset(tok for toggle in TOGGLES for tok in toggle.tokens)
+TOGGLE_TOKENS = frozenset(tok for toggle in TOGGLES for tok in (*toggle.tokens, *toggle.off_tokens))
 # Variables UMU-Proton 11 does not read (GE-Proton's upscaler upgrades, Wayland, HDR and SDL switches;
 # NVAPI and esync flags; large address, on by default): dropped whenever a launch line is rewritten.
 OBSOLETE_KEYS = frozenset({
@@ -75,6 +79,7 @@ _DXVK_FRAME_KEYS = ("dxgi.maxFrameRate", "d3d9.maxFrameRate")
 _DXVK_MANAGED = frozenset((*_DXVK_FRAME_KEYS, *(t.dxvk.split("=", 1)[0] for t in TOGGLES if t.dxvk)))
 _MANAGED_KEYS = ("DXVK_CONFIG", "VKD3D_FRAME_RATE", "DXVK_FRAME_RATE")
 FLAGS = FLAGS + tuple(toggle.key for toggle in TOGGLES)
+_DEFAULT_ON = frozenset(toggle.key for toggle in TOGGLES if toggle.off_tokens)
 
 
 def _dxvk_entries(tokens: list[str]) -> list[str]:
@@ -225,7 +230,11 @@ def parse_presets(opts: str) -> dict[str, Any]:
         mh_fps_limit,
     )
     toggles = {
-        toggle.key: (toggle.dxvk in dxvk) if toggle.dxvk else all(tok in tokens_now for tok in toggle.tokens)
+        toggle.key: (
+            (toggle.dxvk in dxvk) if toggle.dxvk
+            else not any(tok in tokens_now for tok in toggle.off_tokens) if toggle.off_tokens
+            else all(tok in tokens_now for tok in toggle.tokens)
+        )
         for toggle in TOGGLES
     }
 
@@ -274,7 +283,13 @@ def apply_presets(
     level = merged.get("mh_level")
     frame = merged.get("frame_rate")
     frame = frame if isinstance(frame, int) and frame > 0 else 0
-    extra = [tok for toggle in TOGGLES if windows and flag(toggle.key) for tok in toggle.tokens]
+    def toggle_tokens(toggle: Toggle) -> tuple[str, ...]:
+        if not toggle.off_tokens:
+            return toggle.tokens if flag(toggle.key) else ()
+        # On by default (also when missing from `state`), written out so Steam's Proton gets it too.
+        return toggle.tokens if merged.get(toggle.key, True) else toggle.off_tokens
+
+    extra = [tok for toggle in TOGGLES if windows for tok in toggle_tokens(toggle)]
     # One DXVK_CONFIG: the user's own entries (always from `opts`), then the cap and DXVK toggles.
     dxvk = list(parse_presets(opts)["dxvk_custom"])
     if windows:
@@ -326,6 +341,15 @@ def prime_vendor() -> str:
 
 
 def active_flags(opts: str) -> list[str]:
-    """Names (from FLAGS) of the presets turned on in `opts`, in display order."""
+    """Names (from FLAGS) of the presets turned on in `opts`, in display order.
+
+    Default-on presets (the shader cache) are left out: every game has them, so naming them says nothing.
+    """
     state = parse_presets(opts)
-    return [key for key in FLAGS if state.get(key)]
+    return [key for key in FLAGS if state.get(key) and key not in _DEFAULT_ON]
+
+
+def turned_off_defaults(opts: str) -> list[str]:
+    """Names of the default-on presets turned off in `opts` (the only way such a game differs)."""
+    state = parse_presets(opts)
+    return [key for key in FLAGS if key in _DEFAULT_ON and not state.get(key)]

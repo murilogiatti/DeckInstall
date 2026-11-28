@@ -63,6 +63,11 @@ def test_windows_launcher_logs_and_keeps_args(tmp_path: Path) -> None:
     assert "== DeckInstall: command: " in script and "-dx11" in script.split("command: ", 1)[1].splitlines()[0]
     assert "export STEAM_COMPAT_LIBRARY_PATHS=" in script
     assert f"export PROTON_LOG_DIR={standalone.game_log_dir(game)}" in script
+    assert "export PROTON_LOCAL_SHADER_CACHE=1" in script  # on by default
+    off = _install(tmp_path, "Off Game", "Game.exe", PE)
+    standalone.update_standalone_launch_options(off.game_dir, launch_options="PROTON_LOCAL_SHADER_CACHE=0 %command%")
+    off_script = off.launch_script.read_text(encoding="utf-8")
+    assert "export PROTON_LOCAL_SHADER_CACHE=0" in off_script and "PROTON_LOCAL_SHADER_CACHE=1" not in off_script
     assert "export UMU_RUNTIME_UPDATE=0" in script  # only once the weekly check stamp is fresh
     assert "systemd-inhibit --what=idle --mode=block --who=DeckInstall" in script
     assert script.rstrip().endswith('exit "$rc"')

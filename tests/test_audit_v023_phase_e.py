@@ -88,6 +88,8 @@ def test_legacy_import_reuses_original_appid(tmp_path: Path) -> None:
     assert standalone.import_standalone_to_steam(paths, game) == appid
     assert steam_vdf.load_shortcuts(paths.shortcuts_vdf, strict=True)[0].exe == f'"{game.exe_path}"'
     assert (paths.compatdata_dir / str(appid) / "pfx" / "drive_c" / "save").read_bytes() == b"standalone"
+    # The shader cache is on by default (launch.sh adds it): Steam's Proton gets it written out.
+    assert "PROTON_LOCAL_SHADER_CACHE=1" in steam_vdf.load_shortcuts(paths.shortcuts_vdf, strict=True)[0].launch_options
 
 
 def test_manually_installed_umu_proton_is_preserved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -212,7 +214,7 @@ def test_mangohud_wrapper_survives_preset_changes() -> None:
     options = "MANGOHUD_CONFIG=preset=3 mangohud %command%"
     assert launch_presets.parse_presets(options)["mangohud"]
     assert "mangohud %command%" in launch_presets.apply_presets(options, no_fsync=True)
-    assert launch_presets.apply_presets(options, mangohud=False) == ""
+    assert launch_presets.apply_presets(options, mangohud=False) == "PROTON_LOCAL_SHADER_CACHE=1 %command%"
 
 
 @pytest.mark.parametrize("valid", [True, False])
