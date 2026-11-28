@@ -307,6 +307,7 @@ class MainWindow(QMainWindow):
     btn_remove_existing: QPushButton
     act_remove_game: QAction
     btn_scan: QPushButton
+    chk_show_other_programs: QCheckBox
     btn_scan_folders: QPushButton
     default_fps_combo: QComboBox
     lbl_hardware: QLabel
@@ -1642,7 +1643,18 @@ class MainWindow(QMainWindow):
         if worker is not self._scan_worker:
             return
         self.btn_scan.setEnabled(True)
-        self._detected_games = games
+        self._all_detected_games = games
+        others = sum(1 for g in games if not g.looks_like_game)
+        self.chk_show_other_programs.setText(tr("add.show_other_programs", count=others))
+        self.chk_show_other_programs.setVisible(others > 0)
+        self._show_detected_games()
+
+    def _show_detected_games(self) -> None:
+        """The detected games, plus the other programs found when their box is ticked."""
+        show_all = self.chk_show_other_programs.isChecked()
+        self._detected_games = [
+            g for g in getattr(self, "_all_detected_games", []) if show_all or g.looks_like_game
+        ]
         self.games_list.setSortingEnabled(False)
         self.games_list.clearSpans()
         self.games_list.setRowCount(0)

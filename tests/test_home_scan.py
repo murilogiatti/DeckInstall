@@ -121,3 +121,46 @@ def test_dir_has_game_exe_detects_proton_pe_only(tmp_path: Path) -> None:
     (tmp_path / "gog" / "goggame-1.info").write_text("{}", encoding="utf-8")
     found = {d.name for d in tmp_path.iterdir() if scanner._dir_has_game_exe(d)}
     assert found == {"i386", "amd64"}  # native Linux games are not supported
+
+
+def _pe(path, subsystem: int = 2) -> None:
+    import struct
+
+    head = bytearray(4096)
+    head[0:2] = b"MZ"
+    struct.pack_into("<I", head, 0x3C, 64)
+    head[64:68] = b"PE\0\0"
+    struct.pack_into("<H", head, 64 + 4, 0x8664)
+    struct.pack_into("<H", head, 64 + 24 + 68, subsystem)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(head))
+
+
+def test_only_games_are_listed_other_programs_flagged(tmp_path, monkeypatch) -> None:
+    """Window programs that draw (DirectX/Vulkan/OpenGL or a known engine) are games; terminal
+    programs, programs that draw nothing and folders of loose .exe files are not."""
+    from deckinstall import scanner
+
+    tech = {"Game.exe": ("DirectX 11", "Other"), "Novel.exe": ("-", "Ren'Py 8")}
+    monkeypatch.setattr(scanner, "detect_game_tech", lambda exe, _root: tech.get(exe.name, ("-", "Other")))
+    game = tmp_path / "Game"
+    _pe(game / "Game.exe")
+    (game / "data.pak").write_bytes(b"x")
+    novel = tmp_path / "Novel"
+    _pe(novel / "Novel.exe")
+    (novel / "lib").mkdir()
+    console = tmp_path / "Exercises"
+    _pe(console / "Game.exe", subsystem=3)  # draws, but runs in a terminal
+    (console / "notes.txt").write_text("x")
+    tax = tmp_path / "Tax"
+    _pe(tax / "irpf.exe")
+    (tax / "irpf.jar").write_bytes(b"x")
+    loose = tmp_path / "exe"
+    for name in ("Game.exe", "setup.exe"):
+        _pe(loose / name)
+    verdict = {}
+    for folder in (game, novel, console, tax, loose):
+        detected = scanner.scan_game_folder(folder)
+        assert detected is not None
+        verdict[folder.name] = scanner.looks_like_game(detected)
+    assert verdict == {"Game": True, "Novel": True, "Exercises": False, "Tax": False, "exe": False}

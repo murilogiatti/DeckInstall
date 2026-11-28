@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import os
 import re
+import struct
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .gameinfo import is_unreal_binary_name
+from .gameinfo import detect_game_tech, is_unreal_binary_name
 from .library import LIBRARY_DIRNAME, _unescape_mount
 
 IGNORED_EXE_PATTERNS = (
@@ -71,6 +72,58 @@ class DetectedGame:
     executables: list[Path]
     primary_exe: Path
     steam_appid: int | None
+    looks_like_game: bool = True  # False: another program (a tool, an installer, a school exercise)
+
+
+_PE_GUI = 2  # IMAGE_SUBSYSTEM_WINDOWS_GUI; 3 is a console (terminal) program
+
+
+def _pe_subsystem(exe: Path) -> int | None:
+    """The PE subsystem of an .exe (2 = window, 3 = terminal), None when it cannot be read."""
+    try:
+        with exe.open("rb") as fh:
+            head = fh.read(4096)
+        pe = struct.unpack_from("<I", head, 0x3C)[0]
+        if head[pe:pe + 4] != b"PE\0\0":
+            return None
+        return int(struct.unpack_from("<H", head, pe + 24 + 68)[0])
+    except (OSError, struct.error):
+        return None
+
+
+def _only_loose_exes(folder: Path) -> bool:
+    """A folder of unrelated .exe files and nothing else (no DLLs, data or subfolders): a
+    downloads/backup folder of tools and installers, not a game."""
+    try:
+        entries = list(folder.iterdir())
+    except OSError:
+        return False
+    exes = [e for e in entries if e.is_file() and e.suffix.lower() == ".exe"]
+    return len(exes) >= 2 and len(exes) == len(entries)
+
+
+def looks_like_game(game: DetectedGame) -> bool:
+    """A game is a window program that draws with DirectX, Vulkan, OpenGL or DirectDraw, or sits in
+    a recognized engine (Unity, Unreal, Godot, RPG Maker, Ren'Py...). Read from the files only,
+    with the same detector as the Library's Graphics and Engine columns."""
+    if _only_loose_exes(game.primary_exe.parent):
+        return False
+    for exe in [game.primary_exe, *[e for e in game.executables if e != game.primary_exe][:3]]:
+        if _pe_subsystem(exe) not in (None, _PE_GUI):
+            continue
+        graphics, engine = detect_game_tech(exe, game.root_dir)
+        if graphics != "-" or engine not in ("-", "Other"):
+            return True
+    return False
+
+
+def _judged(game: DetectedGame | None) -> DetectedGame | None:
+    if game is None:
+        return None
+    try:
+        return game if looks_like_game(game) else replace(game, looks_like_game=False)
+    except Exception:
+        return game  # never hide a folder because the check itself failed
 
 
 def clean_game_name(raw_name: str) -> str:
@@ -687,7 +740,7 @@ def scan_all_games(
         return []
     if len(candidates) == 1:
         try:
-            detected = scan_game_folder(candidates[0], should_stop)
+            detected = _judged(scan_game_folder(candidates[0], should_stop))
         except Exception:
             return []
         return [detected] if detected is not None else []
@@ -696,7 +749,9 @@ def scan_all_games(
     max_workers = min(8, os.cpu_count() or 4)
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(scan_game_folder, child, should_stop) for child in candidates]
+            futures = [
+                executor.submit(lambda c: _judged(scan_game_folder(c, should_stop)), child) for child in candidates
+            ]
             for fut in futures:
                 if should_stop is not None and should_stop():
                     for pending in futures:
@@ -713,7 +768,7 @@ def scan_all_games(
             if should_stop is not None and should_stop():
                 return []
             try:
-                detected = scan_game_folder(child, should_stop)
+                detected = _judged(scan_game_folder(child, should_stop))
             except Exception:
                 continue
             if detected is not None:

@@ -174,6 +174,11 @@ def build_add_page(win: MainWindow) -> QWidget:
         lambda row, _column, _previous_row, _previous_column: win._on_game_selected(row)
     )
     list_layout.addWidget(win.games_list, 1)
+    # Only games are listed; other programs found (tools, installers...) stay one tick away.
+    win.chk_show_other_programs = QCheckBox()
+    win.chk_show_other_programs.setVisible(False)
+    win.chk_show_other_programs.toggled.connect(lambda _on: win._show_detected_games())
+    list_layout.addWidget(win.chk_show_other_programs)
 
     # Step 2 (Game): which folder and exe, its name, the Steam match and the cover preview.
     cfg_split = QSplitter(Qt.Orientation.Horizontal)

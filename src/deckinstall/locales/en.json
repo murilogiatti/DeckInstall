@@ -1122,5 +1122,6 @@
   "runtimes.tool_innoextract": "GOG installers",
   "runtimes.tool_gamemode": "system performance mode",
   "runtime.previous_of": "previous version of {count} game(s)",
-  "runtime.previous_lost": "{count} game(s) lose \"Use previous version\""
+  "runtime.previous_lost": "{count} game(s) lose \"Use previous version\"",
+  "add.show_other_programs": "Also show other programs found ({count}: tools, installers and other programs that do not look like games)"
 }
