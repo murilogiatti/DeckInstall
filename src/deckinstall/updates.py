@@ -22,8 +22,8 @@ APP = "app"
 ORDER = (APP, "umu_proton", "umu", "optiscaler", "mangohud")
 LABELS = {
     APP: "DeckInstall",
-    "umu_proton": "UMU-Proton",
-    "umu": "umu-run",
+    "umu_proton": "Proton",
+    "umu": "umu-run",  # shown as the "game starter" (translated) in the Updates card
     "optiscaler": "OptiScaler",
     "mangohud": "MangoHud",
 }

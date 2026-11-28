@@ -253,19 +253,19 @@ def _setting_int(settings: QSettings, key: str, default: int = 0) -> int:
     return default
 
 
-PAGE_INSTALL, PAGE_LIBRARY, PAGE_SAVES, PAGE_MAINT, PAGE_RUNTIMES, PAGE_SETTINGS = range(6)
+PAGE_INSTALL, PAGE_LIBRARY, PAGE_SAVES, PAGE_SETTINGS = range(4)
+# Sections of the one Settings page (not pages of their own): showing one scrolls the page to it.
+PAGE_RUNTIMES, PAGE_MAINT = 4, 5
 # Order of the tabs on top of the window (Library first); each maps to a page of the stack.
 NAV_PAGES = (PAGE_LIBRARY, PAGE_INSTALL, PAGE_SAVES, PAGE_SETTINGS)
 # Message bar keys about one tab's action; switching tabs clears them (updates and welcome stay).
 _PAGE_MESSAGE_KEYS = ("notify", "scale")
-# The Settings tab holds three pages, picked with the section pills under the tabs.
-SETTINGS_PAGES = (PAGE_SETTINGS, PAGE_RUNTIMES, PAGE_MAINT)
-SETTINGS_SECTION_KEY = "ui/settings_section"
+SETTINGS_SECTIONS = (PAGE_RUNTIMES, PAGE_MAINT)
 
 
 def nav_tab_of(page: int) -> int:
     """The top tab that shows this page."""
-    return NAV_PAGES.index(PAGE_SETTINGS if page in SETTINGS_PAGES else page)
+    return NAV_PAGES.index(PAGE_SETTINGS if page in SETTINGS_SECTIONS else page)
 
 
 class MainWindow(QMainWindow):
@@ -714,37 +714,24 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.nav_tabs)
         self.message_bar = MessageBar()  # inline news that needs no answer (instead of a modal box)
         right_layout.addWidget(self.message_bar)
-        # Sections of the Settings tab: general, updates & runtimes, cleanup.
-        self.settings_sections = QWidget()
-        sections_row = QHBoxLayout(self.settings_sections)
-        sections_row.setContentsMargins(0, 0, 0, 0)
-        sections_row.setSpacing(6)
-        self._section_group = QButtonGroup(self)
-        self._section_buttons: dict[int, QPushButton] = {}
-        for page, label in (
-            (PAGE_SETTINGS, tr("settings.section_general")),
-            (PAGE_RUNTIMES, tr("nav.runtimes")),
-            (PAGE_MAINT, tr("nav.maintenance")),
-        ):
-            pill = QPushButton(label)
-            pill.setObjectName("FilterPill")
-            pill.setCheckable(True)
-            pill.clicked.connect(lambda _=False, p=page: self._show_page(p))
-            self._section_group.addButton(pill)
-            self._section_buttons[page] = pill
-            sections_row.addWidget(pill)
-        sections_row.addStretch()
-        self.settings_sections.setVisible(False)
-        right_layout.addWidget(self.settings_sections)
-
         self.stack = QStackedWidget()
         self.stack.addWidget(_wrap_scroll(self._build_extract_page()))  # PAGE_INSTALL
         self.stack.addWidget(_wrap_scroll(self._build_library_page()))  # PAGE_LIBRARY
         self.stack.addWidget(_wrap_scroll(self._build_saves_page()))  # PAGE_SAVES
-        runtimes_page = _wrap_scroll(build_runtimes_page(self))  # its labels are filled by the health check
-        self.stack.addWidget(_wrap_scroll(self._build_maintenance_page()))  # PAGE_MAINT
-        self.stack.addWidget(runtimes_page)  # PAGE_RUNTIMES
-        self.stack.addWidget(_wrap_scroll(self._build_settings_page()))  # PAGE_SETTINGS
+        # Settings: one page, top to bottom: updates and components, preferences and system, cleanup.
+        maint_section = self._build_maintenance_page()
+        runtimes_section = build_runtimes_page(self)  # its labels are filled by the health check
+        general_section = self._build_settings_page()
+        settings_body = QWidget()
+        settings_lay = QVBoxLayout(settings_body)
+        settings_lay.setContentsMargins(0, 0, 0, 0)
+        settings_lay.setSpacing(12)
+        for section in (runtimes_section, general_section, maint_section):
+            settings_lay.addWidget(section)
+        settings_lay.addStretch(1)
+        self._settings_scroll = _wrap_scroll(settings_body)
+        self._settings_anchors = {PAGE_RUNTIMES: runtimes_section, PAGE_MAINT: maint_section}
+        self.stack.addWidget(self._settings_scroll)  # PAGE_SETTINGS
         self.stack.setCurrentIndex(PAGE_LIBRARY)  # always open on the Library (no jump after the scan)
         self.nav_tabs.setCurrentIndex(NAV_PAGES.index(PAGE_LIBRARY))
         self.nav_tabs.currentChanged.connect(self._on_nav_tab_changed)
@@ -752,7 +739,6 @@ class MainWindow(QMainWindow):
         for keys, step in ((QKeySequence.StandardKey.NextChild, 1), (QKeySequence.StandardKey.PreviousChild, -1)):
             shortcut = QShortcut(keys, self)  # every binding of the platform (Ctrl+Tab, Ctrl+F6…)
             shortcut.activated.connect(lambda s=step: self._cycle_nav_tab(s))
-        self.stack.currentChanged.connect(self._sync_settings_sections)
         self.stack.currentChanged.connect(self._on_stack_tab_changed)
         right_layout.addWidget(self.stack)
 
@@ -804,8 +790,13 @@ class MainWindow(QMainWindow):
         style.polish(self.steam_status_lbl)
 
     def _show_page(self, idx: int) -> None:
-        self.nav_tabs.setCurrentIndex(nav_tab_of(idx))
-        self.stack.setCurrentIndex(idx)
+        page = PAGE_SETTINGS if idx in SETTINGS_SECTIONS else idx
+        self.nav_tabs.setCurrentIndex(nav_tab_of(page))
+        self.stack.setCurrentIndex(page)
+        anchor = self._settings_anchors.get(idx)
+        if anchor is not None:  # a section of Settings: scroll the page to it
+            bar = self._settings_scroll.verticalScrollBar()
+            QTimer.singleShot(0, lambda: bar.setValue(anchor.y()))  # a direct child of the page body
 
     def _cycle_nav_tab(self, step: int) -> None:
         if self.nav_tabs.isEnabled():
@@ -815,27 +806,13 @@ class MainWindow(QMainWindow):
         # News about the tab being left (an action's result) must not follow the user to other tabs.
         for key in _PAGE_MESSAGE_KEYS:
             self.message_bar.dismiss(key)
-        page = NAV_PAGES[tab]
-        if page == PAGE_SETTINGS:  # back to the section opened last
-            try:
-                saved = int(str(self.settings.value(SETTINGS_SECTION_KEY, PAGE_SETTINGS)))
-            except ValueError:
-                saved = PAGE_SETTINGS
-            page = saved if saved in SETTINGS_PAGES else PAGE_SETTINGS
-        self.stack.setCurrentIndex(page)
-
-    def _sync_settings_sections(self, page: int) -> None:
-        in_settings = page in SETTINGS_PAGES
-        self.settings_sections.setVisible(in_settings)
-        if in_settings:
-            self._section_buttons[page].setChecked(True)
-            self.settings.setValue(SETTINGS_SECTION_KEY, page)
+        self.stack.setCurrentIndex(NAV_PAGES[tab])
 
     def _on_stack_tab_changed(self, idx: int) -> None:
         """Refresh Saves list or Maintenance metrics when their page opens."""
         if idx == PAGE_SAVES:
             self._refresh_saves_list()
-        elif idx in (PAGE_MAINT, PAGE_RUNTIMES):
+        elif idx == PAGE_SETTINGS:
             refresh_maintenance_health(self)
 
     def _format_steam_status_text(self) -> str:

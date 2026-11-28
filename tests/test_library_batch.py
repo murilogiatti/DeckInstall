@@ -28,7 +28,7 @@ def test_batch_actions_are_grouped_in_the_library() -> None:
     ):
         win = ui.MainWindow(app)
     try:
-        pages = {idx: win.stack.widget(idx) for idx in (ui.PAGE_LIBRARY, ui.PAGE_MAINT, ui.PAGE_RUNTIMES)}
+        pages = {idx: win.stack.widget(idx) for idx in (ui.PAGE_LIBRARY, ui.PAGE_SETTINGS)}
         labels = {
             idx: [b.text() for b in page.findChildren(QPushButton)] + [a.text() for a in page.findChildren(QAction)]
             for idx, page in pages.items()

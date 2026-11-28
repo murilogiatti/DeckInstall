@@ -94,7 +94,7 @@ def list_runtimes(paths: SteamPaths | None = None) -> list[RuntimeItem]:
     mh_dir = rm.get_mangohud_dir()
     fixed = (
         (UMU, "umu-run", rm.get_umu_dir()),
-        (STEAMRT4, "Steam Runtime 4 (umu)", rm.get_steamrt4_dir()),
+        (STEAMRT4, "Steam Runtime 4", rm.get_steamrt4_dir()),
         (OPTISCALER, "OptiScaler", rm.get_optiscaler_dir().parent),
     )
     for kind, name, path in fixed:

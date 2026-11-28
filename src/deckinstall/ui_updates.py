@@ -79,6 +79,10 @@ def build_updates_card(win: MainWindow) -> QWidget:
     return card
 
 
+def _label(comp: str) -> str:
+    return tr("runtimes.umu_title") if comp == "umu" else LABELS.get(comp, comp)
+
+
 def _sync_check_button(win: MainWindow) -> None:
     cooling = win._updates_cooldown.isActive()
     win.btn_updates_check.setEnabled(not win._updates_checking and not cooling and not win._steam_busy)
@@ -124,7 +128,7 @@ def render_updates(win: MainWindow) -> None:
             w.deleteLater()
     win._update_checks = {}
     for row, (comp, entry) in enumerate(win._update_results.items()):
-        check = QCheckBox(LABELS.get(comp, comp))
+        check = QCheckBox(_label(comp))
         can = bool(entry["update"]) and not entry["error"]
         check.setChecked(can)
         check.setEnabled(can)
@@ -158,11 +162,10 @@ def _sync_badge(win: MainWindow) -> None:
     from .ui import PAGE_RUNTIMES, nav_tab_of
 
     count = len(pending(win._update_results))
-    for label, set_text in (
-        (tr("nav.settings"), lambda text: win.nav_tabs.setTabText(nav_tab_of(PAGE_RUNTIMES), text)),
-        (tr("nav.runtimes"), win._section_buttons[PAGE_RUNTIMES].setText),
-    ):
-        set_text(tr("updates.tab_badge", label=label, count=count) if count else label)
+    label = tr("nav.settings")
+    win.nav_tabs.setTabText(
+        nav_tab_of(PAGE_RUNTIMES), tr("updates.tab_badge", label=label, count=count) if count else label
+    )
 
 
 def _runtimes_in_use(win: MainWindow) -> tuple[str, ...]:
@@ -202,7 +205,7 @@ def check_updates(win: MainWindow, *, silent: bool = False) -> None:
         render_updates(win)
         found = pending(data)
         if silent and found:
-            names = ", ".join(LABELS.get(c, c) for c in found)
+            names = ", ".join(_label(c) for c in found)
             win.message_bar.show_message(
                 tr("updates.banner", count=len(found), names=names),
                 "info",

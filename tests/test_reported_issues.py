@@ -183,7 +183,7 @@ class UniqueLibraryActionTests(unittest.TestCase):
                 self.assertEqual(remove.text(), tr("library.btn_uninstall"))
                 self.assertEqual(win.act_remove_game.text(), tr("library.btn_uninstall"))
                 self.assertIsNone(win.btn_save_sync.menu())
-                self.assertEqual(win.stack.count(), 6)
+                self.assertEqual(win.stack.count(), 4)  # Settings is one page
                 self.assertFalse(hasattr(win, "_nav_buttons"))  # no sidebar
                 self.assertEqual(win.findChildren(QWidget, "Sidebar"), [])
                 self.assertEqual(win.stack.currentIndex(), ui.PAGE_LIBRARY)
@@ -195,21 +195,15 @@ class UniqueLibraryActionTests(unittest.TestCase):
                     [tr("nav.library"), tr("nav.install"), tr("nav.saves"), tr("nav.settings")],
                 )
                 self.assertEqual(win.nav_tabs.currentIndex(), 0)
-                self.assertTrue(win.settings_sections.isHidden())
                 for tab, page in enumerate(ui.NAV_PAGES):
                     win.nav_tabs.setCurrentIndex(tab)
                     self.assertEqual(win.stack.currentIndex(), page)
-                # Runtimes and Cleanup are sections of the Settings tab.
-                self.assertFalse(win.settings_sections.isHidden())
-                win._section_buttons[ui.PAGE_MAINT].click()
-                self.assertEqual(win.stack.currentIndex(), ui.PAGE_MAINT)
+                # Updates/components and Cleanup are sections of the one Settings page.
+                self.assertFalse(hasattr(win, "settings_sections"))
+                win._show_page(ui.PAGE_MAINT)
+                self.assertEqual(win.stack.currentIndex(), ui.PAGE_SETTINGS)
                 self.assertEqual(win.nav_tabs.currentIndex(), ui.NAV_PAGES.index(ui.PAGE_SETTINGS))
-                win._show_page(ui.PAGE_LIBRARY)
-                self.assertTrue(win.settings_sections.isHidden())
-                win.nav_tabs.setCurrentIndex(ui.NAV_PAGES.index(ui.PAGE_SETTINGS))
-                self.assertEqual(win.stack.currentIndex(), ui.PAGE_MAINT)  # the section opened last
-                win._show_page(ui.PAGE_RUNTIMES)
-                self.assertTrue(win._section_buttons[ui.PAGE_RUNTIMES].isChecked())
+                self.assertTrue(win.stack.widget(ui.PAGE_SETTINGS).isAncestorOf(win.btn_maint_scan))
                 win._show_page(ui.PAGE_INSTALL)  # code paths that jump to a page keep the tab in sync
                 self.assertEqual(win.nav_tabs.currentIndex(), ui.NAV_PAGES.index(ui.PAGE_INSTALL))
                 win._show_page(ui.PAGE_LIBRARY)
@@ -575,8 +569,8 @@ class UiUxSimplificationTests(unittest.TestCase):
                     self.assertFalse(hasattr(win, "chk_verify_md5"))
                     self.assertTrue(win.extract_details_box.isHidden())
                     self.assertTrue(win.stack.widget(0).isAncestorOf(win.add_name))
-                    self.assertTrue(win.stack.widget(ui.PAGE_RUNTIMES).isAncestorOf(win.btn_update_runtimes))
-                    self.assertTrue(win.stack.widget(ui.PAGE_RUNTIMES).isAncestorOf(win.btn_updates_check))  # app + runtimes together
+                    self.assertTrue(win.stack.widget(ui.PAGE_SETTINGS).isAncestorOf(win.btn_update_runtimes))
+                    self.assertTrue(win.stack.widget(ui.PAGE_SETTINGS).isAncestorOf(win.btn_updates_check))  # app + runtimes together
 
                     for always_visible in (win.chk_keep_in_place, win.add_library_combo, win.lbl_add_presets,
                                            win.btn_shortcut_menu):
