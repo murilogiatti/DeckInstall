@@ -306,7 +306,6 @@ class MainWindow(QMainWindow):
     btn_reload: QPushButton
     btn_remove_existing: QPushButton
     act_remove_game: QAction
-    btn_scan: QPushButton
     chk_show_other_programs: QCheckBox
     btn_scan_folders: QPushButton
     default_fps_combo: QComboBox
@@ -1626,7 +1625,7 @@ class MainWindow(QMainWindow):
         open_scan_folders_dialog(self)
 
     def _refresh_games(self, *, on_done: Callable[[], None] | None = None) -> None:
-        self.btn_scan.setEnabled(False)
+        self.btn_scan_folders.setEnabled(False)
         self._update_scan_folders_label()
         roots = [] if self._smoke else self._enabled_scan_roots()
         worker = ScanWorker(roots=roots, scan_fn=scan_all_games)
@@ -1642,7 +1641,7 @@ class MainWindow(QMainWindow):
     def _on_games_scanned(self, worker: ScanWorker, games: list[DetectedGame]) -> None:
         if worker is not self._scan_worker:
             return
-        self.btn_scan.setEnabled(True)
+        self.btn_scan_folders.setEnabled(True)
         self._all_detected_games = games
         others = sum(1 for g in games if not g.looks_like_game)
         self.chk_show_other_programs.setText(tr("add.show_other_programs", count=others))
