@@ -73,7 +73,7 @@ def test_real_7z_listing_reports_declared_size(tmp_path: Path) -> None:
     archive = tmp_path / "Game.7z"
     subprocess.run([str(extractor._find_7z_bin()), "a", "-bd", str(archive), str(src)], check=True, capture_output=True)
 
-    declared = extractor._precheck_cli_archive(str(extractor._find_7z_bin()), archive)
+    declared = extractor._precheck_7z_archive(str(extractor._find_7z_bin()), archive)
     assert declared == 4096 + 20_000
     out = tmp_path / "out"
     extractor.extract_archive_to_dir(archive, out)

@@ -164,6 +164,11 @@ def show_runtime_health(win: MainWindow, data: dict) -> None:
     )
     win.lbl_rt_optiscaler.setText(tr("runtimes.optiscaler_status", status=data.get("optiscaler_status", "-")))
     tools = data.get("tools") or {}
-    win.lbl_rt_tools.setText(
-        "  ".join(f"{'✓' if ok else '✗'} {name}" for name, ok in sorted(tools.items()))
-    )
+    uses = {
+        "7z": tr("runtimes.tool_7z"),
+        "innoextract": tr("runtimes.tool_innoextract"),
+        "gamemoderun": tr("runtimes.tool_gamemode"),
+    }
+    win.lbl_rt_tools.setText("   ".join(
+        f"{'✓' if ok else '✗'} {name} ({uses.get(name, '')})" for name, ok in tools.items()
+    ))

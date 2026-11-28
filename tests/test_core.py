@@ -31,7 +31,6 @@ from conftest import pe_exe_bytes  # noqa: E402
 
 from deckinstall.cleanup import find_cleanup_candidates  # noqa: E402
 from deckinstall.extractor import (  # noqa: E402
-    _select_extract_cmd,
     extract_archive_to_dir,
     is_archive,
     sanitize_folder_name,
@@ -202,8 +201,6 @@ class CoreTests(unittest.TestCase):
             sanitize_folder_name("../escape")
         with self.assertRaises(ValueError):
             sanitize_folder_name("/abs/path")
-        cmd = _select_extract_cmd(Path("game.tar.gz"), Path("/tmp/out"))
-        self.assertEqual(cmd[0], "tar")
 
     def test_infer_game_root_skips_binaries_win64_and_guards_downloads(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1046,11 +1043,6 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(is_archive(Path("game.part1.rar")))
         self.assertTrue(is_archive(Path("game.7z.001")))
         self.assertTrue(is_archive(Path("game.zip.001")))
-        tar_cmd = _select_extract_cmd(Path("game.tar.gz"), Path("/tmp/out"))
-        self.assertIn("--no-same-owner", tar_cmd)
-        self.assertIn("--no-same-permissions", tar_cmd)
-        sevenz_cmd = _select_extract_cmd(Path("game.7z"), Path("/tmp/out"))
-        self.assertIn("-p-", sevenz_cmd)
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

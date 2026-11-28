@@ -108,22 +108,6 @@ def _find_7z_bin() -> str | None:
     return shutil.which("7z") or shutil.which("7zz") or shutil.which("7za")
 
 
-def _select_extract_cmd(archive: Path, out_dir: Path) -> list[str]:
-    arc = archive.resolve()
-    low = arc.name.lower()
-    tar_exts = (".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.zst", ".tar.bz2", ".tar")
-    if any(low.endswith(ext) for ext in tar_exts) and shutil.which("tar"):
-        return ["tar", "--force-local", "--no-same-owner", "--no-same-permissions", "-xf", str(arc), "-C", str(out_dir)]
-    if low.endswith((".rar", ".part1.rar", ".rar.001")) and shutil.which("unrar"):
-        return ["unrar", "x", "-o+", "-y", "-p-", "--", str(arc), str(out_dir) + "/"]
-    if low.endswith(".zip") and shutil.which("unzip"):
-        return ["unzip", "-o", "--", str(arc), "-d", str(out_dir)]
-    seven_z = _find_7z_bin()
-    if seven_z:
-        return [seven_z, "x", "-y", "-p-", f"-o{out_dir}", "--", str(arc)]
-    raise RuntimeError(f"No extraction tool found for: {archive.name}")
-
-
 _MAX_ARCHIVE_ENTRIES = 50_000
 # Zip-bomb guard: the declared uncompressed size may be at most this many times the size of
 # the archive (all its parts). Game data compresses far less; bombs go well past 1000x.
@@ -365,204 +349,6 @@ def _precheck_7z_archive(seven_z_bin: str, archive: Path) -> int:
     return total_bytes
 
 
-def _precheck_unrar_archive(unrar_bin: str, archive: Path) -> int:
-    """List .rar archive via unrar vt and abort if symlinks or traversal paths are present."""
-    max_file, max_total = _archive_limits(archive)
-    try:
-        proc = subprocess.run(
-            [unrar_bin, "vt", "-p-", "--", str(archive)],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Timed out inspecting {archive.name}.") from exc
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()[:300]
-        raise RuntimeError(
-            f"Failed to inspect {archive.name} (code {proc.returncode})"
-            + (f": {detail}" if detail else ".")
-        )
-    entry_count = 0
-    total_bytes = 0
-    for raw_line in proc.stdout.splitlines():
-        if ":" not in raw_line:
-            continue
-        key, _, val = raw_line.partition(":")
-        key_low = key.strip().lower()
-        val_str = val.strip()
-        if key_low == "name":
-            entry_count += 1
-            if entry_count > _MAX_ARCHIVE_ENTRIES:
-                raise RuntimeError("Archive exceeds maximum allowed entry count.")
-            _check_unsafe_member_path(val_str)
-        elif key_low == "size" and val_str.isdigit():
-            size = int(val_str)
-            if size > max_file:
-                raise RuntimeError(f"Archive member exceeds maximum allowed size: {size}")
-            total_bytes += size
-            if total_bytes > max_total:
-                raise _too_big_error(total_bytes)
-        elif key_low == "type" and ("link" in val_str.lower()):
-            raise RuntimeError(f"Unsafe link in archive {archive.name}: {val_str}")
-        elif key_low == "target" and val_str:
-            raise RuntimeError(f"Unsafe link target in archive {archive.name}: {val_str}")
-        elif key_low == "attributes" and val_str.startswith("l"):
-            raise RuntimeError(f"Unsafe symlink in archive {archive.name}.")
-    return total_bytes
-
-
-def _precheck_tar_cli_archive(tar_bin: str, archive: Path) -> int:
-    """List tar archive via `tar -tvf` and abort if symlinks, hardlinks, specials, or traversal exist."""
-    max_file, max_total = _archive_limits(archive)
-    try:
-        proc = subprocess.run(
-            [tar_bin, "--force-local", "-tvf", str(archive)],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Timed out inspecting {archive.name}.") from exc
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()[:300]
-        raise RuntimeError(
-            f"Failed to inspect {archive.name} (code {proc.returncode})"
-            + (f": {detail}" if detail else ".")
-        )
-    total_bytes = 0
-    for idx, raw_line in enumerate(proc.stdout.splitlines()):
-        if idx >= _MAX_ARCHIVE_ENTRIES:
-            raise RuntimeError("Archive exceeds maximum allowed entry count.")
-        line = raw_line.strip()
-        if not line:
-            continue
-        type_ch = line[0]
-        if type_ch in ("l", "h", "c", "b", "p", "D"):
-            raise RuntimeError(f"Unsafe link or special file in archive {archive.name}: {line[:120]}")
-        parts = line.split(None, 5)
-        if len(parts) < 6:
-            continue
-        if type_ch != "d" and parts[2].isdigit():
-            size = int(parts[2])
-            if size > max_file:
-                raise RuntimeError(f"Archive member exceeds maximum allowed size: {parts[5]}")
-            total_bytes += size
-            if total_bytes > max_total:
-                raise _too_big_error(total_bytes)
-        entry_part = parts[5]
-        if " -> " in entry_part or " link to " in entry_part:
-            raise RuntimeError(f"Unsafe link in archive {archive.name}: {entry_part[:120]}")
-        _check_unsafe_member_path(entry_part)
-    return total_bytes
-
-
-def _precheck_unzip_archive(unzip_bin: str, archive: Path) -> int:
-    """List zip archive via `unzip -Z -l` (or `-Z -1`) and reject symlinks, oversized entries, and traversal."""
-    max_file, max_total = _archive_limits(archive)
-    if zipfile.is_zipfile(archive):
-        try:
-            with zipfile.ZipFile(archive, "r") as zf:
-                infos = zf.infolist()
-                if len(infos) > _MAX_ARCHIVE_ENTRIES:
-                    raise RuntimeError("Archive exceeds maximum allowed entry count.")
-                total_bytes = sum(max(0, info.file_size) for info in infos)
-                if total_bytes > max_total:
-                    raise _too_big_error(total_bytes)
-                for info in infos:
-                    if info.file_size > max_file:
-                        raise RuntimeError(f"Archive member exceeds maximum allowed size: {info.filename}")
-                    if stat.S_ISLNK(info.external_attr >> 16):
-                        raise RuntimeError(f"Unsafe symlink in archive {archive.name}: {info.filename}")
-                    _check_unsafe_member_path(info.filename)
-            return total_bytes
-        except zipfile.BadZipFile:
-            pass
-    try:
-        proc = subprocess.run(
-            [unzip_bin, "-Z", "-l", "--", str(archive)],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Timed out inspecting {archive.name}.") from exc
-    if proc.returncode == 0:
-        entry_count = 0
-        total_bytes = 0
-        for raw_line in proc.stdout.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            parts = line.split(None, 8)
-            if len(parts) == 9 and parts[3].isdigit():
-                mode = parts[0]
-                if mode.startswith("l"):
-                    raise RuntimeError(f"Unsafe symlink in archive {archive.name}: {parts[8]}")
-                entry_count += 1
-                if entry_count > _MAX_ARCHIVE_ENTRIES:
-                    raise RuntimeError("Archive exceeds maximum allowed entry count.")
-                size = int(parts[3])
-                if size > max_file:
-                    raise RuntimeError(f"Archive member exceeds maximum allowed size: {parts[8]}")
-                total_bytes += size
-                if total_bytes > max_total:
-                    raise _too_big_error(total_bytes)
-                _check_unsafe_member_path(parts[8])
-            elif len(parts) == 1:
-                entry_count += 1
-                if entry_count > _MAX_ARCHIVE_ENTRIES:
-                    raise RuntimeError("Archive exceeds maximum allowed entry count.")
-                _check_unsafe_member_path(parts[0])
-        return total_bytes
-
-    try:
-        proc = subprocess.run(
-            [unzip_bin, "-Z", "-1", "--", str(archive)],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=60,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Timed out inspecting {archive.name}.") from exc
-    if proc.returncode != 0:
-        detail = (proc.stderr or proc.stdout or "").strip()[:300]
-        raise RuntimeError(
-            f"Failed to inspect {archive.name} (code {proc.returncode})"
-            + (f": {detail}" if detail else ".")
-        )
-    for idx, raw_line in enumerate(proc.stdout.splitlines()):
-        if idx >= _MAX_ARCHIVE_ENTRIES:
-            raise RuntimeError("Archive exceeds maximum allowed entry count.")
-        _check_unsafe_member_path(raw_line)
-    return 0
-
-
-def _precheck_cli_archive(cmd_bin: str, archive: Path) -> int:
-    """Pre-list CLI-extracted archives to reject symlinks, hardlinks, and path traversal.
-
-    Returns the declared uncompressed size (0 when the listing does not show sizes).
-    """
-    bin_name = Path(cmd_bin).name.lower()
-    if bin_name.startswith("7z"):
-        return _precheck_7z_archive(cmd_bin, archive)
-    if bin_name == "unrar":
-        return _precheck_unrar_archive(cmd_bin, archive)
-    if bin_name == "tar":
-        return _precheck_tar_cli_archive(cmd_bin, archive)
-    if bin_name == "unzip":
-        return _precheck_unzip_archive(cmd_bin, archive)
-    return 0
-
-
 def _merge_staging_dir(stage_dir: Path, dest_dir: Path) -> None:
     """Move files/directories from stage_dir into dest_dir without following symlinks."""
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -585,34 +371,28 @@ def _merge_staging_dir(stage_dir: Path, dest_dir: Path) -> None:
 
 
 def extract_archive_to_dir(archive: Path, dest_dir: Path) -> None:
-    """Extract an archive safely into dest_dir using staging for CLI extractors."""
+    """Extract a downloaded runtime archive safely into dest_dir: .zip and .tar.* in Python, .7z
+    (OptiScaler's only format) with the system's 7-Zip after a listing check, through a staging folder."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     low = archive.name.lower()
     if low.endswith(".zip"):
         _extract_zip_safe(archive, dest_dir)
         return
     if _is_tar_archive(low):
-        try:
-            _extract_tar_safe(archive, dest_dir)
-            return
-        except tarfile.CompressionError:
-            if not low.endswith(".tar.zst"):
-                raise
+        _extract_tar_safe(archive, dest_dir)
+        return
+    if not low.endswith(".7z"):
+        raise RuntimeError(f"Unsupported archive: {archive.name}")
+    seven_z = _find_7z_bin()
+    if not seven_z:
+        raise RuntimeError(
+            "No 7-Zip extraction tool found (tried 7z, 7zz, 7za). Install 7zip/p7zip to extract .7z archives."
+        )
 
     with tempfile.TemporaryDirectory(prefix=".deckinstall_stage_", dir=str(dest_dir.parent)) as tmp_str:
         stage_dir = Path(tmp_str)
-        if low.endswith(".7z"):
-            seven_z = _find_7z_bin()
-            if not seven_z:
-                raise RuntimeError(
-                    "No 7-Zip extraction tool found (tried 7z, 7zz, 7za). "
-                    "Install 7zip/p7zip to extract .7z archives."
-                )
-            cmd = [seven_z, "x", "-y", "-p-", f"-o{stage_dir}", "--", str(archive)]
-        else:
-            cmd = _select_extract_cmd(archive, stage_dir)
-
-        _precheck_cli_archive(cmd[0], archive)
+        cmd = [seven_z, "x", "-y", "-p-", f"-o{stage_dir}", "--", str(archive)]
+        _precheck_7z_archive(seven_z, archive)
 
         try:
             proc = subprocess.run(

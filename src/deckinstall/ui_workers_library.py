@@ -300,6 +300,7 @@ class ShortcutsRefreshWorker(QThread):
         self.owned: dict[int, StandaloneGame] | None = None
         self.primary: dict[Path, ShortcutEntry] | None = None
         self.repairs: list[tuple[ShortcutEntry, StandaloneGame]] | None = None
+        self.sandbox_blocked: list[Path] = []  # only filled when Steam is there
         self._load_shortcuts = load_shortcuts_fn or load_shortcuts
         self._list_standalone_games = list_standalone_games_fn or list_standalone_games
         self._scan_external_launcher_games = (

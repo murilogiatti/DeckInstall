@@ -180,11 +180,12 @@ class MaintHealthWorker(QThread):
             label for tool_id, label in (list_installed_protons(steam_root) if steam_root is not None else [])
             if not tool_id.lower().startswith(("ge-proton", "umu-proton"))
         ]
+        # What DeckInstall still calls on the system (each optional; games are never unpacked here).
         tools = {
-            name: shutil.which(name) is not None
-            for name in ("gamemoderun", "innoextract", "unrar", "unzip")
+            "7z": _find_7z_bin() is not None,  # OptiScaler's download is a .7z
+            "innoextract": shutil.which("innoextract") is not None,  # GOG offline installers
+            "gamemoderun": shutil.which("gamemoderun") is not None,  # the system performance mode option
         }
-        tools["7z"] = _find_7z_bin() is not None
 
         self.ready.emit(
             self._req_id,

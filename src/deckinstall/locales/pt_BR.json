@@ -842,7 +842,7 @@
   "runtimes.optiscaler_status": "Pacote: {status}",
   "runtimes.status_not_downloaded": "não baixado (é baixado na primeira instalação num jogo)",
   "runtimes.tools_title": "Ferramentas do sistema",
-  "runtimes.tools_about": "Usadas em instaladores, arquivos compactados e ajustes quando existem; o DeckInstall nunca as instala sem perguntar.",
+  "runtimes.tools_about": "Programas opcionais do sistema que o DeckInstall usa quando existem: o 7-Zip abre o pacote do OptiScaler, o innoextract abre instaladores offline da GOG sem executá-los e o gamemoderun é o modo de desempenho do sistema. O DeckInstall nunca os instala sem perguntar.",
   "runtimes.note_standalone_only": "Só para jogos no modo Autônomo; jogos no modo Steam usam o da Steam.",
   "add.confirm_standalone_runtime": "O modo Autônomo precisa do umu-run e do UMU-Proton (cerca de 500 MB), que ainda não estão instalados.\n\nBaixar agora?",
   "mode.note_steam_shortcut_standalone": "No modo Autônomo o jogo abre pela Biblioteca, pelo menu ou pela área de trabalho, então não é adicionado à Steam.",
@@ -1120,5 +1120,8 @@
   "library.bulk_proton_hint": "Troca o Proton de vários jogos de uma vez (ou volta ao padrão, o UMU-Proton).",
   "library.bulk_optiscaler_hint": "Instala ou atualiza o OptiScaler em todos os jogos que trazem DLSS, FSR 2+ ou XeSS.",
   "runtimes.btn_download": "Baixar",
-  "winetricks.needs_umu_proton": "O winetricks vem com o UMU-Proton e roda no próprio contêiner do jogo: escolha o UMU-Proton para este jogo (Configurar > Proton) para usá-lo."
+  "winetricks.needs_umu_proton": "O winetricks vem com o UMU-Proton e roda no próprio contêiner do jogo: escolha o UMU-Proton para este jogo (Configurar > Proton) para usá-lo.",
+  "runtimes.tool_7z": "OptiScaler",
+  "runtimes.tool_innoextract": "instaladores da GOG",
+  "runtimes.tool_gamemode": "modo de desempenho do sistema"
 }

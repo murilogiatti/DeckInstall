@@ -842,7 +842,7 @@
   "runtimes.optiscaler_status": "Package: {status}",
   "runtimes.status_not_downloaded": "not downloaded (it is downloaded when first installed on a game)",
   "runtimes.tools_title": "System tools",
-  "runtimes.tools_about": "Used for installers, archives and tweaks when present; DeckInstall never installs them without asking.",
+  "runtimes.tools_about": "Optional programs of this system that DeckInstall calls when they exist: 7-Zip unpacks OptiScaler, innoextract opens GOG offline installers without running them, and gamemoderun is the system performance mode. DeckInstall never installs them without asking.",
   "runtimes.note_standalone_only": "Only for Standalone games; Steam-mode games use Steam's.",
   "add.confirm_standalone_runtime": "Standalone mode needs umu-run and UMU-Proton (about 500 MB), which are not installed yet.\n\nDownload them now?",
   "mode.note_steam_shortcut_standalone": "In Standalone mode the game opens from the Library, the menu or the desktop, so it is not added to Steam.",
@@ -1120,5 +1120,8 @@
   "library.bulk_proton_hint": "Moves several games to another Proton at once (or back to the default, UMU-Proton).",
   "library.bulk_optiscaler_hint": "Installs or updates OptiScaler in every game that ships DLSS, FSR 2+ or XeSS.",
   "runtimes.btn_download": "Download",
-  "winetricks.needs_umu_proton": "Winetricks comes with UMU-Proton and runs inside the game's own container: choose UMU-Proton for this game (Configure > Proton) to use it."
+  "winetricks.needs_umu_proton": "Winetricks comes with UMU-Proton and runs inside the game's own container: choose UMU-Proton for this game (Configure > Proton) to use it.",
+  "runtimes.tool_7z": "OptiScaler",
+  "runtimes.tool_innoextract": "GOG installers",
+  "runtimes.tool_gamemode": "system performance mode"
 }

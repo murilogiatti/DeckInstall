@@ -505,36 +505,6 @@ class Fase4RegressionTests(unittest.TestCase):
 
 
 class Phase1SecurityAndCoreTests(unittest.TestCase):
-    def test_extractor_precheck_tar_and_unzip_rejects_links_and_traversal(self) -> None:
-        from deckinstall import extractor
-
-        with tempfile.TemporaryDirectory() as tmp:
-            arc = Path(tmp) / "fake.tar.zst"
-            arc.write_bytes(b"dummy")
-
-            sym_proc = mock.Mock(
-                returncode=0,
-                stdout="lrwxrwxrwx user/user 0 2026-01-01 00:00 sub -> /etc/passwd\n",
-                stderr="",
-            )
-            with mock.patch("deckinstall.extractor.subprocess.run", return_value=sym_proc):
-                with self.assertRaises(RuntimeError):
-                    extractor._precheck_cli_archive("/usr/bin/tar", arc)
-
-            trav_proc = mock.Mock(
-                returncode=0,
-                stdout="-rw-r--r-- user/user 10 2026-01-01 00:00 ../evil.txt\n",
-                stderr="",
-            )
-            with mock.patch("deckinstall.extractor.subprocess.run", return_value=trav_proc):
-                with self.assertRaises(RuntimeError):
-                    extractor._precheck_cli_archive("/usr/bin/tar", arc)
-
-            unzip_proc = mock.Mock(returncode=0, stdout="../evil.txt\n", stderr="")
-            with mock.patch("deckinstall.extractor.subprocess.run", return_value=unzip_proc):
-                with self.assertRaises(RuntimeError):
-                    extractor._precheck_cli_archive("/usr/bin/unzip", arc)
-
     def test_extractor_zip_entry_limit_and_staging_cleanup(self) -> None:
         import zipfile
 

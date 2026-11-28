@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import stat
 import subprocess
 import sys
 import tarfile
@@ -27,76 +26,6 @@ def _completed(stdout: str = "", stderr: str = "", returncode: int = 0) -> subpr
         stdout=stdout,
         stderr=stderr,
     )
-
-
-class TestPrecheckCliArchiveTar(unittest.TestCase):
-    """Tests for _precheck_cli_archive('tar', ...)."""
-
-    def test_tar_rejects_unsafe_entries(self) -> None:
-        listing_lines = [
-            "lrwxrwxrwx user/group 0 2026-01-01 00:00 Game/link -> /etc/passwd",
-            "hrw-r--r-- user/group 0 2026-01-01 00:00 Game/hard link to Game/other.txt",
-            "crw-r--r-- root/root 1,3 2026-01-01 00:00 dev/null",
-            "brw-r--r-- root/root 8,0 2026-01-01 00:00 dev/sda",
-            "prw-r--r-- user/group 0 2026-01-01 00:00 Game/my_pipe",
-            "Drw-r--r-- user/group 0 2026-01-01 00:00 Game/door",
-            "-rw-r--r-- user/group 10 2026-01-01 00:00 ../escape.txt",
-            "-rw-r--r-- user/group 10 2026-01-01 00:00 Game/../../escape.txt",
-            "-rw-r--r-- user/group 10 2026-01-01 00:00 /etc/passwd",
-        ]
-        for listing_line in listing_lines:
-            with self.subTest(listing_line=listing_line), tempfile.TemporaryDirectory() as tmp:
-                archive = Path(tmp) / "test.tar"
-                archive.write_bytes(b"")
-                with mock.patch.object(
-                    extractor.subprocess, "run", return_value=_completed(stdout=listing_line + "\n")
-                ):
-                    with self.assertRaises(RuntimeError):
-                        extractor._precheck_cli_archive("tar", archive)
-
-    def test_tar_accepts_clean_output(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            archive = Path(tmp) / "clean.tar"
-            archive.write_bytes(b"")
-            clean_stdout = (
-                "drwxr-xr-x user/group 0 2026-01-01 00:00 Game/\n"
-                "-rw-r--r-- user/group 1024 2026-01-01 00:00 Game/game.exe\n"
-                "-rw-r--r-- user/group 512 2026-01-01 00:00 Game/data/config.ini\n"
-            )
-            with mock.patch.object(extractor.subprocess, "run", return_value=_completed(stdout=clean_stdout)):
-                extractor._precheck_cli_archive("tar", archive)
-
-
-class TestPrecheckCliArchiveUnzip(unittest.TestCase):
-    """Tests for _precheck_cli_archive('unzip', ...)."""
-
-    def test_unzip_rejects_traversal_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            archive = Path(tmp) / "traversal.zip"
-            with zipfile.ZipFile(archive, "w") as zf:
-                zf.writestr("../escape.txt", b"evil")
-
-            with self.assertRaisesRegex(RuntimeError, "Unsafe archive member path"):
-                extractor._precheck_cli_archive("unzip", archive)
-
-    def test_unzip_rejects_symlink_external_attr(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            archive = Path(tmp) / "symlink.zip"
-            with zipfile.ZipFile(archive, "w") as zf:
-                info = zipfile.ZipInfo("Game/evil_link")
-                info.external_attr = (stat.S_IFLNK | 0o777) << 16
-                zf.writestr(info, b"/etc/passwd")
-
-            with self.assertRaisesRegex(RuntimeError, "Unsafe symlink"):
-                extractor._precheck_cli_archive("unzip", archive)
-
-    def test_unzip_accepts_clean_zip(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            archive = Path(tmp) / "clean.zip"
-            with zipfile.ZipFile(archive, "w") as zf:
-                zf.writestr("Game/game.exe", b"MZ")
-
-            extractor._precheck_cli_archive("unzip", archive)
 
 
 class TestExtractZipSafe(unittest.TestCase):
@@ -276,7 +205,7 @@ class TestExtractArchiveToDirStaging(unittest.TestCase):
 
             with (
                 mock.patch.object(extractor, "_find_7z_bin", return_value="7z"),
-                mock.patch.object(extractor, "_precheck_cli_archive", return_value=None),
+                mock.patch.object(extractor, "_precheck_7z_archive", return_value=0),
                 mock.patch.object(extractor.subprocess, "run", side_effect=fake_run),
             ):
                 with self.assertRaisesRegex(RuntimeError, "Failed to extract"):
@@ -300,7 +229,7 @@ class TestExtractArchiveToDirStaging(unittest.TestCase):
 
             with (
                 mock.patch.object(extractor, "_find_7z_bin", return_value="7z"),
-                mock.patch.object(extractor, "_precheck_cli_archive", return_value=None),
+                mock.patch.object(extractor, "_precheck_7z_archive", return_value=0),
                 mock.patch.object(extractor.subprocess, "run", side_effect=fake_run),
             ):
                 with self.assertRaisesRegex(RuntimeError, "timed out"):
@@ -341,104 +270,3 @@ class TestPrecheckSizeAndEntryLimits(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "maximum allowed total"):
                     extractor._precheck_7z_archive("7z", archive)
 
-    def test_unrar_rejects_entry_count_file_size_and_total_size(self) -> None:
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.multiple(
-                extractor,
-                _MAX_ARCHIVE_ENTRIES=2,
-                _MAX_ARCHIVE_FILE_BYTES=100,
-                _MAX_ARCHIVE_TOTAL_BYTES=150,
-            ),
-        ):
-            archive = Path(tmp) / "test.rar"
-            archive.write_bytes(b"rar")
-
-            too_many = "Name: a.txt\nSize: 1\nName: b.txt\nSize: 1\nName: c.txt\nSize: 1\n"
-            with mock.patch.object(extractor.subprocess, "run", return_value=_completed(stdout=too_many)):
-                with self.assertRaisesRegex(RuntimeError, "maximum allowed entry count"):
-                    extractor._precheck_unrar_archive("unrar", archive)
-
-            too_big_file = "Name: big.bin\nSize: 101\n"
-            with mock.patch.object(extractor.subprocess, "run", return_value=_completed(stdout=too_big_file)):
-                with self.assertRaisesRegex(RuntimeError, "maximum allowed size"):
-                    extractor._precheck_unrar_archive("unrar", archive)
-
-            too_big_total = "Name: a.bin\nSize: 80\nName: b.bin\nSize: 80\n"
-            with mock.patch.object(extractor.subprocess, "run", return_value=_completed(stdout=too_big_total)):
-                with self.assertRaisesRegex(RuntimeError, "maximum allowed total"):
-                    extractor._precheck_unrar_archive("unrar", archive)
-
-    def test_tar_cli_rejects_entry_count_file_size_and_total_size(self) -> None:
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.multiple(
-                extractor,
-                _MAX_ARCHIVE_ENTRIES=2,
-                _MAX_ARCHIVE_FILE_BYTES=100,
-                _MAX_ARCHIVE_TOTAL_BYTES=150,
-            ),
-        ):
-            archive = Path(tmp) / "test.tar.gz"
-            archive.write_bytes(b"tar")
-
-            too_many = (
-                "-rw-r--r-- u/g 1 2026-01-01 00:00 a.txt\n"
-                "-rw-r--r-- u/g 1 2026-01-01 00:00 b.txt\n"
-                "-rw-r--r-- u/g 1 2026-01-01 00:00 c.txt\n"
-            )
-            with mock.patch.object(extractor.subprocess, "run", return_value=_completed(stdout=too_many)):
-                with self.assertRaisesRegex(RuntimeError, "maximum allowed entry count"):
-                    extractor._precheck_tar_cli_archive("tar", archive)
-
-            too_big_file = "-rw-r--r-- u/g 101 2026-01-01 00:00 big.bin\n"
-            with mock.patch.object(extractor.subprocess, "run", return_value=_completed(stdout=too_big_file)):
-                with self.assertRaisesRegex(RuntimeError, "maximum allowed size"):
-                    extractor._precheck_tar_cli_archive("tar", archive)
-
-            too_big_total = (
-                "-rw-r--r-- u/g 80 2026-01-01 00:00 a.bin\n"
-                "-rw-r--r-- u/g 80 2026-01-01 00:00 b.bin\n"
-            )
-            with mock.patch.object(extractor.subprocess, "run", return_value=_completed(stdout=too_big_total)):
-                with self.assertRaisesRegex(RuntimeError, "maximum allowed total"):
-                    extractor._precheck_tar_cli_archive("tar", archive)
-
-    def test_unzip_cli_fallback_rejects_entry_count_file_size_and_total_size(self) -> None:
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.multiple(
-                extractor,
-                _MAX_ARCHIVE_ENTRIES=2,
-                _MAX_ARCHIVE_FILE_BYTES=100,
-                _MAX_ARCHIVE_TOTAL_BYTES=150,
-            ),
-        ):
-            archive = Path(tmp) / "fallback.zip"
-            archive.write_bytes(b"not-a-valid-zip-header")
-
-            too_many = (
-                "-rw-r--r-- 2.0 unx 1 b- defN 26-Jan-01 00:00 a.txt\n"
-                "-rw-r--r-- 2.0 unx 1 b- defN 26-Jan-01 00:00 b.txt\n"
-                "-rw-r--r-- 2.0 unx 1 b- defN 26-Jan-01 00:00 c.txt\n"
-            )
-            with mock.patch.object(extractor.subprocess, "run", return_value=_completed(stdout=too_many)):
-                with self.assertRaisesRegex(RuntimeError, "maximum allowed entry count"):
-                    extractor._precheck_unzip_archive("unzip", archive)
-
-            too_big_file = "-rw-r--r-- 2.0 unx 101 b- defN 26-Jan-01 00:00 big.bin\n"
-            with mock.patch.object(extractor.subprocess, "run", return_value=_completed(stdout=too_big_file)):
-                with self.assertRaisesRegex(RuntimeError, "maximum allowed size"):
-                    extractor._precheck_unzip_archive("unzip", archive)
-
-            too_big_total = (
-                "-rw-r--r-- 2.0 unx 80 b- defN 26-Jan-01 00:00 a.bin\n"
-                "-rw-r--r-- 2.0 unx 80 b- defN 26-Jan-01 00:00 b.bin\n"
-            )
-            with mock.patch.object(extractor.subprocess, "run", return_value=_completed(stdout=too_big_total)):
-                with self.assertRaisesRegex(RuntimeError, "maximum allowed total"):
-                    extractor._precheck_unzip_archive("unzip", archive)
-
-
-if __name__ == "__main__":
-    unittest.main()
