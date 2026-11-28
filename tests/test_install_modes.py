@@ -83,9 +83,6 @@ def test_steam_mode_drops_mangohud_from_the_install_presets(tmp_path: Path) -> N
         win._add_launch_options = "MANGOHUD=1 gamemoderun %command%"
         _with_steam(win, tmp_path)
         assert "MANGOHUD" not in win._add_launch_options and "gamemoderun" in win._add_launch_options
-        with mock.patch.object(ui, "open_launch_presets_dialog", return_value=None) as dlg:
-            win._open_add_launch_advanced()
-        assert dlg.call_args.kwargs["mode"] == STEAM
     finally:
         win.paths = None
         _drain(win, app)
@@ -104,13 +101,12 @@ def test_steam_mode_install_creates_no_app_launchers(tmp_path: Path) -> None:
         win.add_exe_combo.setEditText(str(exe))
         win.btn_shortcut_menu.setChecked(True)
         win.chk_keep_in_place.setChecked(True)
-        win._add_proton = STEAM, "proton_experimental"
         with mock.patch.object(ui, "StandaloneInstallWorker") as worker, mock.patch.object(win, "_track_worker"):
             win._install_selected()  # a Mock worker must not be tracked: closing would wait for it forever
         kwargs = worker.call_args.kwargs
         assert kwargs["create_menu_shortcut"] is False and kwargs["create_desktop_shortcut"] is False
         assert kwargs["prepare_standalone_runtime"] is False
-        assert kwargs["proton_name"] == "proton_experimental"
+        assert "proton_name" not in kwargs  # Steam's default; changed later in Configure
         win._end_busy()
     finally:
         win.paths = None
@@ -134,7 +130,6 @@ def test_runtimes_tab_greys_out_what_steamos_does_not_use(tmp_path: Path) -> Non
             (win.btn_rt_mangohud_update, win.lbl_rt_mangohud_note, "runtimes.note_mangohud_steamos"),
         ):
             assert not btn.isEnabled() and note.text() == tr(key)
-        assert win.btn_rt_optiscaler_update.isEnabled()  # OptiScaler serves both modes
     finally:
         win.paths = None
         _drain(win, app)

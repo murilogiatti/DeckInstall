@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import hashlib
-import io
 import json
 import os
 import sys
-import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -342,28 +339,10 @@ def test_non_ge_compat_tool_managed_and_orphan_mangohud_in_runtime_uninstall(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _home(tmp_path, monkeypatch)
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for name, data in (
-            ("Proton-CachyOS-10/proton", b"#!/bin/sh\n"),
-            ("Proton-CachyOS-10/compatibilitytool.vdf", b'"compatibilitytools"\n{}\n'),
-        ):
-            info = tarfile.TarInfo(name)
-            info.size = len(data)
-            tf.addfile(info, io.BytesIO(data))
-    tar_bytes = buf.getvalue()
-    digest = hashlib.sha256(tar_bytes).hexdigest()
-
-    rel = rm.ProtonRelease(
-        family_id="cachyos",
-        tag_name="Proton-CachyOS-10",
-        name="Proton-CachyOS-10",
-        asset_name="tool.tar.gz",
-        download_url="https://github.com/CachyOS/proton-cachyos/releases/download/10/tool.tar.gz",
-        sha256_digest=digest,
-    )
-    with mock.patch.object(rm, "_download_file", side_effect=lambda _u, dst, _l, **k: dst.write_bytes(tar_bytes)):
-        installed_dir = rm.install_compat_tool(rel)
+    installed_dir = rm.get_compat_tools_dir() / "Proton-CachyOS-10"  # one DeckInstall installed earlier
+    installed_dir.mkdir(parents=True)
+    (installed_dir / "proton").write_text("#!/bin/sh\n", encoding="utf-8")
+    (installed_dir / ".deckinstall-managed").write_text("Proton-CachyOS-10\n", encoding="utf-8")
     assert (installed_dir / ".deckinstall-managed").is_file()
     assert rm.is_managed_compat_tool(installed_dir)
 
@@ -409,7 +388,6 @@ def test_retarget_without_ge_and_repair_backup(
     marker = broken / "keep-on-fail.txt"
     marker.write_text("precious", encoding="utf-8")
     with (
-        mock.patch.object(rm, "fetch_available_proton_releases", side_effect=RuntimeError("offline")),
         mock.patch.object(rm, "ensure_umu_proton", side_effect=RuntimeError("offline")),
         pytest.raises(RuntimeError, match="offline"),
     ):

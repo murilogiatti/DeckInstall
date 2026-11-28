@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
 from collections.abc import Callable
 from pathlib import Path
@@ -23,11 +24,8 @@ from .runtime_manager import (
 )
 from .steam_paths import SteamPaths, dir_size_bytes_many, find_proton_binary, find_steam_root
 from .steam_vdf import (
-    ShortcutEntry,
     _prefix_has_unconventional_saves,
     backup_prefix_candidates_to_zip,
-    load_shortcuts,
-    plan_bulk_migration,
     sync_all_external_saves,
 )
 from .ui_cards import _format_worker_error, _is_wine_game_running
@@ -206,11 +204,10 @@ class MaintHealthWorker(QThread):
 
 
 class MaintScanWorker(QThread):
-    """Scan for cleanup candidates including system caches."""
+    """Scan for cleanup candidates including system caches. With Steam, the saves of games kept
+    outside their prefix are copied in first, so prefixes whose saves are kept show as safe."""
 
-    read_only = True  # only reads: closing the window never waits for it on screen
-
-    found = Signal(list)
+    found = Signal(list, int)  # candidates, saves copied
     failed = Signal(str)
 
     def __init__(self, paths: SteamPaths | None) -> None:
@@ -219,43 +216,13 @@ class MaintScanWorker(QThread):
 
     def run(self) -> None:
         try:
-            self.found.emit(
-                find_cleanup_candidates(self._paths, include_system_caches=True)
-            )
-        except Exception as exc:
-            self.failed.emit(_format_worker_error(exc))
-
-
-class MaintRevalWorker(QThread):
-    """Revalidate pending migrations, sync external saves, and rescan cleanup items."""
-
-    done = Signal(list, int, int, int)
-    failed = Signal(str)
-
-    def __init__(
-        self,
-        paths: SteamPaths,
-        *,
-        load_shortcuts_fn: Callable[[Path], list[ShortcutEntry]] | None = None,
-    ) -> None:
-        super().__init__()
-        self._paths = paths
-        self._load_shortcuts = load_shortcuts_fn or load_shortcuts
-
-    def run(self) -> None:
-        try:
-            if _is_wine_game_running():
-                raise RuntimeError(tr("cleanup.wine_running"))
-            entries = self._load_shortcuts(self._paths.shortcuts_vdf)
-            pending_plan = plan_bulk_migration(
-                entries=entries,
-                games_root=Path.home() / "Games",
-                compatdata_dir=self._paths.compatdata_dir,
-                config_vdf=self._paths.config_vdf,
-            )
-            checked, copied = sync_all_external_saves(self._paths)
-            new_cands = find_cleanup_candidates(self._paths, include_system_caches=True)
-            self.done.emit(new_cands, checked, copied, len(pending_plan))
+            copied = 0
+            if self._paths is not None and not _is_wine_game_running():
+                try:
+                    copied = sync_all_external_saves(self._paths)[1]
+                except Exception:
+                    logging.exception("Could not copy external saves before the cleanup scan")
+            self.found.emit(find_cleanup_candidates(self._paths, include_system_caches=True), copied)
         except Exception as exc:
             self.failed.emit(_format_worker_error(exc))
 

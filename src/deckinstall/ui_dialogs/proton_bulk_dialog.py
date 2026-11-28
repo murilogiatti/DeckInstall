@@ -427,17 +427,15 @@ def _show(
     btn_previous.setToolTip(tr("proton_bulk.btn_previous_tip"))
     btn_orphans = QPushButton(tr("proton_bulk.btn_clean_orphans", count=len(orphans)))
     btn_orphans.setVisible(bool(orphans))
-    btn_versions = QPushButton(tr("library.btn_manage_protons"))
     btn_close = QPushButton(tr("proton_bulk.btn_close"))
     lay.addLayout(dialog_footer(btn_update_all, btn_update, left=(btn_select_all, btn_select_none)))
-    lay.addLayout(dialog_footer(btn_close, left=(btn_previous, btn_orphans, btn_versions)))
+    lay.addLayout(dialog_footer(btn_close, left=(btn_previous, btn_orphans)))
     actions = (
         cmb_target,
         btn_update,
         btn_update_all,
         btn_previous,
         btn_orphans,
-        btn_versions,
         btn_select_all,
         btn_select_none,
         btn_close,
@@ -746,18 +744,11 @@ def _show(
         worker.failed.connect(lambda err: _finish_reload([tr("proton.error", err=err)]))
         worker.start()
 
-    def _versions() -> None:
-        from .proton_dialogs import open_proton_manager_dialog
-
-        open_proton_manager_dialog(win)
-        _reload([])
-
     btn_select_all.clicked.connect(lambda: _set_all(Qt.CheckState.Checked))
     btn_select_none.clicked.connect(lambda: _set_all(Qt.CheckState.Unchecked))
     btn_update.clicked.connect(lambda: _update(_checked()))
     btn_update_all.clicked.connect(lambda: _update(list(current)))
     btn_previous.clicked.connect(_previous)
     btn_orphans.clicked.connect(_clean_orphans)
-    btn_versions.clicked.connect(_versions)
     dlg.exec()
     dlg.deleteLater()

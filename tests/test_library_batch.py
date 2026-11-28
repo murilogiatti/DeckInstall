@@ -36,7 +36,6 @@ def test_batch_actions_are_grouped_in_the_library() -> None:
         expected = {
             "library.btn_bulk_optiscaler": ui.PAGE_LIBRARY,
             "library.btn_bulk_proton": ui.PAGE_LIBRARY,
-            "maint.btn_migrate_legacy": ui.PAGE_LIBRARY,
         }
         for key, home in expected.items():
             for idx, page_labels in labels.items():  # exactly one place, the one of its purpose

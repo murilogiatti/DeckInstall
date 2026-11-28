@@ -86,11 +86,12 @@ def test_install_form_has_one_presets_button_with_summary(tmp_path: Path) -> Non
         win._add_launch_options = ""
         win._add_winedlloverrides = ""
         win._update_add_presets_summary()
-        assert win.lbl_add_presets.text() == tr("presets.none")
+        assert win.lbl_add_presets.text() == tr("add.presets_after", opts=tr("presets.none"))
+        assert not hasattr(win, "btn_add_launch_adv")  # changed later in Configure, never twice
 
-        with mock.patch.object(win, "_open_launch_presets_dialog", return_value=("gamemoderun MANGOHUD=1 %command%", "")):
-            win._open_add_launch_advanced()
-        assert win.lbl_add_presets.text() == f"{tr('opt.gamemode')}, {tr('opt.mangohud')}"
+        win._add_launch_options = "gamemoderun MANGOHUD=1 %command%"  # what was used last
+        win._update_add_presets_summary()
+        assert win.lbl_add_presets.text() == tr("add.presets_after", opts=f"{tr('opt.gamemode')}, {tr('opt.mangohud')}")
         opts, dll = win._resolve_add_launch_options()
         assert "gamemoderun" in opts and "MANGOHUD=1" in opts and dll == ""
     finally:

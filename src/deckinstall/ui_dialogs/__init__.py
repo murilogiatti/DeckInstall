@@ -10,7 +10,6 @@ from .prefix_tools_dialogs import (
     run_exe_in_prefix_dialog,
 )
 from .proton_bulk_dialog import bulk_proton_dialog
-from .proton_dialogs import open_proton_manager_dialog
 from .save_sync_dialog import open_save_sync_dialog
 
 __all__ = [
@@ -18,7 +17,6 @@ __all__ = [
     "open_configure_game_dialog",
     "open_launch_presets_dialog",
     "open_optiscaler_dialog",
-    "open_proton_manager_dialog",
     "open_save_sync_dialog",
     "open_scan_folders_dialog",
     "open_winetricks_dialog",

@@ -349,8 +349,8 @@ def _edit_launch_hooks(win: MainWindow, parent: QDialog, game: StandaloneGame) -
     win.status_label.setText(tr("hooks.saved", name=game.name))
 
 
-def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> None:
-    """Show the game launch settings or its tools from the Library menu."""
+def open_configure_game_dialog(win: MainWindow) -> None:
+    """The selected game's launch settings, then its prefix and tools, in one dialog."""
     from .launch_presets_dialog import (
         LaunchOptions,
         build_launch_options,
@@ -381,11 +381,10 @@ def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> 
 
     operation = {"migrating": False, "saving": False}
     dlg = _BusyGuardedDialog(_dialog_parent(win), lambda: any(operation.values()))
-    dlg.setWindowTitle(tr("configure.tools_title", name=title_name) if tools_only
-                       else tr("configure.title", name=title_name))
+    dlg.setWindowTitle(tr("configure.title", name=title_name))
     from ..ui_cards import clamp_dialog_size
 
-    clamp_dialog_size(dlg, 620, 560 if tools_only else 280, dlg.parentWidget())
+    clamp_dialog_size(dlg, 620, 560, dlg.parentWidget())
     dlg_alive = _dialog_guard(dlg)
     root_lay = QVBoxLayout(dlg)
 
@@ -406,10 +405,10 @@ def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> 
     game_group, game_tab_lay = _group()
     run_group, run_tab_lay = _group()
     tools_group, prefix_lay = _group()
-    body_layout.addWidget(tools_group if tools_only else run_group)
+    body_layout.addWidget(run_group)
+    body_layout.addWidget(tools_group)
     body_layout.addStretch(1)
     game_group.hide()
-    (run_group if tools_only else tools_group).hide()
 
     def _with_button(label: QLabel, button: QPushButton) -> QWidget:
         box = QWidget()
@@ -520,16 +519,14 @@ def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> 
             proton_combo.setObjectName("gameProton")
             proton_combo.addItem(tr("configure.loading"), "")
             proton_combo.setEnabled(False)
-            if sa_obj is not None and tools_only:
+            if sa_obj is not None:
                 btn_previous_proton = QPushButton(tr("configure.btn_previous_proton"))
                 btn_previous_proton.setEnabled(False)
-                prefix_lay.addWidget(btn_previous_proton)
         else:
             lbl_cur_proton = QLabel(tr("configure.loading"), run_group)
-        if sa_obj is not None and tools_only:
+        if sa_obj is not None:
             lbl_umu_badge = QLabel(tr("configure.loading"))
             lbl_umu_badge.setWordWrap(True)
-            prefix_lay.addWidget(lbl_umu_badge)
     launch_grid = action_grid()
     if sa_obj is not None and not is_steam:
         btn_hooks = QPushButton(tr("hooks.btn"))
@@ -588,7 +585,6 @@ def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> 
     btn_view_log.clicked.connect(_on_view_log)
     action_row(launch_grid, 2, btn_view_log, tr("configure.view_log_hint"))
 
-    prefix_lay.addLayout(launch_grid)
 
     def _more(parent: QWidget, layout: QVBoxLayout, editor: LaunchOptions) -> None:
         from ..steam_paths import find_proton_binary, resolve_proton_dir
@@ -642,15 +638,14 @@ def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> 
     if queued_opts is not None:
         opts = str(queued_opts.payload.get("launch_options") or "")
         original_opts = opts, str(parse_presets(opts).get("winedll") or "")
-    if not tools_only:
-        editor = build_launch_options(
-            win, dlg, kind, *original_opts, game_obj=obj, is_native_linux=is_native,
-            proton=game_proton(win, kind, obj), proton_control=proton_combo or lbl_cur_proton,
-            extra_options=game_group, more=None if is_native else _more,
-        )
-        run_tab_lay.addWidget(editor.widget)
-        editor.widget.setEnabled(not is_steam or win.paths is not None)
-        original_opts = editor.values()
+    editor = build_launch_options(
+        win, dlg, kind, *original_opts, game_obj=obj, is_native_linux=is_native,
+        proton=game_proton(win, kind, obj), proton_control=proton_combo or lbl_cur_proton,
+        extra_options=game_group, more=None if is_native else _more,
+    )
+    run_tab_lay.addWidget(editor.widget)
+    editor.widget.setEnabled(not is_steam or win.paths is not None)
+    original_opts = editor.values()
 
     def _proton_changed() -> bool:
         return bool(proton_combo is not None and proton_combo.isEnabled()
@@ -711,6 +706,7 @@ def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> 
     pfx_card, pfx_card_lay, _top = section_card(tr("configure.card_prefix"), tr("configure.card_prefix_hint"))
     if is_native:
         pfx_card_lay.addWidget(note_label(tr("configure.native_no_prefix")))
+        pfx_card_lay.addLayout(launch_grid)
         prefix_lay.addWidget(pfx_card)
     else:
         pfx_label = QLabel(tr("configure.loading"))
@@ -733,6 +729,10 @@ def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> 
         win32_warn = note_label(kind="WarningText")
         win32_warn.setVisible(False)
         pfx_card_lay.addWidget(win32_warn)
+        if lbl_umu_badge is not None:
+            pfx_card_lay.addWidget(lbl_umu_badge)  # the umu id protonfixes uses for this game
+        if btn_previous_proton is not None:
+            pfx_card_lay.addWidget(btn_previous_proton, 0, Qt.AlignmentFlag.AlignLeft)
         prefix_lay.addWidget(pfx_card)
 
         tools_card, tools_lay, _top = section_card(tr("configure.card_tools"))
@@ -747,27 +747,9 @@ def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> 
         action_row(tools_grid, 0, btn_wt, tr("configure.winetricks_hint"))
         action_row(tools_grid, 1, btn_run_exe, tr("configure.run_exe_hint"))
         tools_lay.addLayout(tools_grid)
+        tools_lay.addLayout(launch_grid)  # commands around the game and its last log
         prefix_lay.addWidget(tools_card)
 
-    org_hints = {
-        win.act_ext_to_steam: tr("configure.ext_to_steam_hint"),
-        win.act_ext_import_saves: tr("configure.ext_import_saves_hint"),
-    }
-    visible_org_actions = [action for action in org_hints if action.isVisible() and action.isEnabled()]
-    if visible_org_actions:
-        org_card, org_lay, _top = section_card(tr("configure.tab_organization"))
-        org_grid = action_grid()
-        for row, action in enumerate(visible_org_actions):
-            button = QPushButton(action.text())
-
-            def run_action(_checked=False, selected_action=action):
-                dlg.accept()
-                selected_action.trigger()
-
-            button.clicked.connect(run_action)
-            action_row(org_grid, row, button, org_hints[action])
-        org_lay.addLayout(org_grid)
-        prefix_lay.addWidget(org_card)
     prefix_lay.addStretch()
 
     if not is_native:
@@ -1321,7 +1303,7 @@ def open_configure_game_dialog(win: MainWindow, *, tools_only: bool = False) -> 
     if editor is not None:
         editor.raw.textChanged.connect(_update_apply)
         editor.dll.textChanged.connect(_update_apply)
-    root_lay.addLayout(dialog_footer(btn_close) if tools_only else dialog_footer(btn_apply, btn_close))
+    root_lay.addLayout(dialog_footer(btn_apply, btn_close))
 
     dlg.exec()
     dlg.deleteLater()

@@ -44,7 +44,6 @@ from .ui_workers_maint import (
     MaintBackupWorker,
     MaintDeleteWorker,
     MaintHealthWorker,
-    MaintRevalWorker,
     MaintScanWorker,
 )
 
@@ -70,14 +69,9 @@ def build_maintenance_page(win: MainWindow) -> QWidget:
     clean_lbl.setObjectName("SectionTitle")
     win.btn_maint_scan = QPushButton(tr("maint.btn_scan"))
     win.btn_maint_scan.clicked.connect(lambda: scan_maintenance_cleanup(win))
-    win.btn_maint_revalidate = QPushButton(tr("cleanup.btn_revalidate"))
-    win.btn_maint_revalidate.setEnabled(win.paths is not None)
-    win.btn_maint_revalidate.setToolTip(tr("maint.revalidate_tip"))
-    win.btn_maint_revalidate.clicked.connect(lambda: revalidate_maintenance_cleanup(win))
     clean_top.addWidget(clean_lbl)
     clean_top.addStretch()
     clean_top.addWidget(win.btn_maint_scan)
-    clean_top.addWidget(win.btn_maint_revalidate)
     clean_layout.addLayout(clean_top)
     clean_hint = QLabel(tr("maint.cleanup_hint"))
     clean_hint.setObjectName("MutedText")
@@ -357,7 +351,7 @@ def scan_maintenance_cleanup(win: MainWindow, *, appids: set[int] | None = None)
     win._begin_busy()
     win.status_label.setText(tr("cleanup.scanning"))
 
-    def _on_found(candidates: list[CleanupCandidate]) -> None:
+    def _on_found(candidates: list[CleanupCandidate], copied: int) -> None:
         win._end_busy()
         if win._closing_pending:
             return
@@ -370,7 +364,8 @@ def scan_maintenance_cleanup(win: MainWindow, *, appids: set[int] | None = None)
             ]
         _apply_maint_scan_results(win, candidates)
         win.status_label.setText(
-            tr("cleanup.none_found") if not candidates else tr("status.ready")
+            tr("cleanup.saves_copied", copied=copied) if copied
+            else tr("cleanup.none_found") if not candidates else tr("status.ready")
         )
 
     def _on_failed(err: str) -> None:
@@ -384,45 +379,6 @@ def scan_maintenance_cleanup(win: MainWindow, *, appids: set[int] | None = None)
     worker = MaintScanWorker(win.paths)
     win._track_worker(worker)
     worker.found.connect(_on_found)
-    worker.failed.connect(_on_failed)
-    worker.start()
-
-
-def revalidate_maintenance_cleanup(win: MainWindow) -> None:
-    """Sync external saves and revalidate cleanup candidates."""
-    if not win.paths:
-        return
-    if _is_wine_game_running():
-        QMessageBox.warning(_dialog_parent(win), __app_name__, tr("cleanup.wine_running"))
-        return
-    win._begin_busy()
-    win.status_label.setText(tr("cleanup.revalidating"))
-
-    def _on_done(
-        new_cands: list[CleanupCandidate], checked: int, copied: int, pending: int
-    ) -> None:
-        win._end_busy()
-        if win._closing_pending:
-            return
-        _apply_maint_scan_results(win, new_cands)
-        extra = tr("cleanup.reval_pending", pending=pending) if pending else ""
-        win.status_label.setText(
-            tr("cleanup.reval_done", checked=checked, copied=copied) + extra
-        )
-
-    def _on_failed(err: str) -> None:
-        win._end_busy()
-        if win._closing_pending:
-            return
-        msg = tr("cleanup.reval_error", err=err)
-        win.status_label.setText(msg)
-        QMessageBox.critical(_dialog_parent(win), __app_name__, msg)
-
-    ui_mod = sys.modules.get("deckinstall.ui")
-    load_sc_fn = getattr(ui_mod, "load_shortcuts", None) if ui_mod is not None else None
-    worker = MaintRevalWorker(win.paths, load_shortcuts_fn=load_sc_fn)
-    win._track_worker(worker)
-    worker.done.connect(_on_done)
     worker.failed.connect(_on_failed)
     worker.start()
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import (
@@ -24,7 +23,6 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
-    QMenu,
     QProgressBar,
     QPushButton,
     QSplitter,
@@ -89,18 +87,6 @@ def build_extract_page(win: MainWindow) -> QWidget:
     src_row.addWidget(btn_src)
     drop_layout.addLayout(src_row)
 
-    # Only used for archives and installers; the game name comes from step 2.
-    dst_row = QHBoxLayout()
-    dst_row.addWidget(QLabel(tr("install.dest_label")))
-    win.extract_dst_root = QLineEdit()
-    win.extract_dst_root.setPlaceholderText(
-        tr("install.dest_library_placeholder") if uses_library_layout() else str(Path.home() / "Games")
-    )
-    btn_dst = QPushButton(tr("install.choose_folder"))
-    btn_dst.clicked.connect(win._pick_dest_root)
-    dst_row.addWidget(win.extract_dst_root, 1)
-    dst_row.addWidget(btn_dst)
-    drop_layout.addLayout(dst_row)
 
     btn_row = FlowLayout(spacing=8)
     win.btn_extract = QPushButton(tr("install.btn_extract"))
@@ -155,10 +141,15 @@ def build_add_page(win: MainWindow) -> QWidget:
     win.btn_scan.setToolTip(tr("install.rescan_tip"))  # the folders searched are in Settings
     btn_browse_exe = QPushButton(tr("install.pick_exe"))
     btn_browse_exe.clicked.connect(win._pick_manual_exe)
+    # Games already installed elsewhere (Heroic, Lutris, Hydra, old Steam shortcuts...) come in here.
+    win.btn_adopt_games = QPushButton(tr("adopt.btn_open"))
+    win.btn_adopt_games.setToolTip(tr("adopt.btn_open_tip"))
+    win.btn_adopt_games.clicked.connect(win._open_adopt_wizard)
     scan_row.addWidget(lbl_det)
     scan_row.addStretch()
     scan_row.addWidget(win.btn_scan)
     scan_row.addWidget(btn_browse_exe)
+    scan_row.addWidget(win.btn_adopt_games)
     list_layout.addLayout(scan_row)
 
     win.games_list = QTableWidget(0, 2)
@@ -279,18 +270,11 @@ def build_add_page(win: MainWindow) -> QWidget:
 
     win._add_launch_options = ""
     win._add_winedlloverrides = ""
-    win._add_proton = ("", "", "")
-    # The installer uses the same launch controls as the Library.
-    launch_row = QHBoxLayout()
-    launch_row.setSpacing(10)
-    win.btn_add_launch_adv = QPushButton(tr("add.btn_launch_presets"))
-    win.btn_add_launch_adv.clicked.connect(win._open_add_launch_advanced)
+    # New games start with the options used last; they are changed in the Library's Configure.
     win.lbl_add_presets = QLabel()
     win.lbl_add_presets.setObjectName("MutedText")
     win.lbl_add_presets.setWordWrap(True)
-    launch_row.addWidget(win.btn_add_launch_adv)
-    launch_row.addWidget(win.lbl_add_presets, 1)
-    run_form.addRow(tr("add.presets_label"), launch_row)
+    run_form.addRow(tr("add.presets_label"), win.lbl_add_presets)
 
     # Standalone mode: where to find the game besides the Library.
     targets_row = FlowLayout(spacing=16)
@@ -449,10 +433,6 @@ def build_library_page(win: MainWindow) -> QWidget:
     win.btn_reload.setToolTip(tr("library.btn_reload_tip"))
     win.btn_reload.clicked.connect(win._refresh_shortcuts)
     top.addWidget(win.btn_reload)
-    win.btn_lib_sub_add = QPushButton(tr("library.subtab_add"))
-    win.btn_lib_sub_add.clicked.connect(lambda: win._switch_library_subview(1))
-    win.btn_adopt_games = QPushButton(tr("adopt.btn_open"))
-    win.btn_adopt_games.clicked.connect(win._open_adopt_wizard)
 
     win.vdf_error_banner = QLabel()
     win.vdf_error_banner.setWordWrap(True)
@@ -605,21 +585,13 @@ def build_library_page(win: MainWindow) -> QWidget:
     win.act_move_game = QAction(tr("library.btn_move_disk"), win)
     win.act_move_game.triggered.connect(win._move_selected_game)
     win.act_game_art = QAction(tr("art.btn_selected"), win)
-    win.act_tools = QAction(tr("configure.tab_prefix"), win)
-    win.act_tools.triggered.connect(lambda: win._open_configure_game_dialog(tools_only=True))
     win.act_remove_game = QAction(tr("library.btn_uninstall"), win)
     win.act_remove_game.triggered.connect(win._remove_selected_shortcut)
 
-    win.btn_bulk_actions = QPushButton(tr("library.bulk_actions"))
-    all_actions = QMenu(win.btn_bulk_actions)
-    win.btn_bulk_actions.setMenu(all_actions)
-    win.act_bulk_proton = all_actions.addAction(tr("library.btn_bulk_proton"))
+    win.act_bulk_proton = QAction(tr("library.btn_bulk_proton"), win)
     win.act_bulk_proton.triggered.connect(lambda: bulk_proton_dialog(win))
-    win.act_bulk_optiscaler = all_actions.addAction(tr("library.btn_bulk_optiscaler"))
+    win.act_bulk_optiscaler = QAction(tr("library.btn_bulk_optiscaler"), win)
     win.act_bulk_optiscaler.triggered.connect(win._open_bulk_optiscaler)
-
-    win.btn_migrate_legacy = QPushButton(tr("maint.btn_migrate_legacy"))
-    win.btn_migrate_legacy.clicked.connect(lambda: win._start_legacy_migration())
     from .ui_library_art import fetch_missing_art, fetch_selected_art
 
     win.act_game_art.triggered.connect(lambda: fetch_selected_art(win))
@@ -629,7 +601,7 @@ def build_library_page(win: MainWindow) -> QWidget:
     footer.addWidget(win.btn_configure_game)
     win.game_action_buttons = {}
     for action in (
-        win.act_favorite, win.act_tools, win.act_game_art, win.act_move_game,
+        win.act_favorite, win.act_game_art, win.act_move_game,
         win.act_ext_to_steam, win.act_ext_import_saves, win.act_remove_game,
     ):
         btn = action_button(action, "dangerBtn" if action is win.act_remove_game else "")
@@ -638,24 +610,16 @@ def build_library_page(win: MainWindow) -> QWidget:
     win.shortcuts_list.setMinimumHeight(420)
     win.library_grid.setMinimumHeight(420)
 
-    # 2. Bring in games: install one, or adopt what is already on the computer.
-    add_card, add_layout, _top = section_card(tr("library.section_add"))
-    add_grid = action_grid()
-    action_row(add_grid, 0, win.btn_lib_sub_add, tr("library.add_hint"))
-    action_row(add_grid, 1, win.btn_adopt_games, tr("adopt.btn_open_tip"))
-    add_layout.addLayout(add_grid)
-
-    # 3. Every game at once.
-    all_card, all_layout, all_top = section_card(tr("library.section_all"))
-    all_top.addWidget(win.btn_bulk_actions)
+    # 2. Every game at once (games are added on the Install tab).
+    all_card, all_layout, _all_top = section_card(tr("library.section_all"))
     win.btn_all_art = QPushButton(tr("art.btn_missing"))
     win.btn_all_art.clicked.connect(lambda: fetch_missing_art(win))
     all_grid = action_grid()
-    action_row(all_grid, 0, win.btn_all_art, tr("art.btn_missing_hint"))
-    action_row(all_grid, 1, win.btn_migrate_legacy, tr("maint.migrate_legacy_tooltip"))
+    action_row(all_grid, 0, action_button(win.act_bulk_proton), tr("library.bulk_proton_hint"))
+    action_row(all_grid, 1, action_button(win.act_bulk_optiscaler), tr("library.bulk_optiscaler_hint"))
+    action_row(all_grid, 2, win.btn_all_art, tr("art.btn_missing_hint"))
     all_layout.addLayout(all_grid)
     my_lib_layout.addWidget(lib_card, 1)
-    my_lib_layout.addWidget(add_card)
     my_lib_layout.addWidget(all_card)
     layout.addWidget(my_lib_page, 1)
     return page

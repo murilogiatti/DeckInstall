@@ -98,7 +98,7 @@ def test_check_box_without_cache_dir_still_styles(monkeypatch, tmp_path: Path) -
 
 def test_reload_buttons_do_not_say_update_in_portuguese() -> None:
     pt = json.loads((LOCALES_DIR / "pt_BR.json").read_text(encoding="utf-8"))
-    for key in ("proton_mgr.btn_refresh_installed", "save_sync.btn_refresh"):
+    for key in ("save_sync.btn_refresh",):
         assert pt[key] == "Recarregar"
 
 

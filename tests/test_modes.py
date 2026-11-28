@@ -79,11 +79,11 @@ def test_immutable_os_detection(tmp_path: Path) -> None:
     assert modes.is_immutable_os(ubuntu_rel, tmp_path / "missing") is False
 
 
-def test_cachyos_proton_and_system_runtime_handling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_system_proton_and_runtime_handling(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from deckinstall import proton_policy, runtime_manager
 
     sys_compat = tmp_path / "usr_share_compat"
-    cachy_dir = sys_compat / "proton-cachyos"
+    cachy_dir = sys_compat / "UMU-Proton-11.0-2"  # a distro package (system folder)
     cachy_dir.mkdir(parents=True)
     (cachy_dir / "proton").write_text("#!/bin/sh\n", encoding="utf-8")
 
@@ -95,7 +95,7 @@ def test_cachyos_proton_and_system_runtime_handling(tmp_path: Path, monkeypatch:
     monkeypatch.setattr(runtime_manager, "list_ge_proton11_dirs", lambda: [])
     monkeypatch.setattr(runtime_manager, "list_ge_proton10_dirs", lambda: [])
 
-    assert runtime_manager.list_cachyos_proton_dirs() == [cachy_dir]
+    assert runtime_manager.list_umu_proton_dirs() == [cachy_dir]
     assert proton_policy.newest_default_proton() == cachy_dir
     assert runtime_manager.is_managed_compat_tool(cachy_dir) is False
 

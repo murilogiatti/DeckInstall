@@ -63,6 +63,7 @@ def build_updates_card(win: MainWindow) -> QWidget:
     win.btn_update_runtimes = QPushButton(tr("updates.btn_apply", count=0))
     win.btn_update_runtimes.setObjectName("primaryBtn")
     win.btn_update_runtimes.setEnabled(False)
+    win.btn_update_runtimes.setVisible(False)  # shown once a check lists something
     win.btn_update_runtimes.clicked.connect(lambda: apply_selected_updates(win))
     foot.addWidget(win.chk_updates_auto)
     foot.addStretch(1)
@@ -150,6 +151,7 @@ def _sync_apply_button(win: MainWindow) -> None:
     count = sum(1 for c in win._update_checks.values() if c.isChecked())
     win.btn_update_runtimes.setText(tr("updates.btn_apply", count=count))
     win.btn_update_runtimes.setEnabled(count > 0 and not win._steam_busy and not win._updates_checking)
+    win.btn_update_runtimes.setVisible(bool(win._update_checks))  # only once there is something listed
 
 
 def _sync_badge(win: MainWindow) -> None:

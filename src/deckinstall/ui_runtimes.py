@@ -56,7 +56,7 @@ def _component_row(
     status_lay.addLayout(line)
     status_lay.addWidget(note)
     grid.addWidget(status, row, 1)
-    for col, btn in enumerate(buttons, start=2):
+    for col, btn in enumerate(buttons, start=4 - len(buttons)):  # "Remove…" always in the last column
         btn.setToolTip(about)
         grid.addWidget(btn, row, col)
 
@@ -77,7 +77,8 @@ def build_runtimes_page(win: MainWindow) -> QWidget:
         return btn
 
     def _update(component: str) -> QPushButton:
-        btn = QPushButton(tr("runtimes.btn_update"))
+        """Only while the component is missing: updates are in the Updates card above."""
+        btn = QPushButton(tr("runtimes.btn_download"))
         btn.clicked.connect(lambda: win._update_runtimes((component,)))
         return btn
 
@@ -113,11 +114,10 @@ def build_runtimes_page(win: MainWindow) -> QWidget:
         grid, 2, tr("runtimes.mangohud_title"), tr("runtimes.mangohud_about"),
         [win.lbl_maint_mangohud], [win.btn_rt_mangohud_update, _remove({MANGOHUD})], win.lbl_rt_mangohud_note,
     )
-    win.lbl_rt_optiscaler = _status_label()
-    win.btn_rt_optiscaler_update = _update("optiscaler")
+    win.lbl_rt_optiscaler = _status_label()  # downloaded with its first install in a game
     _component_row(
         grid, 3, tr("runtimes.optiscaler_title"), tr("runtimes.optiscaler_about"),
-        [win.lbl_rt_optiscaler], [win.btn_rt_optiscaler_update, _remove({OPTISCALER})], _note_label(),
+        [win.lbl_rt_optiscaler], [_remove({OPTISCALER})], _note_label(),
     )
     win.lbl_rt_tools = _status_label()
     _component_row(
@@ -129,8 +129,18 @@ def build_runtimes_page(win: MainWindow) -> QWidget:
     return page
 
 
+def _installed(component: str) -> bool:
+    from .runtime_manager import get_umu_run_path, list_default_proton_dirs, official_mangohud_installed
+
+    if component == "umu":
+        return get_umu_run_path().is_file()
+    if component == "umu_proton":
+        return bool(list_default_proton_dirs())
+    return official_mangohud_installed()
+
+
 def apply_runtimes_mode(win: MainWindow) -> None:
-    """Grey out what this system's mode does not use, and say why."""
+    """Grey out what this system's mode does not use, and say why; "Download" only for what is missing."""
     env = win.mode_env
     for component, button, note in (
         ("umu_proton", win.btn_rt_proton_update, win.lbl_rt_proton_note),
@@ -139,6 +149,7 @@ def apply_runtimes_mode(win: MainWindow) -> None:
     ):
         blocked = env.component_note(component)
         button.setEnabled(not blocked)
+        button.setVisible(not blocked and not _installed(component))
         text = blocked or (tr("runtimes.note_standalone_only") if env.steam else "")
         note.setText(text)
         note.setVisible(bool(text))
@@ -146,6 +157,7 @@ def apply_runtimes_mode(win: MainWindow) -> None:
 
 def show_runtime_health(win: MainWindow, data: dict) -> None:
     """Fill the Runtimes cards from MaintHealthWorker's result."""
+    apply_runtimes_mode(win)  # something may have been installed or removed meanwhile
     protons = [str(p) for p in data.get("steam_protons") or []]
     win.lbl_rt_steam_proton.setText(
         tr("runtimes.steam_protons", names=", ".join(protons)) if protons else tr("runtimes.steam_protons_none")

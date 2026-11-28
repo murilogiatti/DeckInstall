@@ -512,33 +512,6 @@ def test_fix_bwrap_userns_confirmed_omits_sysctl_userns_disable(monkeypatch: pyt
     assert "sysctl -w kernel.apparmor_restrict_unprivileged_userns=0" not in script
 
 
-def test_install_compat_tool_verifies_sha256_digest_mismatch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """install_compat_tool verifies ProtonRelease.sha256_digest and raises RuntimeError on mismatch."""
-    compat_dir = tmp_path / "compatibilitytools.d"
-    monkeypatch.setattr(rm, "get_compat_tools_dir", lambda: compat_dir)
-
-    def fake_download(_url: str, dest: Path, _label: str, **_kwargs) -> None:
-        dest.write_bytes(b"not-the-expected-tarball")
-
-    monkeypatch.setattr(rm, "_download_file", fake_download)
-
-    release = rm.ProtonRelease(
-        family_id="ge-proton",
-        tag_name="GE-Proton10-1",
-        name="GE-Proton10-1",
-        asset_name="GE-Proton10-1.tar.gz",
-        download_url="https://example.invalid/GE-Proton10-1.tar.gz",
-        checksum_url=None,
-        sha256_digest="0" * 64,
-        size_bytes=len(b"not-the-expected-tarball"),
-    )
-
-    with pytest.raises(RuntimeError, match="SHA-256"):
-        rm.install_compat_tool(release)
-
-
 def test_verify_release_asset_integrity_requires_checksum_when_flag_set(tmp_path: Path) -> None:
     """_verify_release_asset_integrity(..., require_checksum=True) raises RuntimeError without checksum."""
     downloaded = tmp_path / "asset.tar.gz"

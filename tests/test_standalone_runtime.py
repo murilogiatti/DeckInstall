@@ -689,3 +689,32 @@ def test_bundled_winetricks_and_cabextract_when_the_system_has_none(tmp_path, mo
     monkeypatch.setattr(runtime_manager.shutil, "which", lambda name, path=None: f"/usr/bin/{name}")
     assert runtime_manager.find_winetricks() == "/usr/bin/winetricks"  # the system's first
     assert runtime_manager.with_bundled_tools({"PATH": "/usr/bin"})["PATH"] == "/usr/bin"
+
+
+def test_winetricks_runs_through_umu_run_for_umu_proton_games(tmp_path, monkeypatch) -> None:
+    """UMU-Proton's wine only runs inside the Steam Runtime container: winetricks goes through
+    umu-run (its own copy and cabextract), and verbs the prefix already has are skipped."""
+    proton = tmp_path / "UMU-Proton-11.0-2e-x86_64"
+    (proton / "protonfixes" / "files" / "bin").mkdir(parents=True)
+    (proton / "protonfixes" / "winetricks").write_text("#!/bin/sh\n")
+    umu = tmp_path / "umu-run"
+    umu.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(runtime_manager, "find_system_umu_run", lambda: umu)
+    prefix = tmp_path / "Game" / "prefix"
+    prefix.mkdir(parents=True)
+    (prefix / "winetricks.log").write_text("vcrun2022\n")
+    calls: list[tuple[list[str], dict[str, str]]] = []
+
+    class Proc:
+        def __init__(self, cmd, env, **_kw) -> None:
+            calls.append((cmd, env))
+
+    monkeypatch.setattr(runtime_manager.subprocess, "Popen", Proc)
+    monkeypatch.setattr(runtime_manager, "drain_stream_lines", lambda *_a: 0)
+    assert runtime_manager.find_winetricks(proton) == str(proton / "protonfixes" / "winetricks")
+    runtime_manager.run_winetricks_verbs(prefix, ["vcrun2022", "d3dx9"], proton_dir=proton, snapshot_before=False)
+    cmd, env = calls[0]
+    assert cmd == [str(umu), "winetricks", "d3dx9"]
+    assert env["WINEPREFIX"] == str(prefix) and env["PROTONPATH"] == str(proton)
+    runtime_manager.run_winetricks_verbs(prefix, ["vcrun2022"], proton_dir=proton, snapshot_before=False)
+    assert len(calls) == 1  # already installed: umu-run is not called (it would refuse anyway)

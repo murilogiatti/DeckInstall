@@ -243,25 +243,3 @@ def test_restored_snapshot_can_be_removed_only_while_game_files_match() -> None:
     assert not archive.exists() and live.read_bytes() == b"verified"
 
 
-def test_compat_cleanup_keeps_latest_for_each_build_variant() -> None:
-    from deckinstall import steam_paths
-
-    root = runtime_manager.get_compat_tools_dir()
-    old, current, another_variant = (
-        root / f"proton-cachyos-{build}" for build in ("11.0-2-slr", "11.0-10-slr", "11.0-1-native")
-    )
-    for tool in (old, current, another_variant):
-        tool.mkdir(parents=True)
-        (tool / "proton").write_bytes(b"release")
-        (tool / ".deckinstall-managed").write_text(tool.name)
-    with mock.patch.object(steam_paths, "find_steam_root", return_value=None):
-        candidates = {
-            item.path: item for item in find_cleanup_candidates(include_system_caches=True)
-            if item.category == "Old Proton/Runtime"
-        }
-        assert set(candidates) == {old}
-        deleted, _, errors = cleanup.delete_cleanup_candidates_checked(
-            candidates=list(candidates.values()), include_system_caches=True,
-        )
-    assert deleted == 1 and not errors and not old.exists()
-    assert current.is_dir() and another_variant.is_dir()

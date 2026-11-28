@@ -160,26 +160,6 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class ProtonUsageTests(unittest.TestCase):
-    def test_manager_counts_standalone_games_without_steam_and_resolves_fallback(self) -> None:
-        from types import SimpleNamespace
-
-        from deckinstall.ui_dialogs import proton_dialogs
-
-        games = [SimpleNamespace(name=f"Game {i}", proton_name="old-proton", native_linux=False) for i in range(5)]
-        games.append(SimpleNamespace(name="Native", proton_name="", native_linux=True))
-        with (
-            mock.patch.object(proton_dialogs, "list_standalone_games", return_value=games),
-            mock.patch.object(proton_dialogs, "resolve_standalone_proton_fallback", return_value=(Path('/tools/GE-Proton11-12'), 'GE-Proton11-12')),
-            mock.patch.object(proton_dialogs, "list_compat_tool_usage") as steam_usage,
-        ):
-            usage = proton_dialogs._manager_tool_usage(None)
-        self.assertEqual(len(usage), 5)
-        self.assertEqual({entry.tool_name for entry in usage}, {"GE-Proton11-12"})
-        self.assertEqual({entry.source for entry in usage}, {"Standalone"})
-        steam_usage.assert_not_called()
-
-
 class UniqueLibraryActionTests(unittest.TestCase):
     def test_library_has_one_visible_entry_for_each_action(self) -> None:
         from PySide6.QtCore import QSettings, Qt
@@ -596,13 +576,10 @@ class UiUxSimplificationTests(unittest.TestCase):
                     self.assertTrue(win.extract_details_box.isHidden())
                     self.assertTrue(win.stack.widget(0).isAncestorOf(win.add_name))
                     self.assertTrue(win.stack.widget(ui.PAGE_RUNTIMES).isAncestorOf(win.btn_update_runtimes))
-                    self.assertTrue(win.stack.widget(ui.PAGE_LIBRARY).isAncestorOf(win.btn_bulk_actions))
-                    self.assertIn(win.act_bulk_proton, win.btn_bulk_actions.menu().actions())
-                    self.assertIn(win.act_bulk_optiscaler, win.btn_bulk_actions.menu().actions())
                     self.assertTrue(win.stack.widget(ui.PAGE_RUNTIMES).isAncestorOf(win.btn_updates_check))  # app + runtimes together
 
-                    for always_visible in (win.chk_keep_in_place, win.add_library_combo, win.btn_add_launch_adv,
-                                           win.btn_shortcut_menu, win.extract_dst_root):
+                    for always_visible in (win.chk_keep_in_place, win.add_library_combo, win.lbl_add_presets,
+                                           win.btn_shortcut_menu):
                         self.assertTrue(win.stack.widget(0).isAncestorOf(always_visible))
                         self.assertFalse(always_visible.isHidden() and always_visible is not win.add_library_combo)
                     self.assertTrue(win.btn_shortcut_menu.isCheckable())

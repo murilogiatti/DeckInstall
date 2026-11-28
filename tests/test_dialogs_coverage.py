@@ -31,14 +31,13 @@ from deckinstall.relocate import RelocatePlan
 from deckinstall.runtime_manager import InstalledCompatTool
 from deckinstall.standalone import StandaloneGame
 from deckinstall.steam_paths import SteamPaths
-from deckinstall.steam_vdf import CompatMappingEntry, ShortcutEntry
+from deckinstall.steam_vdf import ShortcutEntry
 from deckinstall.ui_dialogs import (
     configure_game_dialog,
     launch_presets_dialog,
     optiscaler_bulk_dialog,
     prefix_tools_dialogs,
     proton_bulk_dialog,
-    proton_dialogs,
     relocate_dialog,
 )
 
@@ -124,60 +123,6 @@ def _escape(dlg: QDialog) -> bool:
     return True
 
 
-@pytest.mark.parametrize("appid", [0, 2147483649])
-def test_proton_manager_rechecks_usage_before_removing_in_gaming_mode(
-    window: ui.MainWindow, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, appid: int,
-) -> None:
-    window.paths = _paths(tmp_path)
-    monkeypatch.setattr(ui, "is_gamescope_session", lambda: True)
-    tool = InstalledCompatTool("GE-Used", "GE-Used", tmp_path / "GE-Used", 100)
-    monkeypatch.setattr(proton_dialogs, "list_installed_compat_tools", lambda: [tool])
-    release = Event()
-    calls: list[int] = []
-
-    def usage(_paths: SteamPaths) -> list[CompatMappingEntry]:
-        calls.append(appid)
-        if len(calls) == 1:
-            return []
-        assert release.wait(5)
-        return [CompatMappingEntry(appid, "Game", "Steam", tool.tool_id)]
-
-    monkeypatch.setattr(proton_dialogs, "_manager_tool_usage", usage)
-    remove = Mock()
-    monkeypatch.setattr(proton_dialogs, "remove_compat_tool", remove)
-
-    def click_remove(dialog: QDialog) -> bool:
-        table = dialog.findChild(QTableWidget)
-        if table.rowCount() != 1:
-            return False
-        table.selectRow(0)
-        button = _button(dialog, "proton_mgr.btn_remove")
-        if not button.isEnabled():
-            return False
-        button.click()
-        return True
-
-    def busy_escape(dialog: QDialog) -> bool:
-        assert window._steam_busy
-        assert not dialog.close()
-        _escape(dialog)
-        assert dialog.isVisible()
-        release.set()
-        return True
-
-    def dismiss_warning(dialog: QDialog) -> bool:
-        if not isinstance(dialog, QMessageBox):
-            return False
-        assert dialog.text() == tr("proton_mgr.remove_requires_review")
-        dialog.button(QMessageBox.StandardButton.Ok).click()
-        return True
-
-    _modal(lambda: proton_dialogs.open_proton_manager_dialog(window),
-           [click_remove, busy_escape, dismiss_warning, _escape])
-    remove.assert_not_called()
-    assert len(calls) == 2 and not window._steam_busy
-
-
 def test_winetricks_busy_escape_and_explicit_cancel(
     window: ui.MainWindow, game: StandaloneGame, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -242,7 +187,7 @@ def test_game_tools_run_exe_uses_active_parent(
         assert picker_parent == [dialog]
         return _escape(dialog)
 
-    _modal(lambda: configure_game_dialog.open_configure_game_dialog(window, tools_only=True),
+    _modal(lambda: configure_game_dialog.open_configure_game_dialog(window),
            [run_exe, wait_for_run])
     runner.assert_called_once_with(game.exe_path, game.prefix_dir, proton_path=None)
 

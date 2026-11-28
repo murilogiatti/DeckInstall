@@ -131,31 +131,6 @@ ProgressCb = ProgressCallback
 
 
 @dataclass(frozen=True)
-class ProtonFamily:
-    """Supported custom Proton release family hosted on GitHub."""
-
-    id: str
-    label: str
-    repo: str
-
-
-@dataclass(frozen=True)
-class ProtonRelease:
-    """Metadata for an available custom Proton release asset on GitHub."""
-
-    family_id: str
-    tag_name: str
-    name: str
-    asset_name: str
-    download_url: str
-    checksum_url: str | None = None
-    sha256_digest: str | None = None
-    size_bytes: int = 0
-    published_at: str = ""
-    prerelease: bool = False
-
-
-@dataclass(frozen=True)
 class InstalledCompatTool:
     """An installed custom compatibility tool in compatibilitytools.d."""
 
@@ -186,20 +161,6 @@ class UmuDbLookupResult:
     common_redist: str
     note: str
     match_source: str
-
-
-PROTON_FAMILIES: dict[str, ProtonFamily] = {
-    "umu-proton": ProtonFamily(
-        id="umu-proton",
-        label="UMU-Proton (Open Wine Components)",
-        repo="Open-Wine-Components/umu-proton",
-    ),
-    "cachyos-proton": ProtonFamily(
-        id="cachyos-proton",
-        label="CachyOS-Proton",
-        repo="CachyOS/proton-cachyos",
-    ),
-}
 
 
 @dataclass(frozen=True)
@@ -834,76 +795,12 @@ def superseded_managed_compat_tools() -> list[Path]:
     # (Cleanup still keeps the ones a game uses).
     superseded = [path for path in (ge if umu else ge[1:]) if is_managed_ge_proton(path)]
     superseded += [path for path in umu[1:] if is_managed_compat_tool(path)]
-    other_families = {
-        name.lower(): family.id
-        for family in PROTON_FAMILIES.values() if family.id != "umu-proton"
-        for name in (family.id, family.repo.rsplit("/", 1)[-1])
-    }
-    root = get_compat_tools_dir()
-    try:
-        entries = list(root.iterdir())
-    except OSError:
-        return superseded
-    variants: dict[tuple[str, str], list[tuple[tuple[int, ...], Path]]] = {}
-    for tool in entries:
-        for prefix, family in other_families.items():
-            if not tool.name.lower().startswith(f"{prefix}-"):
-                continue
-            release = re.fullmatch(r"([0-9]+(?:[._-][0-9]+)*)([-_.].*)?", tool.name[len(prefix) + 1:])
-            if release is None or tool.is_symlink() or not (tool / "proton").is_file():
-                break
-            version = tuple(int(part) for part in re.findall(r"[0-9]+", release[1]))
-            variant = (release[2] or "").lower()
-            variants.setdefault((family, variant), []).append((version, tool))
-            break
-    for builds in variants.values():
-        newest = max(version for version, _ in builds)
-        superseded.extend(p for version, p in builds if version < newest and is_managed_compat_tool(p))
     return superseded
 
 
 def list_ge_proton11_dirs() -> list[Path]:
     """List installed GE-Proton11+ directories sorted newest first."""
     return list_ge_proton_dirs(min_major=11)
-
-
-def list_cachyos_proton_dirs() -> list[Path]:
-    """List installed Proton-CachyOS directories (system or user compatibilitytools.d) sorted newest first."""
-    candidate_dirs = _all_compat_tool_dirs()
-    seen_dirs: set[Path] = set()
-    seen_entries: set[Path] = set()
-    found: list[tuple[tuple[int, ...], str, Path]] = []
-    for compat_dir in candidate_dirs:
-        if not compat_dir.is_dir():
-            continue
-        try:
-            resolved_dir = compat_dir.resolve()
-        except OSError:
-            resolved_dir = compat_dir
-        if resolved_dir in seen_dirs:
-            continue
-        seen_dirs.add(resolved_dir)
-        try:
-            entries = list(compat_dir.iterdir())
-        except OSError:
-            continue
-        for entry in entries:
-            low = entry.name.lower()
-            if not (low.startswith("proton-cachyos") or low.startswith("cachyos-proton")):
-                continue
-            try:
-                if not entry.is_dir() or not (entry / "proton").is_file():
-                    continue
-                resolved_entry = entry.resolve()
-            except OSError:
-                continue
-            if resolved_entry in seen_entries:
-                continue
-            seen_entries.add(resolved_entry)
-            nums = tuple(int(n) for n in re.findall(r"\d+", entry.name))
-            found.append((nums, low, entry))
-    found.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    return [entry for _, _, entry in found]
 
 
 def list_ge_proton10_dirs() -> list[Path]:
@@ -952,13 +849,8 @@ def list_umu_proton_dirs() -> list[Path]:
 
 def list_default_proton_dirs() -> list[Path]:
     """The Proton a "Default" game runs on, newest first: UMU-Proton; while none is installed, a
-    GE-Proton 11 or CachyOS Proton already on disk (then GE-Proton 10), so older games keep running."""
-    return (
-        list_umu_proton_dirs()
-        or list_ge_proton11_dirs()
-        or list_cachyos_proton_dirs()
-        or list_ge_proton10_dirs()
-    )
+    GE-Proton already on disk (11, then 10), so older games keep running until it is downloaded."""
+    return list_umu_proton_dirs() or list_ge_proton11_dirs() or list_ge_proton10_dirs()
 
 
 @contextlib.contextmanager
@@ -1835,14 +1727,6 @@ def repair_managed_proton(
     if not is_managed_compat_tool(proton_dir):
         raise ValueError(f"Refusing to repair a compatibility tool installed outside DeckInstall: {proton_dir}")
     _emit_progress(progress_cb, f"Replacing broken Proton directory {proton_dir.name}...", 0)
-    tag = umu_proton_release_name(proton_dir.name)
-    if _parse_umu_proton_version(tag) is not None:
-        try:
-            for rel in fetch_available_proton_releases("umu-proton", limit=50):
-                if rel.tag_name == tag:
-                    return install_compat_tool(rel, progress_cb=progress_cb)
-        except Exception:
-            logging.warning("Could not reinstall %s; trying the latest UMU-Proton", tag, exc_info=True)
     return ensure_umu_proton(force_update=True, progress_cb=progress_cb)
 
 
@@ -1942,128 +1826,6 @@ def ensure_umu_proton(
     return target_dir
 
 
-def _strip_tar_suffix(name: str) -> str:
-    for suffix in (".tar.gz", ".tar.xz"):
-        if name.endswith(suffix):
-            return name[: -len(suffix)]
-    return name
-
-
-def _pick_proton_tar_asset(assets: list[Any], arch: str) -> dict[str, Any] | None:
-    """Select the best .tar.gz or .tar.xz Proton release asset for the host arch."""
-    tar_assets = [
-        asset
-        for asset in assets
-        if isinstance(asset, dict)
-        and str(asset.get("name") or "").endswith((".tar.gz", ".tar.xz"))
-    ]
-    if not tar_assets:
-        return None
-
-    def _score(asset: dict[str, Any]) -> tuple[int, int, str]:
-        name = str(asset.get("name") or "")
-        low = name.lower()
-        if arch == "x86_64" and ("aarch64" in low or "arm64" in low):
-            return (-10, 0, name)
-        if arch == "aarch64" and ("x86_64" in low or "amd64" in low):
-            return (-10, 0, name)
-        arch_score = 0
-        if f"-{arch}." in low or f"_{arch}." in low:
-            arch_score = 4
-        elif arch in low:
-            arch_score = 2 if ("_v3" in low or "_v4" in low) else 3
-        else:
-            arch_score = 1
-        ext_score = 1 if low.endswith(".tar.xz") else 0
-        return (arch_score, ext_score, name)
-
-    best = max(tar_assets, key=_score)
-    if _score(best)[0] < 0:
-        return None
-    return best
-
-
-def _find_proton_checksum_asset(
-    assets: list[Any], asset_name: str
-) -> dict[str, Any] | None:
-    """Find an optional .sha512sum asset corresponding to asset_name."""
-    stem = _strip_tar_suffix(asset_name)
-    for target_name in (f"{asset_name}.sha512sum", f"{stem}.sha512sum"):
-        for asset in assets:
-            if isinstance(asset, dict) and asset.get("name") == target_name:
-                return asset
-    sha_assets = [
-        asset
-        for asset in assets
-        if isinstance(asset, dict) and str(asset.get("name") or "").endswith(".sha512sum")
-    ]
-    if len(sha_assets) == 1:
-        return sha_assets[0]
-    return None
-
-
-def fetch_available_proton_releases(
-    family_id: str, limit: int = 15
-) -> list[ProtonRelease]:
-    """Fetch available custom Proton releases from GitHub for the given family."""
-    family = PROTON_FAMILIES.get(family_id)
-    if family is None:
-        raise ValueError(f"Unknown Proton family: {family_id!r}")
-
-    per_page = max(1, min(100, int(limit)))
-    url = f"https://api.github.com/repos/{family.repo}/releases?per_page={per_page}"
-    releases_raw = _fetch_json(url)
-    if not isinstance(releases_raw, list):
-        raise RuntimeError(f"Unexpected GitHub releases response for {family.label}.")
-
-    arch = _get_arch()
-    results: list[ProtonRelease] = []
-    for rel in releases_raw:
-        if not isinstance(rel, dict) or rel.get("draft"):
-            continue
-        tag_name = str(rel.get("tag_name") or "").strip()
-        if not tag_name:
-            continue
-        assets = rel.get("assets")
-        if not isinstance(assets, list):
-            continue
-        tar_asset = _pick_proton_tar_asset(assets, arch)
-        if tar_asset is None:
-            continue
-        download_url = str(tar_asset.get("browser_download_url") or "").strip()
-        if not download_url:
-            continue
-        asset_name = str(tar_asset.get("name") or "").strip()
-        sha_asset = _find_proton_checksum_asset(assets, asset_name)
-        checksum_url = (
-            str(sha_asset.get("browser_download_url") or "").strip() or None
-            if sha_asset is not None
-            else None
-        )
-        raw_size = tar_asset.get("size")
-        size_bytes = int(raw_size) if isinstance(raw_size, int) and raw_size >= 0 else 0
-        results.append(
-            ProtonRelease(
-                family_id=family.id,
-                tag_name=tag_name,
-                name=str(rel.get("name") or tag_name).strip() or tag_name,
-                asset_name=asset_name,
-                download_url=download_url,
-                checksum_url=checksum_url,
-                sha256_digest=_extract_github_asset_sha256(tar_asset),
-                size_bytes=size_bytes,
-                published_at=str(rel.get("published_at") or "").strip(),
-                prerelease=bool(rel.get("prerelease", False)),
-            )
-        )
-    # GitHub lists by publish date, which can put 11.0-9 above 11.0-12: order by version.
-    results.sort(
-        key=lambda r: (tuple(int(n) for n in re.findall(r"\d+", r.tag_name)), r.published_at),
-        reverse=True,
-    )
-    return results
-
-
 def list_installed_compat_tools() -> list[InstalledCompatTool]:
     """List all custom compatibility tools with compatibilitytool.vdf installed."""
     from .steam_paths import _read_compat_tool_id
@@ -2120,98 +1882,6 @@ def list_installed_compat_tools() -> list[InstalledCompatTool]:
         reverse=True,
     )
     return tools
-
-
-@_serialize_runtime("compat-tools")
-def install_compat_tool(
-    release: ProtonRelease,
-    progress_cb: ProgressCb | None = None,
-) -> Path:
-    """Download, verify (when checksum_url is set), and install a Proton release."""
-    if not release.download_url:
-        raise ValueError("ProtonRelease is missing download_url.")
-
-    compat_dir = get_compat_tools_dir()
-    compat_dir.mkdir(parents=True, exist_ok=True)
-    raw_tar_name = release.asset_name or Path(release.download_url.split("?", 1)[0]).name
-    tar_name = _sanitize_asset_name(raw_tar_name)
-
-    with tempfile.TemporaryDirectory(
-        prefix=_runtime_temp_prefix("proton"), dir=str(compat_dir)
-    ) as tmp_dir:
-        tmp_path = Path(tmp_dir)
-        tar_path = tmp_path / tar_name
-        sha_path: Path | None = None
-        if release.checksum_url:
-            sha_path = tmp_path / f"{tar_name}.sha512sum"
-            _download_file(release.checksum_url, sha_path, sha_path.name)
-
-        _download_file(
-            release.download_url,
-            tar_path,
-            tar_name,
-            progress_cb=progress_cb,
-            timeout=180,
-        )
-
-        if release.size_bytes > 0:
-            actual_size = tar_path.stat().st_size
-            if actual_size != release.size_bytes:
-                raise RuntimeError(
-                    f"Downloaded {tar_name} size mismatch: expected {release.size_bytes} bytes, got {actual_size}."
-                )
-
-        if sha_path is not None:
-            _emit_progress(progress_cb, f"Verifying SHA-512 for {tar_name}...", 92)
-            _verify_sha512(
-                tar_path, sha_path.read_text(encoding="utf-8", errors="ignore")
-            )
-        elif release.sha256_digest:
-            _emit_progress(progress_cb, f"Verifying SHA-256 for {tar_name}...", 92)
-            _verify_sha256(tar_path, release.sha256_digest)
-        else:
-            raise RuntimeError(
-                f"No checksum published for {release.tag_name} ({tar_name}); not installed, "
-                "the current version is kept."
-            )
-
-        _emit_progress(progress_cb, f"Extracting {tar_name}...", 95)
-        extract_dir = tmp_path / "extract"
-        extract_dir.mkdir(parents=True, exist_ok=True)
-        _safe_extract_tar(tar_path, extract_dir)
-
-        subdirs = [p for p in extract_dir.iterdir() if p.is_dir()]
-        if len(subdirs) == 1:
-            extracted_root = subdirs[0]
-            folder_name = extracted_root.name
-        elif (extract_dir / release.tag_name).is_dir():
-            extracted_root = extract_dir / release.tag_name
-            folder_name = extracted_root.name
-        else:
-            extracted_root = extract_dir
-            folder_name = _strip_tar_suffix(tar_name) or release.tag_name
-
-        if not folder_name or folder_name in (".", "..") or "/" in folder_name or "\\" in folder_name:
-            raise RuntimeError(f"Unsafe compatibility tool folder name: {folder_name!r}")
-
-        target_dir = compat_dir / folder_name
-        if ".." in folder_name or target_dir.resolve().parent != compat_dir.resolve():
-            raise RuntimeError(f"Unsafe compatibility tool target directory: {target_dir}")
-        if not all((extracted_root / name).is_file() for name in ("proton", "compatibilitytool.vdf")):
-            raise RuntimeError(f"Compatibility tool package is incomplete: {folder_name}")
-        if release.family_id == "umu-proton":
-            report = validate_proton_integrity(extracted_root)
-            if not report.valid:
-                raise RuntimeError(f"Invalid UMU-Proton package {folder_name}: {report.error}")
-        atomic_write_text(extracted_root / _MANAGED_MARKER, f"{folder_name}\n")
-        if (target_dir.exists() or target_dir.is_symlink()) and not is_managed_compat_tool(target_dir):
-            raise ValueError(f"Refusing to overwrite a compatibility tool installed outside DeckInstall: {target_dir}")
-        with _publish_runtime_directory(extracted_root, target_dir):
-            pass
-
-
-    _emit_progress(progress_cb, f"{folder_name} installed.", 100)
-    return target_dir
 
 
 _SYSTEM_COMPAT_TOOL_DIRS = (
@@ -2771,8 +2441,19 @@ def bundled_tools_dir() -> Path | None:
     return None
 
 
-def find_winetricks() -> str | None:
-    """The system's winetricks, else the one bundled with DeckInstall."""
+def _protonfixes_dir(proton_dir: Path | None) -> Path | None:
+    """UMU-Proton's protonfixes folder: its own winetricks, with cabextract and unzip in files/bin."""
+    folder = proton_dir / "protonfixes" if proton_dir is not None else None
+    return folder if folder is not None and (folder / "winetricks").is_file() else None
+
+
+def find_winetricks(proton_dir: Path | None = None) -> str | None:
+    """The winetricks that comes with UMU-Proton (the game's, else the newest installed), else the
+    system's, else the one bundled with the AppImage (Valve's Proton on SteamOS has none)."""
+    for candidate in (proton_dir, *list_umu_proton_dirs()[:1]):
+        folder = _protonfixes_dir(candidate)
+        if folder is not None:
+            return str(folder / "winetricks")
     found = shutil.which("winetricks")
     if found:
         return found
@@ -2781,13 +2462,26 @@ def find_winetricks() -> str | None:
     return str(script) if script is not None and script.is_file() else None
 
 
-def with_bundled_tools(env: dict[str, str]) -> dict[str, str]:
-    """Put the bundled cabextract on PATH when the system has none (winetricks needs it for most
-    DirectX and Visual C++ packages)."""
+def with_bundled_tools(env: dict[str, str], winetricks: str = "") -> dict[str, str]:
+    """Put cabextract on PATH (winetricks needs it for most DirectX and Visual C++ packages): the
+    copy beside UMU-Proton's winetricks, else the AppImage's when the system has none."""
+    pf_bin = Path(winetricks).parent / "files" / "bin" if winetricks else None
+    if pf_bin is not None and (pf_bin / "cabextract").is_file():
+        env["PATH"] = f"{pf_bin}:{env.get('PATH', '/usr/bin:/bin')}"
+        return env
     tools = bundled_tools_dir()
     if tools is not None and (tools / "cabextract").is_file() and not shutil.which("cabextract", path=env.get("PATH")):
         env["PATH"] = f"{tools}:{env.get('PATH', '/usr/bin:/bin')}"
     return env
+
+
+def _installed_winetricks_verbs(prefix_dir: Path) -> set[str]:
+    """Verbs winetricks recorded in the prefix (umu-run refuses to run one twice)."""
+    try:
+        lines = (prefix_dir / "winetricks.log").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return set()
+    return {line.strip().lower() for line in lines if line.strip()}
 
 
 def run_winetricks_verbs(
@@ -2806,7 +2500,7 @@ def run_winetricks_verbs(
         if not _WINETRICKS_VERB_RE.fullmatch(verb):
             raise ValueError(f"Invalid winetricks verb: {verb!r}")
 
-    winetricks = find_winetricks()
+    winetricks = find_winetricks(proton_dir)
     if winetricks is None:
         raise RuntimeError("winetricks is not installed or not found in PATH.")
 
@@ -2826,9 +2520,26 @@ def run_winetricks_verbs(
                 on_log(f"Warning: prefix snapshot failed ({exc}); continuing winetricks.")
 
     prefix_dir.mkdir(parents=True, exist_ok=True)
-    env = with_bundled_tools(clean_child_env())  # keeps DISPLAY/XAUTHORITY: installers open windows
+    umu_run = find_system_umu_run() or get_umu_run_path()
+    if _protonfixes_dir(proton_dir) is not None and umu_run.is_file() and prefix_dir.name != "pfx":
+        # A Standalone game on UMU-Proton: its wine only runs inside the Steam Runtime container, so
+        # winetricks goes through umu-run like the game (same prefix, Proton and container; umu-run
+        # uses UMU-Proton's own winetricks and cabextract, and adds -q itself).
+        assert proton_dir is not None
+        done = _installed_winetricks_verbs(prefix_dir)
+        todo = [verb for verb in verbs if verb.lower() not in done]
+        if not todo:
+            if on_log:
+                on_log(f"Already installed: {', '.join(verbs)}")
+            return
+        env = build_umu_env(prefix_dir, proton_dir)
+        cmd = [str(umu_run), "winetricks", *todo]
+        verbs = todo
+    else:
+        env = with_bundled_tools(clean_child_env(), winetricks)  # keeps DISPLAY/XAUTHORITY: installers open windows
+        cmd = [winetricks, "-q", *verbs]
     env["WINEPREFIX"] = str(prefix_dir)
-    if proton_dir is not None:
+    if proton_dir is not None and cmd[0] == winetricks:
         for rel in ("files/bin/wine", "dist/bin/wine"):
             wine_bin = proton_dir / rel
             if wine_bin.is_file():
@@ -2841,7 +2552,6 @@ def run_winetricks_verbs(
     if cancel_flag and cancel_flag():
         raise RuntimeError("Winetricks cancelled by user.")
 
-    cmd = [winetricks, "-q", *verbs]
     if on_log:
         on_log(f"Running winetricks ({', '.join(verbs)}) in {prefix_dir}...")
 

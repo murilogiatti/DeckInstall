@@ -325,16 +325,12 @@ def build_saves_page(win: MainWindow) -> QWidget:
     win.btn_save_restore_selected.clicked.connect(lambda: _restore_selected(win))
     win.btn_save_open_folder = QPushButton(tr("saves.btn_open_folder"))
     win.btn_save_open_folder.clicked.connect(lambda: _open_folder(win))
-    # Ludusavi, for this game only (the whole backup is imported in "Every game at once").
-    win.btn_save_import_one = QPushButton(tr("saves.btn_import_one"))
-    win.btn_save_import_one.setToolTip(tr("saves.import_one_hint"))
-    win.btn_save_import_one.clicked.connect(lambda: _ludusavi_pick(win, export=False, one=True))
     win.btn_save_export = QPushButton(tr("saves.btn_export"))
     win.btn_save_export.setToolTip(tr("saves.export_hint"))
     win.btn_save_export.clicked.connect(lambda: _ludusavi_pick(win, export=True))
     for b in (
         win.btn_save_snapshot_now, win.btn_save_restore_selected, win.btn_save_open_folder,
-        win.btn_save_import_one, win.btn_save_export,
+        win.btn_save_export,
     ):
         row_actions.addWidget(b)
     row_actions.addStretch()
@@ -421,7 +417,6 @@ def save_row_buttons(win: MainWindow) -> tuple[QPushButton, ...]:
         win.btn_save_open_folder,
         win.btn_save_export,
         win.btn_save_import,
-        win.btn_save_import_one,
     )
 
 
@@ -440,7 +435,6 @@ def update_saves_action_states(win: MainWindow) -> None:
     win.btn_save_open_folder.setEnabled(row is not None)
     win.btn_save_export.setEnabled(idle and has_target)
     win.btn_save_import.setEnabled(idle)  # every game of a backup folder, installed or not
-    win.btn_save_import_one.setEnabled(idle and has_target)
 
 
 def refresh_saves_page(win: MainWindow, after_play: bool = True, scan_sources: bool = True) -> None:
@@ -1031,13 +1025,13 @@ def _ludusavi_import_setting_dir(root: Path) -> str:
     return str(root.parent if (root / lds.MAPPING_FILE).is_file() else root)
 
 
-def _ludusavi_pick(win: MainWindow, *, export: bool, one: bool = False) -> None:
-    """Export/import-one work on the selected game; plain import takes every game of a backup folder."""
+def _ludusavi_pick(win: MainWindow, *, export: bool) -> None:
+    """Export works on the selected game; import takes every game of a Ludusavi backup folder (as
+    copies: each game is then restored from its own copies)."""
     row = _selected_row(win)
-    if win._steam_busy or win._closing_pending or ((export or one) and (row is None or row.target is None)):
+    if win._steam_busy or win._closing_pending or (export and (row is None or row.target is None)):
         return
-    if not export and not one:
-        row = None
+    if not export:
         start_dir = _ludusavi_start_dir(win)
 
         def _picked_root(chosen: str) -> None:
@@ -1045,104 +1039,47 @@ def _ludusavi_pick(win: MainWindow, *, export: bool, one: bool = False) -> None:
                 return
             root = Path(chosen)
             win.settings.setValue(LUDUSAVI_DIR_KEY, _ludusavi_import_setting_dir(root))
-            _import_to_snapshots(win, root, row)
+            _import_to_snapshots(win, root, None)
 
         _pick_dir_async(_dialog_parent(win), tr("saves.pick_import"), start_dir, _picked_root)
         return
     assert row is not None and row.target is not None
     t = row.target
     start = _ludusavi_start_dir(win)
-    title = tr("saves.pick_export") if export else tr("saves.pick_import")
 
     def _picked(chosen: str) -> None:
         if not chosen or win._closing_pending or win._steam_busy:
             return
         root = Path(chosen)
-        win.settings.setValue(
-            LUDUSAVI_DIR_KEY,
-            str(root) if export else _ludusavi_import_setting_dir(root),
+        win.settings.setValue(LUDUSAVI_DIR_KEY, str(root))
+        target_dir = root / lds.escape_folder_name(t.name)
+        if (target_dir / lds.MAPPING_FILE).is_file():
+            box = QMessageBox(
+                QMessageBox.Icon.Question,
+                __app_name__,
+                tr("saves.confirm_export_overwrite", name=t.name, path=target_dir),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                _dialog_parent(win),
+            )
+            box.setDefaultButton(QMessageBox.StandardButton.No)
+            answer = box.exec()
+            box.deleteLater()
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        def _exported(res: object) -> None:
+            if isinstance(res, tuple):
+                path, count, left = res
+                _info(win, tr("saves.export_done", name=t.name, count=count, left=left, path=path))
+
+        _run(
+            win,
+            tr("saves.export_running", name=t.name),
+            lambda: lds.export_ludusavi(t.prefix_dir, t.name, root, game_dir=t.game_dir, steam_appid=t.steam_appid),
+            _exported,
         )
-        if export:
-            target_dir = root / lds.escape_folder_name(t.name)
-            if (target_dir / lds.MAPPING_FILE).is_file():
-                box = QMessageBox(
-                    QMessageBox.Icon.Question,
-                    __app_name__,
-                    tr("saves.confirm_export_overwrite", name=t.name, path=target_dir),
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    _dialog_parent(win),
-                )
-                box.setDefaultButton(QMessageBox.StandardButton.No)
-                answer = box.exec()
-                box.deleteLater()
-                if answer != QMessageBox.StandardButton.Yes:
-                    return
 
-            def _exported(res: object) -> None:
-                if isinstance(res, tuple):
-                    path, count, left = res
-                    _info(win, tr("saves.export_done", name=t.name, count=count, left=left, path=path))
-
-            _run(
-                win,
-                tr("saves.export_running", name=t.name),
-                lambda: lds.export_ludusavi(t.prefix_dir, t.name, root, game_dir=t.game_dir, steam_appid=t.steam_appid),
-                _exported,
-            )
-            return
-
-        win._begin_busy()
-        win.status_label.setText(tr("saves.import_scanning"))
-        scan_worker = SteamOpWorker(lambda: lds.find_game_folder(root, t.name))
-        win._track_worker(scan_worker)
-
-        def _on_found_one(res: object) -> None:
-            win._end_busy()
-            win.status_label.setText(tr("status.ready"))
-            if win._closing_pending or win._steam_busy:
-                return
-            folder = res if isinstance(res, Path) else None
-            if folder is None:
-                QMessageBox.warning(
-                    _dialog_parent(win), __app_name__, tr("saves.import_not_found", name=t.name, path=root)
-                )
-                return
-            if t.source == "nexus" and is_nexus_running():
-                QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.nexus_running"))
-                return
-            if _is_wine_game_running():
-                QMessageBox.warning(_dialog_parent(win), __app_name__, tr("saves.game_running"))
-                return
-            if QMessageBox.question(
-                _dialog_parent(win), __app_name__, tr("saves.confirm_import", name=t.name, path=folder)
-            ) != QMessageBox.StandardButton.Yes:
-                return
-
-            def _ok(imp_res: object) -> None:
-                if isinstance(imp_res, lds.ImportResult):
-                    _info(win, tr(
-                        "saves.import_done", name=t.name, restored=imp_res.restored, unchanged=imp_res.unchanged,
-                        kept=imp_res.kept, skipped=imp_res.skipped, safety=imp_res.snapshot or "-",
-                    ))
-
-            _run(
-                win,
-                tr("saves.import_running", name=t.name),
-                lambda: _import_ludusavi_checked(t, folder),
-                _ok,
-            )
-
-        def _on_find_err(err: str) -> None:
-            win._end_busy()
-            win.status_label.setText(tr("status.ready"))
-            if not win._closing_pending:
-                QMessageBox.critical(_dialog_parent(win), __app_name__, tr("saves.error", err=err))
-
-        scan_worker.finished_ok.connect(_on_found_one)
-        scan_worker.failed.connect(_on_find_err)
-        scan_worker.start()
-
-    _pick_dir_async(_dialog_parent(win), title, start, _picked)
+    _pick_dir_async(_dialog_parent(win), tr("saves.pick_export"), start, _picked)
 
 
 def open_save_sync_dialog(win: MainWindow) -> None:
