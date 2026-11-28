@@ -420,7 +420,6 @@ class StandaloneAndVdfTests(unittest.TestCase):
             gamemode=True,
             mangohud=False,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
             winedlloverrides="dxgi=n,b",
         )

@@ -79,7 +79,7 @@ def test_level_2_is_the_full_top_bar(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(hwnames, "cpu_short_name", lambda: "R5-5600H")
     monkeypatch.setattr(hwnames, "mangohud_gpu_text", lambda: "RTX-3050+Radeon-Vega")
     old = "MANGOHUD=1 MANGOHUD_CONFIG=legacy_layout=0,horizontal,hud_compact,gpu_text=RTX-3050,gpu_list=0 %command%"
-    opts = steam_vdf.apply_launch_presets(old, False, True, False, False, False, mangohud_level=2)
+    opts = steam_vdf.apply_launch_presets(old, False, True, False, False, mangohud_level=2)
     assert opts.count("MANGOHUD_CONFIG") == 1 and "gpu_list" not in opts
     cfg = opts.split("MANGOHUD_CONFIG=")[1].split()[0].split(",")
     for key in ("fps", "frame_timing", "gpu_power", "cpu_power", "vram", "ram", "battery", "battery_watt"):

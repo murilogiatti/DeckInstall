@@ -265,7 +265,6 @@ class TestNewFeatures(unittest.TestCase):
             gamemode=False,
             mangohud=True,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
         )
         self.assertIn("ENABLE_LSFG=1", preserved)

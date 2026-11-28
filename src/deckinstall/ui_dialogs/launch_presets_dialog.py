@@ -36,7 +36,6 @@ from ..i18n import tr
 from ..launch_presets import (
     FRAME_RATES,
     HIDE,
-    LEGACY,
     OFF,
     OK,
     TOGGLES,
@@ -212,9 +211,9 @@ def build_launch_options(
         lbl.setContentsMargins(20, 0, 0, 4)
         return lbl
 
-    chk_gm = QCheckBox(tr("launch.gamemode"))
+    chk_gm = QCheckBox(tr("opt.gamemode"))
     chk_gm.setChecked(bool(st["gamemode"]))
-    chk_mh = QCheckBox(tr("launch.mangohud"))
+    chk_mh = QCheckBox(tr("opt.mangohud"))
     chk_mh.setChecked(bool(st["mangohud"]) and not mangohud_note)
     chk_mh.setEnabled(not mangohud_note)
 
@@ -259,45 +258,36 @@ def build_launch_options(
     mh_opts_col.addLayout(mh_extra_row)
 
     profile = hardware()
-    nvapi_active = bool(st["nvapi"])
     prime_active = bool(st["prime"])
-    wayland_active = bool(st["wayland"])
 
-    chk_nvapi = QCheckBox(tr("launch.nvidia_nvapi"))
-    chk_nvapi.setChecked(nvapi_active)
-    chk_prime = QCheckBox(tr("launch.prime_offload"))
+    chk_prime = QCheckBox()  # no box of its own: the GPU picker above drives it
     chk_prime.setChecked(prime_active)
-    chk_wayland = QCheckBox(tr("launch.proton_wayland"))
-    chk_wayland.setChecked(wayland_active)
 
-    chk_debug = QCheckBox(tr("launch.debug_log"))
+    chk_debug = QCheckBox(tr("opt.debug_log"))
     chk_debug.setChecked(bool(st.get("debug_log")))
 
-    chk_dlss = QCheckBox(tr("launch.dlss_upgrade"))
-    chk_dlss.setChecked(bool(st["dlss_upgrade"]))
-
-    chk_w3d = QCheckBox(tr("launch.wined3d"))
+    chk_w3d = QCheckBox(tr("opt.wined3d"))
     chk_w3d.setChecked(bool(st["wined3d"]))
-    chk_esync = QCheckBox(tr("launch.no_esync"))
-    chk_esync.setChecked(bool(st["no_esync"]))
-    chk_fsync = QCheckBox(tr("launch.no_fsync"))
+    chk_fsync = QCheckBox(tr("opt.no_fsync"))
     chk_fsync.setChecked(bool(st["no_fsync"]))
-    chk_dxgi = QCheckBox(tr("launch.dxgi_preset"))
+    chk_dxgi = QCheckBox(tr("opt.dxgi"))
     chk_dxgi.setChecked(remove_winedlloverride(winedll_now, "dxgi") != winedll_now)
 
     st_all = parse_presets(opts_now)
-    toggle_texts = {  # label, hint
-        "fsr4_upgrade": (tr("launch.fsr4_upgrade"), tr("launch.fsr4_upgrade_hint")),
-        "fsr4_rdna3": (tr("launch.fsr4_rdna3"), tr("launch.fsr4_rdna3_hint")),
-        "xess_upgrade": (tr("launch.xess_upgrade"), tr("launch.xess_upgrade_hint")),
-        "hdr": (tr("launch.hdr"), tr("launch.hdr_hint")),
-        "vendor_amd": (tr("launch.vendor_amd"), tr("launch.vendor_amd_hint")),
-        "large_address": (tr("launch.large_address"), tr("launch.large_address_hint")),
-        "prefer_sdl": (tr("launch.prefer_sdl"), tr("launch.prefer_sdl_hint")),
-        "descriptor_heap": (tr("launch.descriptor_heap"), tr("launch.descriptor_heap_hint")),
-        "fsr3_upgrade": (tr("launch.fsr3_upgrade"), tr("launch.fsr3_upgrade_hint")),
-        "disable_nvapi": (tr("launch.disable_nvapi"), tr("launch.disable_nvapi_hint")),
-        "no_ntsync": (tr("launch.no_ntsync"), tr("launch.no_ntsync_hint")),
+    # A plain name on the box; what it does, when to use it and the variable it sets underneath.
+    toggle_texts = {  # label, caption
+        "local_shader_cache": (tr("opt.local_shader_cache"), tr("opt.local_shader_cache_hint")),
+        "disable_nvapi": (tr("opt.disable_nvapi"), tr("opt.disable_nvapi_hint")),
+        "hide_nvidia_gpu": (tr("opt.hide_nvidia_gpu"), tr("opt.hide_nvidia_gpu_hint")),
+        "vendor_amd": (tr("opt.vendor_amd"), tr("opt.vendor_amd_hint")),
+        "descriptor_heap": (tr("opt.descriptor_heap"), tr("opt.descriptor_heap_hint")),
+        "dxvk_d3d8": (tr("opt.dxvk_d3d8"), tr("opt.dxvk_d3d8_hint")),
+        "no_d3d11": (tr("opt.no_d3d11"), tr("opt.no_d3d11_hint")),
+        "no_ntsync": (tr("opt.no_ntsync"), tr("opt.no_ntsync_hint")),
+        "heap_delay_free": (tr("opt.heap_delay_free"), tr("opt.heap_delay_free_hint")),
+        "old_gl_string": (tr("opt.old_gl_string"), tr("opt.old_gl_string_hint")),
+        "integer_scaling": (tr("opt.integer_scaling"), tr("opt.integer_scaling_hint")),
+        "no_xalia": (tr("opt.no_xalia"), tr("opt.no_xalia_hint")),
     }
     toggle_checks: dict[str, QCheckBox] = {}
     for toggle in TOGGLES:
@@ -353,8 +343,7 @@ def build_launch_options(
         if is_native_linux or not chk_w3d.isChecked():
             wined3d_warn.setVisible(False)
             return
-        has_vulkan_feat = chk_dlss.isChecked() or chk_nvapi.isChecked() or chk_dxgi.isChecked()
-        wined3d_warn.setVisible(has_vulkan_feat)
+        wined3d_warn.setVisible(chk_dxgi.isChecked())  # DXGI/OptiScaler need DXVK, which wined3d turns off
 
     def _apply_optiscaler_dxgi_guard(opt_st: object | None) -> None:
         if not dlg_alive():
@@ -389,10 +378,8 @@ def build_launch_options(
         worker.start()
 
     checks = {
-        "gamemode": chk_gm, "mangohud": chk_mh, "wined3d": chk_w3d,
-        "no_esync": chk_esync, "no_fsync": chk_fsync, "dlss_upgrade": chk_dlss,
-        "nvapi": chk_nvapi, "prime": chk_prime, "wayland": chk_wayland,
-        "debug_log": chk_debug, **toggle_checks,
+        "gamemode": chk_gm, "mangohud": chk_mh, "wined3d": chk_w3d, "no_fsync": chk_fsync,
+        "prime": chk_prime, "debug_log": chk_debug, **toggle_checks,
     }
 
     def _widget_state() -> dict[str, object]:
@@ -612,8 +599,8 @@ def build_launch_options(
     gpu_choice.currentIndexChanged.connect(lambda: chk_prime.setChecked(bool(gpu_choice.currentData())))
 
     _section(tr("launch.section_performance"))
-    _add_tool_preset(chk_gm, tr("launch.gamemode_hint"), "gamemoderun")
-    _add_tool_preset(chk_mh, tr("launch.mangohud_hint"), "mangohud", extra_row=mh_opts_col, blocked_note=mangohud_note)
+    _add_tool_preset(chk_gm, tr("opt.gamemode_hint"), "gamemoderun")
+    _add_tool_preset(chk_mh, tr("opt.mangohud_hint"), "mangohud", extra_row=mh_opts_col, blocked_note=mangohud_note)
     mh_level_combo.currentIndexChanged.connect(_sync_preview)
     mh_pos_combo.currentIndexChanged.connect(_sync_preview)
     frame_combo.activated.connect(_on_frame_picked)
@@ -624,10 +611,7 @@ def build_launch_options(
     ruled: dict[str, tuple[QCheckBox, QLabel, str]] = {}
     reasons = {
         "need_nvidia_driver": tr("launch.need_nvidia_driver"),
-        "need_rtx": tr("launch.need_rtx"),
-        "need_rdna4": tr("launch.need_rdna4"),
         "need_nvidia_595": tr("launch.need_nvidia_595"),
-        "need_wayland": tr("launch.need_wayland"),
     }
 
     def _ruled(key: str, chk: QCheckBox, hint_text: str) -> None:
@@ -650,10 +634,7 @@ def build_launch_options(
             chk.setVisible(state != HIDE or on)
             hint.setVisible(state != HIDE or on)
             chk.setEnabled(state == OK or on)
-            if key in LEGACY:
-                hint.setText(tr("launch.legacy_hint"))  # only shown while on: say why to turn it off
-            else:
-                hint.setText(reasons.get(reason, normal) if state == OFF else normal)
+            hint.setText(reasons.get(reason, normal) if state == OFF else normal)
         # A card whose every option is hidden on this GPU goes too (no empty "GPU" card).
         for card, card_lay in section_cards:
             items = (card_lay.itemAt(i) for i in range(card_lay.count()))
@@ -668,38 +649,28 @@ def build_launch_options(
 
     chk_prime.toggled.connect(_gpu_changed)
     if not is_native_linux:
+        _add_toggles("performance")  # still in Performance
+
         _section(tr("launch.section_gpu"))
-        _ruled("nvapi", chk_nvapi, tr("launch.nvidia_nvapi_hint"))
         _add_toggles("gpu")
 
         _add_optiscaler_card()
-        # Upscaler upgrades of the old GE-Proton: shown only on a game that still has one on (to turn it off).
-        _ruled("dlss_upgrade", chk_dlss, tr("launch.dlss_hint"))
-        _add_toggles("upscaler")
 
         _section(tr("launch.section_compat"))
-        _ruled("wayland", chk_wayland, tr("launch.proton_wayland_hint"))
-    else:
-        for chk in (chk_nvapi, chk_dlss, chk_wayland, *toggle_checks.values()):
-            chk.setVisible(False)
-            chk.setEnabled(False)
-
-    if not is_native_linux:
         for chk, hint in (
-            (chk_w3d, tr("launch.wined3d_hint")),
-            (chk_fsync, tr("launch.no_fsync_hint")),
+            (chk_w3d, tr("opt.wined3d_hint")),
+            (chk_fsync, tr("opt.no_fsync_hint")),
         ):
             chk.toggled.connect(_sync_preview)
             _add(chk)
             _add(_muted_hint(hint))
-        _ruled("no_esync", chk_esync, tr("launch.no_esync_hint"))
         _add_toggles("compat")
         chk_dxgi.toggled.connect(_on_dxgi_toggled)
         _add(chk_dxgi)
-        _add(_muted_hint(tr("launch.dxgi_hint")))
+        _add(_muted_hint(tr("opt.dxgi_hint")))
         _add(wined3d_warn)
     else:
-        for chk in (chk_w3d, chk_esync, chk_fsync, chk_dxgi):
+        for chk in (chk_w3d, chk_fsync, chk_dxgi, *toggle_checks.values()):
             chk.setVisible(False)
             chk.setEnabled(False)
 
@@ -708,7 +679,7 @@ def build_launch_options(
         _section(tr("launch.section_advanced"))
         chk_debug.toggled.connect(_sync_preview)
         _add(chk_debug)
-        _add(_muted_hint(tr("launch.debug_log_hint")))
+        _add(_muted_hint(tr("opt.debug_log_hint")))
         _add(winedll_lbl)
         _add(winedll_edit)
         _add(_muted_hint(tr("launch.dll_hint")))

@@ -257,7 +257,7 @@ def test_launch_presets_applies_checkbox_with_real_dialog(
         assert not apply.isEnabled()
         assert not dialog.findChild(QLineEdit, "gameLaunchOptions").isVisible()
         next(b for b in dialog.findChildren(QToolButton) if b.text() == tr("launch.more_options")).click()
-        checkbox = next(c for c in dialog.findChildren(QCheckBox) if "GameMode" in c.text())
+        checkbox = next(c for c in dialog.findChildren(QCheckBox) if c.text() == tr("opt.gamemode"))
         checkbox.click()
         assert apply.isEnabled()
         apply.click()
@@ -537,7 +537,7 @@ def test_launch_editor_moves_standalone_dll_token_to_its_field(window: ui.MainWi
         raw = dialog.findChild(QLineEdit, "gameLaunchOptions")
         assert "WINEDLLOVERRIDES" not in raw.text()
         _open_more(dialog)
-        dxgi = next(c for c in dialog.findChildren(QCheckBox) if c.text() == tr("launch.dxgi_preset"))
+        dxgi = next(c for c in dialog.findChildren(QCheckBox) if c.text() == tr("opt.dxgi"))
         assert dxgi.isChecked()
         dxgi.click()
         dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Apply).click()
@@ -558,7 +558,7 @@ def test_launch_editor_enforces_optiscaler_dxgi_without_more_options(
                         lambda _exe: SimpleNamespace(proxy_dll="dxgi"))
 
     def edit(dialog: QDialog) -> bool:
-        dxgi = next(c for c in dialog.findChildren(QCheckBox) if c.text() == tr("launch.dxgi_preset"))
+        dxgi = next(c for c in dialog.findChildren(QCheckBox) if c.text() == tr("opt.dxgi"))
         if dxgi.isEnabled():
             return False  # the OptiScaler check runs in the background
         assert dxgi.isChecked()

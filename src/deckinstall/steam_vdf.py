@@ -3027,14 +3027,10 @@ def apply_launch_presets(
     gamemode: bool,
     mangohud: bool,
     wined3d: bool,
-    no_esync: bool,
     no_fsync: bool,
     winedlloverrides: str | None = None,
-    dlss_upgrade: bool = False,
     mangohud_level: int | None = None,
-    nvidia_nvapi: bool = False,
     prime_offload: bool = False,
-    proton_wayland: bool = False,
     mangohud_position: str = "",
     mangohud_fps_limit: int | None = None,
     preserve_mangohud_config: bool = False,
@@ -3108,15 +3104,8 @@ def apply_launch_presets(
             preset_envs.append(f"MANGOHUD_CONFIG={','.join(mh_parts)}")
     if wined3d:
         preset_envs.append("PROTON_USE_WINED3D=1")
-    if no_esync:
-        preset_envs.append("PROTON_NO_ESYNC=1")
     if no_fsync:
         preset_envs.append("PROTON_NO_FSYNC=1")
-    if dlss_upgrade:
-        preset_envs.append("PROTON_DLSS_UPGRADE=1")
-    if nvidia_nvapi:
-        preset_envs.append("PROTON_ENABLE_NVAPI=1")
-        preset_envs.append("DXVK_ENABLE_NVAPI=1")
     if prime_offload:
         if prime_vendor == "mesa":
             preset_envs.append("DRI_PRIME=1")
@@ -3124,8 +3113,6 @@ def apply_launch_presets(
             preset_envs.append("__NV_PRIME_RENDER_OFFLOAD=1")
             preset_envs.append("__GLX_VENDOR_LIBRARY_NAME=nvidia")
             preset_envs.append("__VK_LAYER_NV_optimus=NVIDIA_only")
-    if proton_wayland:
-        preset_envs.append("PROTON_ENABLE_WAYLAND=1")
     if debug_log:
         preset_envs.append("UMU_LOG=1")
         preset_envs.append("PROTON_LOG=1")

@@ -103,10 +103,6 @@ def _preset_text(key: str) -> str:
     dedicated = hardware().dedicated
     texts = {
         "prime": tr("launch.prime_on_gpu", name=dedicated.name if dedicated is not None else "-"),
-        "dlss_upgrade": tr("presets.short_dlss"),
-        "fsr4_upgrade": tr("presets.short_fsr4"),
-        "xess_upgrade": tr("presets.short_xess"),
-        "fsr3_upgrade": tr("presets.short_fsr3"),
     }
     return texts.get(key, key)
 

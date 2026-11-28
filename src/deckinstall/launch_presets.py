@@ -1,7 +1,8 @@
-"""Launch presets (MangoHud, gamemode, frame cap, upscaler upgrades, PRIME, Wayland, wined3d, ...).
+"""Launch presets (GameMode, MangoHud, frame cap, PRIME, wined3d, sync, GPU and compatibility switches).
 
-Checked against what UMU-Proton 11 (the default Proton) and Valve's Proton 11 really read (their
-`proton` scripts and the DXVK/VKD3D-Proton DLLs), not against older guides.
+Every preset is one UMU-Proton 11 (the default Proton) really reads: checked in its `proton` script,
+its protonfixes, wineserver/win32u and the DXVK/VKD3D-Proton DLLs, and in Valve's Proton 11 README
+("Runtime Config Options"). GE-Proton's own variables are gone (see OBSOLETE_KEYS).
 
 One place to read the presets out of a launch-options string, re-apply them after a change
 and describe them; the single presets dialog and every caller go through here.
@@ -20,12 +21,8 @@ from .steam_vdf import apply_launch_presets
 FLAGS: tuple[str, ...] = (
     "gamemode",
     "mangohud",
-    "dlss_upgrade",
-    "nvapi",
     "prime",
-    "wayland",
     "wined3d",
-    "no_esync",
     "no_fsync",
     "debug_log",
 )
@@ -46,27 +43,31 @@ class Toggle:
 
 # Data, not code: one line per preset.
 TOGGLES: tuple[Toggle, ...] = (
-    Toggle("fsr3_upgrade", ("PROTON_FSR3_UPGRADE=1",), "upscaler"),
-    Toggle("fsr4_upgrade", ("PROTON_FSR4_UPGRADE=1",), "upscaler"),
-    Toggle("xess_upgrade", ("PROTON_XESS_UPGRADE=1",), "upscaler"),
+    # Performance: a shader cache per game (umu gives each game its own folder).
+    Toggle("local_shader_cache", ("PROTON_LOCAL_SHADER_CACHE=1",), "performance"),
+    # GPU
+    Toggle("disable_nvapi", ("PROTON_DISABLE_NVAPI=1",), "gpu"),
+    Toggle("hide_nvidia_gpu", ("PROTON_HIDE_NVIDIA_GPU=1",), "gpu"),
     Toggle("vendor_amd", (), "gpu", dxvk="dxgi.customVendorId=1002"),
     Toggle("descriptor_heap", ("VKD3D_CONFIG=descriptor_heap",), "gpu"),
-    Toggle("disable_nvapi", ("PROTON_DISABLE_NVAPI=1",), "gpu"),
-    Toggle("large_address", ("PROTON_FORCE_LARGE_ADDRESS_AWARE=1",), "compat"),
-    Toggle("prefer_sdl", ("PROTON_PREFER_SDL=1",), "compat"),
+    # Compatibility
+    Toggle("dxvk_d3d8", ("PROTON_DXVK_D3D8=1",), "compat"),
+    Toggle("no_d3d11", ("PROTON_NO_D3D11=1",), "compat"),
     Toggle("no_ntsync", ("PROTON_NO_NTSYNC=1",), "compat"),
-    # No Proton reads these any more (kept so a game that has them can turn them off).
-    Toggle("fsr4_rdna3", ("PROTON_FSR4_RDNA3_UPGRADE=1",), "upscaler"),
-    Toggle("hdr", ("PROTON_ENABLE_HDR=1",), "gpu"),
+    Toggle("heap_delay_free", ("PROTON_HEAP_DELAY_FREE=1",), "compat"),
+    Toggle("old_gl_string", ("PROTON_OLD_GL_STRING=1",), "compat"),
+    Toggle("integer_scaling", ("WINE_FULLSCREEN_INTEGER_SCALING=1",), "compat"),
+    Toggle("no_xalia", ("PROTON_USE_XALIA=0",), "compat"),
 )
 TOGGLE_TOKENS = frozenset(tok for toggle in TOGGLES for tok in toggle.tokens)
-# Old presets: shown only while on (so they can be turned off), never offered or recommended. NVAPI is
-# on by default; esync is gone; RDNA3 FSR 4 and HDR flags are gone; the upscaler upgrades, Wayland,
-# SDL and NTSYNC variables were GE-Proton's, which DeckInstall no longer uses (UMU-Proton ignores them).
-LEGACY = frozenset({
-    "nvapi", "no_esync", "fsr4_rdna3", "hdr",
-    "dlss_upgrade", "fsr3_upgrade", "fsr4_upgrade", "xess_upgrade", "wayland", "prefer_sdl", "no_ntsync",
+# Variables UMU-Proton 11 does not read (GE-Proton's upscaler upgrades, Wayland, HDR and SDL switches;
+# NVAPI and esync flags; large address, on by default): dropped whenever a launch line is rewritten.
+OBSOLETE_KEYS = frozenset({
+    "PROTON_DLSS_UPGRADE", "PROTON_FSR3_UPGRADE", "PROTON_FSR4_UPGRADE", "PROTON_FSR4_RDNA3_UPGRADE",
+    "PROTON_XESS_UPGRADE", "PROTON_ENABLE_WAYLAND", "PROTON_ENABLE_HDR", "PROTON_PREFER_SDL",
+    "PROTON_ENABLE_NVAPI", "DXVK_ENABLE_NVAPI", "PROTON_NO_ESYNC",
 })
+OBSOLETE_TOKENS = frozenset({"PROTON_FORCE_LARGE_ADDRESS_AWARE=1"})  # =0 still turns it off: kept
 # Frame cap (works in Steam mode too): DXVK reads it from DXVK_CONFIG (DXVK_FRAME_RATE is gone,
 # checked in Proton 11 and UMU-Proton 11), VKD3D-Proton from VKD3D_FRAME_RATE.
 FRAME_RATES = (30, 40, 45, 60, 90, 120, 144)
@@ -94,20 +95,17 @@ class Need:
     """
 
     vendor: str = ""
-    generations: tuple[str, ...] = ()
     proprietary_nvidia: bool = False
     min_nvidia: int = 0
     hybrid: bool = False
-    wayland: bool = False  # a Wayland or gamescope session
-    legacy: bool = False  # no Proton reads it any more: hidden unless already on
 
 
 NEEDS: dict[str, Need] = {
     "descriptor_heap": Need(vendor="nvidia", proprietary_nvidia=True, min_nvidia=595),
     "disable_nvapi": Need(vendor="nvidia"),
+    "hide_nvidia_gpu": Need(vendor="nvidia"),
     "vendor_amd": Need(vendor="intel"),
     "prime": Need(hybrid=True),
-    **{key: Need(legacy=True) for key in LEGACY},
 }
 
 OK, HIDE, OFF = "ok", "hide", "off"
@@ -130,14 +128,11 @@ def proton_kind(name: str) -> str:
 def availability(key: str, gpu: Any, profile: Any, proton: str = "") -> tuple[str, str]:
     """(OK, "") or (HIDE | OFF, reason) for a preset on the game's GPU (a hardware.Gpu) and Proton.
 
-    Reasons: "need_nvidia_driver", "need_rtx", "need_rdna4", "need_nvidia_595",
-    "need_wayland". Unknown hardware or Proton never blocks.
+    Reasons: "need_nvidia_driver" and "need_nvidia_595". Unknown hardware never blocks.
     """
     need = NEEDS.get(key)
     if need is None:
         return OK, ""
-    if need.legacy:
-        return HIDE, ""
     if need.hybrid and profile is not None and not profile.is_hybrid:
         return HIDE, ""
     if gpu is not None:
@@ -145,12 +140,8 @@ def availability(key: str, gpu: Any, profile: Any, proton: str = "") -> tuple[st
             return HIDE, ""
         if need.proprietary_nvidia and gpu.driver != "nvidia":
             return OFF, "need_nvidia_driver"
-        if need.generations and gpu.generation and gpu.generation not in need.generations:
-            return OFF, f"need_{need.generations[0]}"
         if need.min_nvidia and profile is not None and 0 < profile.nvidia_major < need.min_nvidia:
             return OFF, "need_nvidia_595"
-    if need.wayland and profile is not None and profile.session == "x11":
-        return OFF, "need_wayland"
     return OK, ""
 
 
@@ -246,16 +237,12 @@ def parse_presets(opts: str) -> dict[str, Any]:
         "mh_level": mh_level,
         "mh_position": mh_position,
         "mh_fps_limit": mh_fps_limit,
-        "nvapi": "PROTON_ENABLE_NVAPI=1" in tokens_now or "DXVK_ENABLE_NVAPI=1" in tokens_now,
         "prime": (
             "__NV_PRIME_RENDER_OFFLOAD=1" in tokens_now
             or "__GLX_VENDOR_LIBRARY_NAME=nvidia" in tokens_now
             or "DRI_PRIME=1" in tokens_now
         ),
-        "wayland": "PROTON_ENABLE_WAYLAND=1" in tokens_now,
-        "dlss_upgrade": "PROTON_DLSS_UPGRADE=1" in tokens_now,
         "wined3d": "PROTON_USE_WINED3D=1" in tokens_now,
-        "no_esync": "PROTON_NO_ESYNC=1" in tokens_now,
         "no_fsync": "PROTON_NO_FSYNC=1" in tokens_now,
         "debug_log": "UMU_LOG=1" in tokens_now or "PROTON_LOG=1" in tokens_now,
         "winedll": winedll_from_tokens,
@@ -303,34 +290,28 @@ def apply_presets(
         gamemode=flag("gamemode"),
         mangohud=flag("mangohud"),
         wined3d=windows and flag("wined3d"),
-        no_esync=windows and flag("no_esync"),
         no_fsync=windows and flag("no_fsync"),
         winedlloverrides=winedlloverrides,
-        dlss_upgrade=windows and flag("dlss_upgrade"),
         mangohud_level=level if isinstance(level, int) and level in MANGOHUD_LEVELS else None,
-        nvidia_nvapi=windows and flag("nvapi"),
         prime_offload=flag("prime"),
-        proton_wayland=windows and flag("wayland"),
         mangohud_position=str(merged.get("mh_position") or ""),
         mangohud_fps_limit=frame or None,  # one cap: MangoHud also covers Vulkan/OpenGL games
         prime_vendor=prime_vendor(),
         debug_log=flag("debug_log"),
         extra_envs=extra,
-        managed_tokens=TOGGLE_TOKENS,
-        managed_keys=_MANAGED_KEYS,
+        managed_tokens=TOGGLE_TOKENS | OBSOLETE_TOKENS,
+        managed_keys=(*_MANAGED_KEYS, *OBSOLETE_KEYS),
     )
 
 
-_OBSOLETE = ("PROTON_ENABLE_NVAPI=1", "DXVK_ENABLE_NVAPI=1", "DXVK_FRAME_RATE=")
-
-
 def migrate_launch_options(opts: str) -> str:
-    """Rewrite options saved by older versions: drop the NVAPI flags (on by default now) and move
-    the frame cap from DXVK_FRAME_RATE (no longer read) to DXVK_CONFIG. Anything else is kept."""
-    if not any(old in opts for old in _OBSOLETE):
+    """Rewrite options saved by older versions: drop what UMU-Proton does not read (OBSOLETE_KEYS)
+    and move the frame cap from DXVK_FRAME_RATE (no longer read) to DXVK_CONFIG. Anything else is kept."""
+    markers = (*OBSOLETE_TOKENS, *(f"{key}=" for key in OBSOLETE_KEYS), "DXVK_FRAME_RATE=")
+    if not any(marker in opts for marker in markers):
         return opts
     try:
-        return apply_presets(opts, nvapi=False)
+        return apply_presets(opts)
     except ValueError:
         return opts
 

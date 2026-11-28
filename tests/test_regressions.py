@@ -684,7 +684,6 @@ class Phase1SecurityAndCoreTests(unittest.TestCase):
             gamemode=False,
             mangohud=False,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
             winedlloverrides=None,
         )
@@ -695,7 +694,6 @@ class Phase1SecurityAndCoreTests(unittest.TestCase):
             gamemode=True,
             mangohud=False,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
             winedlloverrides=None,
         )

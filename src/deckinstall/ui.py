@@ -236,12 +236,8 @@ class LaunchPresetState(TypedDict):
     mh_level: int
     mh_position: str
     mh_fps_limit: int
-    nvapi: bool
     prime: bool
-    wayland: bool
-    dlss_upgrade: bool
     wined3d: bool
-    no_esync: bool
     no_fsync: bool
     debug_log: bool
     winedll: str
@@ -253,7 +249,7 @@ _VDF_WATCH_MS = 5000  # how often queued Steam edits check whether Steam has clo
 
 # How versions before 0.32 stored the last presets (one setting each); still read once.
 _OLD_LAST_PREFS_FLAGS = (
-    "gamemode", "mangohud", "nvapi", "prime", "wayland", "dlss_upgrade", "wined3d", "no_esync", "no_fsync",
+    "gamemode", "mangohud", "prime", "wined3d", "no_fsync",
 )
 
 
@@ -1815,27 +1811,25 @@ class MainWindow(QMainWindow):
         self._update_add_presets_summary()
 
     def _update_add_presets_summary(self) -> None:
-        names = {
-            "gamemode": tr("presets.short_gamemode"),
-            "mangohud": tr("presets.short_mangohud"),
-            "dlss_upgrade": tr("presets.short_dlss"),
-            "nvapi": tr("presets.short_nvapi"),
+        names = {  # the same plain names the options have in Configure
+            "gamemode": tr("opt.gamemode"),
+            "mangohud": tr("opt.mangohud"),
             "prime": tr("presets.short_prime"),
-            "wayland": tr("presets.short_wayland"),
-            "wined3d": tr("presets.short_wined3d"),
-            "no_esync": tr("presets.short_no_esync"),
-            "no_fsync": tr("presets.short_no_fsync"),
-            "debug_log": tr("presets.short_debug_log"),
-            "fsr3_upgrade": tr("presets.short_fsr3"),
-            "disable_nvapi": tr("presets.short_disable_nvapi"),
-            "no_ntsync": tr("presets.short_no_ntsync"),
-            "fsr4_upgrade": tr("presets.short_fsr4"),
-            "fsr4_rdna3": tr("presets.short_fsr4"),
-            "xess_upgrade": tr("presets.short_xess"),
-            "hdr": tr("presets.short_hdr"),
-            "vendor_amd": tr("presets.short_vendor_amd"),
-            "large_address": tr("presets.short_large_address"),
-            "prefer_sdl": tr("presets.short_prefer_sdl"),
+            "wined3d": tr("opt.wined3d"),
+            "no_fsync": tr("opt.no_fsync"),
+            "debug_log": tr("opt.debug_log"),
+            "local_shader_cache": tr("opt.local_shader_cache"),
+            "disable_nvapi": tr("opt.disable_nvapi"),
+            "hide_nvidia_gpu": tr("opt.hide_nvidia_gpu"),
+            "vendor_amd": tr("opt.vendor_amd"),
+            "descriptor_heap": tr("opt.descriptor_heap"),
+            "dxvk_d3d8": tr("opt.dxvk_d3d8"),
+            "no_d3d11": tr("opt.no_d3d11"),
+            "no_ntsync": tr("opt.no_ntsync"),
+            "heap_delay_free": tr("opt.heap_delay_free"),
+            "old_gl_string": tr("opt.old_gl_string"),
+            "integer_scaling": tr("opt.integer_scaling"),
+            "no_xalia": tr("opt.no_xalia"),
         }
         active = list(dict.fromkeys(names[k] for k in active_flags(self._add_launch_options) if k in names))
         frame = int(parse_presets(self._add_launch_options).get("frame_rate") or 0)

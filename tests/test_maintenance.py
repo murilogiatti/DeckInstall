@@ -240,17 +240,15 @@ class MaintenanceTests(unittest.TestCase):
             desktop_files = sorted(apps_dir.glob("*.desktop"))
             self.assertEqual(len(desktop_files), 2)
 
-    def test_dlss_upgrade_preset_and_mangohud_topbar(self) -> None:
+    def test_gamemode_and_mangohud_presets(self) -> None:
         opts = steam_vdf.apply_launch_presets(
             "",
             gamemode=True,
             mangohud=True,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
-            dlss_upgrade=True,
         )
-        self.assertIn("PROTON_DLSS_UPGRADE=1", opts)
+        self.assertNotIn("PROTON_DLSS_UPGRADE", opts)  # GE-Proton's: UMU-Proton does not read it
         self.assertIn("MANGOHUD=1", opts)
         self.assertIn("gamemoderun", opts)
 
@@ -269,7 +267,6 @@ class MaintenanceTests(unittest.TestCase):
             gamemode=True,
             mangohud=True,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
             mangohud_level=2,
         )
@@ -284,7 +281,6 @@ class MaintenanceTests(unittest.TestCase):
             gamemode=False,
             mangohud=False,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
         )
         self.assertEqual(stripped, "")
@@ -295,7 +291,6 @@ class MaintenanceTests(unittest.TestCase):
             gamemode=False,
             mangohud=True,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
             mangohud_level=2,
             mangohud_position="bottom-right",
@@ -312,7 +307,6 @@ class MaintenanceTests(unittest.TestCase):
             gamemode=False,
             mangohud=True,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
             mangohud_level=1,
             mangohud_position="top-left",
@@ -325,7 +319,6 @@ class MaintenanceTests(unittest.TestCase):
             gamemode=False,
             mangohud=True,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
             mangohud_level=None,
             mangohud_position="top-right",
@@ -338,7 +331,6 @@ class MaintenanceTests(unittest.TestCase):
             gamemode=False,
             mangohud=True,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
             mangohud_level=None,
             mangohud_position="",
@@ -361,28 +353,23 @@ class MaintenanceTests(unittest.TestCase):
             gamemode=True,
             mangohud=True,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
             mangohud_level=2,
-            nvidia_nvapi=True,
             prime_offload=True,
-            proton_wayland=True,
         )
         self.assertIn("MANGOHUD=1", opts)
         self.assertIn("position=top-center", opts)
         self.assertIn("horizontal", opts)
-        self.assertIn("PROTON_ENABLE_NVAPI=1", opts)
-        self.assertIn("DXVK_ENABLE_NVAPI=1", opts)
         self.assertIn("__NV_PRIME_RENDER_OFFLOAD=1", opts)
         self.assertIn("__GLX_VENDOR_LIBRARY_NAME=nvidia", opts)
-        self.assertIn("PROTON_ENABLE_WAYLAND=1", opts)
+        for gone in ("PROTON_ENABLE_NVAPI", "DXVK_ENABLE_NVAPI", "PROTON_ENABLE_WAYLAND"):  # not read by UMU-Proton
+            self.assertNotIn(gone, opts)
 
         stripped = steam_vdf.apply_launch_presets(
             opts,
             gamemode=False,
             mangohud=False,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
         )
         self.assertEqual(stripped, "")

@@ -278,7 +278,6 @@ class LaunchPresetsAndStandaloneGuardTests(unittest.TestCase):
             gamemode=True,
             mangohud=True,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
             mangohud_level=None,
         )

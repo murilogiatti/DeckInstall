@@ -525,9 +525,9 @@ class CoreTests(unittest.TestCase):
         )
 
         # 1) Launch presets
-        opts = apply_launch_presets("--fullscreen", gamemode=True, mangohud=True, wined3d=False, no_esync=True, no_fsync=False)
+        opts = apply_launch_presets("--fullscreen", gamemode=True, mangohud=True, wined3d=False, no_fsync=False)
         self.assertIn("MANGOHUD=1", opts)
-        self.assertIn("PROTON_NO_ESYNC=1", opts)
+        self.assertNotIn("PROTON_NO_ESYNC", opts)  # obsolete in Proton 11: never written
         self.assertIn("gamemoderun", opts)
         self.assertIn("%command%", opts)
         self.assertIn("--fullscreen", opts)
@@ -606,7 +606,6 @@ class CoreTests(unittest.TestCase):
             gamemode=True,
             mangohud=True,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
         )
         self.assertEqual(opts, "FOO=bar MANGOHUD=1 gamemoderun %command% --fullscreen")
@@ -615,7 +614,6 @@ class CoreTests(unittest.TestCase):
             gamemode=True,
             mangohud=False,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
         )
         self.assertIn("LOG=$HOME/out.log", opts_env)
@@ -846,7 +844,6 @@ class CoreTests(unittest.TestCase):
             gamemode=True,
             mangohud=True,
             wined3d=False,
-            no_esync=False,
             no_fsync=False,
         )
         self.assertIn("';'", out)
@@ -1103,7 +1100,7 @@ class CoreTests(unittest.TestCase):
             self.assertIsNone(fetch_header_preview(12345))
 
         # 5) Launch options safety + empty preset + reentrant flock + Default user skip
-        _preset_off = dict(gamemode=False, mangohud=False, wined3d=False, no_esync=False, no_fsync=False)
+        _preset_off = dict(gamemode=False, mangohud=False, wined3d=False, no_fsync=False)
         with self.assertRaises(ValueError):
             apply_launch_presets("FOO=1\nrm -rf /", **_preset_off)
         quoted_cmd = apply_launch_presets("$(whoami)", **_preset_off)

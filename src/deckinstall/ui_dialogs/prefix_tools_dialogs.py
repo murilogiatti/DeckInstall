@@ -669,9 +669,8 @@ def build_optiscaler_panel(
                 return str(_parse_launch_preset_state(load_external_launch_presets(obj))["winedll"])
         return str(_parse_launch_preset_state(current_steam_opts)["winedll"])
 
-    def _apply_winedll_to_opts(cur_opts: str, winedll: str, *, allow_dlss_upgrade: bool = False) -> str:
-        extra: dict[str, Any] = {} if allow_dlss_upgrade else {"dlss_upgrade": False}
-        return apply_presets(cur_opts, winedlloverrides=winedll, **extra)
+    def _apply_winedll_to_opts(cur_opts: str, winedll: str) -> str:
+        return apply_presets(cur_opts, winedlloverrides=winedll)
 
     def _apply_winedll_update(
         new_winedll: str,
@@ -713,7 +712,7 @@ def build_optiscaler_panel(
                 _set_busy(False)
                 return
             cur_opts = load_external_launch_presets(obj)
-            new_opts = _apply_winedll_to_opts(cur_opts, new_winedll, allow_dlss_upgrade=True)
+            new_opts = _apply_winedll_to_opts(cur_opts, new_winedll)
             try:
                 save_external_launch_presets(obj, new_opts)
             except Exception as exc:
@@ -735,7 +734,7 @@ def build_optiscaler_panel(
         paths = win.paths
         entry = obj
 
-        new_opts = _apply_winedll_to_opts(current_steam_opts, new_winedll, allow_dlss_upgrade=True)
+        new_opts = _apply_winedll_to_opts(current_steam_opts, new_winedll)
 
         def _queue_steam_winedll() -> None:
             nonlocal current_steam_opts

@@ -441,7 +441,7 @@ def test_install_remembers_the_last_choices() -> None:
         win = _window(app, tmp)
         try:
             assert isinstance(win.btn_shortcut_menu, QCheckBox) and isinstance(win.btn_shortcut_desktop, QCheckBox)
-            win._save_last_launch_prefs("PROTON_XESS_UPGRADE=1 DXVK_FRAME_RATE=40 gamemoderun %command% -game", "")
+            win._save_last_launch_prefs("PROTON_LOCAL_SHADER_CACHE=1 DXVK_FRAME_RATE=40 gamemoderun %command% -game", "")
             if win.btn_mode_standalone.isEnabled():
                 win.btn_mode_standalone.click()
                 win.btn_shortcut_desktop.setChecked(True)
@@ -452,7 +452,7 @@ def test_install_remembers_the_last_choices() -> None:
         try:
             opts, _dll = win._load_last_launch_prefs()
             state = parse_presets(opts)
-            assert state["xess_upgrade"] and state["gamemode"] and state["frame_rate"] == 40
+            assert state["local_shader_cache"] and state["gamemode"] and state["frame_rate"] == 40
             assert "-game" not in opts  # a game's own arguments are not carried to the next one
             if win.btn_mode_standalone.isEnabled():
                 assert win._selected_install_mode() == STANDALONE
