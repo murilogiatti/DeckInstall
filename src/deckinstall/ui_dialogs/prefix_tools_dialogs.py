@@ -46,11 +46,9 @@ from ..runtime_manager import (
     WINE_TOOLS,
     WINETRICKS_PRESETS,
     find_system_umu_run,
-    find_winetricks,
-    get_system_package_install_cmd,
     get_umu_run_path,
-    install_system_package,
     resolve_game_prefix,
+    winetricks_proton,
 )
 from ..standalone import StandaloneGame, list_standalone_games, update_standalone_launch_options
 from ..steam_vdf import (
@@ -151,7 +149,7 @@ def run_exe_in_prefix_dialog(
 
 
 def open_winetricks_dialog(
-    win: MainWindow, kind: str | None = None, obj: object | None = None, preset_verbs: list[str] | None = None
+    win: MainWindow, kind: str | None = None, obj: object | None = None
 ) -> None:
     """Open Winetricks verbs/presets installer dialog for the selected game's prefix."""
     if kind is None or obj is None:
@@ -187,16 +185,10 @@ def open_winetricks_dialog(
 
     dlg_alive = _dialog_guard(dlg)
 
-    warn_row = QWidget()
-    warn_lay = QHBoxLayout(warn_row)
-    warn_lay.setContentsMargins(0, 0, 0, 0)
-    warn_lay.setSpacing(8)
-    warn_lay.addWidget(note_label(tr("winetricks.missing_warn"), "WarningText"), 1)
-    btn_install_wt = QPushButton(tr("launch.btn_install_bin", bin="winetricks"))
-    warn_lay.addWidget(btn_install_wt)
-    has_winetricks = find_winetricks() is not None
-    warn_row.setVisible(not has_winetricks)
-    lay.addWidget(warn_row)
+    # Winetricks comes with UMU-Proton and runs through umu-run, in the game's own container.
+    has_winetricks = winetricks_proton(proton_dir) is not None
+    if not has_winetricks:
+        lay.addWidget(note_label(tr("winetricks.needs_umu_proton"), "WarningText"))
 
     # 1. Wine's own tools: open at once, nothing to install.
     tools_card, tools_lay, _top = section_card(tr("winetricks.tools_label"), tr("winetricks.tools_hint"))
@@ -246,15 +238,10 @@ def open_winetricks_dialog(
         chk = QCheckBox(desc)
         chk.setToolTip(verb)
         preset_checks[verb] = chk
-        chk.setChecked(verb in (preset_verbs or ()))
         checks_grid.addWidget(chk, i // 2, i % 2)
     deps_lay.addLayout(checks_grid)
     custom_edit = QLineEdit()
     custom_edit.setPlaceholderText(tr("winetricks.custom_placeholder"))
-    for verb in preset_verbs or ():  # from the recommendations: tick the known ones, list the rest
-        if verb in WINETRICKS_PRESETS:
-            continue
-        custom_edit.setText((custom_edit.text() + " " + verb).strip())
     deps_form_extra = QFormLayout()
     deps_form_extra.addRow(tr("winetricks.custom_label"), custom_edit)
     deps_lay.addLayout(deps_form_extra)
@@ -276,64 +263,6 @@ def open_winetricks_dialog(
     btn_close.clicked.connect(dlg.accept)
     lay.addLayout(dialog_footer(btn_install, btn_close, left=(btn_cancel,)))
 
-    def _on_install_wt_pkg() -> None:
-        cmd = get_system_package_install_cmd("winetricks")
-        if not cmd:
-            QMessageBox.information(
-                dlg,
-                __app_name__,
-                tr("launch.install_bin_manual", cmd="<install winetricks>"),
-            )
-            return
-        ans = QMessageBox.question(
-            dlg,
-            __app_name__,
-            tr("launch.install_bin_confirm", bin="winetricks", cmd="sudo " + " ".join(cmd)),
-        )
-        if ans != QMessageBox.StandardButton.Yes:
-            return
-        btn_install_wt.setEnabled(False)
-        btn_install_wt.setText(tr("launch.installing_bin", bin="winetricks"))
-
-        def _pkg_ok(ok: bool, out: str) -> None:
-            if dlg_alive():
-                btn_install_wt.setEnabled(True)
-                btn_install_wt.setText(tr("launch.btn_install_bin", bin="winetricks"))
-            parent_win = dlg if dlg_alive() else win
-            if win._closing_pending:
-                return
-            if ok:
-                if dlg_alive():
-                    warn_row.setVisible(False)
-                    btn_install.setEnabled(True)
-                QMessageBox.information(
-                    parent_win, __app_name__, tr("launch.install_bin_done", bin="winetricks")
-                )
-            else:
-                QMessageBox.warning(
-                    parent_win,
-                    __app_name__,
-                    tr("launch.install_bin_error", bin="winetricks", err=out),
-                )
-
-        def _pkg_err(err: str) -> None:
-            if dlg_alive():
-                btn_install_wt.setEnabled(True)
-                btn_install_wt.setText(tr("launch.btn_install_bin", bin="winetricks"))
-            if not win._closing_pending:
-                QMessageBox.warning(
-                    dlg if dlg_alive() else win,
-                    __app_name__,
-                    tr("launch.install_bin_error", bin="winetricks", err=err),
-                )
-
-        win._run_pkexec(
-            lambda: install_system_package("winetricks"),
-            on_result=_pkg_ok,
-            on_error=_pkg_err,
-        )
-
-    btn_install_wt.clicked.connect(_on_install_wt_pkg)
 
     def _set_running(running: bool) -> None:
         if not dlg_alive():
@@ -344,7 +273,7 @@ def open_winetricks_dialog(
         winver_combo.setEnabled(not running)
         for btn_tool in tool_buttons:
             btn_tool.setEnabled(not running)
-        btn_install.setEnabled((not running) and (find_winetricks() is not None))
+        btn_install.setEnabled((not running) and has_winetricks)
         btn_cancel.setEnabled(running)
         btn_close.setEnabled(not running)
 

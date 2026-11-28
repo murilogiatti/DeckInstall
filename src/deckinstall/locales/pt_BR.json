@@ -285,7 +285,6 @@
   "winetricks.done": "Dependências instaladas com sucesso!",
   "winetricks.error": "Falha no winetricks: {err}",
   "winetricks.cancelled": "Instalação do winetricks cancelada.",
-  "winetricks.missing_warn": "'winetricks' não foi encontrado no PATH do sistema. Instale-o antes de executar.",
   "error.insufficient_space": "Falta espaço em {path}.\nPrecisa de: {required}\nLivre: {available}",
   "maint.btn_backup_and_delete": "Guardar saves (.zip) e apagar",
   "maint.btn_delete_anyway": "Apagar mesmo assim",
@@ -1062,13 +1061,11 @@
   "rec.from_valve": "Do Proton da Valve: ele só aplica isto em jogos comprados na Steam, não em atalhos.",
   "rec.from_umu": "Do umu (protonfixes), traduzida para funcionar com qualquer Proton.",
   "rec.umu_automatic": "No modo Autônomo, o umu aplica sozinho as correções (protonfixes) deste jogo.",
-  "rec.after_first_play": "Precisa do prefixo do jogo: abra o jogo uma vez e aplique depois em Configurar jogo.",
-  "rec.umu_advanced": "Parte da correção do umu só o UMU-Proton ou o umu fazem (ela mexe em arquivos, no registro ou no executável).",
+  "rec.umu_advanced": "Parte da correção do umu só o UMU-Proton ou o umu fazem (ela instala pacotes do winetricks ou mexe em arquivos, no registro ou no executável).",
   "rec.apply": "Aplicar",
   "rec.fix_env": "Variável {value}",
   "rec.fix_arg": "Argumento do jogo {value}",
   "rec.fix_dll": "DLL {value}",
-  "rec.fix_winetricks": "Instalar {value} (winetricks)",
   "rec.fix_compat": "Opção do Proton {value}",
   "rec.optiscaler": "Este jogo só tem DLSS, que esta placa não roda: o OptiScaler (Mais opções > Upscaler) pode dar a ele FSR ou XeSS no lugar.",
   "settings.prefs_title": "Preferências",
@@ -1122,5 +1119,6 @@
   "add.presets_after": "{opts} (as opções usadas por último; mude depois na Biblioteca, em Configurar)",
   "library.bulk_proton_hint": "Troca o Proton de vários jogos de uma vez (ou volta ao padrão, o UMU-Proton).",
   "library.bulk_optiscaler_hint": "Instala ou atualiza o OptiScaler em todos os jogos que trazem DLSS, FSR 2+ ou XeSS.",
-  "runtimes.btn_download": "Baixar"
+  "runtimes.btn_download": "Baixar",
+  "winetricks.needs_umu_proton": "O winetricks vem com o UMU-Proton e roda no próprio contêiner do jogo: escolha o UMU-Proton para este jogo (Configurar > Proton) para usá-lo."
 }

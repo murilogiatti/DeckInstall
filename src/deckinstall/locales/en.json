@@ -285,7 +285,6 @@
   "winetricks.done": "Dependencies installed successfully!",
   "winetricks.error": "winetricks failed: {err}",
   "winetricks.cancelled": "winetricks installation cancelled.",
-  "winetricks.missing_warn": "'winetricks' was not found in your system PATH. Install it before running.",
   "error.insufficient_space": "Insufficient disk space at {path}.\nRequired: {required}\nAvailable: {available}",
   "maint.btn_backup_and_delete": "Backup saves (.zip) & Delete",
   "maint.btn_delete_anyway": "Delete anyway",
@@ -1062,13 +1061,11 @@
   "rec.from_valve": "From Valve's Proton: it applies this only to games bought on Steam, not to shortcuts.",
   "rec.from_umu": "From umu (protonfixes), translated so it works with any Proton.",
   "rec.umu_automatic": "umu applies this game's protonfixes by itself in Standalone mode.",
-  "rec.after_first_play": "Needs the game's prefix: open the game once, then apply it from Configure game.",
-  "rec.umu_advanced": "Part of umu's fix only UMU-Proton or umu can do (it changes files, the registry or the executable).",
+  "rec.umu_advanced": "Part of umu's fix is only done by UMU-Proton or umu (it installs winetricks packages or changes files, the registry or the executable).",
   "rec.apply": "Apply",
   "rec.fix_env": "Variable {value}",
   "rec.fix_arg": "Game argument {value}",
   "rec.fix_dll": "DLL {value}",
-  "rec.fix_winetricks": "Install {value} (winetricks)",
   "rec.fix_compat": "Proton option {value}",
   "rec.optiscaler": "This game only has DLSS, which this GPU cannot run: OptiScaler (More options > Upscaler) can give it FSR or XeSS instead.",
   "settings.prefs_title": "Preferences",
@@ -1122,5 +1119,6 @@
   "add.presets_after": "{opts} (the options used last; change them later in the Library under Configure)",
   "library.bulk_proton_hint": "Moves several games to another Proton at once (or back to the default, UMU-Proton).",
   "library.bulk_optiscaler_hint": "Installs or updates OptiScaler in every game that ships DLSS, FSR 2+ or XeSS.",
-  "runtimes.btn_download": "Download"
+  "runtimes.btn_download": "Download",
+  "winetricks.needs_umu_proton": "Winetricks comes with UMU-Proton and runs inside the game's own container: choose UMU-Proton for this game (Configure > Proton) to use it."
 }

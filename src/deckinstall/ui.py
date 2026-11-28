@@ -3700,9 +3700,9 @@ class MainWindow(QMainWindow):
         )
 
     def _open_winetricks_dialog(
-        self, kind: str | None = None, obj: object | None = None, preset_verbs: list[str] | None = None
+        self, kind: str | None = None, obj: object | None = None
     ) -> None:
-        open_winetricks_dialog(self, kind=kind, obj=obj, preset_verbs=preset_verbs)
+        open_winetricks_dialog(self, kind=kind, obj=obj)
 
     def _open_optiscaler_dialog(
         self, kind: str | None = None, obj: object | None = None, *,

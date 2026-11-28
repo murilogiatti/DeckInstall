@@ -4,8 +4,8 @@
   game's Steam AppID, so a non-Steam shortcut never gets it. Its options can be given back with
   STEAM_COMPAT_CONFIG, which Valve's Proton and UMU-Proton both read.
 - umu/protonfixes: one small Python file per game, which umu and UMU-Proton run by themselves.
-  With Valve's Proton they do not run; most of them only set variables, arguments, DLLs or
-  install winetricks packages, which DeckInstall can do with any Proton.
+  With Valve's Proton they do not run; most of them only set variables, arguments or DLLs, which
+  DeckInstall can give any Proton (winetricks packages need UMU-Proton, which installs them itself).
 
 Both are read as source (Python's ast), never executed. Nothing here talks to the network except
 `refresh_protonfixes`, which downloads the whole protonfixes archive (it says nothing about which
@@ -44,9 +44,9 @@ _ENV_TOKEN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 class Fix:
     """One thing to do for a game.
 
-    kind: "env" (KEY=VALUE), "arg" (game argument), "dll" (name=order), "winetricks" (a verb),
-    "compat" (a Proton compat option, given through STEAM_COMPAT_CONFIG) or "advanced" (a step only
-    umu/UMU-Proton can do: shown, never applied). source: "valve" or "umu".
+    kind: "env" (KEY=VALUE), "arg" (game argument), "dll" (name=order), "compat" (a Proton compat
+    option, given through STEAM_COMPAT_CONFIG) or "advanced" (a step only umu/UMU-Proton can do,
+    winetricks packages included: shown, never applied). source: "valve" or "umu".
     """
 
     kind: str
@@ -255,7 +255,7 @@ def _translate(stmts: list[ast.stmt], game_dir: Path | None, out: list[Fix]) -> 
         if any(a is None for a in args):
             out.append(Fix("advanced", name, "umu"))
         elif name == "protontricks" and isinstance(args[0], str) and _VERB.match(args[0]):
-            out.append(Fix("winetricks", args[0], "umu"))
+            out.append(Fix("advanced", f"winetricks {args[0]}", "umu"))  # UMU-Proton does it itself
         elif name == "set_environment" and len(args) == 2 and _ENV_KEY.match(str(args[0])):
             out.append(Fix("env", f"{args[0]}={args[1]}", "umu"))
         elif name == "append_argument" and isinstance(args[0], str):
@@ -298,7 +298,7 @@ def umu_fixes(path: Path | None, game_dir: Path | None = None) -> list[Fix]:
 
 def apply_fixes(opts: str, winedll: str, fixes: Iterable[Fix]) -> tuple[str, str]:
     """Add env, argument, DLL and compat fixes to the launch options (and WINEDLLOVERRIDES);
-    winetricks and advanced items are not options and are left out."""
+    advanced items are not options and are left out."""
     from .steam_vdf import _format_launch_token, merge_winedlloverride
 
     try:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -33,7 +32,6 @@ class Target:
     proton_dir: Path | None
     opts: str
     winedll: str
-    prefix_ready: bool  # winetricks needs a prefix the game has already created
     store: str = ""
     codename: str = ""
     exe: Path | None = None  # to read which upscalers the game ships
@@ -93,7 +91,6 @@ def _fix_text(fix: Fix) -> str:
         "env": tr("rec.fix_env", value=fix.value),
         "arg": tr("rec.fix_arg", value=fix.value),
         "dll": tr("rec.fix_dll", value=fix.value),
-        "winetricks": tr("rec.fix_winetricks", value=fix.value),
         "compat": tr("rec.fix_compat", value=fix.value),
     }
     return texts.get(fix.kind, fix.value)
@@ -113,7 +110,6 @@ def add_game_recommendations(
     layout: QVBoxLayout,
     editor: LaunchOptions,
     target: Target,
-    install_verb: Callable[[str], None] | None = None,
 ) -> None:
     """Load suggestions when More options is opened. Each change is explicit."""
     from .ui_workers import SteamOpWorker
@@ -127,19 +123,14 @@ def add_game_recommendations(
     def add_fix(fix: Fix) -> None:
         btn = QPushButton(_fix_text(fix))
         btn.setToolTip(tr("rec.from_valve") if fix.source == "valve" else tr("rec.from_umu"))
-        if fix.kind == "winetricks":
-            if install_verb is None or not target.prefix_ready:
-                btn.setEnabled(False)
-                btn.setToolTip(tr("rec.after_first_play"))
-            else:
-                btn.clicked.connect(lambda: install_verb(fix.value))
-        else:
-            def apply() -> None:
-                opts, dll = apply_fixes(*editor.values(), [fix])
-                if target.dll_in_opts:
-                    opts = apply_presets(opts, winedlloverrides=dll)
-                editor.set_options(opts, dll)
-            btn.clicked.connect(apply)
+
+        def apply() -> None:
+            opts, dll = apply_fixes(*editor.values(), [fix])
+            if target.dll_in_opts:
+                opts = apply_presets(opts, winedlloverrides=dll)
+            editor.set_options(opts, dll)
+
+        btn.clicked.connect(apply)
         actions.addWidget(btn)
 
     def loaded(found: object) -> None:

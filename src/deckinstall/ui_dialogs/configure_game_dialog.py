@@ -601,7 +601,6 @@ def open_configure_game_dialog(win: MainWindow) -> None:
                 binary = find_proton_binary(root)
                 proton_dir = binary.parent if binary else None
         opts, dll = editor.values()
-        prefix = resolved_pfx_ref[0] or getattr(sa_obj or obj, "prefix_dir", None)
         target = Target(
             title=title_name,
             steam_appid=sa_obj.steam_appid if sa_obj is not None else None,
@@ -611,16 +610,12 @@ def open_configure_game_dialog(win: MainWindow) -> None:
             proton_dir=proton_dir,
             opts=opts,
             winedll=dll,
-            prefix_ready=prefix is not None and prefix.is_dir(),
             store=obj.store if isinstance(obj, ExternalLauncherGame) else "",
             codename=obj.game_id if isinstance(obj, ExternalLauncherGame) else "",
             dll_in_opts=not is_standalone,
             exe=sa_obj.exe_path if sa_obj is not None else Path(exe_str.strip('"')),
         )
-        add_game_recommendations(
-            win, parent, layout, editor, target,
-            lambda verb: win._open_winetricks_dialog(kind, obj, preset_verbs=[verb]),
-        )
+        add_game_recommendations(win, parent, layout, editor, target)
 
     def pending_steam_edit(op: str) -> QueuedVdfEdit | None:
         if not isinstance(obj, ShortcutEntry) or win.paths is None:

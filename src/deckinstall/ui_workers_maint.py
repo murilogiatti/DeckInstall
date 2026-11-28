@@ -182,7 +182,7 @@ class MaintHealthWorker(QThread):
         ]
         tools = {
             name: shutil.which(name) is not None
-            for name in ("winetricks", "gamemoderun", "innoextract", "unrar", "unzip")
+            for name in ("gamemoderun", "innoextract", "unrar", "unzip")
         }
         tools["7z"] = _find_7z_bin() is not None
 

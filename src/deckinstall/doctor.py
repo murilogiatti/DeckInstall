@@ -28,7 +28,6 @@ _TOOLS: dict[str, str] = {
     "7z": "unpack the OptiScaler download (.7z)",
     "7zz": "unpack the OptiScaler download (.7z)",
     "innoextract": "unpack GOG offline installers",
-    "winetricks": "Winetricks verbs on a prefix",
     "gamemoderun": "GameMode preset",
     "bwrap": "umu-run container (Standalone mode)",
     "unshare": "user namespace probe",

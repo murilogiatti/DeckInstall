@@ -76,7 +76,7 @@ def test_umu_fixes_are_translated_not_executed(tmp_path: Path) -> None:
     game_dir.mkdir()
     fixes = umu_fixes(fix_file(root, 1), game_dir)
     assert fixes == [
-        Fix("winetricks", "d3dcompiler_47", "umu"),
+        Fix("advanced", "winetricks d3dcompiler_47", "umu"),  # UMU-Proton installs it itself
         Fix("env", "PULSE_LATENCY_MSEC=60", "umu"),
         Fix("arg", "-dx11", "umu"),
         Fix("dll", "xinput1_3=n,b", "umu"),
@@ -98,12 +98,12 @@ def test_real_protonfixes_translate_without_errors() -> None:
 
     real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)  # the tests redirect HOME
     root = next((p / "protonfixes" for p in sorted((real_home / ".local/share/Steam/compatibilitytools.d")
-                 .glob("GE-Proton*")) if (p / "protonfixes/gamefixes-steam").is_dir()), None)
+                 .glob("*Proton*")) if (p / "protonfixes/gamefixes-steam").is_dir()), None)
     if root is None:
-        pytest.skip("no GE-Proton with protonfixes here")
+        pytest.skip("no UMU-Proton with protonfixes here")
     files = list((root / "gamefixes-steam").glob("*.py"))
     usable = sum(1 for f in files if any(x.kind != "advanced" for x in umu_fixes(f)))
-    assert len(files) > 100 and usable > len(files) // 2
+    assert len(files) > 100 and usable > len(files) // 4  # winetricks packages are UMU-Proton's own
 
 
 def _archive(members: dict[str, bytes], symlink: str = "") -> bytes:
@@ -163,7 +163,7 @@ def test_fixes_go_into_the_launch_options_in_the_right_order() -> None:
         Fix("arg", "-dx11", "umu"),
         Fix("compat", "noopwr", "valve"),
         Fix("dll", "dwmapi=n,b", "umu"),
-        Fix("winetricks", "d3dx9", "umu"),
+        Fix("advanced", "winetricks d3dx9", "umu"),
     ]
     opts, dll = apply_fixes("A=1 STEAM_COMPAT_CONFIG=hidenvgpu gamemoderun %command% -x", "", fixes)
     # Variables before gamemoderun (after it they would be its arguments), Steam's options merged.
@@ -184,11 +184,11 @@ def test_inline_recommendations_change_only_the_selected_setting(monkeypatch: py
     found = rec.Found(
         presets={"prime": True},
         valve=[Fix("compat", "noopwr", "valve")],
-        umu=[Fix("arg", "-dx11", "umu"), Fix("winetricks", "d3dx9", "umu")],
+        umu=[Fix("arg", "-dx11", "umu"), Fix("advanced", "winetricks d3dx9", "umu")],
         umu_file=True,
     )
     monkeypatch.setattr(rec, "gather", lambda target: found)
-    target = rec.Target("Game", 1, None, "steam", "valve", None, "%command% --custom", "", prefix_ready=False)
+    target = rec.Target("Game", 1, None, "steam", "valve", None, "%command% --custom", "")
     parent = QWidget()
     layout = QVBoxLayout(parent)
     win, editor = mock.Mock(), mock.Mock()
@@ -200,7 +200,7 @@ def test_inline_recommendations_change_only_the_selected_setting(monkeypatch: py
 
     buttons = {b.text(): b for b in parent.findChildren(QPushButton)}
     editor.set_options.assert_not_called()
-    assert not buttons[tr("rec.fix_winetricks", value="d3dx9")].isEnabled()
+    assert not any("d3dx9" in text for text in buttons)  # only UMU-Proton installs it (a note says so)
     assert tr("launch.prime_offload") not in buttons
     buttons[tr("rec.fix_compat", value="noopwr")].click()
     editor.set_options.assert_called_once_with("STEAM_COMPAT_CONFIG=noopwr %command% --custom", "")

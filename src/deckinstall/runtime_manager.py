@@ -17,7 +17,6 @@ import shutil
 import signal
 import stat
 import subprocess
-import sys
 import tarfile
 import tempfile
 import threading
@@ -2068,12 +2067,6 @@ _SYSTEM_PACKAGE_MAP: dict[str, dict[str, list[str]]] = {
         "pacman": ["gamemode"],
         "zypper": ["gamemode"],
     },
-    "winetricks": {
-        "apt-get": ["winetricks"],
-        "dnf": ["winetricks"],
-        "pacman": ["winetricks"],
-        "zypper": ["winetricks"],
-    },
     "innoextract": {
         "apt-get": ["innoextract"],
         "dnf": ["innoextract"],
@@ -2431,48 +2424,13 @@ def resolve_game_prefix(
     raise ValueError(f"Unsupported game kind: {kind!r}")
 
 
-def bundled_tools_dir() -> Path | None:
-    """The AppImage's tools/ folder (winetricks and cabextract travel with the app, so they work on
-    SteamOS, whose read-only system has neither and loses anything installed at the next update)."""
-    roots = [os.environ.get("APPDIR", ""), str(Path(sys.executable).resolve().parent)]
-    for root in roots:
-        if root and (Path(root) / "tools").is_dir():
-            return Path(root) / "tools"
-    return None
+def winetricks_proton(proton_dir: Path | None) -> Path | None:
+    """The game's Proton when it carries winetricks (UMU-Proton's protonfixes), else None.
 
-
-def _protonfixes_dir(proton_dir: Path | None) -> Path | None:
-    """UMU-Proton's protonfixes folder: its own winetricks, with cabextract and unzip in files/bin."""
+    Winetricks only runs through `umu-run winetricks`: UMU-Proton's own copy, with its cabextract,
+    inside the same Steam Runtime container as the game (its wine does not run outside it)."""
     folder = proton_dir / "protonfixes" if proton_dir is not None else None
-    return folder if folder is not None and (folder / "winetricks").is_file() else None
-
-
-def find_winetricks(proton_dir: Path | None = None) -> str | None:
-    """The winetricks that comes with UMU-Proton (the game's, else the newest installed), else the
-    system's, else the one bundled with the AppImage (Valve's Proton on SteamOS has none)."""
-    for candidate in (proton_dir, *list_umu_proton_dirs()[:1]):
-        folder = _protonfixes_dir(candidate)
-        if folder is not None:
-            return str(folder / "winetricks")
-    found = shutil.which("winetricks")
-    if found:
-        return found
-    tools = bundled_tools_dir()
-    script = tools / "winetricks" if tools is not None else None
-    return str(script) if script is not None and script.is_file() else None
-
-
-def with_bundled_tools(env: dict[str, str], winetricks: str = "") -> dict[str, str]:
-    """Put cabextract on PATH (winetricks needs it for most DirectX and Visual C++ packages): the
-    copy beside UMU-Proton's winetricks, else the AppImage's when the system has none."""
-    pf_bin = Path(winetricks).parent / "files" / "bin" if winetricks else None
-    if pf_bin is not None and (pf_bin / "cabextract").is_file():
-        env["PATH"] = f"{pf_bin}:{env.get('PATH', '/usr/bin:/bin')}"
-        return env
-    tools = bundled_tools_dir()
-    if tools is not None and (tools / "cabextract").is_file() and not shutil.which("cabextract", path=env.get("PATH")):
-        env["PATH"] = f"{tools}:{env.get('PATH', '/usr/bin:/bin')}"
-    return env
+    return proton_dir if folder is not None and (folder / "winetricks").is_file() else None
 
 
 def _installed_winetricks_verbs(prefix_dir: Path) -> set[str]:
@@ -2493,16 +2451,20 @@ def run_winetricks_verbs(
     game_name: str = "",
     snapshot_before: bool = True,
 ) -> None:
-    """Install one or more winetricks verbs silently into prefix_dir."""
+    """Install winetricks verbs into prefix_dir with `umu-run winetricks` (skips installed ones)."""
     if not verbs:
         raise ValueError("At least one winetricks verb is required.")
     for verb in verbs:
         if not _WINETRICKS_VERB_RE.fullmatch(verb):
             raise ValueError(f"Invalid winetricks verb: {verb!r}")
-
-    winetricks = find_winetricks(proton_dir)
-    if winetricks is None:
-        raise RuntimeError("winetricks is not installed or not found in PATH.")
+    proton = winetricks_proton(proton_dir)
+    if proton is None:
+        raise RuntimeError("Winetricks comes with UMU-Proton: choose UMU-Proton for this game first.")
+    todo = [verb for verb in verbs if verb.lower() not in _installed_winetricks_verbs(prefix_dir)]
+    if not todo:
+        if on_log:
+            on_log(f"Already installed: {', '.join(verbs)}")
+        return
 
     if snapshot_before and prefix_dir.is_dir():
         try:
@@ -2519,44 +2481,17 @@ def run_winetricks_verbs(
             if on_log:
                 on_log(f"Warning: prefix snapshot failed ({exc}); continuing winetricks.")
 
-    prefix_dir.mkdir(parents=True, exist_ok=True)
-    umu_run = find_system_umu_run() or get_umu_run_path()
-    if _protonfixes_dir(proton_dir) is not None and umu_run.is_file() and prefix_dir.name != "pfx":
-        # A Standalone game on UMU-Proton: its wine only runs inside the Steam Runtime container, so
-        # winetricks goes through umu-run like the game (same prefix, Proton and container; umu-run
-        # uses UMU-Proton's own winetricks and cabextract, and adds -q itself).
-        assert proton_dir is not None
-        done = _installed_winetricks_verbs(prefix_dir)
-        todo = [verb for verb in verbs if verb.lower() not in done]
-        if not todo:
-            if on_log:
-                on_log(f"Already installed: {', '.join(verbs)}")
-            return
-        env = build_umu_env(prefix_dir, proton_dir)
-        cmd = [str(umu_run), "winetricks", *todo]
-        verbs = todo
-    else:
-        env = with_bundled_tools(clean_child_env(), winetricks)  # keeps DISPLAY/XAUTHORITY: installers open windows
-        cmd = [winetricks, "-q", *verbs]
-    env["WINEPREFIX"] = str(prefix_dir)
-    if proton_dir is not None and cmd[0] == winetricks:
-        for rel in ("files/bin/wine", "dist/bin/wine"):
-            wine_bin = proton_dir / rel
-            if wine_bin.is_file():
-                env["WINE"] = str(wine_bin)
-                wineserver = wine_bin.parent / "wineserver"
-                if wineserver.is_file():
-                    env["WINESERVER"] = str(wineserver)
-                break
-
     if cancel_flag and cancel_flag():
         raise RuntimeError("Winetricks cancelled by user.")
-
+    umu_run = ensure_umu_run()
+    prefix_dir.mkdir(parents=True, exist_ok=True)
+    # Steam keeps the prefix in compatdata/<appid>/pfx: umu-run takes the folder above it, as Steam does.
+    steam_layout = prefix_dir.name == "pfx" and not prefix_dir.is_symlink()
+    env = build_umu_env(prefix_dir.parent if steam_layout else prefix_dir, proton)
     if on_log:
-        on_log(f"Running winetricks ({', '.join(verbs)}) in {prefix_dir}...")
-
+        on_log(f"Running winetricks ({', '.join(todo)}) in {prefix_dir}...")
     proc = subprocess.Popen(
-        cmd,
+        [str(umu_run), "winetricks", *todo],  # umu-run adds -q
         env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
@@ -2570,7 +2505,7 @@ def run_winetricks_verbs(
 
     rc = drain_stream_lines(proc, cancel_flag, _handle_line, "Winetricks cancelled by user.")
     if rc != 0:
-        raise RuntimeError(f"winetricks exited with code {rc} for verbs: {', '.join(verbs)}")
+        raise RuntimeError(f"winetricks exited with code {rc} for verbs: {', '.join(todo)}")
 
 
 def build_umu_env(

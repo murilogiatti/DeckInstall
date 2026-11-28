@@ -147,8 +147,8 @@ class RuntimeManagerTests(unittest.TestCase):
             self.assertIsNone(runtime_manager.get_system_package_install_cmd("mangohud"))
         with mock.patch("shutil.which", side_effect=lambda b: "/usr/bin/pacman" if b == "pacman" else None):
             self.assertEqual(
-                runtime_manager.get_system_package_install_cmd("winetricks"),
-                ["pacman", "-S", "--noconfirm", "winetricks"],
+                runtime_manager.get_system_package_install_cmd("gamemoderun"),
+                ["pacman", "-S", "--noconfirm", "gamemode"],
             )
         with mock.patch("shutil.which", return_value=None):
             ok_unconfirmed, _ = runtime_manager.fix_bwrap_userns()
@@ -654,8 +654,11 @@ class StandaloneAndVdfTests(unittest.TestCase):
             r_fd, w_fd = os.pipe()
             os.write(w_fd, b"Executing vcrun2022\n")
             os.close(w_fd)
+            proton = Path(tmp) / "UMU-Proton-11.0-2"
+            (proton / "protonfixes").mkdir(parents=True)
+            (proton / "protonfixes" / "winetricks").write_text("#!/bin/sh\n")
             with (
-                mock.patch("shutil.which", side_effect=lambda b: "/usr/bin/winetricks" if b == "winetricks" else None),
+                mock.patch.object(runtime_manager, "ensure_umu_run", return_value=Path("/usr/bin/umu-run")),
                 mock.patch("subprocess.Popen") as mock_popen,
                 os.fdopen(r_fd, "r", encoding="utf-8") as stdout_reader,
             ):
@@ -666,7 +669,11 @@ class StandaloneAndVdfTests(unittest.TestCase):
                 proc.returncode = 0
                 mock_popen.return_value = proc
                 logs: list[str] = []
-                runtime_manager.run_winetricks_verbs(Path(tmp) / "pfx", ["vcrun2022"], on_log=logs.append)
+                with self.assertRaises(RuntimeError):  # no UMU-Proton: no winetricks
+                    runtime_manager.run_winetricks_verbs(Path(tmp) / "game", ["vcrun2022"])
+                runtime_manager.run_winetricks_verbs(
+                    Path(tmp) / "game", ["vcrun2022"], proton_dir=proton, on_log=logs.append,
+                )
                 self.assertTrue(any("vcrun2022" in line for line in logs))
 
 
@@ -674,32 +681,15 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def test_bundled_winetricks_and_cabextract_when_the_system_has_none(tmp_path, monkeypatch) -> None:
-    """SteamOS has neither and loses what is installed at updates: the AppImage carries them."""
-    tools = tmp_path / "tools"
-    tools.mkdir()
-    for name in ("winetricks", "cabextract"):
-        (tools / name).write_text("#!/bin/sh\n")
-        (tools / name).chmod(0o755)
-    monkeypatch.setenv("APPDIR", str(tmp_path))
-    monkeypatch.setattr(runtime_manager.shutil, "which", lambda name, path=None: None)
-    assert runtime_manager.find_winetricks() == str(tools / "winetricks")
-    env = runtime_manager.with_bundled_tools({"PATH": "/usr/bin", "DISPLAY": ":0"})
-    assert env["PATH"] == f"{tools}:/usr/bin" and env["DISPLAY"] == ":0"
-    monkeypatch.setattr(runtime_manager.shutil, "which", lambda name, path=None: f"/usr/bin/{name}")
-    assert runtime_manager.find_winetricks() == "/usr/bin/winetricks"  # the system's first
-    assert runtime_manager.with_bundled_tools({"PATH": "/usr/bin"})["PATH"] == "/usr/bin"
-
-
-def test_winetricks_runs_through_umu_run_for_umu_proton_games(tmp_path, monkeypatch) -> None:
+def test_winetricks_runs_only_through_umu_run(tmp_path, monkeypatch) -> None:
     """UMU-Proton's wine only runs inside the Steam Runtime container: winetricks goes through
-    umu-run (its own copy and cabextract), and verbs the prefix already has are skipped."""
+    umu-run (UMU-Proton's own copy and cabextract), verbs the prefix already has are skipped, and a
+    Steam prefix (compatdata/<appid>/pfx) is given to umu-run as Steam does (the folder above)."""
     proton = tmp_path / "UMU-Proton-11.0-2e-x86_64"
-    (proton / "protonfixes" / "files" / "bin").mkdir(parents=True)
+    (proton / "protonfixes").mkdir(parents=True)
     (proton / "protonfixes" / "winetricks").write_text("#!/bin/sh\n")
     umu = tmp_path / "umu-run"
-    umu.write_text("#!/bin/sh\n")
-    monkeypatch.setattr(runtime_manager, "find_system_umu_run", lambda: umu)
+    monkeypatch.setattr(runtime_manager, "ensure_umu_run", lambda: umu)
     prefix = tmp_path / "Game" / "prefix"
     prefix.mkdir(parents=True)
     (prefix / "winetricks.log").write_text("vcrun2022\n")
@@ -711,10 +701,15 @@ def test_winetricks_runs_through_umu_run_for_umu_proton_games(tmp_path, monkeypa
 
     monkeypatch.setattr(runtime_manager.subprocess, "Popen", Proc)
     monkeypatch.setattr(runtime_manager, "drain_stream_lines", lambda *_a: 0)
-    assert runtime_manager.find_winetricks(proton) == str(proton / "protonfixes" / "winetricks")
+    assert runtime_manager.winetricks_proton(proton) == proton
+    assert runtime_manager.winetricks_proton(tmp_path / "proton_11") is None  # Valve's Proton has none
     runtime_manager.run_winetricks_verbs(prefix, ["vcrun2022", "d3dx9"], proton_dir=proton, snapshot_before=False)
     cmd, env = calls[0]
     assert cmd == [str(umu), "winetricks", "d3dx9"]
     assert env["WINEPREFIX"] == str(prefix) and env["PROTONPATH"] == str(proton)
     runtime_manager.run_winetricks_verbs(prefix, ["vcrun2022"], proton_dir=proton, snapshot_before=False)
     assert len(calls) == 1  # already installed: umu-run is not called (it would refuse anyway)
+    steam_pfx = tmp_path / "compatdata" / "123" / "pfx"
+    steam_pfx.mkdir(parents=True)
+    runtime_manager.run_winetricks_verbs(steam_pfx, ["d3dx9"], proton_dir=proton, snapshot_before=False)
+    assert calls[1][1]["WINEPREFIX"] == str(steam_pfx.parent)
