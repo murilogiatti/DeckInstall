@@ -1759,7 +1759,8 @@ class MainWindow(QMainWindow):
             "no_xalia": tr("opt.no_xalia"),
         }
         active = list(dict.fromkeys(names[k] for k in active_flags(self._add_launch_options) if k in names))
-        active += [tr(f"presets.short_{key}_off") for key in turned_off_defaults(self._add_launch_options)]
+        turned_off = {"local_shader_cache": tr("presets.short_local_shader_cache_off")}  # on by default
+        active += [turned_off[k] for k in turned_off_defaults(self._add_launch_options) if k in turned_off]
         frame = int(parse_presets(self._add_launch_options).get("frame_rate") or 0)
         if frame:
             active.append(tr("presets.short_frame_rate", fps=frame))
